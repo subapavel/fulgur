@@ -63,6 +63,10 @@ pub(super) fn absolute_to_rgba(c: style::color::AbsoluteColor) -> [u8; 4] {
     // instead of 127. Truncation introduces a half-channel down-bias for
     // every fractional component, which is most visible in gradient stops.
     let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    // Stylo keeps a colour in the space it was specified in (`oklch()`, `lab()`,
+    // `color-mix(in oklab, …)` …), so `components` are only R/G/B after
+    // converting to sRGB. Out-of-gamut values are clipped by `q`.
+    let c = c.into_srgb_legacy();
     [
         q(c.components.0),
         q(c.components.1),
