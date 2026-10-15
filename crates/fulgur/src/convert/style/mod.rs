@@ -66,7 +66,16 @@ pub(super) fn absolute_to_rgba(c: style::color::AbsoluteColor) -> [u8; 4] {
     // Stylo keeps a colour in the space it was specified in (`oklch()`, `lab()`,
     // `color-mix(in oklab, …)` …), so `components` are only R/G/B after
     // converting to sRGB. Out-of-gamut values are clipped by `q`.
-    let c = c.into_srgb_legacy();
+    // `none` components behave as 0 outside interpolation (css-color-4 §4.4);
+    // Stylo's conversion would carry them as NaN instead.
+    let c = style::color::AbsoluteColor::new(
+        c.color_space,
+        c.c0().unwrap_or(0.0),
+        c.c1().unwrap_or(0.0),
+        c.c2().unwrap_or(0.0),
+        c.alpha,
+    )
+    .into_srgb_legacy();
     [
         q(c.components.0),
         q(c.components.1),
