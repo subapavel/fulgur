@@ -1680,6 +1680,12 @@ fn fragment_block_subtree(
     // for the rationale and the outer-Option semantics.
     let mut prev_used_page: Option<Option<String>> = None;
     let mut row_state: Option<RowState> = None;
+    // F12: a table whose first `table-header-group` can be repeated on
+    // continuation pages. `band` is the block-size reserved for the repeated
+    // header at the top of the current page strip (0 on the first strip and
+    // on any strip without a repeat).
+    let mut repeat: Option<HeaderRepeat> = repeating_table_header(doc, parent_id, page_height_px);
+    let mut band: f32 = 0.0;
     // fulgur-uebl: flex / grid containers establish a flex/grid
     // formatting context where children are not class A break points
     // (CSS Fragmentation 3 §3.2). The `page` property doesn't apply to
@@ -1797,6 +1803,7 @@ fn fragment_block_subtree(
         // it (and break-before / break-after rebases the
         // `page_taffy_origin` against it on page advance).
         let this_top_in_parent = layout.location.y;
+        let is_header_cell = repeat.as_ref().is_some_and(|r| r.cells.contains(&child_id));
 
         // fulgur-ysms: row-level co-split for flex/grid containers.
         // Must run BEFORE origin_pending_target_y is consumed so that
@@ -1885,7 +1892,7 @@ fn fragment_block_subtree(
             // `fragment_pagination_root`'s zero-height branch where
             // `continue` happens before the gap calc), so break-before
             // can fire here without first folding gap into cursor_y.
-            if break_before_page && cursor_y > page_start_y {
+            if break_before_page && cursor_y > page_start_y + band {
                 geometry
                     .entry(parent_id)
                     .or_default()
@@ -1898,11 +1905,12 @@ fn fragment_block_subtree(
                         height: (cursor_y - page_start_y).as_px(),
                     });
                 page_index += 1;
-                cursor_y = 0.0;
+                band = reserve_header_band(&mut repeat, is_header_cell, geometry, page_index);
+                cursor_y = band;
                 page_start_y = 0.0;
                 // Zero-height break-before: this child IS the first
                 // on the new page — apply origin rebase eagerly.
-                page_taffy_origin = this_top_in_parent;
+                page_taffy_origin = this_top_in_parent - band;
                 (origin_pending_target_y, origin_pending_same_row) = (None, None);
             }
             if child.element_data().is_some() {
@@ -1934,11 +1942,13 @@ fn fragment_block_subtree(
                         height: (cursor_y - page_start_y).as_px(),
                     });
                 page_index += 1;
-                cursor_y = 0.0;
+                band = reserve_header_band(&mut repeat, is_header_cell, geometry, page_index);
+                cursor_y = band;
                 page_start_y = 0.0;
                 // Zero-height break-after: NEXT child is the first
                 // on the new page — defer origin rebase.
-                (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
+                (origin_pending_target_y, origin_pending_same_row) =
+                    (Some(page_start_y + band), None);
             }
             if !is_float {
                 prev_used_page = Some(used_end.clone());
@@ -1966,7 +1976,7 @@ fn fragment_block_subtree(
         // when some content has already been placed on this page —
         // gated by `cursor_y > page_start_y` (mirrors body-level's
         // `cursor_y > 0.0` since body's implicit page_start is 0).
-        if break_before_page && cursor_y > page_start_y {
+        if break_before_page && cursor_y > page_start_y + band {
             geometry
                 .entry(parent_id)
                 .or_default()
@@ -1979,15 +1989,17 @@ fn fragment_block_subtree(
                     height: (cursor_y - page_start_y).as_px(),
                 });
             page_index += 1;
-            cursor_y = 0.0;
+            band = reserve_header_band(&mut repeat, is_header_cell, geometry, page_index);
+            cursor_y = band;
             page_start_y = 0.0;
             // The breaking child is the first in-flow child on the
             // new page strip. Rebase the Taffy origin to its
-            // `this_top_in_parent` so it lands at `page_start_y` (= 0)
-            // — discarding the inter-child gap, matching CSS 3
-            // Fragmentation §3 (margins at forced breaks truncate).
-            page_taffy_origin = this_top_in_parent;
-            child_page_y = 0.0;
+            // `this_top_in_parent` so it lands at `page_start_y` (= 0,
+            // or just below the repeated table header band) — discarding
+            // the inter-child gap, matching CSS 3 Fragmentation §3
+            // (margins at forced breaks truncate).
+            page_taffy_origin = this_top_in_parent - band;
+            child_page_y = band;
         }
 
         // (Strip-overflow page cut moved below the recursion gate as
@@ -2048,6 +2060,22 @@ fn fragment_block_subtree(
                 depth + 1,
             );
             page_index = np;
+            if is_header_cell {
+                // F12: a header cell whose own content split across pages
+                // cannot be repeated; the header must sit on one page.
+                let keep = np == pre_recursion_page
+                    && repeat.as_mut().is_none_or(|r| {
+                        r.note_header_cell(
+                            pre_recursion_page,
+                            parent_x_in_body,
+                            parent_w,
+                            child_page_y - this_top_in_parent,
+                        )
+                    });
+                if !keep {
+                    repeat = None;
+                }
+            }
             // fulgur-u0p0: when the recursion stayed on the same page,
             // keep the larger of the parent's existing `cursor_y` (row max
             // bottom from a previous parallel sibling) and the recursion's
@@ -2135,6 +2163,9 @@ fn fragment_block_subtree(
                     }
                 }
                 page_start_y = 0.0;
+                // F12: a page reached through a cell's own content split
+                // gets no repeated header (it would overlap that content).
+                band = 0.0;
                 origin_pending_target_y = Some(cursor_y);
                 let row_top = this_top_in_parent;
                 let row_bottom = row_top + child_h;
@@ -2161,9 +2192,11 @@ fn fragment_block_subtree(
                         height: (cursor_y - page_start_y).as_px(),
                     });
                 page_index += 1;
-                cursor_y = 0.0;
+                band = reserve_header_band(&mut repeat, is_header_cell, geometry, page_index);
+                cursor_y = band;
                 page_start_y = 0.0;
-                (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
+                (origin_pending_target_y, origin_pending_same_row) =
+                    (Some(page_start_y + band), None);
             }
             if !is_float {
                 prev_used_page = Some(used_end.clone());
@@ -2186,7 +2219,12 @@ fn fragment_block_subtree(
         // Use `child_page_y + child_h` (the actual placement bottom)
         // rather than `cursor_y + child_h` so a parallel sibling
         // returning to a smaller page-local y is checked correctly.
-        if child_page_y > page_start_y && child_page_y + child_h > page_height_px {
+        //
+        // F12: `band` is the repeated table header reserved at the top of
+        // this strip. A child that starts right below it is the first body
+        // content of the strip and is not cut again (a row taller than
+        // `page - header` would otherwise advance a page per attempt).
+        if child_page_y > page_start_y + band && child_page_y + child_h > page_height_px {
             let should_emit = row_state
                 .as_mut()
                 .map(|rs| rs.emitted_parent_pages.insert(page_index))
@@ -2205,13 +2243,15 @@ fn fragment_block_subtree(
                     });
             }
             page_index += 1;
-            cursor_y = 0.0;
+            band = reserve_header_band(&mut repeat, is_header_cell, geometry, page_index);
+            cursor_y = band;
             page_start_y = 0.0;
             // Forced to a fresh page: rebase the Taffy origin so the
-            // current child lands at page_start_y (= 0) on the new
-            // page. Sequential siblings then continue from this point.
-            page_taffy_origin = this_top_in_parent;
-            child_page_y = 0.0;
+            // current child lands at page_start_y (= 0, or just below the
+            // repeated table header band) on the new page. Sequential
+            // siblings then continue from this point.
+            page_taffy_origin = this_top_in_parent - band;
+            child_page_y = band;
         }
 
         // Child fits the strip (or is an atomic oversized leaf that
@@ -2239,6 +2279,19 @@ fn fragment_block_subtree(
             child_x_in_body,
             depth + 1,
         );
+        if is_header_cell {
+            let keep = repeat.as_mut().is_none_or(|r| {
+                r.note_header_cell(
+                    page_index,
+                    parent_x_in_body,
+                    parent_w,
+                    child_page_y - this_top_in_parent,
+                )
+            });
+            if !keep {
+                repeat = None;
+            }
+        }
         // Track the lowest point reached on this page so the
         // overflow / break-before checks above see the full row's
         // bottom for grid / flex parents (parallel siblings update
@@ -2261,9 +2314,10 @@ fn fragment_block_subtree(
                     height: (cursor_y - page_start_y).as_px(),
                 });
             page_index += 1;
-            cursor_y = 0.0;
+            band = reserve_header_band(&mut repeat, is_header_cell, geometry, page_index);
+            cursor_y = band;
             page_start_y = 0.0;
-            (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
+            (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y + band), None);
         }
         if !is_float {
             prev_used_page = Some(used_end.clone());
@@ -2309,6 +2363,185 @@ fn fragment_block_subtree(
         });
 
     (page_index, cursor_y)
+}
+
+/// F12: a table's first `table-header-group`, repeated at the top of every
+/// continuation page of the table (CSS 2.1 §17.2: "Print user agents may
+/// repeat header rows on each page spanned by a table").
+///
+/// Blitz lays a table out as a grid whose `layout_children` are the cells
+/// only, in DOM order (`thead` / `tbody` / `tr` get zero size), so the
+/// header group is represented by the cells that are a prefix of that list.
+/// The fragmenter reserves `height` px at the top of each continuation page
+/// and records one extra fragment of `group_id` there; `render` paints the
+/// header cells again at that spot.
+struct HeaderRepeat {
+    /// The `thead` (or any `display: table-header-group`) node.
+    group_id: usize,
+    /// Cells of the header group; a prefix of the table's `layout_children`.
+    cells: BTreeSet<usize>,
+    /// Block-size of the band, measured from the table's top border edge to
+    /// the bottom of the lowest header cell.
+    height: f32,
+    /// Where the header was first placed (the table's top edge on that page).
+    /// Written to the geometry table lazily, together with the first repeat,
+    /// so tables that never need one leave the table untouched.
+    source: Option<Fragment>,
+}
+
+impl HeaderRepeat {
+    /// Record where a header cell landed. `table_top_y` is the page-local y of
+    /// the table's top edge implied by that cell. Returns `false` when the
+    /// header ended up on more than one page, which disables the repeat.
+    fn note_header_cell(
+        &mut self,
+        page_index: u32,
+        table_x: f32,
+        table_w: f32,
+        table_top_y: f32,
+    ) -> bool {
+        match &self.source {
+            None => {
+                self.source = Some(Fragment {
+                    page_index,
+                    x: table_x.as_px(),
+                    y: table_top_y.as_px(),
+                    width: table_w.as_px(),
+                    height: self.height.as_px(),
+                });
+                true
+            }
+            Some(src) => src.page_index == page_index,
+        }
+    }
+}
+
+/// F12: reserve the repeated-header band at the top of `page_index`, a page
+/// the table has just advanced to while placing a body cell. Returns the
+/// reserved block-size (0 when there is nothing to repeat, or when the cell
+/// being placed is itself a header cell).
+///
+/// Pushes the repeat fragment into the header group's geometry. The first
+/// push also records the source fragment, so `fragments[0]` is always where
+/// the header was originally laid out; `is_repeat` keeps `is_split()` false.
+fn reserve_header_band(
+    repeat: &mut Option<HeaderRepeat>,
+    is_header_cell: bool,
+    geometry: &mut PaginationGeometryTable,
+    page_index: u32,
+) -> f32 {
+    let Some(r) = repeat.as_mut().filter(|_| !is_header_cell) else {
+        return 0.0;
+    };
+    let Some(src) = r.source.clone() else {
+        return 0.0;
+    };
+    if src.page_index == page_index {
+        return 0.0;
+    }
+    let entry = geometry.entry(r.group_id).or_default();
+    if entry.fragments.is_empty() {
+        entry.fragments.push(src.clone());
+        entry.is_repeat = true;
+    }
+    entry.fragments.push(Fragment {
+        page_index,
+        x: src.x,
+        y: 0.0_f32.as_px(),
+        width: src.width,
+        height: r.height.as_px(),
+    });
+    r.height
+}
+
+/// F12: decide whether `table_id` repeats its header group, and gather what
+/// the fragmenter needs. `None` (no repeat, today's behaviour) unless all hold:
+///
+/// - `table_id` is a table with a `table-header-group` child;
+/// - the group's cells are a prefix of the table's `layout_children` (a
+///   `tbody` before the `thead` puts body cells first, and Blitz places cells
+///   in DOM order, so the header would not be at the top);
+/// - `0 < height <= page_height_px / 4` (Chrome's policy: a header larger
+///   than a quarter page is not repeated; it also rules out pages holding
+///   nothing but a header);
+/// - neither the table nor an ancestor (below `<body>`) clips its overflow,
+///   is transformed, or is translucent: those subtrees are painted through
+///   wrappers that the repeated copy would not pass through.
+fn repeating_table_header(
+    doc: &BaseDocument,
+    table_id: usize,
+    page_height_px: f32,
+) -> Option<HeaderRepeat> {
+    let group_id = crate::blitz_adapter::first_table_header_group(doc, table_id)?;
+    let table = doc.get_node(table_id)?;
+    let layout_children = table.layout_children.borrow();
+    let layout_children = layout_children.as_deref()?;
+
+    let in_group = |mut id: usize| {
+        while let Some(parent) = doc.get_node(id).and_then(|n| n.parent) {
+            if parent == group_id {
+                return true;
+            }
+            if parent == table_id {
+                return false;
+            }
+            id = parent;
+        }
+        false
+    };
+    let n = layout_children.iter().take_while(|&&c| in_group(c)).count();
+    if n == 0 || layout_children[n..].iter().any(|&c| in_group(c)) {
+        return None;
+    }
+    let cells: BTreeSet<usize> = layout_children[..n].iter().copied().collect();
+
+    let height = layout_children[..n]
+        .iter()
+        .filter_map(|&c| doc.get_node(c))
+        .map(|c| c.final_layout.location.y + c.final_layout.size.height)
+        .filter(|h| h.is_finite())
+        .fold(0.0_f32, f32::max);
+    if height <= 0.0 || height > page_height_px / 4.0 {
+        return None;
+    }
+    if table_subtree_is_wrapped(doc, table_id) {
+        return None;
+    }
+    Some(HeaderRepeat {
+        group_id,
+        cells,
+        height,
+        source: None,
+    })
+}
+
+/// F12: true if `table_id` or one of its ancestors below `<body>` has
+/// `overflow` other than `visible`, a `transform`, or `opacity < 1`.
+fn table_subtree_is_wrapped(doc: &BaseDocument, table_id: usize) -> bool {
+    use ::style::values::computed::Overflow as Ov;
+    let mut cur = Some(table_id);
+    while let Some(id) = cur {
+        let Some(node) = doc.get_node(id) else {
+            break;
+        };
+        if let Some(elem) = node.element_data() {
+            let tag = elem.name.local.as_ref();
+            if tag == "body" || tag == "html" {
+                break;
+            }
+        }
+        if let Some(s) = node.primary_styles() {
+            if s.clone_overflow_x() != Ov::Visible
+                || s.clone_overflow_y() != Ov::Visible
+                || !s.get_box().transform.0.is_empty()
+                || s.clone_opacity() < 1.0
+            {
+                return true;
+            }
+        }
+        cur = node.parent;
+    }
+    false
 }
 
 /// fulgur-p55h: read per-line `(min_coord, max_coord)` pairs from a
@@ -3868,7 +4101,7 @@ fn compute_pagination_layout(
 mod tests {
     use super::*;
     use crate::blitz_adapter;
-    use std::ops::DerefMut;
+    use std::ops::{Deref, DerefMut};
     use std::sync::Arc;
 
     /// Parse helper for the fragmenter's tests.
@@ -6814,6 +7047,251 @@ h2 { string-set: chapter-title content(text); }
             "position:absolute child must be recursively walked and appear in geometry; \
              geom keys={:?}",
             geom.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ── F12: repeating the table header group on continuation pages ─────────
+
+    /// A table of `rows` body rows of `row_h` px under a one-row header of
+    /// `head_h` px, with no padding / spacing so geometry is exact. Header
+    /// cells are `h0` / `h1`; body cells are `r{i}a` / `r{i}b`.
+    fn thead_table_html(head_h: f32, rows: usize, row_h: f32) -> String {
+        let body: String = (0..rows)
+            .map(|i| {
+                format!(
+                    r#"<tr><td id="r{i}a" style="height:{row_h}px;padding:0">x</td>
+                       <td id="r{i}b" style="padding:0">y</td></tr>"#
+                )
+            })
+            .collect();
+        format!(
+            r#"<html><body style="margin:0"><table style="border-spacing:0;width:200px">
+                 <thead><tr><th id="h0" style="height:{head_h}px;padding:0">a</th>
+                            <th id="h1" style="padding:0">b</th></tr></thead>
+                 <tbody>{body}</tbody></table></body></html>"#
+        )
+    }
+
+    fn table_geometry(
+        html: &str,
+        page_h: f32,
+    ) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        let mut doc = parse(html, 600.0);
+        let geom = super::run_pass(doc.deref_mut(), page_h);
+        (doc, geom)
+    }
+
+    fn frag_on_page(geom: &PaginationGeometryTable, id: usize, page: u32) -> Option<&Fragment> {
+        geom.get(&id)?
+            .fragments
+            .iter()
+            .find(|f| f.page_index == page)
+    }
+
+    #[test]
+    fn table_header_has_one_fragment_per_page() {
+        // 10 rows x 40px under a 30px header on 200px pages: 4 rows fit the
+        // first page (30 + 4*40 = 190), then 4 per continuation page
+        // (30 + 4*40), so 3 pages.
+        let (doc, geom) = table_geometry(&thead_table_html(30.0, 10, 40.0), 200.0);
+        let thead = find_node_by_local_name(&doc, "thead").unwrap();
+        let group = geom.get(&thead).expect("thead has geometry");
+        let pages: Vec<u32> = group.fragments.iter().map(|f| f.page_index).collect();
+        assert_eq!(pages, vec![0, 1, 2], "one header fragment per page");
+        assert!(group.is_repeat, "repeat fragments must not read as a split");
+        assert!(!group.is_split());
+        for f in &group.fragments[1..] {
+            assert_eq!(f.y.to_f32(), 0.0, "repeat sits at the page top");
+            assert!(
+                (f.height.to_f32() - 30.0).abs() < 0.5,
+                "band = header height"
+            );
+        }
+        // The first fragment is where the header was laid out.
+        assert_eq!(group.fragments[0].y.to_f32(), 0.0);
+    }
+
+    #[test]
+    fn table_first_body_cell_starts_below_the_repeated_header() {
+        let (doc, geom) = table_geometry(&thead_table_html(30.0, 10, 40.0), 200.0);
+        // Row 4 is the first row of page 1, row 8 of page 2.
+        for (row, page) in [(4, 1), (8, 2)] {
+            let id = find_by_id(doc.deref(), &format!("r{row}a")).unwrap();
+            let f =
+                frag_on_page(&geom, id, page).unwrap_or_else(|| panic!("r{row}a on page {page}"));
+            assert!(
+                (f.y.to_f32() - 30.0).abs() < 0.5,
+                "row {row} must start at the header height, got y={}",
+                f.y.to_f32()
+            );
+        }
+        // Page 0 is unaffected: the first body row follows the header in place.
+        let r0 = find_by_id(doc.deref(), "r0a").unwrap();
+        assert!((frag_on_page(&geom, r0, 0).unwrap().y.to_f32() - 30.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn table_body_cells_never_overflow_a_page_with_a_repeated_header() {
+        let page_h = 200.0;
+        let (doc, geom) = table_geometry(&thead_table_html(30.0, 25, 37.0), page_h);
+        let mut seen = 0;
+        for i in 0..25 {
+            let id = find_by_id(doc.deref(), &format!("r{i}a")).unwrap();
+            let frags = &geom[&id].fragments;
+            assert_eq!(frags.len(), 1, "row {i} is placed exactly once");
+            let f = &frags[0];
+            assert!(
+                f.y.to_f32() + f.height.to_f32() <= page_h + 0.5,
+                "row {i} overflows page {}: y={} h={}",
+                f.page_index,
+                f.y.to_f32(),
+                f.height.to_f32()
+            );
+            if f.page_index > 0 {
+                assert!(f.y.to_f32() >= 30.0 - 0.5, "row {i} sits under the band");
+            }
+            seen += 1;
+        }
+        assert_eq!(seen, 25);
+        // Rows on one page never overlap.
+        let mut by_page: BTreeMap<u32, Vec<(f32, f32)>> = BTreeMap::new();
+        for i in 0..25 {
+            let id = find_by_id(doc.deref(), &format!("r{i}a")).unwrap();
+            let f = &geom[&id].fragments[0];
+            by_page
+                .entry(f.page_index)
+                .or_default()
+                .push((f.y.to_f32(), f.y.to_f32() + f.height.to_f32()));
+        }
+        for (page, rows) in by_page {
+            for w in rows.windows(2) {
+                assert!(w[0].1 <= w[1].0 + 0.5, "page {page}: rows overlap {w:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn table_header_taller_than_a_quarter_page_is_not_repeated() {
+        // 60px > 200/4.
+        let (doc, geom) = table_geometry(&thead_table_html(60.0, 10, 40.0), 200.0);
+        let thead = find_node_by_local_name(&doc, "thead").unwrap();
+        assert!(
+            !geom.contains_key(&thead),
+            "no geometry for the header group when it is not repeated"
+        );
+        // Continuation pages start with body rows at the top, as before:
+        // 60 + 3*40 = 180 fits page 0, so row 3 opens page 1 at y = 0.
+        let id = find_by_id(doc.deref(), "r3a").unwrap();
+        let f = &geom[&id].fragments[0];
+        assert_eq!(f.page_index, 1);
+        assert!(f.y.to_f32().abs() < 0.5, "got y={}", f.y.to_f32());
+    }
+
+    #[test]
+    fn table_header_exactly_a_quarter_page_is_repeated() {
+        let (doc, geom) = table_geometry(&thead_table_html(50.0, 10, 40.0), 200.0);
+        let thead = find_node_by_local_name(&doc, "thead").unwrap();
+        assert!(geom.get(&thead).is_some_and(|g| g.is_repeat));
+    }
+
+    #[test]
+    fn table_with_tbody_before_thead_is_not_repeated() {
+        // Blitz places cells in DOM order, so the "header" is not at the top.
+        let rows: String = (0..10)
+            .map(|i| format!(r#"<tr><td id="r{i}" style="height:40px;padding:0">x</td></tr>"#))
+            .collect();
+        let html = format!(
+            r#"<html><body style="margin:0"><table style="border-spacing:0;width:200px">
+                 <tbody>{rows}</tbody>
+                 <thead><tr><th style="height:20px;padding:0">h</th></tr></thead>
+               </table></body></html>"#
+        );
+        let (doc, geom) = table_geometry(&html, 200.0);
+        let thead = find_node_by_local_name(&doc, "thead").unwrap();
+        assert!(!geom.contains_key(&thead));
+    }
+
+    #[test]
+    fn table_header_group_is_chosen_by_display_not_tag() {
+        // `<thead>` demoted to a row group, a `<tbody>` promoted to header.
+        let html = r#"<html><body style="margin:0"><table style="border-spacing:0;width:200px">
+              <tbody id="promoted" style="display:table-header-group">
+                <tr><td style="height:20px;padding:0">h</td></tr></tbody>
+              <thead id="demoted" style="display:table-row-group">
+                <tr><td style="height:20px;padding:0">x</td></tr></thead>
+              <tbody><tr><td style="height:300px;padding:0">b</td></tr></tbody>
+            </table></body></html>"#;
+        let doc = parse(html, 600.0);
+        let promoted = find_by_id(doc.deref(), "promoted").unwrap();
+        assert_eq!(
+            crate::blitz_adapter::first_table_header_group(
+                doc.deref(),
+                find_node_by_local_name(&doc, "table").unwrap()
+            ),
+            Some(promoted)
+        );
+    }
+
+    #[test]
+    fn table_row_taller_than_page_minus_header_stays_on_one_page() {
+        // Header 30px, one 190px row on a 200px page: it cannot fit below the
+        // band (30 + 190 > 200) but must not be pushed to a new page forever.
+        let rows = r#"<tr><td id="big" style="height:190px;padding:0">x</td><td style="padding:0">y</td></tr>
+                      <tr><td id="after" style="height:20px;padding:0">z</td><td style="padding:0">w</td></tr>"#;
+        let html = format!(
+            r#"<html><body style="margin:0"><table style="border-spacing:0;width:200px">
+                 <thead><tr><th style="height:30px;padding:0">a</th><th style="padding:0">b</th></tr></thead>
+                 <tbody><tr><td id="first" style="height:100px;padding:0">q</td><td style="padding:0">r</td></tr>{rows}</tbody>
+               </table></body></html>"#
+        );
+        let (doc, geom) = table_geometry(&html, 200.0);
+        let big = find_by_id(doc.deref(), "big").unwrap();
+        let after = find_by_id(doc.deref(), "after").unwrap();
+        let fb = &geom[&big].fragments;
+        assert_eq!(fb.len(), 1, "the tall row is placed once");
+        // It moves to page 1, directly under the repeated header ...
+        assert_eq!(fb[0].page_index, 1);
+        assert!((fb[0].y.to_f32() - 30.0).abs() < 0.5);
+        // ... and the next row follows it on page 2 (30 + 190 + 20 > 200),
+        // again under a header, not on a page of its own beyond that.
+        let fa = &geom[&after].fragments;
+        assert_eq!(fa[0].page_index, 2);
+        assert!((fa[0].y.to_f32() - 30.0).abs() < 0.5);
+        let thead = find_node_by_local_name(&doc, "thead").unwrap();
+        let pages: Vec<u32> = geom[&thead]
+            .fragments
+            .iter()
+            .map(|f| f.page_index)
+            .collect();
+        assert_eq!(pages, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn table_that_fits_one_page_leaves_header_group_out_of_geometry() {
+        let (doc, geom) = table_geometry(&thead_table_html(30.0, 3, 40.0), 400.0);
+        let thead = find_node_by_local_name(&doc, "thead").unwrap();
+        assert!(!geom.contains_key(&thead));
+    }
+
+    #[test]
+    fn table_with_overflow_hidden_is_not_repeated() {
+        let html = thead_table_html(30.0, 10, 40.0)
+            .replace("<table style=\"", "<table style=\"overflow:hidden;");
+        let (doc, geom) = table_geometry(&html, 200.0);
+        let thead = find_node_by_local_name(&doc, "thead").unwrap();
+        assert!(!geom.contains_key(&thead));
+    }
+
+    #[test]
+    fn table_header_repeat_is_ignored_for_non_tables() {
+        let doc = parse(
+            r#"<html><body><div id="d"><p>x</p></div></body></html>"#,
+            600.0,
+        );
+        let d = find_by_id(doc.deref(), "d").unwrap();
+        assert_eq!(
+            crate::blitz_adapter::first_table_header_group(doc.deref(), d),
+            None
         );
     }
 }

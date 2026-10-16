@@ -6431,3 +6431,140 @@ fn regex_lite_link_rects(text: &str) -> Vec<(f32, f32, f32, f32)> {
     }
     out
 }
+
+// ── F12: `<thead>` repeated on continuation pages ───────────────────────────
+
+/// A table with a two-column header (`HDRCELL` + a link or plain text) and
+/// `rows` body rows; at the default A4 size ~45 rows fit a page.
+fn table_with_header_html(rows: usize, header_cell: &str) -> String {
+    let body: String = (0..rows)
+        .map(|i| format!("<tr><td>Row {i}</td><td>{i}</td></tr>"))
+        .collect();
+    format!(
+        r#"<!DOCTYPE html><html lang="en"><head><title>T</title></head><body>
+        <h1>Title</h1>
+        <table><thead><tr><th>{header_cell}</th><th>Value</th></tr></thead>
+        <tbody>{body}</tbody></table></body></html>"#
+    )
+}
+
+/// Occurrences of the PDF name `name` (e.g. `/TH`) not followed by another
+/// name character, so `/TH` does not count `/THead`.
+fn count_pdf_name(pdf: &[u8], name: &str) -> usize {
+    let n = name.as_bytes();
+    pdf.windows(n.len() + 1)
+        .filter(|w| &w[..n.len()] == n && !w[n.len()].is_ascii_alphanumeric())
+        .count()
+}
+
+/// Per page, how many `/Artifact` marked-content sequences its (decoded)
+/// content stream opens.
+fn artifact_sequences_per_page(pdf: &[u8]) -> Vec<usize> {
+    let doc = lopdf::Document::load_mem(pdf).expect("PDF must parse");
+    doc.get_pages()
+        .values()
+        .map(|&id| {
+            let content = doc.get_page_content(id).expect("page content");
+            String::from_utf8_lossy(&content)
+                .matches("/Artifact BMC")
+                .count()
+        })
+        .collect()
+}
+
+#[test]
+fn table_header_repeats_on_each_page_untagged() {
+    let html = table_with_header_html(150, "HDRCELL");
+    let pdf = Engine::builder().build().render(&html).expect("render");
+    let pages = page_count(&pdf);
+    assert!(pages >= 3, "expected a multi-page table, got {pages}");
+    if let Some(text) = extract_pdf_text(&pdf) {
+        assert_eq!(
+            text.matches("HDRCELL").count(),
+            pages,
+            "header once per page; text: {text:?}"
+        );
+        for i in 0..150 {
+            let row = format!("Row {i} {i}");
+            assert_eq!(
+                text.lines().filter(|l| l.trim() == row).count(),
+                1,
+                "row {i} must be printed exactly once; text: {text:?}"
+            );
+        }
+    }
+    // Untagged documents get no artifact markers from the repeat.
+    assert!(artifact_sequences_per_page(&pdf).iter().all(|&n| n == 0));
+}
+
+#[test]
+fn table_header_repeat_is_deterministic() {
+    let html = table_with_header_html(150, "HDRCELL");
+    let render = || Engine::builder().build().render(&html).expect("render");
+    assert_eq!(render(), render(), "same input must give identical bytes");
+}
+
+#[test]
+fn tagged_table_repeated_header_is_an_artifact_without_extra_th() {
+    let one_page = tagged_render_with_noto(&table_with_header_html(3, "HDRCELL"));
+    let many_pages = tagged_render_with_noto(&table_with_header_html(150, "HDRCELL"));
+    assert_eq!(page_count(&one_page), 1);
+    let pages = page_count(&many_pages);
+    assert!(pages >= 3, "expected a multi-page table, got {pages}");
+    // The repeated copies must not add structure elements: both documents
+    // have one header row of two TH cells.
+    assert_eq!(
+        count_pdf_name(&many_pages, "/TH"),
+        count_pdf_name(&one_page, "/TH"),
+        "repeated header added /TH structure elements"
+    );
+    assert!(count_pdf_name(&one_page, "/TH") >= 2);
+    // The copies are painted as artifacts: none on the first page (the
+    // source header is tagged content), one per continuation page.
+    assert!(
+        artifact_sequences_per_page(&one_page)
+            .iter()
+            .all(|&n| n == 0)
+    );
+    let artifacts = artifact_sequences_per_page(&many_pages);
+    assert_eq!(artifacts.len(), pages);
+    assert_eq!(artifacts[0], 0, "first page has the real header");
+    assert!(
+        artifacts[1..].iter().all(|&n| n == 1),
+        "one /Artifact sequence per continuation page, got {artifacts:?}"
+    );
+    if let Some(text) = extract_pdf_text(&many_pages) {
+        assert_eq!(text.matches("HDRCELL").count(), pages);
+    }
+}
+
+#[test]
+fn pdf_ua_table_header_with_link_and_inline_span_repeats_without_panic() {
+    let header = r#"<a href="https://example.com/h">Link <span>HDRCELL</span></a>"#;
+    let html = table_with_header_html(150, header);
+    let font_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/.fonts/NotoSans-Regular.ttf");
+    let mut assets = AssetBundle::default();
+    assets.add_font_file(&font_path).expect("font");
+    assets.add_css("body { font-family: 'Noto Sans', sans-serif; }");
+    let pdf = Engine::builder()
+        .pdf_ua(true)
+        .lang("en")
+        .assets(assets)
+        .build()
+        .render(&html)
+        .expect("PDF/UA render with a link in a repeated header");
+    let pages = page_count(&pdf);
+    assert!(pages >= 3);
+    // The link exists once (the source header); the copies carry no link.
+    assert_eq!(
+        String::from_utf8_lossy(&pdf)
+            .matches("/Subtype /Link")
+            .count(),
+        1,
+        "repeated header must not duplicate the link annotation"
+    );
+    if let Some(text) = extract_pdf_text(&pdf) {
+        assert_eq!(text.matches("HDRCELL").count(), pages);
+    }
+}

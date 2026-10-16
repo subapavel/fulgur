@@ -63,6 +63,7 @@ pub fn render_v2(
         None
     };
 
+    let tagging = tag_collector.is_some();
     let page_count = crate::pagination_layout::implied_page_count(geometry).max(1) as usize;
 
     // Pre-pass: register `id` anchors for `href="#..."` resolution.
@@ -295,6 +296,18 @@ pub fn render_v2(
                     &clipped_descendants,
                     &opacity_wrapped_descendants,
                     page_node_ids,
+                );
+                paint_repeated_table_headers(
+                    &mut canvas,
+                    page_idx as u32,
+                    resolved_margin.left,
+                    body_top_pt,
+                    geometry,
+                    drawables,
+                    &transformed_descendants,
+                    &clipped_descendants,
+                    &opacity_wrapped_descendants,
+                    tagging,
                 );
             }
             // Paint margin boxes after body content so page headers /
@@ -552,9 +565,95 @@ fn draw_v2_page(
     }
 }
 
+/// F12: paint the table headers the fragmenter repeated on `page_index`.
+///
+/// For each `table-header-group` in `drawables.table_header_groups` whose
+/// geometry holds a repeat fragment on this page (every fragment after the
+/// first; see `pagination_layout::reserve_header_band`), dispatch the group's
+/// drawables as if they sat on the page of the first fragment, shifted by the
+/// difference between the two fragments' page-local positions. The margins
+/// passed in are this page's, so per-page `@page` margins apply.
+///
+/// The copy is page furniture, not content: it is painted on a canvas without
+/// tag, link and bookmark collectors (no second set of TH structure elements,
+/// no duplicate link targets or outline entries) and, when the document is
+/// tagged, inside an `/Artifact` marked-content sequence (ISO 32000-1
+/// §14.8.2.2; PDF/UA-1 §7.1). `ArtifactType::Other` is used on purpose:
+/// krilla maps `Header` to `/Pagination /Attached [/Top]`, which describes
+/// running headers, not table headers.
+///
+/// Iteration is by `BTreeMap` order so the output is deterministic.
+#[allow(clippy::too_many_arguments)]
+fn paint_repeated_table_headers(
+    canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
+    page_index: u32,
+    margin_left_pt: f32,
+    margin_top_pt: f32,
+    geometry: &crate::pagination_layout::PaginationGeometryTable,
+    drawables: &Drawables,
+    transformed_descendants: &std::collections::BTreeSet<usize>,
+    clipped_descendants: &std::collections::BTreeSet<usize>,
+    opacity_wrapped_descendants: &std::collections::BTreeSet<usize>,
+    tagging: bool,
+) {
+    for (group_id, node_ids) in &drawables.table_header_groups {
+        let Some(group_geom) = geometry.get(group_id).filter(|g| g.is_repeat) else {
+            continue;
+        };
+        let Some(source) = group_geom.fragments.first() else {
+            continue;
+        };
+        for repeat in group_geom.fragments[1..]
+            .iter()
+            .filter(|f| f.page_index == page_index)
+        {
+            let left_pt = margin_left_pt + (repeat.x - source.x).in_pt().to_f32();
+            let top_pt = margin_top_pt + (repeat.y - source.y).in_pt().to_f32();
+            let mut copy_canvas = crate::draw_primitives::Canvas {
+                surface: &mut *canvas.surface,
+                bookmark_collector: None,
+                link_collector: None,
+                tag_collector: None,
+                link_run_node_id: None,
+                in_marked_content: false,
+            };
+            if tagging {
+                copy_canvas
+                    .surface
+                    .start_tagged(krilla::tagging::ContentTag::Artifact(
+                        krilla::tagging::ArtifactType::Other,
+                    ));
+                // Nested `start_tagged` panics in krilla; this flag makes every
+                // paragraph / marker entry point skip its own sequence.
+                copy_canvas.in_marked_content = true;
+            }
+            for node_id in node_ids {
+                if !geometry.contains_key(node_id) {
+                    continue;
+                }
+                dispatch_page_node(
+                    &mut copy_canvas,
+                    *node_id,
+                    source.page_index,
+                    left_pt,
+                    top_pt,
+                    geometry,
+                    drawables,
+                    transformed_descendants,
+                    clipped_descendants,
+                    opacity_wrapped_descendants,
+                );
+            }
+            if tagging {
+                copy_canvas.surface.end_tagged();
+            }
+        }
+    }
+}
+
 /// Paint everything the geometry records for `node_id` on `page_index`:
 /// the per-node body of [`draw_v2_page`]'s dispatch loop, also used to paint
-/// a repeated table header (F12).
+/// a repeated table header (F12, [`paint_repeated_table_headers`]).
 ///
 /// `node_id` must be a key of `geometry`. Applies the transform / clip /
 /// opacity skip sets, so a node painted inside an ancestor wrapper is not
@@ -2869,9 +2968,9 @@ fn draw_block_inner_paint(
 ///
 /// Tables with `overflow: hidden | clip` route through
 /// [`draw_under_clip_table`] instead so the clip path wraps every
-/// cell dispatched in the same scope. Multi-page table header
-/// repetition (`<thead>` cloned on continuation pages) is deferred
-/// to a later change.
+/// cell dispatched in the same scope. A repeated `<thead>` on
+/// continuation pages is painted separately, after the page's own
+/// content, by [`paint_repeated_table_headers`].
 fn draw_table_v2(
     canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
     entry: &crate::drawables::TableEntry,
