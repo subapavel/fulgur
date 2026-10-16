@@ -2582,6 +2582,7 @@ fn fragment_block_subtree(
         // in-flow child there is no valid interior split point, so
         // the leaf emits whole). Emit its fragment and recurse into
         // descendants on the same page.
+        warn_unprinted_inline_lines(child, child_page_y, page_height_px);
         geometry
             .entry(child_id)
             .or_default()
@@ -3255,6 +3256,35 @@ fn record_split_inline_root_descendants(
             base_y + parent_y_in_root,
             parent_x_in_body,
             depth + 1,
+        );
+    }
+}
+
+/// F30b guard: how far below the page the lines of an inline root end when the
+/// fragmenter places it whole at `child_page_y` (a table cell with direct text,
+/// a flex / grid item, a paragraph in a clipping box), with its line count.
+/// `None` when it fits or has no lines.
+fn inline_lines_below_page(
+    child: &blitz_dom::Node,
+    child_page_y: f32,
+    page_height_px: f32,
+) -> Option<(usize, f32)> {
+    let lines = collect_inline_line_metrics(child);
+    let (first, last) = (lines.first()?, lines.last()?);
+    let layout = &child.final_layout;
+    let bottom = child_page_y + layout.border.top + layout.padding.top + (last.1 - first.0);
+    (bottom > page_height_px + 1.0).then_some((lines.len(), bottom - page_height_px))
+}
+
+/// Say so when [`inline_lines_below_page`] finds lines that will not be printed,
+/// rather than lose them silently (only paragraphs in plain block flow are split
+/// between line boxes; the rest is F30b).
+fn warn_unprinted_inline_lines(child: &blitz_dom::Node, child_page_y: f32, page_height_px: f32) {
+    if let Some((lines, below)) = inline_lines_below_page(child, child_page_y, page_height_px) {
+        log::warn!(
+            "pagination: a paragraph of {lines} lines is placed whole and ends {below:.0}px below the \
+             page; the lines past the page bottom are not printed (only paragraphs in plain block flow \
+             are split between lines)",
         );
     }
 }
@@ -8736,5 +8766,20 @@ h2 { string-set: chapter-title content(text); }
         // On a page the paragraph fits, it counts whole.
         let whole = super::leading_block_size(doc.deref(), d, 0, 10_000.0);
         assert!((whole - 600.0).abs() < 0.5, "{whole}");
+    }
+
+    #[test]
+    fn inline_lines_below_the_page_are_reported_for_unsplit_paragraphs() {
+        // A flex item is placed whole, so its lines past the page are reported.
+        let html = format!(
+            "<html><head>{LINE_CSS}</head><body><div style=\"display:flex\"><p id=\"f\">{}</p></div></body></html>",
+            br_lines(30)
+        );
+        let doc = parse(&html, 600.0);
+        let f = doc.get_node(find_by_id(doc.deref(), "f").unwrap()).unwrap();
+        let (lines, below) = inline_lines_below_page(f, 0.0, 200.0).expect("overflows");
+        assert_eq!(lines, 30);
+        assert!((below - 400.0).abs() < 0.5, "{below}");
+        assert!(inline_lines_below_page(f, 0.0, 1000.0).is_none());
     }
 }
