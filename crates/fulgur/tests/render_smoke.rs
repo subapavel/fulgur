@@ -6702,3 +6702,75 @@ fn table_row_background_is_deterministic() {
     );
     assert_eq!(render_plain(&html), render_plain(&html));
 }
+
+/// `table_with_header_html` with a blue `<thead>` background.
+fn table_with_blue_header_html(rows: usize) -> String {
+    table_with_header_html(rows, "HDRCELL")
+        .replace("<thead>", r#"<thead style="background:#0000ff">"#)
+}
+
+#[test]
+fn repeated_table_header_repeats_its_background() {
+    let pdf = Engine::builder()
+        .build()
+        .render(&table_with_blue_header_html(150))
+        .expect("render");
+    let pages = page_contents(&pdf);
+    assert!(pages.len() >= 3, "expected a multi-page table");
+    // One fill per header cell (two), on the first page and on every copy.
+    for (i, content) in pages.iter().enumerate() {
+        assert_eq!(
+            content.matches("0 0 1 rg").count(),
+            2,
+            "page {i}: {content}"
+        );
+    }
+}
+
+#[test]
+fn tagged_repeated_table_header_background_is_inside_the_artifact() {
+    let pdf = tagged_render_with_noto(&table_with_blue_header_html(150));
+    let pages = page_contents(&pdf);
+    assert!(pages.len() >= 3, "expected a multi-page table");
+    // First page: the real header, tagged content, no artifact.
+    assert!(!pages[0].contains("/Artifact BMC"));
+    assert_eq!(pages[0].matches("0 0 1 rg").count(), 2);
+    for (i, content) in pages.iter().enumerate().skip(1) {
+        let start = content
+            .find("/Artifact BMC")
+            .unwrap_or_else(|| panic!("page {i} has no artifact"));
+        let end = start + content[start..].find("EMC").expect("artifact is closed");
+        let fills: Vec<usize> = content
+            .match_indices("0 0 1 rg")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(fills.len(), 2, "page {i}: {content}");
+        assert!(
+            fills.iter().all(|&at| start < at && at < end),
+            "page {i}: the header fill must be inside the /Artifact sequence"
+        );
+    }
+}
+
+#[test]
+fn repeated_table_header_with_a_background_only_row_and_empty_cells() {
+    // The header cells draw nothing themselves; the `<tr>` background is all there is to repeat.
+    let rows: String = (0..150)
+        .map(|i| format!("<tr><td>Row {i}</td></tr>"))
+        .collect();
+    let html = format!(
+        r#"<html><head><style>td, th {{ padding: 0 }}</style></head><body><table>
+        <thead><tr style="background:#0000ff"><th style="height:30px"></th></tr></thead>
+        <tbody>{rows}</tbody></table></body></html>"#
+    );
+    let pdf = Engine::builder().build().render(&html).expect("render");
+    let pages = page_contents(&pdf);
+    assert!(pages.len() >= 3);
+    for (i, content) in pages.iter().enumerate() {
+        assert_eq!(
+            content.matches("0 0 1 rg").count(),
+            1,
+            "page {i}: {content}"
+        );
+    }
+}

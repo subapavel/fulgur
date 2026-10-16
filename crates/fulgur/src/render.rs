@@ -574,6 +574,9 @@ fn draw_v2_page(
 /// difference between the two fragments' page-local positions. The margins
 /// passed in are this page's, so per-page `@page` margins apply.
 ///
+/// The header's row-group and row backgrounds (F19) are painted first, under
+/// the cells, on the same canvas.
+///
 /// The copy is page furniture, not content: it is painted on a canvas without
 /// tag, link and bookmark collectors (no second set of TH structure elements,
 /// no duplicate link targets or outline entries) and, when the document is
@@ -596,7 +599,25 @@ fn paint_repeated_table_headers(
     opacity_wrapped_descendants: &std::collections::BTreeSet<usize>,
     tagging: bool,
 ) {
-    for (group_id, node_ids) in &drawables.table_header_groups {
+    if drawables.table_header_groups.is_empty()
+        && drawables.table_header_background_owners.is_empty()
+    {
+        return;
+    }
+    // A header group is repeated when it has drawables to paint again or a
+    // row / row-group background (F19) behind its cells; a header whose cells
+    // draw nothing but whose `<tr>` has a background is in the second map only.
+    let groups: std::collections::BTreeSet<usize> = drawables
+        .table_header_groups
+        .keys()
+        .chain(drawables.table_header_background_owners.keys())
+        .copied()
+        .collect();
+    for group_id in &groups {
+        let node_ids: &[usize] = drawables
+            .table_header_groups
+            .get(group_id)
+            .map_or(&[], Vec::as_slice);
         let Some(group_geom) = geometry.get(group_id).filter(|g| g.is_repeat) else {
             continue;
         };
@@ -626,6 +647,20 @@ fn paint_repeated_table_headers(
                 // Nested `start_tagged` panics in krilla; this flag makes every
                 // paragraph / marker entry point skip its own sequence.
                 copy_canvas.in_marked_content = true;
+            }
+            // F19: the header's row-group and row backgrounds go first, below
+            // the cells, in the same artifact.
+            if let Some(&table_id) = drawables.table_header_background_owners.get(group_id) {
+                paint_table_row_backgrounds(
+                    &mut copy_canvas,
+                    table_id,
+                    Some(*group_id),
+                    geometry,
+                    drawables,
+                    left_pt,
+                    top_pt,
+                    source.page_index,
+                );
             }
             for node_id in node_ids {
                 if !geometry.contains_key(node_id) {
