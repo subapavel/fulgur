@@ -2474,7 +2474,9 @@ fn fragment_block_subtree(
             // The inset above the first line and ORPHANS lines must fit; a
             // paragraph that cannot even start here moves to the next page.
             let leading = split.leading();
-            if leading <= strips.fresh() {
+            // Of a flex / grid row only the first item decides, as for an
+            // entered item below (F28).
+            if first_in_row && leading <= strips.fresh() {
                 leading
             } else {
                 0.0
@@ -2491,7 +2493,7 @@ fn fragment_block_subtree(
                 0.0
             }
         } else if child_h > strips.fresh()
-            && table_row_mate_can_split(doc, parent, &walk_children, child_id, strips.fresh())
+            && row_mate_can_split(doc, parent, &walk_children, child_id, strips.fresh())
         {
             // A table cell stretched to the height of a row that spans pages
             // (F30): another cell of the row splits, so the row starts here
@@ -2531,6 +2533,7 @@ fn fragment_block_subtree(
             // siblings then continue from this point.
             page_taffy_origin = this_top_in_parent - band;
             child_page_y = band;
+            let was_entered = line_split.is_some() || needs_recursion;
             if line_split.is_some() {
                 // On a fresh page the paragraph may fit whole after all.
                 line_split = nested_line_split(
@@ -2545,6 +2548,8 @@ fn fragment_block_subtree(
             } else if needs_recursion {
                 // The child may fit the new page whole.
                 needs_recursion = gate((strips.bottom(page_index) - cursor_y).max(0.0));
+            }
+            if was_entered {
                 // A later cell of this flex / grid row restores the row's
                 // start state when the cell recurses across pages; that
                 // start is now the new page.
@@ -3334,10 +3339,12 @@ impl LineSplit {
 /// F30: whether a child of `parent` is an inline root that the fragmenter may
 /// split between its line boxes, and if so its lines — whatever its height.
 ///
-/// Only paragraphs in plain block flow qualify. Anything the fragmenter treats as
-/// one unit stays one: flex / grid items, atomic inlines, orthogonal flows,
-/// multicol containers, transformed or clipping boxes, floats, and table cells (a
-/// cell with direct text is F30b).
+/// Paragraphs in block flow qualify, and so do inline roots that are flex items,
+/// grid items (css-flexbox-1 §4, css-grid-2 §6: each is a block container whose
+/// lines are class B break points) or cells of a `display: table` box (F30b).
+/// Anything the fragmenter treats as one unit stays one: atomic inlines and
+/// their contents, orthogonal flows, multicol containers, transformed or
+/// clipping boxes, floats, other children of a `display: table` box (F30e).
 fn line_split_candidate(
     doc: &BaseDocument,
     parent: &blitz_dom::Node,
@@ -3353,18 +3360,21 @@ fn line_split_candidate(
         .and_then(|gp| doc.get_node(gp))
         .is_some_and(|gp| crate::blitz_adapter::is_orthogonal_to_parent(gp, parent));
     let inside_of = |n: &blitz_dom::Node| n.primary_styles().map(|s| s.clone_display().inside());
-    if crate::blitz_adapter::is_flex_or_grid_container_node(parent)
-        || crate::blitz_adapter::is_atomic_inline_container_node(parent)
+    // A cell of a `display: table` box is a block container (CSS 2.1 §17.5); any
+    // other child of a table box, or a cell outside one, is not handled (F30e).
+    let cell_of_table = inside_of(parent) == Some(DisplayInside::Table)
+        && inside_of(child) == Some(DisplayInside::TableCell);
+    if crate::blitz_adapter::is_atomic_inline_container_node(parent)
         || crate::blitz_adapter::is_multicol_container(parent)
         || parent_orthogonal
         || clips_overflow(parent)
-        || inside_of(parent) == Some(DisplayInside::Table)
+        || (inside_of(parent) == Some(DisplayInside::Table)) != cell_of_table
+        || (inside_of(child) == Some(DisplayInside::TableCell)) != cell_of_table
         || crate::blitz_adapter::is_atomic_inline_container_node(child)
         || crate::blitz_adapter::is_orthogonal_to_parent(parent, child)
         || crate::blitz_adapter::is_multicol_container(child)
         || crate::blitz_adapter::node_is_floating(child)
         || clips_overflow(child)
-        || inside_of(child) == Some(DisplayInside::TableCell)
         || child
             .primary_styles()
             .is_some_and(|s| !s.get_box().transform.0.is_empty())
@@ -3405,8 +3415,9 @@ fn nested_line_split(
 
 /// F30: whether `cell_id`, a cell of table `parent`, shares its row with a cell
 /// taller than a page that the fragmenter can enter and split (it holds a
-/// paragraph that splits between lines, say). Such a row starts where it is.
-fn table_row_mate_can_split(
+/// paragraph that splits between lines, or is one itself: direct text, F30b).
+/// Such a row starts where it is.
+fn row_mate_can_split(
     doc: &BaseDocument,
     parent: &blitz_dom::Node,
     siblings: &[usize],
@@ -3430,7 +3441,9 @@ fn table_row_mate_can_split(
                 m.element_data().is_some()
                     && (m.final_layout.location.y - top).abs() < 0.5
                     && m.final_layout.size.height > page_height_px
-                    && leading_block_size(doc, id, 0, page_height_px) <= page_height_px
+                    && (leading_block_size(doc, id, 0, page_height_px) <= page_height_px
+                        || line_split_candidate(doc, parent, m)
+                            .is_some_and(|split| split.leading() <= page_height_px))
             })
     })
 }
@@ -9212,18 +9225,186 @@ h2 { string-set: chapter-title content(text); }
     }
 
     #[test]
-    fn paragraphs_in_flex_items_and_table_cells_are_not_split() {
+    fn paragraphs_in_flex_grid_items_and_table_cells_are_split() {
+        // F30b: an inline root that is itself a flex item, a grid item or a table cell splits
+        // between its lines like a paragraph in a div (30 lines of 20px on 200px pages).
+        for (what, markup) in [
+            (
+                "flex row",
+                format!(
+                    "<div style=\"display:flex\"><p id=\"x\">{}</p></div>",
+                    br_lines(30)
+                ),
+            ),
+            (
+                "flex column",
+                format!(
+                    "<div style=\"display:flex;flex-direction:column\"><p id=\"x\">{}</p></div>",
+                    br_lines(30)
+                ),
+            ),
+            (
+                "grid",
+                format!(
+                    "<div style=\"display:grid\"><p id=\"x\">{}</p></div>",
+                    br_lines(30)
+                ),
+            ),
+            (
+                "cell",
+                format!(
+                    "<table><tr><td id=\"x\" style=\"line-height:20px\">{}</td></tr></table>",
+                    br_lines(30)
+                ),
+            ),
+        ] {
+            let (doc, table) = nested_geometry(&markup, 200.0);
+            let frags = fragments_of(&doc, &table, "x");
+            assert!(frags.len() >= 3, "{what}: {frags:?}");
+            let lines: f32 = frags.iter().map(|f| f.height.to_f32()).sum();
+            assert!(
+                (lines - 600.0).abs() < 0.5,
+                "{what}: every line once: {frags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn paragraphs_that_are_not_in_plain_flow_stay_whole() {
+        // The exclusions of `line_split_candidate` still hold: a clipping parent, an atomic-inline
+        // parent and a non-cell child of a `display: table` box are placed as one unit.
+        for (what, markup) in [
+            (
+                "overflow:hidden flex",
+                format!(
+                    "<div style=\"display:flex;overflow:hidden\"><p id=\"x\">{}</p></div>",
+                    br_lines(30)
+                ),
+            ),
+            (
+                "inline-flex",
+                format!(
+                    "<div style=\"display:inline-flex\"><p id=\"x\">{}</p></div>",
+                    br_lines(30)
+                ),
+            ),
+            (
+                "display:table",
+                format!(
+                    "<div style=\"display:table\"><p id=\"x\">{}</p></div>",
+                    br_lines(30)
+                ),
+            ),
+        ] {
+            let (doc, table) = nested_geometry(&markup, 200.0);
+            // Not entered at all (no entry), or one whole fragment: never split between lines.
+            let node = find_by_id(doc.deref(), "x").unwrap();
+            let n = table.get(&node).map_or(0, |g| g.fragments.len());
+            assert!(n <= 1, "{what}: {n} fragments");
+        }
+    }
+
+    #[test]
+    fn a_padded_flex_column_box_closes_below_its_direct_split_item() {
         let (doc, table) = nested_geometry(
             &format!(
-                "<div style=\"display:flex\"><p id=\"f\">{}</p></div>\
-                 <table><tr><td id=\"c\">{}</td></tr></table>",
-                br_lines(30),
+                "<div id=\"w\" style=\"display:flex;flex-direction:column;border:1px solid #000;padding:15px\">\
+                 <p id=\"p\">{}</p></div><p id=\"next\">next</p>",
                 br_lines(30)
             ),
             200.0,
         );
-        assert_eq!(fragments_of(&doc, &table, "f").len(), 1);
-        assert_eq!(fragments_of(&doc, &table, "c").len(), 1);
+        let w = fragments_of(&doc, &table, "w");
+        let (last_frame, p) = (
+            w.last().unwrap(),
+            fragments_of(&doc, &table, "p").last().unwrap(),
+        );
+        let frame_bottom = last_frame.y.to_f32() + last_frame.height.to_f32();
+        let p_bottom = p.y.to_f32() + p.height.to_f32();
+        assert!(
+            (frame_bottom - p_bottom - 16.0).abs() < 0.5,
+            "frame {frame_bottom}, text {p_bottom}"
+        );
+        let next = &fragments_of(&doc, &table, "next")[0];
+        assert!(next.y.to_f32() >= frame_bottom - 0.5, "{next:?}");
+    }
+
+    #[test]
+    fn a_grid_row_whose_first_item_cannot_start_here_moves_with_its_mates() {
+        // Second row: room for one line only (orphans). The paragraph, first in its row, moves to
+        // the next page and the square beside it comes along instead of staying behind.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"display:grid;grid-template-columns:100px 100px;align-items:start\">\
+                 <div style=\"height:170px\"></div><div></div>\
+                 <p id=\"p\">{}</p><div id=\"sq\" style=\"height:20px\"></div></div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let p = fragments_of(&doc, &table, "p");
+        let sq = &fragments_of(&doc, &table, "sq")[0];
+        assert_eq!(p[0].page_index, 1, "{p:?}");
+        assert_eq!((sq.page_index, sq.y.to_f32()), (1, 0.0), "{sq:?}");
+    }
+
+    #[test]
+    fn a_later_item_of_a_grid_row_does_not_move_the_row() {
+        // F28: only the first item of a row decides. In the second row the paragraph sits beside
+        // a square that fits where it is; the paragraph starts there too, with the one line that
+        // fits, instead of cutting the row in two with a page break.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"display:grid;grid-template-columns:100px 100px;align-items:start\">\
+                 <div style=\"height:170px\"></div><div></div>\
+                 <div id=\"sq\" style=\"height:20px\"></div><p id=\"p\">{}</p></div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let sq = &fragments_of(&doc, &table, "sq")[0];
+        let p = fragments_of(&doc, &table, "p");
+        assert_eq!((sq.page_index, sq.y.to_f32()), (0, 170.0), "{sq:?}");
+        assert_eq!((p[0].page_index, p[0].y.to_f32()), (0, 170.0), "{p:?}");
+    }
+
+    #[test]
+    fn a_table_row_starts_in_place_beside_a_direct_text_cell_taller_than_a_page() {
+        let (doc, _) = nested_geometry(
+            &format!(
+                "<table><tr><td id=\"short\">x</td><td id=\"tall\">{}</td></tr></table>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let table_node = doc
+            .get_node(find_by_id(doc.deref(), "short").unwrap())
+            .and_then(|c| c.parent)
+            .and_then(|p| doc.get_node(p))
+            .and_then(|p| p.parent)
+            .and_then(|p| doc.get_node(p))
+            .and_then(|p| p.parent)
+            .and_then(|p| doc.get_node(p))
+            .expect("table");
+        let kids = table_node.layout_children.borrow();
+        let ids: Vec<usize> = kids.as_deref().map(<[usize]>::to_vec).unwrap_or_default();
+        let short = find_by_id(doc.deref(), "short").unwrap();
+        let tall = find_by_id(doc.deref(), "tall").unwrap();
+        assert!(super::row_mate_can_split(
+            doc.deref(),
+            table_node,
+            &ids,
+            short,
+            200.0
+        ));
+        // The tall cell itself has no taller mate.
+        assert!(!super::row_mate_can_split(
+            doc.deref(),
+            table_node,
+            &ids,
+            tall,
+            200.0
+        ));
     }
 
     #[test]
@@ -9243,9 +9424,9 @@ h2 { string-set: chapter-title content(text); }
 
     #[test]
     fn inline_lines_below_the_page_are_reported_for_unsplit_paragraphs() {
-        // A flex item is placed whole, so its lines past the page are reported.
+        // A paragraph in a clipping box is placed whole, so its lines past the page are reported.
         let html = format!(
-            "<html><head>{LINE_CSS}</head><body><div style=\"display:flex\"><p id=\"f\">{}</p></div></body></html>",
+            "<html><head>{LINE_CSS}</head><body><div style=\"display:flex;overflow:hidden\"><p id=\"f\">{}</p></div></body></html>",
             br_lines(30)
         );
         let doc = parse(&html, 600.0);
