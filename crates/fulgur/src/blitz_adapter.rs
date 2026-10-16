@@ -1228,9 +1228,12 @@ pub fn extract_inline_svg_tree(
 /// §10.3.2 / §10.6.2 want the natural size, with the ratio filling the missing axis).
 ///
 /// Per image this hands Blitz the same event a completed fetch would, via
-/// [`blitz_dom::BaseDocument::load_resource`] (which also clears the layout cache). For a raster image
-/// (PNG/JPEG/GIF) that is the header size only: the pixel buffer stays empty because fulgur paints from
-/// the bundle bytes, never from Blitz's copy, so no full decode is paid for.
+/// [`blitz_dom::BaseDocument::load_resource`] (which also clears the layout cache):
+///
+/// - raster (PNG/JPEG/GIF): the header size only. The pixel buffer stays empty because fulgur paints
+///   from the bundle bytes, never from Blitz's copy, so no full decode is paid for.
+/// - SVG: the parsed `usvg::Tree` (no host fonts); its `width`/`height` are the natural size.
+///   `convert_image` draws that same tree.
 ///
 /// `src` is looked up with [`AssetBundle::get_image`], the key `convert_image` uses. Missing,
 /// unrecognised or corrupt images are skipped, which leaves today's behaviour (nothing painted). An
@@ -1267,7 +1270,12 @@ pub fn seed_image_natural_sizes(doc: &mut HtmlDocument, assets: &crate::asset::A
                     ));
                 }
             }
-            AssetKind::Svg | AssetKind::Unknown => {}
+            AssetKind::Svg => {
+                if let Ok(tree) = usvg::Tree::from_data(data, &usvg::Options::default()) {
+                    seeds.push(Resource::Svg(node_id, ImageType::Image, Box::new(tree)));
+                }
+            }
+            AssetKind::Unknown => {}
         }
     }
     for seed in seeds {
@@ -7418,5 +7426,15 @@ mod seed_image_natural_size_tests {
         // A zero-sized image has no ratio and no area.
         let zero = bundle("a.png", png_header(0, 0));
         assert_eq!(img_size(html, &zero), (0.0, 0.0));
+    }
+
+    #[test]
+    fn svg_root_size_is_the_natural_size() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="#f00"/></svg>"##;
+        let b = bundle("a.svg", svg.to_vec());
+        let html = r#"<body style="margin:0"><img src="a.svg"></body>"#;
+        assert_eq!(img_size(html, &b), (100.0, 50.0));
+        let bad = bundle("a.svg", b"<svg".to_vec());
+        assert_eq!(img_size(html, &bad), (0.0, 0.0));
     }
 }

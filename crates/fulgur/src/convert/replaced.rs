@@ -181,8 +181,12 @@ fn convert_content_url(
     true
 }
 
-/// Convert an `<img>` element into an `ImageEntry`, plus a wrapping
+/// Convert an `<img>` element into an `ImageEntry` (raster) or `SvgEntry` (SVG), plus a wrapping
 /// `BlockEntry` when the element has visual styling.
+///
+/// An SVG asset reuses the tree [`crate::blitz_adapter::seed_image_natural_sizes`] parsed for layout, so
+/// the drawn tree is the one that sized the box. Returns `false` (falling through to the generic path)
+/// for an unregistered `src`, an unrecognised format or an SVG that did not parse.
 fn convert_image(
     _ctx: &ConvertContext<'_>,
     node: &Node,
@@ -199,22 +203,30 @@ fn convert_image(
     let Some(data) = bundle.get_image(src).cloned() else {
         return false;
     };
-    let Some(format) = ImageRender::detect_format(&data) else {
-        return false;
-    };
-
-    let (content_w, content_h, opacity, visible) =
-        maybe_insert_block_for_replaced(node, assets, out);
-    let entry = make_image_entry(
-        data,
-        format,
-        Some(content_w),
-        Some(content_h),
-        opacity,
-        visible,
-    );
-    out.images.insert(node.id, entry);
-    true
+    match crate::image::AssetKind::detect(&data) {
+        crate::image::AssetKind::Raster(format) => {
+            let (content_w, content_h, opacity, visible) =
+                maybe_insert_block_for_replaced(node, assets, out);
+            let entry = make_image_entry(
+                data,
+                format,
+                Some(content_w),
+                Some(content_h),
+                opacity,
+                visible,
+            );
+            out.images.insert(node.id, entry);
+            true
+        }
+        crate::image::AssetKind::Svg => match extract_inline_svg_tree(elem) {
+            Some(tree) => {
+                insert_svg_entry(node, tree, assets, out);
+                true
+            }
+            None => false,
+        },
+        crate::image::AssetKind::Unknown => false,
+    }
 }
 
 /// Convert an inline `<svg>` element into an `SvgEntry`, plus a wrapping
@@ -231,7 +243,18 @@ fn convert_svg(
     let Some(tree) = extract_inline_svg_tree(elem) else {
         return false;
     };
+    insert_svg_entry(node, tree, assets, out);
+    true
+}
 
+/// Insert the `SvgEntry` (and the wrapping `BlockEntry` for a styled element) of an inline `<svg>` or an
+/// `<img>` of an SVG asset, sized by the node's layout.
+fn insert_svg_entry(
+    node: &Node,
+    tree: std::sync::Arc<usvg::Tree>,
+    assets: Option<&AssetBundle>,
+    out: &mut crate::drawables::Drawables,
+) {
     let (content_w, content_h, opacity, visible) =
         maybe_insert_block_for_replaced(node, assets, out);
     out.svgs.insert(
@@ -244,7 +267,6 @@ fn convert_svg(
             visible,
         },
     );
-    true
 }
 
 #[cfg(test)]

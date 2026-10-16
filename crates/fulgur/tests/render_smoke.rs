@@ -6880,3 +6880,21 @@ fn img_with_unregistered_src_paints_nothing() {
             .is_empty()
     );
 }
+
+#[test]
+fn bundled_svg_img_is_painted_at_its_natural_size() {
+    // `convert_image` used to take PNG/JPEG/GIF only, so a bundled `<img src="x.svg">` never painted;
+    // its natural size is the root `width`/`height` (100 × 50 CSS px = 75 × 37.5 pt).
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="#f00"/></svg>"##;
+    let mut bundle = AssetBundle::default();
+    bundle.add_image("a.svg", svg.as_bytes().to_vec());
+    let html = r#"<!DOCTYPE html><html><body style="margin:0"><img src="a.svg"></body></html>"#;
+    let engine = Engine::builder().assets(bundle).build();
+    let pdf = engine.render(html).expect("render");
+    assert!(pdf.starts_with(b"%PDF"));
+    let drawables = engine.build_drawables_for_testing_no_gcpm(html);
+    assert_eq!(drawables.svgs.len(), 1, "expected exactly one SVG entry");
+    let svg = drawables.svgs.values().next().unwrap();
+    assert_eq!((svg.width.to_f32(), svg.height.to_f32()), (75.0, 37.5));
+    assert!(drawables.images.is_empty());
+}
