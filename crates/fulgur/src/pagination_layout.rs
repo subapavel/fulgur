@@ -135,6 +135,65 @@ impl PaginationGeometry {
 /// downstream depends on iteration order.
 pub type PaginationGeometryTable = BTreeMap<usize, PaginationGeometry>;
 
+/// F29: the block-size of the page strips the fragmenter fills, in CSS px.
+///
+/// The fragmenter works in body coordinates (`y = 0` is the top of the body's
+/// content), but the renderer paints page 0 lower by the body's own offset
+/// (`body` margin, a margin collapsed through `<body>`, `html` padding and
+/// border: `body.final_layout.location.y`). Only page 0 is shifted — the offset
+/// is not repeated on continuation pages — so page 0 ends that much higher in
+/// the fragmenter's coordinates than the others.
+///
+/// Every place that compares a position with the end of the page asks for
+/// [`PageStrips::bottom`] of the page it is on; places that only ask whether
+/// something is taller than a page (it will not fit anywhere, so the offset is
+/// irrelevant) use [`PageStrips::fresh`]. Passing this type instead of a bare
+/// height makes each site choose.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PageStrips {
+    page_h: f32,
+    first_offset: f32,
+}
+
+impl PageStrips {
+    /// `page_h` is the content height of a page; `first_offset` the shift of
+    /// page 0. An offset that is negative, not finite, or leaves no room on page 0
+    /// is ignored (an offset that large is warned about: the content of page 0
+    /// would be painted outside the page).
+    pub(crate) fn new(page_h: f32, first_offset: f32) -> Self {
+        let mut first_offset = if first_offset.is_finite() && first_offset > 0.0 {
+            first_offset
+        } else {
+            0.0
+        };
+        if page_h > 0.0 && first_offset >= page_h {
+            log::warn!(
+                "pagination: the body starts {first_offset}px down the page, no less than the \
+                 {page_h}px content height; page 0 is paginated as if it started at the top",
+            );
+            first_offset = 0.0;
+        }
+        Self {
+            page_h,
+            first_offset,
+        }
+    }
+
+    /// The y (body coordinates) below which nothing may be placed on `page`.
+    pub(crate) fn bottom(self, page: u32) -> f32 {
+        if page == 0 {
+            self.page_h - self.first_offset
+        } else {
+            self.page_h
+        }
+    }
+
+    /// The block-size of a page that starts at its top: every page but the first.
+    pub(crate) fn fresh(self) -> f32 {
+        self.page_h
+    }
+}
+
 /// Taffy tree wrapper that intercepts the pagination root through
 /// `compute_child_layout` and routes it through fulgur's own
 /// page-stripping logic.
@@ -147,7 +206,7 @@ pub type PaginationGeometryTable = BTreeMap<usize, PaginationGeometry>;
 /// observational use.
 pub struct PaginationLayoutTree<'a> {
     pub(crate) doc: &'a mut BaseDocument,
-    pub(crate) page_height_px: f32,
+    pub(crate) strips: PageStrips,
     pub(crate) geometry: PaginationGeometryTable,
     /// Cached id of the `<body>` element, if any. Used as the
     /// fragmentation root for the block-only fragmenter. `None` means the
@@ -283,9 +342,10 @@ fn run_pass_inner<'a>(
 impl<'a> PaginationLayoutTree<'a> {
     pub fn new(doc: &'a mut BaseDocument, page_height_px: f32) -> Self {
         let body_id = find_body_id(doc);
+        let strips = PageStrips::new(page_height_px, body_origin_in_px(doc).1);
         Self {
             doc,
-            page_height_px,
+            strips,
             geometry: BTreeMap::new(),
             body_id,
             column_styles: None,
@@ -414,7 +474,7 @@ impl<'a> PaginationLayoutTree<'a> {
         let Some(body_id) = self.body_id else {
             return 0;
         };
-        if self.page_height_px <= 0.0 {
+        if self.strips.fresh() <= 0.0 {
             return 0;
         }
 
@@ -729,8 +789,8 @@ impl<'a> PaginationLayoutTree<'a> {
                 Some(crate::draw_primitives::BreakBefore::Page)
             );
             let page_filling_break_child = gap > 0.0
-                && child_h >= self.page_height_px * 0.9
-                && gap + child_h <= self.page_height_px + 0.5;
+                && child_h >= self.strips.fresh() * 0.9
+                && gap + child_h <= self.strips.fresh() + 0.5;
             if (explicit_break_before || page_name_changed) && emitted > 0 && cursor_y > 0.0 {
                 page_index += 1;
                 cursor_y = if explicit_break_before && page_filling_break_child {
@@ -772,7 +832,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     .last()
                     .map(|l| l.1 - line_metrics[0].0)
                     .unwrap_or(child_h);
-                if cursor_y > 0.0 && cursor_y + para_total_h > self.page_height_px {
+                if cursor_y > 0.0 && cursor_y + para_total_h > self.strips.fresh() {
                     page_index += 1;
                     cursor_y = 0.0;
                 }
@@ -784,7 +844,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     child_w,
                     cursor_y,
                     page_index,
-                    self.page_height_px,
+                    self.strips,
                     &line_metrics,
                 );
                 page_index = new_page_index;
@@ -865,7 +925,8 @@ impl<'a> PaginationLayoutTree<'a> {
                             .is_some_and(crate::blitz_adapter::has_column_span_all)
                     })
                 });
-            let page_height_px = self.page_height_px;
+            let strips = self.strips;
+            let page_height_px = strips.fresh();
             let gate = |doc: &BaseDocument, available_strip: f32| {
                 has_splittable_children
                     && (!is_multicol || multicol_has_span_all)
@@ -918,7 +979,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     child_x_in_body,
                     page_index,
                     cursor_y,
-                    self.page_height_px,
+                    strips,
                     0,
                     0.0,
                     0.0,
@@ -952,7 +1013,7 @@ impl<'a> PaginationLayoutTree<'a> {
             // `avoid_inside` above (it just suppresses the inline
             // split branch; remaining-strip overflow handling is
             // identical).
-            if cursor_y > 0.0 && cursor_y + child_h > self.page_height_px {
+            if cursor_y > 0.0 && cursor_y + child_h > self.strips.fresh() {
                 page_index += 1;
                 cursor_y = 0.0;
             }
@@ -1006,8 +1067,8 @@ impl<'a> PaginationLayoutTree<'a> {
             let has_transform = child
                 .primary_styles()
                 .is_some_and(|s| !s.get_box().transform.0.is_empty());
-            if !has_transform && child_h > self.page_height_px + 1.0 {
-                let first_slice_h = (self.page_height_px - cursor_y).min(child_h);
+            if !has_transform && child_h > self.strips.fresh() + 1.0 {
+                let first_slice_h = (self.strips.fresh() - cursor_y).min(child_h);
                 self.geometry
                     .entry(child_id)
                     .or_default()
@@ -1054,8 +1115,8 @@ impl<'a> PaginationLayoutTree<'a> {
                 // (the removed `is_replaced_content`) let such a node amplify a
                 // few bytes of HTML into ~`MAX_PAGES` blank pages (a validated
                 // high-severity DoS).
-                let collapse_childless = self.page_height_px > 0.0
-                    && (remaining / self.page_height_px).ceil() > crate::MAX_PAGES as f32
+                let collapse_childless = self.strips.fresh() > 0.0
+                    && (remaining / self.strips.fresh()).ceil() > crate::MAX_PAGES as f32
                     && !subtree_has_rendered_content(self.doc, child_id, 0);
                 if collapse_childless {
                     // fulgur-c8re (Codex P1 on PR #575): bound the OCCUPIED
@@ -1086,7 +1147,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     // `remaining` is `+inf`); content past the cap is truncated.
                     while remaining > 0.0 && page_index < crate::MAX_PAGES {
                         page_index += 1;
-                        last_slice_h = remaining.min(self.page_height_px);
+                        last_slice_h = remaining.min(self.strips.fresh());
                         self.geometry
                             .entry(child_id)
                             .or_default()
@@ -1865,7 +1926,7 @@ fn fragment_block_subtree(
     parent_x_in_body: f32,
     page_in: u32,
     cursor_in: f32,
-    page_height_px: f32,
+    strips: PageStrips,
     depth: usize,
     tail_below: f32,
     top_floor: f32,
@@ -1941,7 +2002,7 @@ fn fragment_block_subtree(
     // continuation pages. `band` is the block-size reserved for the repeated
     // header at the top of the current page strip (0 on the first strip and
     // on any strip without a repeat).
-    let mut repeat: Option<HeaderRepeat> = repeating_table_header(doc, parent_id, page_height_px);
+    let mut repeat: Option<HeaderRepeat> = repeating_table_header(doc, parent_id, strips.fresh());
     let mut band: f32 = 0.0;
     // fulgur-uebl: flex / grid containers establish a flex/grid
     // formatting context where children are not class A break points
@@ -1990,19 +2051,8 @@ fn fragment_block_subtree(
         .map(|v| v.to_vec())
         .unwrap_or_else(|| parent.children.clone());
     drop(layout_children_borrow);
-    // F30: the page-0 shift the renderer applies (body margin, or a margin
-    // collapsed through body), and the last in-flow child with a height: what
-    // is below it in this box (padding, border) is `tail` for a paragraph in it.
-    let body_offset_y = body_origin_in_px(doc).1;
-    // The renderer shifts page 0 down by the body's own offset, so less of it is
-    // left below.
-    let page_limit_of = |page: u32| {
-        if page == 0 {
-            page_height_px - body_offset_y
-        } else {
-            page_height_px
-        }
-    };
+    // F30: the last in-flow child with a height: what is below it in this box
+    // (padding, border) is `tail` for a paragraph in it.
     let last_flow_child = walk_children.iter().rev().copied().find(|&id| {
         doc.get_node(id).is_some_and(|c| {
             let h = c.final_layout.size.height;
@@ -2351,7 +2401,7 @@ fn fragment_block_subtree(
                 && !is_multicol
                 && (has_forced_break_below(doc, child_id, column_styles, 0)
                     || has_page_name_change_below(doc, child_id, used_page_names, 0)
-                    || would_split_block_subtree(doc, child_id, available_strip, page_height_px, 0))
+                    || would_split_block_subtree(doc, child_id, available_strip, strips.fresh(), 0))
         };
         // F30: a paragraph that does not fit any page whole is split between
         // its line boxes instead of being placed as one oversized leaf (the
@@ -2362,11 +2412,11 @@ fn fragment_block_subtree(
             child,
             child_page_y,
             page_start_y + band,
-            page_height_px,
-            page_limit_of(page_index),
+            strips,
+            page_index,
         );
         let mut needs_recursion =
-            line_split.is_none() && gate((page_height_px - cursor_y).max(0.0));
+            line_split.is_none() && gate((strips.fresh() - cursor_y).max(0.0));
 
         // Strip-overflow page cut (fulgur-7hf5 moved it below the gate; F28
         // moves it back above): the child starts a new page when the part of
@@ -2394,24 +2444,24 @@ fn fragment_block_subtree(
             // The inset above the first line and ORPHANS lines must fit; a
             // paragraph that cannot even start here moves to the next page.
             let leading = split.leading();
-            if leading <= page_height_px {
-                leading + page_height_px - page_limit_of(page_index)
+            if leading <= strips.fresh() {
+                leading + strips.fresh() - strips.bottom(page_index)
             } else {
                 0.0
             }
         } else if needs_recursion {
             let leading = if first_in_row {
-                leading_block_size(doc, child_id, 0, page_height_px)
+                leading_block_size(doc, child_id, 0, strips.fresh())
             } else {
                 0.0
             };
-            if leading <= page_height_px {
+            if leading <= strips.fresh() {
                 leading
             } else {
                 0.0
             }
-        } else if child_h > page_height_px
-            && table_row_mate_can_split(doc, parent, &walk_children, child_id, page_height_px)
+        } else if child_h > strips.fresh()
+            && table_row_mate_can_split(doc, parent, &walk_children, child_id, strips.fresh())
         {
             // A table cell stretched to the height of a row that spans pages
             // (F30): another cell of the row splits, so the row starts here
@@ -2420,7 +2470,7 @@ fn fragment_block_subtree(
         } else {
             child_h
         };
-        if child_page_y > page_start_y + band && child_page_y + first_break_h > page_height_px {
+        if child_page_y > page_start_y + band && child_page_y + first_break_h > strips.fresh() {
             let should_emit = row_state
                 .as_mut()
                 .map(|rs| rs.emitted_parent_pages.insert(page_index))
@@ -2457,12 +2507,12 @@ fn fragment_block_subtree(
                     child,
                     child_page_y,
                     page_start_y + band,
-                    page_height_px,
-                    page_limit_of(page_index),
+                    strips,
+                    page_index,
                 );
             } else if needs_recursion {
                 // The child may fit the new page whole.
-                needs_recursion = gate((page_height_px - cursor_y).max(0.0));
+                needs_recursion = gate((strips.fresh() - cursor_y).max(0.0));
                 // A later cell of this flex / grid row restores the row's
                 // start state when the cell recurses across pages; that
                 // start is now the new page.
@@ -2532,8 +2582,7 @@ fn fragment_block_subtree(
                         child_w,
                         child_page_y,
                         page_index,
-                        page_height_px,
-                        page_limit_of(page_index),
+                        strips,
                         child_tail,
                         child_floor,
                         split,
@@ -2551,7 +2600,7 @@ fn fragment_block_subtree(
                     child_x_in_body,
                     page_index,
                     child_page_y,
-                    page_height_px,
+                    strips,
                     depth + 1,
                     child_tail,
                     child_floor,
@@ -2632,9 +2681,9 @@ fn fragment_block_subtree(
                         (pre_recursion_cursor_y + child_h - page_start_y).max(0.0)
                     };
                     let strip_end = if split_below {
-                        page_limit_of(pre_recursion_page)
+                        strips.bottom(pre_recursion_page)
                     } else {
-                        page_height_px
+                        strips.fresh()
                     };
                     let prev_height = logical_height.max((strip_end - page_start_y).max(0.0));
                     if prev_height > 0.0 {
@@ -2671,7 +2720,7 @@ fn fragment_block_subtree(
                                     x: parent_x_in_body.as_px(),
                                     y: 0.0_f32.as_px(),
                                     width: parent_w.as_px(),
-                                    height: page_height_px.as_px(),
+                                    height: strips.fresh().as_px(),
                                 });
                         }
                     }
@@ -2760,7 +2809,7 @@ fn fragment_block_subtree(
         // in-flow child there is no valid interior split point, so
         // the leaf emits whole). Emit its fragment and recurse into
         // descendants on the same page.
-        warn_unprinted_inline_lines(child, child_page_y, page_limit_of(page_index));
+        warn_unprinted_inline_lines(child, child_page_y, strips.bottom(page_index));
         geometry
             .entry(child_id)
             .or_default()
@@ -2890,7 +2939,7 @@ fn fragment_block_subtree(
             // A frame never extends below the content box: padding taller
             // than the room left overflows (the next sibling moves on).
             height: (cursor_y - page_start_y
-                + closing.min((page_limit_of(page_index) - cursor_y).max(0.0)))
+                + closing.min((strips.bottom(page_index) - cursor_y).max(0.0)))
             .as_px(),
         });
 
@@ -3298,8 +3347,8 @@ fn line_split_candidate(
     })
 }
 
-/// F30: the split to apply to `child` when it is placed at `child_page_y` on a
-/// strip that starts at `strip_top`, or `None` to place it as before.
+/// F30: the split to apply to `child` when it is placed at `child_page_y` on
+/// `page`, on a strip that starts at `strip_top`, or `None` to place it as before.
 ///
 /// A paragraph is split when it cannot fit any page whole (taller than a page),
 /// or when it is the first thing on its strip and overflows it. A paragraph that
@@ -3311,14 +3360,14 @@ fn nested_line_split(
     child: &blitz_dom::Node,
     child_page_y: f32,
     strip_top: f32,
-    page_height_px: f32,
-    page_limit: f32,
+    strips: PageStrips,
+    page: u32,
 ) -> Option<LineSplit> {
     let split = line_split_candidate(doc, parent, child)?;
     let total = split.inset_top + split.span();
-    let taller_than_a_page = total > page_height_px + 1.0;
+    let taller_than_a_page = total > strips.fresh() + 1.0;
     let first_and_overflowing =
-        child_page_y <= strip_top + 0.5 && child_page_y + total > page_limit + 1.0;
+        child_page_y <= strip_top + 0.5 && child_page_y + total > strips.bottom(page) + 1.0;
     (taller_than_a_page || first_and_overflowing).then_some(split)
 }
 
@@ -3368,10 +3417,10 @@ fn table_row_mate_can_split(
 /// `top_floor` is reserved at the top of every continuation page (a repeated
 /// table header, F12): the lines there start below it.
 ///
-/// `page_limit` is the block-size of the first page strip below which nothing may
-/// be placed (the page height, less the body's own offset on page 0: the renderer
-/// shifts page 0 by it). `tail` is what the boxes around the paragraph need below
-/// it (their bottom padding and border), so that the last strip leaves room for it.
+/// `strips.bottom(page_in)` is the block-size of the first page strip below which
+/// nothing may be placed (less on page 0: the renderer shifts it by the body's own
+/// offset). `tail` is what the boxes around the paragraph need below it (their
+/// bottom padding and border), so that the last strip leaves room for it.
 ///
 /// Returns `(last_page, cursor_y)`: the page of the last fragment and the y below
 /// the paragraph (including its bottom inset) on it.
@@ -3384,8 +3433,7 @@ fn fragment_nested_inline_root(
     width: f32,
     y_in: f32,
     page_in: u32,
-    page_height_px: f32,
-    page_limit: f32,
+    strips: PageStrips,
     tail: f32,
     top_floor: f32,
     split: &LineSplit,
@@ -3396,13 +3444,13 @@ fn fragment_nested_inline_root(
     // to a line; a bottom padding taller than that overflows, as in browsers,
     // instead of pushing lines onto pages of their own.
     let first_line = split.lines[0].1 - split.lines[0].0;
-    let usable = page_height_px - top_floor - split.inset_top - first_line;
+    let usable = strips.fresh() - top_floor - split.inset_top - first_line;
     let below = split.inset_bottom + tail;
     let last_extra = if below <= usable { below } else { 0.0 };
     let ranges = plan_line_breaks(
         &split.lines,
-        page_limit - y_in - split.inset_top,
-        page_height_px - top_floor - split.inset_top,
+        strips.bottom(page_in) - y_in - split.inset_top,
+        strips.fresh() - top_floor - split.inset_top,
         last_extra,
         max_strips,
     );
@@ -3550,7 +3598,7 @@ fn warn_unprinted_inline_lines(child: &blitz_dom::Node, child_page_y: f32, page_
 /// Walks lines, tracks the first line of the current fragment in
 /// `fragment_start_idx`, and splits when the cumulative height in
 /// paragraph-local coords would push the bottom past
-/// `page_height_px - paragraph_top_in_body`.
+/// `strips.bottom(page) - paragraph_top_in_body`.
 ///
 /// fulgur-s67g Phase 2.1 (widow / orphan): each candidate split point
 /// must leave the **first** fragment with `>= ORPHANS_MIN` lines and
@@ -3589,7 +3637,7 @@ fn fragment_inline_root(
     width: f32,
     initial_cursor_y: f32,
     initial_page_index: u32,
-    page_height_px: f32,
+    strips: PageStrips,
     line_metrics: &[(f32, f32)],
 ) -> (u32, f32, usize) {
     /// CSS 3 Fragmentation default for `orphans`.
@@ -3611,7 +3659,7 @@ fn fragment_inline_root(
         let frag_top_local = line_metrics[fragment_start_idx].0;
         let projected_bottom_in_body = paragraph_top_in_body + (line_bottom_local - frag_top_local);
 
-        if projected_bottom_in_body > page_height_px && i > fragment_start_idx {
+        if projected_bottom_in_body > strips.fresh() && i > fragment_start_idx {
             // fulgur-s67g Phase 2.1: honour widow / orphan minimums.
             let first_size = i - fragment_start_idx;
             let remaining_size = total_lines - i;
@@ -5090,6 +5138,64 @@ mod tests {
         doc
     }
 
+    /// F29: page 0 is shorter by the body's offset, every other page is full.
+    #[test]
+    fn page_strips_shorten_only_page_zero() {
+        let strips = PageStrips::new(1000.0, 40.0);
+        assert_eq!(strips.bottom(0), 960.0);
+        assert_eq!(strips.bottom(1), 1000.0);
+        assert_eq!(strips.bottom(7), 1000.0);
+        assert_eq!(strips.fresh(), 1000.0);
+    }
+
+    /// F29: an offset that is absent, negative, not finite, or leaves no room
+    /// on page 0 changes nothing (the last one is warned about).
+    #[test]
+    fn page_strips_ignore_an_unusable_offset() {
+        for offset in [0.0, -12.0, f32::NAN, f32::INFINITY, 1000.0, 5000.0] {
+            let strips = PageStrips::new(1000.0, offset);
+            assert_eq!(strips.bottom(0), 1000.0, "offset {offset}");
+        }
+        assert_eq!(PageStrips::new(1000.0, 999.0).bottom(0), 1.0);
+    }
+
+    /// F29: the offset is read from the laid-out body: a margin collapsed
+    /// through `<body>` from its first child counts like the body's own.
+    #[test]
+    fn the_tree_takes_the_body_offset_from_the_layout() {
+        for (html, offset) in [
+            (
+                r#"<html><body style="margin:0"><p style="margin:0">x</p></body></html>"#,
+                0.0,
+            ),
+            (
+                r#"<html><body style="margin:40px"><p style="margin:0">x</p></body></html>"#,
+                40.0,
+            ),
+            (
+                r#"<html><body style="margin:0"><p style="margin:60px 0 0">x</p></body></html>"#,
+                60.0,
+            ),
+            (
+                r#"<html style="padding-top:25px"><body style="margin:0"><p style="margin:0">x</p></body></html>"#,
+                25.0,
+            ),
+            (
+                r#"<html><body style="margin:0;padding:30px"><p style="margin:0">x</p></body></html>"#,
+                0.0,
+            ),
+        ] {
+            let mut doc = parse(html, 600.0);
+            let tree = PaginationLayoutTree::new(&mut doc, 800.0);
+            assert!(
+                (tree.strips.bottom(0) - (800.0 - offset)).abs() < 0.01,
+                "{html}: page 0 ends at {}",
+                tree.strips.bottom(0)
+            );
+            assert_eq!(tree.strips.bottom(1), 800.0);
+        }
+    }
+
     #[test]
     fn empty_document_emits_only_body_fragment() {
         let mut doc = parse("<html><body></body></html>", 600.0);
@@ -5194,11 +5300,11 @@ mod tests {
             None, // column_styles
             None, // used_page_names
             parent_id,
-            600.0,                // parent_w
-            0.0,                  // parent_x_in_body
-            0,                    // page_in
-            0.0,                  // cursor_in
-            800.0,                // page_height_px
+            600.0, // parent_w
+            0.0,   // parent_x_in_body
+            0,     // page_in
+            0.0,   // cursor_in
+            PageStrips::new(800.0, 0.0),
             crate::MAX_DOM_DEPTH, // depth → trips the guard immediately
             0.0,                  // tail_below
             0.0,                  // top_floor
@@ -7311,9 +7417,14 @@ h2 { string-set: chapter-title content(text); }
         // 225 > 200), leaving 1 line in the tail — widow violated.
         let lines = vec![(0.0, 75.0), (75.0, 150.0), (150.0, 225.0)];
         let (new_page, new_cursor, emitted) = super::fragment_inline_root(
-            &mut geom, /*child_id=*/ 1, /*paragraph_x=*/ 0.0, /*width=*/ 100.0,
-            /*initial_cursor_y=*/ 0.0, /*initial_page_index=*/ 0,
-            /*page_height_px=*/ 200.0, &lines,
+            &mut geom,
+            /*child_id=*/ 1,
+            /*paragraph_x=*/ 0.0,
+            /*width=*/ 100.0,
+            /*initial_cursor_y=*/ 0.0,
+            /*initial_page_index=*/ 0,
+            /*strips=*/ PageStrips::new(200.0, 0.0),
+            &lines,
         );
         assert_eq!(emitted, 1, "widow violation → single oversized fragment");
         assert_eq!(new_page, 0);
@@ -7336,8 +7447,16 @@ h2 { string-set: chapter-title content(text); }
         // Page strip = 200 → natural split at line 2 (bottom 225 > 200).
         // first_size = 2 ≥ orphans, remaining_size = 2 ≥ widows. Split OK.
         let lines = vec![(0.0, 75.0), (75.0, 150.0), (150.0, 225.0), (225.0, 300.0)];
-        let (new_page, new_cursor, emitted) =
-            super::fragment_inline_root(&mut geom, 1, 0.0, 100.0, 0.0, 0, 200.0, &lines);
+        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            0.0,
+            0,
+            PageStrips::new(200.0, 0.0),
+            &lines,
+        );
         assert_eq!(emitted, 2, "valid split → 2 fragments");
         assert_eq!(new_page, 1);
         let frags = &geom.get(&1).unwrap().fragments;
@@ -7363,8 +7482,16 @@ h2 { string-set: chapter-title content(text); }
         // Page strip = 100 → natural split at line 1 (bottom 150 > 100).
         // first_size = 1 < orphans=2. Don't split.
         let lines = vec![(0.0, 75.0), (75.0, 150.0), (150.0, 225.0)];
-        let (new_page, _new_cursor, emitted) =
-            super::fragment_inline_root(&mut geom, 1, 0.0, 100.0, 0.0, 0, 100.0, &lines);
+        let (new_page, _new_cursor, emitted) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            0.0,
+            0,
+            PageStrips::new(100.0, 0.0),
+            &lines,
+        );
         assert_eq!(emitted, 1, "orphan violation → single oversized fragment");
         assert_eq!(new_page, 0);
         let frags = &geom.get(&1).unwrap().fragments;
