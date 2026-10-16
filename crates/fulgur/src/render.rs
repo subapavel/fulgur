@@ -503,222 +503,18 @@ fn draw_v2_page(
     // documented in fulgur-v1cm.
 
     for &node_id in page_node_ids {
-        // SAFETY: `per_page_node_ids` is populated from `geometry`'s keys
-        // in `render_v2`, so every `node_id` here is guaranteed to be in
-        // `geometry`. Indexing keeps the access on a single line so line
-        // coverage isn't dragged down by an else-arm that never fires.
-        let geom = &geometry[&node_id];
-        // Bookmark anchor: emit on the page where the node's *first*
-        // fragment lands. Run BEFORE the `transformed_descendants`
-        // skip so headings nested inside a transformed ancestor (e.g.
-        // `<div style="transform:..."><h1>`) still register in the PDF
-        // outline — record unconditionally using the untransformed y
-        // position so the outline destination is stable. (`/Link`
-        // annotation rects still receive the transform via the link
-        // collector; only the bookmark destination is keyed by raw y.)
-        if let Some(first_frag) = geom.fragments.first()
-            && first_frag.page_index == page_index
-            && let Some(anchor) = drawables.bookmark_anchors.get(&node_id)
-            && let Some(c) = canvas.bookmark_collector.as_deref_mut()
-        {
-            let y_pt = margin_top_pt.as_pt() + first_frag.y.in_pt();
-            c.record(anchor.level, anchor.label.clone(), y_pt);
-        }
-
-        if transformed_descendants.contains(&node_id) {
-            // Drawn inside an ancestor transform group elsewhere in
-            // this loop. Skipping prevents double-painting. Bookmark
-            // anchor recording above already ran unconditionally.
-            continue;
-        }
-        if clipped_descendants.contains(&node_id) {
-            // Drawn inside an ancestor `overflow: hidden|clip` block's
-            // `push_clip_path / pop` group elsewhere in this loop.
-            continue;
-        }
-        if opacity_wrapped_descendants.contains(&node_id) {
-            // Drawn inside an ancestor `draw_with_opacity` group via
-            // `draw_under_opacity` elsewhere in this loop. Mirrors the
-            // `clipped_descendants` skip — without it, the descendant
-            // paints once at full opacity here and once under the
-            // parent's opacity wrap. (fulgur-gdb9)
-            continue;
-        }
-        if drawables.inline_box_subtree_skip.contains(&node_id) {
-            // PR 8g: belongs to inline-box content (or its descendants)
-            // dispatched explicitly by `paragraph::draw_shaped_lines`
-            // under an offset transform. Skipping here avoids
-            // double-rendering at the body-relative geometry position
-            // (which doesn't include the CSS 2.1 §10.8.1 baseline_shift
-            // that fulgur applies at convert time, see
-            // `convert/inline_root.rs:493`).
-            continue;
-        }
-        // Skip the html root: its bg / border / shadow are painted
-        // per-page in the pre-pass (`paint_root_block_v2`) above.
-        if Some(node_id) == drawables.root_id {
-            continue;
-        }
-
-        // Body block bg is painted by the per-page pre-pass (paint_root_block_v2)
-        // with content_area_h clamping. Body is never a paragraph/image/svg root,
-        // so its inline children render under their own node IDs via the loop below.
-        // Skip here to avoid a double-paint of the block background.
-        if Some(node_id) == drawables.body_id && drawables.block_styles.contains_key(&node_id) {
-            continue;
-        }
-
-        // Per-fragment leaf draws.
-        for frag in &geom.fragments {
-            if frag.page_index != page_index {
-                continue;
-            }
-            let x_pt = margin_left_pt + frag.x.in_pt().to_f32();
-            let y_pt = margin_top_pt + frag.y.in_pt().to_f32();
-
-            if let Some(tx) = drawables.transforms.get(&node_id) {
-                draw_under_transform(
-                    canvas,
-                    tx,
-                    node_id,
-                    geom,
-                    frag,
-                    x_pt,
-                    y_pt,
-                    geometry,
-                    drawables,
-                    margin_left_pt,
-                    margin_top_pt,
-                    page_index,
-                );
-                continue;
-            }
-            // `overflow: hidden | clip` block: paint bg / border /
-            // shadow OUTSIDE the clip, then push the clip path,
-            // dispatch self's inner content + every strict descendant
-            // INSIDE the clip, then pop (CSS 2.1 §11.1.1 painting
-            // order for overflow clipping). Same shape as
-            // `draw_under_transform` but with `push_clip_path`.
-            //
-            // No `!clip_descendants.is_empty()` guard: shared-node_id
-            // inner content (inline-root paragraph from
-            // `convert::inline_root`, replaced image / svg from
-            // `convert::replaced`) lands at the same `node_id` as the
-            // wrapper and so produces an empty `clip_descendants`. The
-            // clip must still be pushed unconditionally when
-            // `has_overflow_clip()` is true so a
-            // `<div style="overflow:hidden;width:50px">long text</div>`
-            // still gets the text clipped at the 50px box even with
-            // no separate descendant NodeIds.
-            // Body is intentionally excluded from `draw_under_clip`:
-            // body has only a page-0 fragment so the clip would only
-            // wrap page-0 content, but body's `clip_descendants`
-            // include every block in the document. Descendants on
-            // page 1+ are dispatched by the main loop via
-            // `dispatch_fragment` (they're omitted from
-            // `clipped_descendants` above). Without this skip, body's
-            // page-0 clip would also re-dispatch every descendant
-            // already painted by the main loop, causing a double
-            // paint. See the `clipped_descendants` collection block
-            // for the rest of the body-overflow rationale.
-            if let Some(block) = drawables.block_styles.get(&node_id)
-                && block.style.has_overflow_clip()
-                && Some(node_id) != drawables.body_id
-            {
-                draw_under_clip(
-                    canvas,
-                    block,
-                    node_id,
-                    geom,
-                    frag,
-                    x_pt,
-                    y_pt,
-                    geometry,
-                    drawables,
-                    margin_left_pt,
-                    margin_top_pt,
-                    page_index,
-                );
-                continue;
-            }
-            // Table with `overflow: hidden | clip`: same painting
-            // order as the block clip arm above (CSS 2.1 §11.1.1).
-            // Route through `draw_under_clip_table`, which paints the
-            // outer frame outside the clip and dispatches each cell
-            // descendant inside.
-            if let Some(table) = drawables
-                .tables
-                .get(&node_id)
-                .filter(|t| t.style.has_overflow_clip())
-            {
-                draw_under_clip_table(
-                    canvas,
-                    table,
-                    geom,
-                    frag,
-                    x_pt,
-                    y_pt,
-                    geometry,
-                    drawables,
-                    margin_left_pt,
-                    margin_top_pt,
-                    page_index,
-                );
-                continue;
-            }
-            // Fractional-opacity block with descendants: wrap own
-            // paint + descendant fragments in a single
-            // `draw_with_opacity` group so descendants paint inside the
-            // parent's opacity transparency group (CSS opacity §2).
-            // Without this, `<div opacity:0.4><svg>..</svg></div>`
-            // paints the svg outside the parent's opacity wrap,
-            // dropping the parent's opacity from the svg. (fulgur-gdb9)
-            //
-            // Body is excluded for the same reason as the clip arm
-            // above: body has only a page-0 fragment so a
-            // `draw_under_opacity(body)` would only wrap page-0
-            // content while the `opacity_wrapped_descendants` skip
-            // (collected above) excludes body explicitly so the main
-            // loop dispatches body's descendants on pages 1+
-            // normally. Without this exclusion `body { opacity: 0.5 }`
-            // would silently blank pages 1+. (PR #314 follow-up Devin
-            // Review)
-            if let Some(block) = drawables
-                .block_styles
-                .get(&node_id)
-                .filter(|b| !b.opacity_descendants.is_empty())
-                .filter(|_| Some(node_id) != drawables.body_id)
-            {
-                draw_under_opacity(
-                    canvas,
-                    block,
-                    node_id,
-                    geom,
-                    frag,
-                    x_pt,
-                    y_pt,
-                    geometry,
-                    drawables,
-                    margin_left_pt,
-                    margin_top_pt,
-                    page_index,
-                );
-                continue;
-            }
-            dispatch_fragment(
-                canvas,
-                node_id,
-                geom,
-                frag,
-                x_pt,
-                y_pt,
-                drawables,
-                geometry,
-                margin_left_pt,
-                margin_top_pt,
-                page_index,
-            );
-        }
+        dispatch_page_node(
+            canvas,
+            node_id,
+            page_index,
+            margin_left_pt,
+            margin_top_pt,
+            geometry,
+            drawables,
+            transformed_descendants,
+            clipped_descendants,
+            opacity_wrapped_descendants,
+        );
     }
 
     // Post-pass: paint multicol column rules between columns. Column
@@ -749,6 +545,244 @@ fn draw_v2_page(
             canvas,
             entry,
             container_geom,
+            margin_left_pt,
+            margin_top_pt,
+            page_index,
+        );
+    }
+}
+
+/// Paint everything the geometry records for `node_id` on `page_index`:
+/// the per-node body of [`draw_v2_page`]'s dispatch loop, also used to paint
+/// a repeated table header (F12).
+///
+/// `node_id` must be a key of `geometry`. Applies the transform / clip /
+/// opacity skip sets, so a node painted inside an ancestor wrapper is not
+/// painted a second time here.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_page_node(
+    canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
+    node_id: usize,
+    page_index: u32,
+    margin_left_pt: f32,
+    margin_top_pt: f32,
+    geometry: &crate::pagination_layout::PaginationGeometryTable,
+    drawables: &Drawables,
+    transformed_descendants: &std::collections::BTreeSet<usize>,
+    clipped_descendants: &std::collections::BTreeSet<usize>,
+    opacity_wrapped_descendants: &std::collections::BTreeSet<usize>,
+) {
+    // SAFETY: `per_page_node_ids` is populated from `geometry`'s keys
+    // in `render_v2`, so every `node_id` here is guaranteed to be in
+    // `geometry`. Indexing keeps the access on a single line so line
+    // coverage isn't dragged down by an else-arm that never fires.
+    let geom = &geometry[&node_id];
+    // Bookmark anchor: emit on the page where the node's *first*
+    // fragment lands. Run BEFORE the `transformed_descendants`
+    // skip so headings nested inside a transformed ancestor (e.g.
+    // `<div style="transform:..."><h1>`) still register in the PDF
+    // outline — record unconditionally using the untransformed y
+    // position so the outline destination is stable. (`/Link`
+    // annotation rects still receive the transform via the link
+    // collector; only the bookmark destination is keyed by raw y.)
+    if let Some(first_frag) = geom.fragments.first()
+        && first_frag.page_index == page_index
+        && let Some(anchor) = drawables.bookmark_anchors.get(&node_id)
+        && let Some(c) = canvas.bookmark_collector.as_deref_mut()
+    {
+        let y_pt = margin_top_pt.as_pt() + first_frag.y.in_pt();
+        c.record(anchor.level, anchor.label.clone(), y_pt);
+    }
+
+    if transformed_descendants.contains(&node_id) {
+        // Drawn inside an ancestor transform group elsewhere in
+        // this loop. Skipping prevents double-painting. Bookmark
+        // anchor recording above already ran unconditionally.
+        return;
+    }
+    if clipped_descendants.contains(&node_id) {
+        // Drawn inside an ancestor `overflow: hidden|clip` block's
+        // `push_clip_path / pop` group elsewhere in this loop.
+        return;
+    }
+    if opacity_wrapped_descendants.contains(&node_id) {
+        // Drawn inside an ancestor `draw_with_opacity` group via
+        // `draw_under_opacity` elsewhere in this loop. Mirrors the
+        // `clipped_descendants` skip — without it, the descendant
+        // paints once at full opacity here and once under the
+        // parent's opacity wrap. (fulgur-gdb9)
+        return;
+    }
+    if drawables.inline_box_subtree_skip.contains(&node_id) {
+        // PR 8g: belongs to inline-box content (or its descendants)
+        // dispatched explicitly by `paragraph::draw_shaped_lines`
+        // under an offset transform. Skipping here avoids
+        // double-rendering at the body-relative geometry position
+        // (which doesn't include the CSS 2.1 §10.8.1 baseline_shift
+        // that fulgur applies at convert time, see
+        // `convert/inline_root.rs:493`).
+        return;
+    }
+    // Skip the html root: its bg / border / shadow are painted
+    // per-page in the pre-pass (`paint_root_block_v2`) above.
+    if Some(node_id) == drawables.root_id {
+        return;
+    }
+
+    // Body block bg is painted by the per-page pre-pass (paint_root_block_v2)
+    // with content_area_h clamping. Body is never a paragraph/image/svg root,
+    // so its inline children render under their own node IDs via the loop below.
+    // Skip here to avoid a double-paint of the block background.
+    if Some(node_id) == drawables.body_id && drawables.block_styles.contains_key(&node_id) {
+        return;
+    }
+
+    // Per-fragment leaf draws.
+    for frag in &geom.fragments {
+        if frag.page_index != page_index {
+            continue;
+        }
+        let x_pt = margin_left_pt + frag.x.in_pt().to_f32();
+        let y_pt = margin_top_pt + frag.y.in_pt().to_f32();
+
+        if let Some(tx) = drawables.transforms.get(&node_id) {
+            draw_under_transform(
+                canvas,
+                tx,
+                node_id,
+                geom,
+                frag,
+                x_pt,
+                y_pt,
+                geometry,
+                drawables,
+                margin_left_pt,
+                margin_top_pt,
+                page_index,
+            );
+            continue;
+        }
+        // `overflow: hidden | clip` block: paint bg / border /
+        // shadow OUTSIDE the clip, then push the clip path,
+        // dispatch self's inner content + every strict descendant
+        // INSIDE the clip, then pop (CSS 2.1 §11.1.1 painting
+        // order for overflow clipping). Same shape as
+        // `draw_under_transform` but with `push_clip_path`.
+        //
+        // No `!clip_descendants.is_empty()` guard: shared-node_id
+        // inner content (inline-root paragraph from
+        // `convert::inline_root`, replaced image / svg from
+        // `convert::replaced`) lands at the same `node_id` as the
+        // wrapper and so produces an empty `clip_descendants`. The
+        // clip must still be pushed unconditionally when
+        // `has_overflow_clip()` is true so a
+        // `<div style="overflow:hidden;width:50px">long text</div>`
+        // still gets the text clipped at the 50px box even with
+        // no separate descendant NodeIds.
+        // Body is intentionally excluded from `draw_under_clip`:
+        // body has only a page-0 fragment so the clip would only
+        // wrap page-0 content, but body's `clip_descendants`
+        // include every block in the document. Descendants on
+        // page 1+ are dispatched by the main loop via
+        // `dispatch_fragment` (they're omitted from
+        // `clipped_descendants` above). Without this skip, body's
+        // page-0 clip would also re-dispatch every descendant
+        // already painted by the main loop, causing a double
+        // paint. See the `clipped_descendants` collection block
+        // for the rest of the body-overflow rationale.
+        if let Some(block) = drawables.block_styles.get(&node_id)
+            && block.style.has_overflow_clip()
+            && Some(node_id) != drawables.body_id
+        {
+            draw_under_clip(
+                canvas,
+                block,
+                node_id,
+                geom,
+                frag,
+                x_pt,
+                y_pt,
+                geometry,
+                drawables,
+                margin_left_pt,
+                margin_top_pt,
+                page_index,
+            );
+            continue;
+        }
+        // Table with `overflow: hidden | clip`: same painting
+        // order as the block clip arm above (CSS 2.1 §11.1.1).
+        // Route through `draw_under_clip_table`, which paints the
+        // outer frame outside the clip and dispatches each cell
+        // descendant inside.
+        if let Some(table) = drawables
+            .tables
+            .get(&node_id)
+            .filter(|t| t.style.has_overflow_clip())
+        {
+            draw_under_clip_table(
+                canvas,
+                table,
+                geom,
+                frag,
+                x_pt,
+                y_pt,
+                geometry,
+                drawables,
+                margin_left_pt,
+                margin_top_pt,
+                page_index,
+            );
+            continue;
+        }
+        // Fractional-opacity block with descendants: wrap own
+        // paint + descendant fragments in a single
+        // `draw_with_opacity` group so descendants paint inside the
+        // parent's opacity transparency group (CSS opacity §2).
+        // Without this, `<div opacity:0.4><svg>..</svg></div>`
+        // paints the svg outside the parent's opacity wrap,
+        // dropping the parent's opacity from the svg. (fulgur-gdb9)
+        //
+        // Body is excluded for the same reason as the clip arm
+        // above: body has only a page-0 fragment so a
+        // `draw_under_opacity(body)` would only wrap page-0
+        // content while the `opacity_wrapped_descendants` skip
+        // (collected above) excludes body explicitly so the main
+        // loop dispatches body's descendants on pages 1+
+        // normally. Without this exclusion `body { opacity: 0.5 }`
+        // would silently blank pages 1+. (PR #314 follow-up Devin
+        // Review)
+        if let Some(block) = drawables
+            .block_styles
+            .get(&node_id)
+            .filter(|b| !b.opacity_descendants.is_empty())
+            .filter(|_| Some(node_id) != drawables.body_id)
+        {
+            draw_under_opacity(
+                canvas,
+                block,
+                node_id,
+                geom,
+                frag,
+                x_pt,
+                y_pt,
+                geometry,
+                drawables,
+                margin_left_pt,
+                margin_top_pt,
+                page_index,
+            );
+            continue;
+        }
+        dispatch_fragment(
+            canvas,
+            node_id,
+            geom,
+            frag,
+            x_pt,
+            y_pt,
+            drawables,
+            geometry,
             margin_left_pt,
             margin_top_pt,
             page_index,
