@@ -2841,6 +2841,69 @@ fn collect_inline_line_metrics(node: &blitz_dom::Node) -> Vec<(f32, f32)> {
         .collect()
 }
 
+/// CSS 3 Fragmentation default for `orphans`: lines kept at the bottom of a
+/// page before a break between line boxes (css-break-3 §4.4). The properties
+/// themselves are not read.
+#[allow(dead_code)]
+const ORPHANS: usize = 2;
+/// CSS 3 Fragmentation default for `widows`: lines carried to the top of the
+/// next page after a break between line boxes.
+#[allow(dead_code)]
+const WIDOWS: usize = 2;
+
+/// F30: where to break the lines of an inline root that spans pages, as
+/// half-open line index ranges, one per page strip.
+///
+/// `lines` are the `(top, bottom)` coordinates from
+/// [`collect_inline_line_metrics`]; a range's height is the bottom of its last
+/// line minus the top of its first. `first_room` is the block-size available
+/// for lines on the first strip, `page_room` on every later one.
+///
+/// Greedy, like the body-level splitter: each strip takes as many lines as fit.
+/// A strip always takes at least one line (a line box is monolithic, css-break-3
+/// §4.1), even when it overflows. When the greedy break would leave fewer than
+/// [`WIDOWS`] lines for the next strip, lines are pulled back to the next strip so
+/// it gets [`WIDOWS`], unless that would leave this strip with fewer than
+/// [`ORPHANS`] — then the constraint is relaxed (css-break-3 §4.4 allows it when
+/// no break avoids a violation).
+///
+/// `max_strips` bounds the number of ranges (the last one takes all the rest and
+/// overflows), so that a huge paragraph cannot create unbounded pages.
+#[allow(dead_code)] // used by the nested paragraph splitter (next commit)
+fn plan_line_breaks(
+    lines: &[(f32, f32)],
+    first_room: f32,
+    page_room: f32,
+    max_strips: usize,
+) -> Vec<std::ops::Range<usize>> {
+    /// Rounding slack when a run of lines is compared with a room.
+    const EPS: f32 = 0.01;
+    let n = lines.len();
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut room = first_room;
+    while start < n {
+        if ranges.len() + 1 >= max_strips.max(1) {
+            ranges.push(start..n);
+            break;
+        }
+        let mut end = start + 1;
+        while end < n && lines[end].1 - lines[start].0 <= room + EPS {
+            end += 1;
+        }
+        if end < n && n - end < WIDOWS {
+            let pulled = n - WIDOWS;
+            if pulled >= start + ORPHANS {
+                end = pulled;
+            }
+        }
+        ranges.push(start..end);
+        start = end;
+        room = page_room;
+    }
+    ranges
+}
+
 /// fulgur-p55h: split a multi-line inline root across page boundaries
 /// at line edges, append one Fragment per page span to the geometry
 /// table, and return the updated `(page_index, cursor_y, fragments_emitted)`.
@@ -8037,5 +8100,76 @@ h2 { string-set: chapter-title content(text); }
         let cells = assert_placed_once_inside_pages(&doc, &geom, &ids("c", 60), 400.0);
         assert!(cells.iter().all(|&p| p == 0), "{cells:?}");
         assert_eq!(implied_page_count(&geom), 1);
+    }
+
+    /// `n` lines of 20px: `(0, 20), (20, 40), ...`.
+    fn uniform_lines(n: usize) -> Vec<(f32, f32)> {
+        (0..n)
+            .map(|i| (i as f32 * 20.0, (i + 1) as f32 * 20.0))
+            .collect()
+    }
+
+    fn ranges_of(n: usize, first_room: f32, page_room: f32) -> Vec<(usize, usize)> {
+        plan_line_breaks(&uniform_lines(n), first_room, page_room, usize::MAX)
+            .into_iter()
+            .map(|r| (r.start, r.end))
+            .collect()
+    }
+
+    #[test]
+    fn plan_line_breaks_keeps_everything_on_one_strip_when_it_fits() {
+        assert_eq!(ranges_of(10, 200.0, 200.0), vec![(0, 10)]);
+        assert_eq!(ranges_of(1, 5.0, 5.0), vec![(0, 1)]);
+        assert!(ranges_of(0, 100.0, 100.0).is_empty());
+    }
+
+    #[test]
+    fn plan_line_breaks_fills_each_strip_greedily() {
+        // 5 lines per strip.
+        assert_eq!(ranges_of(10, 100.0, 100.0), vec![(0, 5), (5, 10)]);
+        // The first strip has less room than the later ones.
+        assert_eq!(ranges_of(12, 60.0, 100.0), vec![(0, 3), (3, 8), (8, 12)]);
+    }
+
+    #[test]
+    fn plan_line_breaks_pulls_a_line_back_to_avoid_a_widow() {
+        // Greedy would be 5, 5, 1: the last strip gets WIDOWS lines.
+        assert_eq!(ranges_of(11, 100.0, 100.0), vec![(0, 5), (5, 9), (9, 11)]);
+    }
+
+    #[test]
+    fn plan_line_breaks_relaxes_widows_when_orphans_would_break() {
+        // 3 lines, room for 2: pulling back would leave 1 line on the first strip.
+        assert_eq!(ranges_of(3, 40.0, 40.0), vec![(0, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn plan_line_breaks_takes_at_least_one_line_per_strip() {
+        // Not even one line fits: it overflows rather than loop or vanish.
+        assert_eq!(ranges_of(3, 5.0, 5.0), vec![(0, 1), (1, 2), (2, 3)]);
+        assert_eq!(
+            ranges_of(4, -50.0, 0.0),
+            vec![(0, 1), (1, 2), (2, 3), (3, 4)]
+        );
+    }
+
+    #[test]
+    fn plan_line_breaks_uses_line_coordinates_not_counts() {
+        // A tall line (60px) among 20px lines: strips are measured, not counted.
+        let lines = vec![(0.0, 20.0), (20.0, 80.0), (80.0, 100.0), (100.0, 120.0)];
+        let r: Vec<_> = plan_line_breaks(&lines, 90.0, 90.0, usize::MAX)
+            .into_iter()
+            .map(|r| (r.start, r.end))
+            .collect();
+        assert_eq!(r, vec![(0, 2), (2, 4)]);
+    }
+
+    #[test]
+    fn plan_line_breaks_stops_at_max_strips() {
+        let r = plan_line_breaks(&uniform_lines(100), 20.0, 20.0, 3);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r.last().unwrap().end, 100, "the last strip takes the rest");
+        let r = plan_line_breaks(&uniform_lines(5), 20.0, 20.0, 0);
+        assert_eq!(r, vec![0..5]);
     }
 }
