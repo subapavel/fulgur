@@ -109,6 +109,12 @@ pub struct Fragment {
 pub struct PaginationGeometry {
     pub fragments: Vec<Fragment>,
     pub is_repeat: bool,
+    /// F30: set for a paragraph nested in a block that was split between line
+    /// boxes by `fragment_nested_inline_root`. Each fragment's `height` is then
+    /// the span of its lines only; the box's own frame (border + padding) is
+    /// `(top, bottom)` px bigger, the top on every fragment and the bottom on the
+    /// last. `None` for everything else.
+    pub line_split_insets: Option<(crate::units::Px, crate::units::Px)>,
 }
 
 impl PaginationGeometry {

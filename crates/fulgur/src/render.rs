@@ -1265,6 +1265,12 @@ pub(crate) fn dispatch_fragment(
         );
         return;
     }
+    // F30: a paragraph split between line boxes records the span of its
+    // lines as the fragment height; its frame (border + padding) is
+    // `line_split_insets` bigger. The paragraph slicing below still reads
+    // `geom.fragments`, so only the frame sees the adjusted fragment.
+    let frame_frag = frame_fragment(geom, frag);
+    let frag = &frame_frag;
     // True when this block / list-item / paragraph spans multiple
     // pages (the fragmenter recorded one fragment per page slice).
     // Passed down so `draw_block_inner_paint` can use the per-page
@@ -1997,16 +2003,17 @@ fn draw_under_clip(
     // covers content that should be cut off.
     // (PR #313 follow-up Devin Review — completes the PR #316 fix.)
     let is_split = geom.is_split();
+    let frame_frag = frame_fragment(geom, frag);
     let total_height = block
         .layout_size
         .map(|s| {
-            if is_split && frag.height > crate::units::Px::ZERO {
-                frag.height.in_pt().to_f32()
+            if is_split && frame_frag.height > crate::units::Px::ZERO {
+                frame_frag.height.in_pt().to_f32()
             } else {
                 s.height.to_f32()
             }
         })
-        .unwrap_or_else(|| frag.height.in_pt().to_f32());
+        .unwrap_or_else(|| frame_frag.height.in_pt().to_f32());
 
     let para_for_block = drawables.paragraphs.get(&node_id);
     let img_for_block = drawables.images.get(&node_id);
@@ -2426,16 +2433,17 @@ fn draw_under_opacity(
             // `draw_block_inner_paint` fix addresses for non-opacity
             // blocks (PR #316). (PR #314 follow-up Devin Review)
             let is_split = geom.is_split();
+            let frame_frag = frame_fragment(geom, frag);
             let total_height = block
                 .layout_size
                 .map(|s| {
-                    if is_split && frag.height > crate::units::Px::ZERO {
-                        frag.height.in_pt().to_f32()
+                    if is_split && frame_frag.height > crate::units::Px::ZERO {
+                        frame_frag.height.in_pt().to_f32()
                     } else {
                         s.height.to_f32()
                     }
                 })
-                .unwrap_or_else(|| frag.height.in_pt().to_f32());
+                .unwrap_or_else(|| frame_frag.height.in_pt().to_f32());
             if block.visible {
                 crate::background::draw_box_shadows(
                     canvas,
@@ -2874,6 +2882,35 @@ fn draw_svg_inner_paint(
         .surface
         .draw_svg(&entry.tree, size, SvgSettings::default());
     canvas.surface.pop();
+}
+
+/// F30: the fragment whose height is the height of the box's frame on this
+/// page. For a paragraph that `fragment_nested_inline_root` split between line
+/// boxes, every fragment records the span of its lines only; the frame also
+/// covers the border and padding above them (reserved on every page, because the
+/// lines are painted at `y + inset_top`) and, on the last page, below them.
+/// Everything else gets `frag` back unchanged.
+fn frame_fragment(
+    geom: &crate::pagination_layout::PaginationGeometry,
+    frag: &crate::pagination_layout::Fragment,
+) -> crate::pagination_layout::Fragment {
+    let mut frame = frag.clone();
+    if let Some((top, bottom)) = geom.line_split_insets
+        && geom.is_split()
+    {
+        let is_last = geom
+            .fragments
+            .last()
+            .is_some_and(|last| last.page_index == frag.page_index);
+        frame.height = top
+            + frag.height
+            + if is_last {
+                bottom
+            } else {
+                crate::units::Px::ZERO
+            };
+    }
+    frame
 }
 
 /// Block draw: emits background / border / box-shadow for the
@@ -3502,8 +3539,13 @@ fn draw_list_item_with_block(
     let inner_x = x + inset.0;
     let inner_y = y + inset.1;
 
+    // F30: an item split across pages has one marker, beside its first line.
+    let is_continuation = is_split
+        && fragments
+            .first()
+            .is_some_and(|first| first.page_index != page_index);
     draw_with_opacity(canvas, list_item.opacity, |canvas| {
-        if list_item.visible {
+        if list_item.visible && !is_continuation {
             draw_list_item_marker_tagged(canvas, list_item, node_id, drawables, x, y);
         }
         if let Some(b) = block {
@@ -5218,6 +5260,44 @@ mod tests {
             baseline: baseline_pt.as_pt(),
             items: vec![],
         }
+    }
+
+    fn geometry_of(
+        heights: &[f32],
+        insets: Option<(f32, f32)>,
+    ) -> crate::pagination_layout::PaginationGeometry {
+        crate::pagination_layout::PaginationGeometry {
+            fragments: heights
+                .iter()
+                .enumerate()
+                .map(|(i, h)| make_fragment(i as u32, *h))
+                .collect(),
+            is_repeat: false,
+            line_split_insets: insets.map(|(t, b)| (t.as_px(), b.as_px())),
+        }
+    }
+
+    #[test]
+    fn frame_fragment_adds_the_top_inset_everywhere_and_the_bottom_on_the_last_page() {
+        let geom = geometry_of(&[100.0, 100.0, 40.0], Some((17.0, 5.0)));
+        let heights: Vec<f32> = geom
+            .fragments
+            .iter()
+            .map(|f| frame_fragment(&geom, f).height.to_f32())
+            .collect();
+        assert_eq!(heights, vec![117.0, 117.0, 62.0]);
+    }
+
+    #[test]
+    fn frame_fragment_leaves_other_geometry_alone() {
+        // No insets recorded: a block split by the block fragmenter.
+        let geom = geometry_of(&[100.0, 40.0], None);
+        for f in &geom.fragments {
+            assert_eq!(frame_fragment(&geom, f), *f);
+        }
+        // Insets but a single fragment (nothing was split): the box's own layout height is used.
+        let geom = geometry_of(&[100.0], Some((17.0, 5.0)));
+        assert_eq!(frame_fragment(&geom, &geom.fragments[0]), geom.fragments[0]);
     }
 
     #[test]
