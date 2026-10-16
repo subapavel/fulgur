@@ -2786,7 +2786,7 @@ fn fragment_block_subtree(
                     rs.crossed_by_recursion = true;
                 }
                 if parent_is_table && !is_header_cell {
-                    split_row = Some(SplitRow {
+                    let this_row = SplitRow {
                         top: this_top_in_parent,
                         bottom: this_top_in_parent + child_h,
                         start: row_start,
@@ -2800,6 +2800,23 @@ fn fragment_block_subtree(
                             pending_prev_bottom: origin_pending_prev_bottom,
                             pending_same_row: origin_pending_same_row,
                         },
+                    };
+                    // A row ends where its last cell ends, not where the cell
+                    // processed last does: an earlier cell of the same row that
+                    // continued further keeps the end (F30b: cells of direct
+                    // text end at their last line, not at the stretched frame).
+                    split_row = Some(match split_row.take() {
+                        Some(prev)
+                            if (prev.top - this_row.top).abs() < 0.5
+                                && (prev.end.page_index, prev.end.cursor_y)
+                                    > (this_row.end.page_index, this_row.end.cursor_y) =>
+                        {
+                            SplitRow {
+                                end: prev.end,
+                                ..this_row
+                            }
+                        }
+                        _ => this_row,
                     });
                 }
             }
@@ -9348,6 +9365,48 @@ h2 { string-set: chapter-title content(text); }
         let sq = &fragments_of(&doc, &table, "sq")[0];
         assert_eq!(p[0].page_index, 1, "{p:?}");
         assert_eq!((sq.page_index, sq.y.to_f32()), (1, 0.0), "{sq:?}");
+    }
+
+    #[test]
+    fn what_follows_a_row_of_two_split_cells_starts_below_the_taller_one() {
+        // Cells of one row split across pages: the row ends where its tallest cell ends, whichever
+        // cell is processed last (F30b: direct text; the same holds for `<td><p>`).
+        for (what, a, b) in [
+            (
+                "direct text",
+                format!("{}", br_lines(30)),
+                format!("{}", br_lines(20)),
+            ),
+            (
+                "paragraphs",
+                format!("<p>{}</p>", br_lines(30)),
+                format!("<p>{}</p>", br_lines(20)),
+            ),
+            (
+                "taller last",
+                format!("{}", br_lines(20)),
+                format!("{}", br_lines(30)),
+            ),
+        ] {
+            let (doc, table) = nested_geometry(
+                &format!(
+                    "<table style=\"width:100%\"><tr><td id=\"a\" style=\"line-height:20px;vertical-align:top\">{a}</td>\
+                     <td id=\"b\" style=\"line-height:20px;vertical-align:top\">{b}</td></tr></table>\
+                     <p id=\"after\">AFTER</p>"
+                ),
+                200.0,
+            );
+            let after = &fragments_of(&doc, &table, "after")[0];
+            for id in ["a", "b"] {
+                let last = fragments_of(&doc, &table, id).last().unwrap();
+                let below = last.y.to_f32() + last.height.to_f32();
+                assert!(
+                    after.page_index > last.page_index
+                        || (after.page_index == last.page_index && after.y.to_f32() >= below - 0.5),
+                    "{what}: AFTER {after:?} is not below cell {id} ending {last:?}"
+                );
+            }
+        }
     }
 
     #[test]
