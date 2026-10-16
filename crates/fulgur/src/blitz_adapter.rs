@@ -1219,6 +1219,62 @@ pub fn extract_inline_svg_tree(
     }
 }
 
+/// Tell Blitz the natural size of every `<img>` whose `src` is a bundled image.
+///
+/// Blitz sizes an `<img>` from the decoded image it fetched through its net provider, but fulgur's
+/// provider ([`crate::net::FulgurNetProvider`]) serves files under `base_path` only and never the
+/// [`AssetBundle`]. Without this call a bundled image has an inherent size of 0 × 0 and an `<img>`
+/// that is not sized on both axes by attributes lays out 0 wide and is never painted (CSS 2.1
+/// §10.3.2 / §10.6.2 want the natural size, with the ratio filling the missing axis).
+///
+/// Per image this hands Blitz the same event a completed fetch would, via
+/// [`blitz_dom::BaseDocument::load_resource`] (which also clears the layout cache). For a raster image
+/// (PNG/JPEG/GIF) that is the header size only: the pixel buffer stays empty because fulgur paints from
+/// the bundle bytes, never from Blitz's copy, so no full decode is paid for.
+///
+/// `src` is looked up with [`AssetBundle::get_image`], the key `convert_image` uses. Missing,
+/// unrecognised or corrupt images are skipped, which leaves today's behaviour (nothing painted). An
+/// `<img>` Blitz already has image data for (a file under `base_path`) is left alone. Call this after
+/// parsing and before the first layout; the sizes are CSS px (css-images-3 §5) and are converted to pt
+/// once, in `size_in_pt`.
+pub fn seed_image_natural_sizes(doc: &mut HtmlDocument, assets: &crate::asset::AssetBundle) {
+    use crate::image::{AssetKind, ImageRender};
+    use blitz_dom::util::ImageType;
+
+    let no_pixels = Arc::new(Vec::new());
+    let mut seeds = Vec::new();
+    for (node_id, node) in doc.tree().iter() {
+        let Some(elem) = node.element_data() else {
+            continue;
+        };
+        if elem.name.local.as_ref() != "img" || elem.image_data().is_some() {
+            continue;
+        }
+        let Some(data) = get_attr(elem, "src").and_then(|src| assets.get_image(src)) else {
+            continue;
+        };
+        match AssetKind::detect(data) {
+            AssetKind::Raster(format) => {
+                if let Some((w, h)) =
+                    ImageRender::decode_dimensions(data, format).filter(|&(w, h)| w > 0 && h > 0)
+                {
+                    seeds.push(Resource::Image(
+                        node_id,
+                        ImageType::Image,
+                        w,
+                        h,
+                        Arc::clone(&no_pixels),
+                    ));
+                }
+            }
+            AssetKind::Svg | AssetKind::Unknown => {}
+        }
+    }
+    for seed in seeds {
+        doc.load_resource(seed);
+    }
+}
+
 /// Inspect a node's computed `content` property and return the first `Image`
 /// variant's URL as an owned `String` if the content is a single
 /// `url(...)` / `image-set(url(...))` item.
@@ -7285,5 +7341,82 @@ mod extract_html_title_tests {
             &[],
         );
         assert_eq!(super::extract_html_title(&doc), None);
+    }
+}
+
+#[cfg(test)]
+mod seed_image_natural_size_tests {
+    use super::*;
+    use crate::asset::AssetBundle;
+
+    /// Header of a PNG that claims `w` × `h`; `decode_dimensions` reads nothing else, and layout never
+    /// looks at pixels.
+    fn png_header(w: u32, h: u32) -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&[8, 2, 0, 0, 0]);
+        v
+    }
+
+    /// Layout size (CSS px) of the first `<img>` after parse, seed and resolve.
+    fn img_size(html: &str, assets: &AssetBundle) -> (f32, f32) {
+        let (mut doc, _gcpm) =
+            parse_html_with_local_resources(html, 400.0, 10000, &[], false, None);
+        seed_image_natural_sizes(&mut doc, assets);
+        resolve(&mut doc);
+        let id = doc
+            .tree()
+            .iter()
+            .find(|(_, n)| {
+                n.element_data()
+                    .is_some_and(|e| e.name.local.as_ref() == "img")
+            })
+            .map(|(id, _)| id)
+            .expect("no <img> in the test document");
+        let size = doc.get_node(id).unwrap().final_layout.size;
+        (size.width, size.height)
+    }
+
+    fn bundle(name: &str, data: Vec<u8>) -> AssetBundle {
+        let mut b = AssetBundle::new();
+        b.add_image(name, data);
+        b
+    }
+
+    #[test]
+    fn bare_img_takes_the_header_size() {
+        let b = bundle("a.png", png_header(80, 40));
+        let html = r#"<body style="margin:0"><img src="a.png"></body>"#;
+        assert_eq!(img_size(html, &b), (80.0, 40.0));
+    }
+
+    #[test]
+    fn one_dimension_follows_the_ratio() {
+        let b = bundle("a.png", png_header(80, 40));
+        let h = r#"<body style="margin:0"><img src="a.png" style="height:60px;width:auto"></body>"#;
+        assert_eq!(img_size(h, &b), (120.0, 60.0));
+        let w = r#"<body style="margin:0"><img src="a.png" width="100"></body>"#;
+        assert_eq!(img_size(w, &b), (100.0, 50.0));
+    }
+
+    #[test]
+    fn dot_slash_src_finds_the_asset() {
+        let b = bundle("a.png", png_header(30, 10));
+        let html = r#"<body style="margin:0"><img src="./a.png"></body>"#;
+        assert_eq!(img_size(html, &b), (30.0, 10.0));
+    }
+
+    #[test]
+    fn unregistered_corrupt_and_empty_images_stay_unsized() {
+        let html = r#"<body style="margin:0"><img src="nope.png"></body>"#;
+        assert_eq!(img_size(html, &AssetBundle::new()), (0.0, 0.0));
+        // A header that is too short to hold the size: `decode_dimensions` fails, nothing is seeded.
+        let short = bundle("a.png", b"\x89PNG\r\n\x1a\n".to_vec());
+        let html = r#"<body style="margin:0"><img src="a.png"></body>"#;
+        assert_eq!(img_size(html, &short), (0.0, 0.0));
+        // A zero-sized image has no ratio and no area.
+        let zero = bundle("a.png", png_header(0, 0));
+        assert_eq!(img_size(html, &zero), (0.0, 0.0));
     }
 }

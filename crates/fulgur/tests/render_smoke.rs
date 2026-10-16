@@ -6807,3 +6807,76 @@ fn consecutive_one_row_tables_paginate_instead_of_stacking_on_page_one() {
         }
     }
 }
+
+// ── F9: <img> without width/height attributes takes its natural size ──
+
+/// A solid `w` × `h` PNG.
+fn smoke_png(w: u32, h: u32) -> Vec<u8> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(w, h, image::Rgb([200, 30, 30]))
+        .write_to(&mut out, image::ImageFormat::Png)
+        .expect("encode png");
+    out.into_inner()
+}
+
+/// pt size of the one image `html` produces, through the same engine configuration as a render.
+fn only_image_size_pt(html: &str, bundle: AssetBundle) -> (f32, f32) {
+    let engine = Engine::builder().assets(bundle).build();
+    let pdf = engine.render(html).expect("render");
+    assert!(
+        pdf.windows(b"/Subtype /Image".len())
+            .any(|w| w == b"/Subtype /Image"),
+        "the PDF has no image XObject"
+    );
+    let drawables = engine.build_drawables_for_testing_no_gcpm(html);
+    assert_eq!(drawables.images.len(), 1, "expected exactly one image");
+    let img = drawables.images.values().next().unwrap();
+    (img.width.to_f32(), img.height.to_f32())
+}
+
+#[test]
+fn bundled_img_without_size_attributes_is_painted_at_its_natural_size() {
+    // Blitz lays an `<img>` out from the image it fetched; fulgur's net provider never serves the
+    // AssetBundle, so a bundled image used to be 0 × 0 and was not painted at all. 80 × 40 CSS px is
+    // 60 × 30 pt (css-images-3 §5: one image pixel is one CSS px).
+    let mut bundle = AssetBundle::default();
+    bundle.add_image("a.png", smoke_png(80, 40));
+    let html = r#"<!DOCTYPE html><html><body style="margin:0"><img src="a.png"></body></html>"#;
+    assert_eq!(only_image_size_pt(html, bundle), (60.0, 30.0));
+}
+
+#[test]
+fn bundled_img_with_one_dimension_keeps_the_ratio() {
+    let mut bundle = AssetBundle::default();
+    bundle.add_image("a.png", smoke_png(80, 40));
+    // `h-12 w-auto`: 48 px tall, so 96 px wide (72 × 36 pt).
+    let html = r#"<!DOCTYPE html><html><body style="margin:0"><img src="a.png" style="height:48px;width:auto"></body></html>"#;
+    assert_eq!(only_image_size_pt(html, bundle.clone()), (72.0, 36.0));
+    // 50 % of a 400 px box is 200 px wide, 100 px tall (150 × 75 pt).
+    let html = r#"<!DOCTYPE html><html><body style="margin:0"><div style="width:400px"><img src="a.png" style="width:50%"></div></body></html>"#;
+    assert_eq!(only_image_size_pt(html, bundle), (150.0, 75.0));
+}
+
+#[test]
+fn bundled_img_with_both_attributes_is_unchanged() {
+    let mut bundle = AssetBundle::default();
+    bundle.add_image("a.png", smoke_png(80, 40));
+    let html = r#"<!DOCTYPE html><html><body style="margin:0"><img src="a.png" width="120" height="36"></body></html>"#;
+    assert_eq!(only_image_size_pt(html, bundle), (90.0, 27.0));
+}
+
+#[test]
+fn img_with_unregistered_src_paints_nothing() {
+    let mut bundle = AssetBundle::default();
+    bundle.add_image("a.png", smoke_png(80, 40));
+    let html = r#"<!DOCTYPE html><html><body><img src="missing.png"></body></html>"#;
+    let engine = Engine::builder().assets(bundle).build();
+    let pdf = engine.render(html).expect("render");
+    assert!(pdf.starts_with(b"%PDF"));
+    assert!(
+        engine
+            .build_drawables_for_testing_no_gcpm(html)
+            .images
+            .is_empty()
+    );
+}

@@ -202,6 +202,11 @@ impl Engine {
             self.system_fonts,
             self.base_path.as_deref(),
         );
+        // Bundled images are invisible to Blitz's layout until told: give every `<img>` its
+        // natural size before anything resolves (F9).
+        if let Some(assets) = &self.assets {
+            crate::blitz_adapter::seed_image_natural_sizes(&mut doc, assets);
+        }
         gcpm.extend_from(link_gcpm);
 
         // Inline `<style>` blocks in the HTML are parsed by stylo for
@@ -853,6 +858,9 @@ impl Engine {
             self.system_fonts,
             self.base_path.as_deref(),
         );
+        if let Some(assets) = &self.assets {
+            crate::blitz_adapter::seed_image_natural_sizes(&mut doc, assets);
+        }
 
         let ctx = crate::blitz_adapter::PassContext { font_data: fonts };
         let passes: Vec<Box<dyn crate::blitz_adapter::DomPass>> = Vec::new();
@@ -918,6 +926,9 @@ impl Engine {
             self.system_fonts,
             self.base_path.as_deref(),
         );
+        if let Some(assets) = &self.assets {
+            crate::blitz_adapter::seed_image_natural_sizes(&mut doc, assets);
+        }
 
         let ctx = crate::blitz_adapter::PassContext { font_data: fonts };
         let passes: Vec<Box<dyn crate::blitz_adapter::DomPass>> = Vec::new();
