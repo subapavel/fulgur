@@ -1318,54 +1318,77 @@ fn record_subtree_descendants(
         .filter(|v| !v.is_empty())
         .unwrap_or(&parent.children);
     for &child_id in walk_children {
-        let Some(child) = doc.get_node(child_id) else {
-            continue;
-        };
-        let layout = child.final_layout;
-        let h = layout.size.height;
-        let w = layout.size.width;
-        // Phase 4 PR 5: zero-size containers (`<tbody>`, `<tr>`,
-        // anonymous boxes) carry no paint payload but DO host visible
-        // descendants (e.g. table cells) that v2 needs in geometry.
-        // Skipping them entirely leaves cells out of `geometry`; the
-        // dispatcher then never finds the cell node_ids and v2 emits
-        // a blank table. Recurse without recording when h/w are
-        // both zero so the descendant cells still register.
-        if h <= 0.0 && w <= 0.0 {
-            record_subtree_descendants(
-                geometry,
-                doc,
-                child_id,
-                page_index,
-                parent_page_y + layout.location.y,
-                parent_x_in_body + layout.location.x,
-                depth + 1,
-            );
-            continue;
-        }
-        let child_x = parent_x_in_body + layout.location.x;
-        let child_y = parent_page_y + layout.location.y;
-        geometry
-            .entry(child_id)
-            .or_default()
-            .fragments
-            .push(Fragment {
-                page_index,
-                x: child_x.as_px(),
-                y: child_y.as_px(),
-                width: w.as_px(),
-                height: h.as_px(),
-            });
+        record_descendant(
+            geometry,
+            doc,
+            child_id,
+            page_index,
+            parent_page_y,
+            parent_x_in_body,
+            depth,
+        );
+    }
+}
+
+/// One step of [`record_subtree_descendants`]: record `child_id` (unless it is a
+/// zero-size container, which only passes through) and everything below it on
+/// `page_index`. `depth` is the depth of the parent.
+fn record_descendant(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    child_id: usize,
+    page_index: u32,
+    parent_page_y: f32,
+    parent_x_in_body: f32,
+    depth: usize,
+) {
+    let Some(child) = doc.get_node(child_id) else {
+        return;
+    };
+    let layout = child.final_layout;
+    let h = layout.size.height;
+    let w = layout.size.width;
+    // Phase 4 PR 5: zero-size containers (`<tbody>`, `<tr>`,
+    // anonymous boxes) carry no paint payload but DO host visible
+    // descendants (e.g. table cells) that v2 needs in geometry.
+    // Skipping them entirely leaves cells out of `geometry`; the
+    // dispatcher then never finds the cell node_ids and v2 emits
+    // a blank table. Recurse without recording when h/w are
+    // both zero so the descendant cells still register.
+    if h <= 0.0 && w <= 0.0 {
         record_subtree_descendants(
             geometry,
             doc,
             child_id,
             page_index,
-            child_y,
-            child_x,
+            parent_page_y + layout.location.y,
+            parent_x_in_body + layout.location.x,
             depth + 1,
         );
+        return;
     }
+    let child_x = parent_x_in_body + layout.location.x;
+    let child_y = parent_page_y + layout.location.y;
+    geometry
+        .entry(child_id)
+        .or_default()
+        .fragments
+        .push(Fragment {
+            page_index,
+            x: child_x.as_px(),
+            y: child_y.as_px(),
+            width: w.as_px(),
+            height: h.as_px(),
+        });
+    record_subtree_descendants(
+        geometry,
+        doc,
+        child_id,
+        page_index,
+        child_y,
+        child_x,
+        depth + 1,
+    );
 }
 
 /// fulgur-7hf5 (Phase 3.1.5c): pre-flight check for the recursion
