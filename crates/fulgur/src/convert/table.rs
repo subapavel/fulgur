@@ -55,10 +55,22 @@ fn convert_table(
     let header_group = crate::blitz_adapter::first_table_header_group(doc, node.id);
 
     // Walk table children to recurse cells.
+    let mut last_wrapper = None;
     for &child_id in &node.children {
         let Some(child_node) = doc.get_node(child_id) else {
             continue;
         };
+        // F50: a child with a non-table `display` sits in an anonymous cell, which is the box that is converted
+        // (once for a run of children); the child itself is reached through it.
+        if let Some(wrapper) = crate::blitz_adapter::anonymous_table_wrapper(doc, node.id, child_id)
+        {
+            if last_wrapper != Some(wrapper) {
+                last_wrapper = Some(wrapper);
+                convert_node(doc, wrapper, ctx, depth + 1, out);
+            }
+            continue;
+        }
+        last_wrapper = None;
         let is_thead = is_table_section(child_node, "thead");
         let header_mark = (Some(child_id) == header_group).then(|| out.draw_mark());
         collect_table_cells(doc, child_id, is_thead, ctx, depth, out);
@@ -135,11 +147,15 @@ fn collect_row_backgrounds(
         match table_part(child) {
             TablePart::RowGroup => {
                 let mut group_cells = Vec::new();
-                for &row_id in &child.children {
+                // F50: the group's layout children are its rows and the cells of its anonymous rows.
+                let layout_children = child.layout_children.borrow();
+                let members = layout_children.as_deref().unwrap_or(&child.children);
+                for &row_id in members {
                     let Some(row) = doc.get_node(row_id) else {
                         continue;
                     };
                     if table_part(row) != TablePart::Row {
+                        group_cells.extend(cell_box(doc, row_id));
                         continue;
                     }
                     let cells = row_cells(doc, row);
@@ -159,27 +175,31 @@ fn collect_row_backgrounds(
     groups
 }
 
-/// The `display: table-cell` children of `row` that have a laid-out box.
+/// The `display: table-cell` children of `row` (and the anonymous cells Blitz wraps its other children in, F50)
+/// that have a laid-out box.
 fn row_cells(doc: &BaseDocument, row: &Node) -> Vec<CellBox> {
+    let layout_children = row.layout_children.borrow();
+    let members = layout_children.as_deref().unwrap_or(&row.children);
+    members.iter().filter_map(|&id| cell_box(doc, id)).collect()
+}
+
+/// The border box of `id` when it is a table cell (a `display: table-cell` node or an anonymous cell) with a
+/// laid-out box.
+fn cell_box(doc: &BaseDocument, id: usize) -> Option<CellBox> {
     use crate::blitz_adapter::{TablePart, table_part};
 
-    row.children
-        .iter()
-        .filter_map(|&id| {
-            let cell = doc.get_node(id)?;
-            let layout = &cell.final_layout;
-            (table_part(cell) == TablePart::Cell
-                && layout.size.width > 0.0
-                && layout.size.height > 0.0)
-                .then_some(CellBox {
-                    id,
-                    x: layout.location.x,
-                    y: layout.location.y,
-                    width: layout.size.width,
-                    height: layout.size.height,
-                })
+    let cell = doc.get_node(id)?;
+    let layout = &cell.final_layout;
+    ((table_part(cell) == TablePart::Cell || cell.is_anonymous())
+        && layout.size.width > 0.0
+        && layout.size.height > 0.0)
+        .then_some(CellBox {
+            id,
+            x: layout.location.x,
+            y: layout.location.y,
+            width: layout.size.width,
+            height: layout.size.height,
         })
-        .collect()
 }
 
 /// The [`RowBackground`](crate::drawables::RowBackground) of one row or row
@@ -550,5 +570,71 @@ mod tests {
             drawables.table_header_background_owners.get(&thead_id),
             Some(&table_id)
         );
+    }
+
+    #[test]
+    fn a_row_background_covers_the_anonymous_cell_around_a_flex_cell() {
+        // F50: `td { display: flex }` is not a cell; Blitz wraps it in an anonymous cell, which the row
+        // background must cover like a real one.
+        let (doc, rows) = backgrounds(&format!(
+            r#"<!doctype html><html><head>{TABLE_CSS}</head><body><table>
+              <tr style="background:red"><td></td><td style="display:flex"></td></tr>
+            </table></body></html>"#
+        ));
+        assert_eq!(rows.len(), 1);
+        let cells = &rows[0].cells;
+        assert_eq!(cells.len(), 2);
+        assert_eq!(tag_of(&doc, cells[0].cell), "td");
+        // The second one is the anonymous block, not the `td` it holds.
+        let second = doc.deref().get_node(cells[1].cell).unwrap();
+        assert!(second.is_anonymous());
+        assert!(
+            (cells[1].dx.to_f32() - 75.0).abs() < 0.01,
+            "{:?}",
+            cells[1].dx
+        );
+    }
+
+    #[test]
+    fn a_group_background_covers_the_anonymous_row_of_a_bare_block() {
+        // F50: a `tr { display: block }` in a `tbody` sits in an anonymous row and cell; the group paints behind it.
+        let (_, rows) = backgrounds(&format!(
+            r#"<!doctype html><html><head>{TABLE_CSS}</head><body><table>
+              <tbody style="background:green"><tr><td></td></tr><tr style="display:block"><td>x</td></tr></tbody>
+            </table></body></html>"#
+        ));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cells.len(), 2, "{:?}", rows[0].cells.len());
+    }
+
+    #[test]
+    fn a_table_child_with_a_non_table_display_is_reached_through_its_anonymous_cell() {
+        let doc = parse_doc(
+            r#"<!doctype html><html><body><table>
+              <tbody style="display:block"><tr><td>a</td></tr></tbody>
+              <tbody><tr><td>b</td></tr></tbody>
+            </table></body></html>"#,
+        );
+        let base = doc.deref();
+        let table_id = find_tag(base, base.root_element().id, "table").unwrap();
+        let table = base.get_node(table_id).unwrap();
+        let wrappers: Vec<Option<usize>> = table
+            .children
+            .iter()
+            .map(|&c| crate::blitz_adapter::anonymous_table_wrapper(base, table_id, c))
+            .collect();
+        // Whitespace text nodes are dropped, so only the block `tbody` has a wrapper.
+        let block_tbody = table
+            .children
+            .iter()
+            .position(|&c| {
+                base.get_node(c)
+                    .and_then(|n| n.element_data())
+                    .is_some_and(|e| e.name.local.as_ref() == "tbody")
+            })
+            .unwrap();
+        let wrapper = wrappers[block_tbody].expect("an anonymous wrapper");
+        assert!(base.get_node(wrapper).unwrap().is_anonymous());
+        assert_eq!(wrappers.iter().flatten().count(), 1, "{wrappers:?}");
     }
 }

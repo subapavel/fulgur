@@ -7082,3 +7082,26 @@ fn paragraphs_that_are_flex_items_and_direct_text_cells_continue_on_the_next_pag
         }
     }
 }
+
+#[test]
+fn table_parts_with_a_non_table_display_are_wrapped_and_printed() {
+    // F50: a `td`, `tr` and `tbody` with `display: block | flex` sit in anonymous table cells and rows; their
+    // content is laid out and painted, and the row backgrounds still show behind it.
+    let html = r#"<!DOCTYPE html><html><body style="margin:0"><style>
+        td{padding:4px;line-height:20px} .b{display:block} .f{display:flex}</style>
+        <table style="width:100%">
+          <tr style="background:#ffe9a8"><td>Alpha</td><td class="f"><span>Bravo</span><span>Charlie</span></td></tr>
+          <tr class="b"><td>Delta</td></tr>
+          <tbody class="b"><tr><td>Echo</td></tr></tbody>
+          <tr><td class="b">Foxtrot</td><td class="b">Golf</td></tr>
+        </table></body></html>"#;
+    let pdf = Engine::builder().build().render(html).expect("render");
+    assert!(pdf.starts_with(b"%PDF"));
+    if let Some(text) = extract_pdf_text(&pdf) {
+        for word in [
+            "Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf",
+        ] {
+            assert_eq!(text.matches(word).count(), 1, "{word} must be printed once");
+        }
+    }
+}

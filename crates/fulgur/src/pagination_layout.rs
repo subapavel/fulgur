@@ -9331,8 +9331,9 @@ h2 { string-set: chapter-title content(text); }
 
     #[test]
     fn paragraphs_that_are_not_in_plain_flow_stay_whole() {
-        // The exclusions of `line_split_candidate` still hold: a clipping parent, an atomic-inline
-        // parent and a non-cell child of a `display: table` box are placed as one unit.
+        // The exclusions of `line_split_candidate` still hold: a clipping parent and an atomic-inline
+        // parent place a paragraph as one unit. (A non-cell child of a `display: table` box used to be
+        // one too; since F50 it sits in an anonymous cell and splits like any block, see below.)
         for (what, markup) in [
             (
                 "overflow:hidden flex",
@@ -9348,13 +9349,6 @@ h2 { string-set: chapter-title content(text); }
                     br_lines(30)
                 ),
             ),
-            (
-                "display:table",
-                format!(
-                    "<div style=\"display:table\"><p id=\"x\">{}</p></div>",
-                    br_lines(30)
-                ),
-            ),
         ] {
             let (doc, table) = nested_geometry(&markup, 200.0);
             // Not entered at all (no entry), or one whole fragment: never split between lines.
@@ -9362,6 +9356,22 @@ h2 { string-set: chapter-title content(text); }
             let n = table.get(&node).map_or(0, |g| g.fragments.len());
             assert!(n <= 1, "{what}: {n} fragments");
         }
+    }
+
+    #[test]
+    fn a_paragraph_that_is_a_non_cell_child_of_a_table_box_splits_in_its_anonymous_cell() {
+        // F50: Blitz wraps the `<p>` in an anonymous row and cell (CSS 2.1 §17.2.1), whose content is
+        // an ordinary block flow, so its lines are split between pages like those of a real cell.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"display:table\"><p id=\"x\">{}</p></div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let node = find_by_id(doc.deref(), "x").unwrap();
+        let n = table.get(&node).map_or(0, |g| g.fragments.len());
+        assert!(n > 1, "{n} fragments");
     }
 
     #[test]

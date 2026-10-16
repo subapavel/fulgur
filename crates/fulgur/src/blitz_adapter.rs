@@ -929,6 +929,20 @@ pub fn table_part(node: &Node) -> TablePart {
     }
 }
 
+/// F50: the anonymous table cell that wraps `child_id`, a child of the table `table_id` whose `display` is
+/// not a table display (a `tbody` with `display: block`). Blitz wraps a run of such children in an anonymous
+/// row and cell (CSS 2.1 §17.2.1) and lays them out as that cell's children, so the table's `children` still
+/// list them but they are reached through the wrapper (an anonymous block whose `parent` is the table).
+pub fn anonymous_table_wrapper(
+    doc: &BaseDocument,
+    table_id: usize,
+    child_id: usize,
+) -> Option<usize> {
+    let wrapper = doc.get_node(child_id)?.layout_parent.get()?;
+    let node = doc.get_node(wrapper)?;
+    (node.is_anonymous() && node.parent == Some(table_id)).then_some(wrapper)
+}
+
 /// F19: true if `node`'s computed `display` is `table` or `inline-table`.
 pub fn is_table_box(node: &Node) -> bool {
     use ::style::values::specified::box_::DisplayInside;
