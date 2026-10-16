@@ -832,7 +832,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     .last()
                     .map(|l| l.1 - line_metrics[0].0)
                     .unwrap_or(child_h);
-                if cursor_y > 0.0 && cursor_y + para_total_h > self.strips.fresh() {
+                if cursor_y > 0.0 && cursor_y + para_total_h > self.strips.bottom(page_index) {
                     page_index += 1;
                     cursor_y = 0.0;
                 }
@@ -945,7 +945,8 @@ impl<'a> PaginationLayoutTree<'a> {
                             0,
                         ))
             };
-            let mut needs_recursion = gate(self.doc, (page_height_px - cursor_y).max(0.0));
+            let mut needs_recursion =
+                gate(self.doc, (strips.bottom(page_index) - cursor_y).max(0.0));
             // F28: entering a box means placing its first row at the current
             // cursor. When even that row does not fit below the cursor, the
             // only break point before it is the class A point in front of the
@@ -961,10 +962,10 @@ impl<'a> PaginationLayoutTree<'a> {
             // (it overflows there too), so such a box is entered where it is.
             if needs_recursion && cursor_y > 0.0 {
                 let leading = leading_block_size(self.doc, child_id, 0, page_height_px);
-                if leading <= page_height_px && cursor_y + leading > page_height_px {
+                if leading <= page_height_px && cursor_y + leading > strips.bottom(page_index) {
                     page_index += 1;
                     cursor_y = 0.0;
-                    needs_recursion = gate(self.doc, page_height_px);
+                    needs_recursion = gate(self.doc, strips.bottom(page_index));
                 }
             }
             if needs_recursion {
@@ -1013,7 +1014,7 @@ impl<'a> PaginationLayoutTree<'a> {
             // `avoid_inside` above (it just suppresses the inline
             // split branch; remaining-strip overflow handling is
             // identical).
-            if cursor_y > 0.0 && cursor_y + child_h > self.strips.fresh() {
+            if cursor_y > 0.0 && cursor_y + child_h > strips.bottom(page_index) {
                 page_index += 1;
                 cursor_y = 0.0;
             }
@@ -1068,7 +1069,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 .primary_styles()
                 .is_some_and(|s| !s.get_box().transform.0.is_empty());
             if !has_transform && child_h > self.strips.fresh() + 1.0 {
-                let first_slice_h = (self.strips.fresh() - cursor_y).min(child_h);
+                let first_slice_h = (strips.bottom(page_index) - cursor_y).min(child_h);
                 self.geometry
                     .entry(child_id)
                     .or_default()
@@ -3659,7 +3660,7 @@ fn fragment_inline_root(
         let frag_top_local = line_metrics[fragment_start_idx].0;
         let projected_bottom_in_body = paragraph_top_in_body + (line_bottom_local - frag_top_local);
 
-        if projected_bottom_in_body > strips.fresh() && i > fragment_start_idx {
+        if projected_bottom_in_body > strips.bottom(page_index) && i > fragment_start_idx {
             // fulgur-s67g Phase 2.1: honour widow / orphan minimums.
             let first_size = i - fragment_start_idx;
             let remaining_size = total_lines - i;
@@ -5482,10 +5483,13 @@ mod tests {
 
     /// fulgur-ezst: a childless band that fits WITHIN the cap renders its
     /// full page count — the collapse must not over-fire on ordinary
-    /// multi-page spacers. `height: 4000px` on an 800px strip = 5 pages.
+    /// multi-page spacers. `height: 4000px` on an 800px strip = 5 pages (the
+    /// body margin is cleared: with the UA's 8px page 0 is 792px, F29, and the
+    /// band needs a sixth page for its last 8px).
     #[test]
     fn childless_subcap_band_renders_full() {
-        let html = r#"<html><body><div style="height: 4000px"></div></body></html>"#;
+        let html =
+            r#"<html><body style="margin:0"><div style="height: 4000px"></div></body></html>"#;
         let mut doc = parse(html, 600.0);
         let table = run_pass(&mut doc, 800.0);
         assert_eq!(
@@ -9284,5 +9288,123 @@ h2 { string-set: chapter-title content(text); }
         for f in fragments_of(&doc, &table, "b") {
             assert!(f.y.to_f32() + f.height.to_f32() <= 200.5, "{f:?}");
         }
+    }
+
+    // ---- F29: page 0 is shorter by the body's own offset -----------------
+
+    /// `body` styled with `body_css` (after `LINE_CSS`, so it wins), paginated on
+    /// `page_h`-px pages.
+    fn offset_geometry(
+        body_css: &str,
+        body: &str,
+        page_h: f32,
+    ) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        let mut doc = parse(
+            &format!(
+                "<html><head>{LINE_CSS}<style>{body_css}</style></head><body>{body}</body></html>"
+            ),
+            600.0,
+        );
+        let table = run_pass(&mut doc, page_h);
+        (doc, table)
+    }
+
+    #[test]
+    fn two_monolithic_blocks_under_a_body_margin_do_not_share_page_zero() {
+        // 40 + 500 + 500 > 1000: the second block moves to page 1 (it used to stay at y = 500, ending 1040px
+        // down the page, below the content box).
+        let body = "<div id=\"a\" style=\"height:500px\"></div><div id=\"b\" style=\"height:500px\"></div>";
+        let (doc, table) = offset_geometry("body{margin:40px}", body, 1000.0);
+        let a = &fragments_of(&doc, &table, "a")[0];
+        let b = &fragments_of(&doc, &table, "b")[0];
+        assert_eq!((a.page_index, b.page_index), (0, 1), "{a:?} {b:?}");
+        assert!(b.y.to_f32().abs() < 0.5, "{b:?}");
+        // Without an offset the pair still fits.
+        let (doc, table) = offset_geometry("body{margin:0}", body, 1000.0);
+        assert_eq!(fragments_of(&doc, &table, "b")[0].page_index, 0);
+    }
+
+    #[test]
+    fn a_body_level_paragraph_splits_at_the_shortened_page_zero() {
+        // 30 lines of 20px on 200px pages under a 40px body margin: 8 lines (160px) on page 0, then 10 + 10 + 2.
+        let (doc, table) = offset_geometry(
+            "body{margin:40px}",
+            &format!("<p id=\"p\">{}</p>", br_lines(30)),
+            200.0,
+        );
+        let f = fragments_of(&doc, &table, "p");
+        let heights: Vec<(u32, i32)> = f
+            .iter()
+            .map(|f| (f.page_index, f.height.to_f32().round() as i32))
+            .collect();
+        assert_eq!(
+            heights,
+            vec![(0, 160), (1, 200), (2, 200), (3, 40)],
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn a_paragraph_after_a_spacer_moves_whole_when_page_zero_has_no_room() {
+        // 100px spacer, 40px offset, 5 lines of 20px: 100 + 100 fits a 200px page but not the 160px that
+        // page 0 has, so the paragraph (which is not taller than a page) starts page 1.
+        let body = format!(
+            "<div style=\"height:100px\"></div><p id=\"p\">{}</p>",
+            br_lines(5)
+        );
+        let (doc, table) = offset_geometry("body{margin:40px}", &body, 200.0);
+        let f = fragments_of(&doc, &table, "p");
+        assert_eq!((f.len(), f[0].page_index), (1, 1), "{f:?}");
+        let (doc, table) = offset_geometry("body{margin:0}", &body, 200.0);
+        assert_eq!(fragments_of(&doc, &table, "p")[0].page_index, 0);
+    }
+
+    #[test]
+    fn a_margin_collapsed_through_body_is_page_zero_s_offset() {
+        // The first paragraph's 60px top margin collapses through <body>: page 0 starts 60px down, 140px
+        // are left. The second paragraph sits at 140px in body coordinates, 200px down the page: page 1.
+        let body = "<p id=\"a\" style=\"margin-top:60px;height:20px\"></p>\
+                    <p id=\"b\" style=\"margin-top:120px;height:20px\"></p>";
+        let (doc, table) = offset_geometry("body{margin:0}", body, 200.0);
+        let b = &fragments_of(&doc, &table, "b")[0];
+        assert_eq!(b.page_index, 1, "{b:?}");
+        assert!(
+            b.y.to_f32().abs() < 0.5,
+            "margins truncate at the break: {b:?}"
+        );
+        assert_eq!(fragments_of(&doc, &table, "a")[0].page_index, 0);
+    }
+
+    #[test]
+    fn a_block_taller_than_a_page_is_sliced_to_the_shortened_page_zero() {
+        // 1500px block under a 40px margin on 1000px pages: 960 + 540.
+        let (doc, table) = offset_geometry(
+            "body{margin:40px}",
+            "<div id=\"d\" style=\"height:1500px\"></div>",
+            1000.0,
+        );
+        let f = fragments_of(&doc, &table, "d");
+        let slices: Vec<(u32, i32)> = f
+            .iter()
+            .map(|f| (f.page_index, f.height.to_f32().round() as i32))
+            .collect();
+        assert_eq!(slices, vec![(0, 960), (1, 540)], "{f:?}");
+    }
+
+    #[test]
+    fn a_box_whose_first_row_does_not_fit_page_zero_moves_to_page_one() {
+        // Spacer 140px, offset 40px, first row 30px: 140 + 30 > 160. Entering the box would hang the row
+        // 10px past the content box of a 200px page.
+        let rows: String = (0..5)
+            .map(|i| format!("<div id=\"r{i}\" style=\"height:30px\"></div>"))
+            .collect();
+        let body = format!("<div style=\"height:140px\"></div><section id=\"s\">{rows}</section>");
+        let (doc, table) = offset_geometry("body{margin:40px}", &body, 200.0);
+        let r0 = &fragments_of(&doc, &table, "r0")[0];
+        assert_eq!(r0.page_index, 1, "{r0:?}");
+        assert!(r0.y.to_f32().abs() < 0.5, "{r0:?}");
+        // With an offset of 0 the row fits where it is (140 + 30 <= 200).
+        let (doc, table) = offset_geometry("body{margin:0}", &body, 200.0);
+        assert_eq!(fragments_of(&doc, &table, "r0")[0].page_index, 0);
     }
 }
