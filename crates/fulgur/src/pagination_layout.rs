@@ -1916,6 +1916,39 @@ struct SplitRow {
     end: RowCursor,
 }
 
+/// An in-flow child that takes part in the block-size of its parent: not
+/// whitespace-only text, not absolutely positioned, with a finite height above 0.
+fn is_flow_child_with_height(c: &blitz_dom::Node) -> bool {
+    use ::style::properties::longhands::position::computed_value::T as Pos;
+    let h = c.final_layout.size.height;
+    let is_blank_text = c
+        .text_data()
+        .is_some_and(|t| t.content.chars().all(char::is_whitespace));
+    let is_oof = c
+        .primary_styles()
+        .is_some_and(|s| matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed));
+    !is_blank_text && !is_oof && h.is_finite() && h > 0.0
+}
+
+/// F30b: whether no two in-flow children of a flex / grid container overlap in
+/// y, i.e. each one starts at or below the bottom of the one before: a column
+/// flex container, a one-column grid, a single item. Such a container
+/// fragments like block flow (css-flexbox-1 §12.1, css-grid-2 "Fragmenting
+/// Grid Layout"); with two items side by side it does not.
+fn items_stack_vertically(doc: &BaseDocument, children: &[usize]) -> bool {
+    let mut spans: Vec<(f32, f32)> = children
+        .iter()
+        .filter_map(|&id| doc.get_node(id))
+        .filter(|c| is_flow_child_with_height(c))
+        .map(|c| {
+            let l = &c.final_layout;
+            (l.location.y, l.location.y + l.size.height)
+        })
+        .collect();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    spans.windows(2).all(|w| w[1].0 >= w[0].1 - 0.5)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fragment_block_subtree(
     geometry: &mut PaginationGeometryTable,
@@ -2054,19 +2087,15 @@ fn fragment_block_subtree(
     drop(layout_children_borrow);
     // F30: the last in-flow child with a height: what is below it in this box
     // (padding, border) is `tail` for a paragraph in it.
-    let last_flow_child = walk_children.iter().rev().copied().find(|&id| {
-        doc.get_node(id).is_some_and(|c| {
-            let h = c.final_layout.size.height;
-            let is_blank_text = c
-                .text_data()
-                .is_some_and(|t| t.content.chars().all(char::is_whitespace));
-            use ::style::properties::longhands::position::computed_value::T as Pos;
-            let is_oof = c.primary_styles().is_some_and(|s| {
-                matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed)
-            });
-            !is_blank_text && !is_oof && h.is_finite() && h > 0.0
-        })
-    });
+    let last_flow_child = walk_children
+        .iter()
+        .rev()
+        .copied()
+        .find(|&id| doc.get_node(id).is_some_and(is_flow_child_with_height));
+    // F30b: a single-column flex / grid box lays its items out like block flow,
+    // so it is closed below a split item like a block (css-flexbox-1 §12.1).
+    // Items of a row are level with each other and keep today's handling.
+    let closes_like_block = !allow_same_row_rebase || items_stack_vertically(doc, &walk_children);
     for &child_id in &walk_children {
         let Some(child) = doc.get_node(child_id) else {
             continue;
@@ -2554,7 +2583,7 @@ fn fragment_block_subtree(
             // the row's y on the current page.
             // What the boxes up to here need below this child, when it is the
             // last thing in flow in this box.
-            let child_tail = if Some(child_id) == last_flow_child && !allow_same_row_rebase {
+            let child_tail = if Some(child_id) == last_flow_child && closes_like_block {
                 let parent_h = parent.final_layout.size.height;
                 let below = if parent_h.is_finite() {
                     (parent_h - (this_top_in_parent + child_h)).max(0.0)
@@ -2911,7 +2940,7 @@ fn fragment_block_subtree(
     // the child): the last fragment of the frame includes them, and the cursor
     // handed back is below the frame so the next sibling does not start inside
     // it. Other splits keep closing at the last child, as before.
-    let closing = if lines_split_below && !allow_same_row_rebase {
+    let closing = if lines_split_below && closes_like_block {
         let parent_h = parent.final_layout.size.height;
         if parent_h.is_finite() {
             (parent_h - children_bottom).max(0.0)
@@ -9090,6 +9119,61 @@ h2 { string-set: chapter-title content(text); }
             next.y.to_f32() >= frame_bottom - 0.5,
             "{next:?} vs {frame_bottom}"
         );
+    }
+
+    #[test]
+    fn a_padded_flex_column_box_closes_below_a_split_paragraph_in_its_item() {
+        // F30b: a single-column flex box is block flow for fragmentation, so its bottom
+        // padding and border follow the last item like a block's (the F30 test above).
+        for display in ["display:flex;flex-direction:column", "display:grid"] {
+            let (doc, table) = nested_geometry(
+                &format!(
+                    "<div id=\"w\" style=\"{display};border:1px solid #000;padding:15px\">\
+                     <div><p>{}</p></div><p id=\"last\">end</p></div><p id=\"next\">next</p>",
+                    br_lines(30)
+                ),
+                200.0,
+            );
+            let w = fragments_of(&doc, &table, "w");
+            let last_frame = w.last().unwrap();
+            let last = &fragments_of(&doc, &table, "last")[0];
+            let frame_bottom = last_frame.y.to_f32() + last_frame.height.to_f32();
+            let last_bottom = last.y.to_f32() + last.height.to_f32();
+            assert!(
+                (frame_bottom - last_bottom - 16.0).abs() < 0.5,
+                "{display}: frame {frame_bottom}, text {last_bottom}"
+            );
+            let next = &fragments_of(&doc, &table, "next")[0];
+            assert!(next.y.to_f32() >= frame_bottom - 0.5, "{display}: {next:?}");
+        }
+    }
+
+    fn stacks(body: &str) -> bool {
+        let (doc, _) = nested_geometry(body, 200.0);
+        let c = doc.get_node(find_by_id(doc.deref(), "c").unwrap()).unwrap();
+        let kids = c.layout_children.borrow();
+        let ids: Vec<usize> = kids.as_deref().map(<[usize]>::to_vec).unwrap_or_default();
+        super::items_stack_vertically(doc.deref(), &ids)
+    }
+
+    #[test]
+    fn items_stack_vertically_tells_columns_from_rows() {
+        let items = "<div style=\"height:30px\">a</div><div style=\"height:30px\">b</div>";
+        assert!(stacks(&format!(
+            "<div id=\"c\" style=\"display:flex;flex-direction:column\">{items}</div>"
+        )));
+        assert!(stacks(&format!(
+            "<div id=\"c\" style=\"display:grid;gap:8px\">{items}</div>"
+        )));
+        assert!(stacks(
+            "<div id=\"c\" style=\"display:flex\"><div style=\"height:30px\">a</div></div>"
+        ));
+        assert!(!stacks(&format!(
+            "<div id=\"c\" style=\"display:flex\">{items}</div>"
+        )));
+        assert!(!stacks(&format!(
+            "<div id=\"c\" style=\"display:grid;grid-template-columns:1fr 1fr\">{items}</div>"
+        )));
     }
 
     #[test]
