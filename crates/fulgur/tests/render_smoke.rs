@@ -1157,6 +1157,30 @@ fn render_v2_smoke_list_item_image_marker() {
 }
 
 #[test]
+fn render_v2_smoke_outside_symbol_markers_with_bundled_font() {
+    // Outside `disc` / `circle` / `square` markers were laid out with the stack
+    // `Bullet, monospace, sans-serif`. A caller-supplied `FontContext` (bundled faces
+    // only) has none of the three, Parley dropped the run and nothing was painted.
+    // The marker is now shaped with the item's own font; the symbol is in the text
+    // layer, followed by the space that separates it from the item text.
+    let html = r##"<!doctype html><html><body>
+<ul><li>First</li></ul>
+<ul style="list-style-type: circle"><li>Second</li></ul>
+<ul style="list-style-type: square"><li>Third</li></ul>
+</body></html>"##;
+    let pdf = noto_engine().render(html).expect("outside markers render");
+    assert!(!pdf.is_empty());
+    if let Some(text) = extract_pdf_text(&pdf) {
+        for (symbol, word) in [("•", "First"), ("◦", "Second"), ("▪", "Third")] {
+            assert!(
+                text.contains(&format!("{symbol} {word}")),
+                "missing outside marker `{symbol}` before `{word}`: {text:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn render_v2_smoke_multicol_rule_inside_transform() {
     // Regression for PR #305 follow-up Devin: a multicol container
     // with `column-rule` nested inside a `transform` ancestor needs
