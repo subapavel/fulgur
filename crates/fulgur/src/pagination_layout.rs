@@ -864,13 +864,16 @@ impl<'a> PaginationLayoutTree<'a> {
             // stays at one and the rest is clipped). The margin above the box
             // truncates at the unforced break, as for the non-recursive advance
             // below.
-            if needs_recursion
-                && cursor_y > 0.0
-                && cursor_y + leading_block_size(self.doc, child_id, 0) > page_height_px
-            {
-                page_index += 1;
-                cursor_y = 0.0;
-                needs_recursion = gate(self.doc, page_height_px);
+            //
+            // A first row taller than a page gains nothing from a fresh page
+            // (it overflows there too), so such a box is entered where it is.
+            if needs_recursion && cursor_y > 0.0 {
+                let leading = leading_block_size(self.doc, child_id, 0);
+                if leading <= page_height_px && cursor_y + leading > page_height_px {
+                    page_index += 1;
+                    cursor_y = 0.0;
+                    needs_recursion = gate(self.doc, page_height_px);
+                }
             }
             if needs_recursion {
                 let child_x_in_body = body_x + layout.location.x;
@@ -2165,9 +2168,17 @@ fn fragment_block_subtree(
         // Before F28 a child the gate would enter was never cut, so a first
         // row of a nested box that sat mid-page hung into the bottom margin.
         // Of a flex / grid row only the first item decides.
+        //
+        // A first row taller than a page is not cut: a fresh page would not
+        // hold it either.
         let first_break_h = if needs_recursion {
-            if first_in_row {
+            let leading = if first_in_row {
                 leading_block_size(doc, child_id, 0)
+            } else {
+                0.0
+            };
+            if leading <= page_height_px {
+                leading
             } else {
                 0.0
             }
@@ -7878,6 +7889,30 @@ h2 { string-set: chapter-title content(text); }
             assert_eq!(place(&format!("{p}2")), (1, 40.0), "{p}2");
             assert_eq!(place(&format!("{p}3")), (2, 0.0), "{p}3");
         }
+    }
+
+    #[test]
+    fn first_row_taller_than_a_page_is_not_pushed_to_a_fresh_page() {
+        // The 300px block cannot fit a 200px page anywhere, so moving its
+        // wrapper to page 1 would only waste the rest of page 0 (F28 follow-up).
+        let html = r#"<html><body style="margin:0"><div style="height:150px"></div>
+            <div><div id="big" style="height:300px">x</div><p style="margin:0;height:20px">y</p></div>
+            </body></html>"#;
+        let (doc, geom) = table_geometry(html, 200.0);
+        let big = find_by_id(doc.deref(), "big").unwrap();
+        assert_eq!(geom[&big].fragments[0].page_index, 0);
+        assert_eq!(implied_page_count(&geom), 2);
+    }
+
+    #[test]
+    fn nested_first_row_taller_than_a_page_is_not_cut_to_a_fresh_page() {
+        let html = r#"<html><body style="margin:0"><div><div style="height:150px"></div>
+            <div><div id="big" style="height:300px">x</div><p style="margin:0;height:20px">y</p></div>
+            </div></body></html>"#;
+        let (doc, geom) = table_geometry(html, 200.0);
+        let big = find_by_id(doc.deref(), "big").unwrap();
+        assert_eq!(geom[&big].fragments[0].page_index, 0);
+        assert_eq!(implied_page_count(&geom), 2);
     }
 
     #[test]
