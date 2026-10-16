@@ -1164,14 +1164,28 @@ fn render_v2_smoke_outside_symbol_markers_with_bundled_font() {
     // The marker is now shaped with the item's own font; the symbol is in the text
     // layer, followed by the space that separates it from the item text.
     let html = r##"<!doctype html><html><body>
-<ul><li>First</li></ul>
-<ul style="list-style-type: circle"><li>Second</li></ul>
-<ul style="list-style-type: square"><li>Third</li></ul>
+<ul><li>First</li><li>Second</li></ul>
 </body></html>"##;
-    let pdf = noto_engine().render(html).expect("outside markers render");
+    // `system_fonts(false)`, like htmltopdf: with host fonts on, `monospace` resolves to a
+    // host face and the bullet is painted from it (and differs between machines).
+    let font_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/.fonts/NotoSans-Regular.ttf");
+    let mut assets = AssetBundle::default();
+    assets
+        .add_font_file(&font_path)
+        .unwrap_or_else(|e| panic!("failed to load Noto Sans from {}: {e}", font_path.display()));
+    assets.add_css("body { font-family: 'Noto Sans'; }");
+    let pdf = Engine::builder()
+        .assets(assets)
+        .system_fonts(false)
+        .build()
+        .render(html)
+        .expect("outside markers render");
     assert!(!pdf.is_empty());
     if let Some(text) = extract_pdf_text(&pdf) {
-        for (symbol, word) in [("•", "First"), ("◦", "Second"), ("▪", "Third")] {
+        // Only `disc`: Noto Sans has no U+25E6 / U+25AA, and a face without the glyph still
+        // paints no `circle` / `square` marker.
+        for (symbol, word) in [("•", "First"), ("•", "Second")] {
             assert!(
                 text.contains(&format!("{symbol} {word}")),
                 "missing outside marker `{symbol}` before `{word}`: {text:?}"
