@@ -232,6 +232,38 @@ pub struct TableEntry {
     pub clip_descendants: Vec<NodeId>,
 }
 
+/// F19: the background of a `<tr>` or a row group (`thead` / `tbody` /
+/// `tfoot`, by computed `display`). Blitz gives neither a box of its own: the
+/// table is a grid of cells, so the background is painted from the table, once
+/// per cell it covers (CSS 2.1 §17.5.1: row groups sit below rows, rows below
+/// cells; a row or row-group background shows where the cells are transparent).
+#[derive(Debug, Clone)]
+pub struct RowBackground {
+    /// The `<tr>` or row-group node the background comes from.
+    pub source: NodeId,
+    /// For a row, the row group that contains it. `None` for a row group and
+    /// for a row that is a direct child of the table.
+    pub group: Option<NodeId>,
+    /// Background colour and layers only: borders, padding, radii and shadows
+    /// are stripped (they are not painted for rows; see F22).
+    pub style: crate::draw_primitives::BlockStyle,
+    /// The area background images are positioned against: the union of the
+    /// border boxes of the cells.
+    pub area: crate::draw_primitives::Size,
+    /// The cells the background is painted behind, in DOM order.
+    pub cells: Vec<RowBackgroundCell>,
+}
+
+/// One cell covered by a [`RowBackground`]. `dx` / `dy` are the cell's offset
+/// from the top-left of [`RowBackground::area`], used to position images and
+/// gradients so they run across the whole row instead of restarting per cell.
+#[derive(Debug, Clone, Copy)]
+pub struct RowBackgroundCell {
+    pub cell: NodeId,
+    pub dx: crate::units::Pt,
+    pub dy: crate::units::Pt,
+}
+
 /// Image marker contents — either a raster image or a parsed SVG tree.
 #[derive(Clone)]
 pub enum ImageMarker {
@@ -454,6 +486,16 @@ pub struct Drawables {
     /// `pagination_layout::reserve_header_band`). Only the first header
     /// group of a table is listed; empty when no table has one.
     pub table_header_groups: BTreeMap<NodeId, Vec<NodeId>>,
+    /// F19: table → the row-group and row backgrounds painted behind its
+    /// cells. Row groups first (DOM order), then rows (DOM order), which is
+    /// the paint order of CSS 2.1 §17.5.1. A table without any such
+    /// background has no entry.
+    pub table_row_backgrounds: BTreeMap<NodeId, Vec<RowBackground>>,
+    /// F19: header group → its table, for every header group that has a
+    /// [`RowBackground`] (as `source` or as `group`). The repeated header copy
+    /// of F12 uses it to paint those backgrounds, including for a header whose
+    /// cells draw nothing and so has no entry in `table_header_groups`.
+    pub table_header_background_owners: BTreeMap<NodeId, NodeId>,
     pub transforms: BTreeMap<NodeId, TransformEntry>,
     pub bookmark_anchors: BTreeMap<NodeId, BookmarkAnchorEntry>,
     pub link_spans: Vec<(NodeId, LinkSpanEntry)>,
@@ -505,6 +547,8 @@ impl Default for Drawables {
             list_items: TrackedMap::default(),
             multicol_rules: BTreeMap::new(),
             table_header_groups: BTreeMap::new(),
+            table_row_backgrounds: BTreeMap::new(),
+            table_header_background_owners: BTreeMap::new(),
             transforms: BTreeMap::new(),
             bookmark_anchors: BTreeMap::new(),
             link_spans: Vec::new(),

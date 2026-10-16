@@ -894,6 +894,48 @@ pub fn first_table_header_group(doc: &BaseDocument, table_id: usize) -> Option<u
     })
 }
 
+/// F19: the role a node plays inside a table, decided on its computed
+/// `display` and not on its tag name (CSS 2.1 §17.2; HTML §15.3.8 maps `thead`,
+/// `tbody`, `tfoot`, `tr`, `td` and `th` to these values).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TablePart {
+    /// `table-row-group`, `table-header-group` or `table-footer-group`.
+    RowGroup,
+    /// `table-row`.
+    Row,
+    /// `table-cell`.
+    Cell,
+    /// Anything else, including text nodes and `display: none`.
+    Other,
+}
+
+/// F19: classify `node` by its computed `display`. See [`TablePart`].
+pub fn table_part(node: &Node) -> TablePart {
+    use ::style::values::specified::box_::{DisplayInside, DisplayOutside};
+    let Some(styles) = node.primary_styles() else {
+        return TablePart::Other;
+    };
+    let display = styles.clone_display();
+    if display.outside() == DisplayOutside::None {
+        return TablePart::Other;
+    }
+    match display.inside() {
+        DisplayInside::TableRowGroup
+        | DisplayInside::TableHeaderGroup
+        | DisplayInside::TableFooterGroup => TablePart::RowGroup,
+        DisplayInside::TableRow => TablePart::Row,
+        DisplayInside::TableCell => TablePart::Cell,
+        _ => TablePart::Other,
+    }
+}
+
+/// F19: true if `node`'s computed `display` is `table` or `inline-table`.
+pub fn is_table_box(node: &Node) -> bool {
+    use ::style::values::specified::box_::DisplayInside;
+    node.primary_styles()
+        .is_some_and(|s| s.clone_display().inside() == DisplayInside::Table)
+}
+
 /// fulgur-uebl: true if `node` establishes a flex / grid formatting
 /// context (its inside display is `Flex` or `Grid`). Children of such
 /// containers are flex / grid items, which the spec excludes from
