@@ -499,6 +499,28 @@ pub fn draw_background(
     }
 }
 
+/// Draw the background of a box at `(x, y, w, h)` but show it only inside
+/// `clip` = `(x, y, w, h)`. Used for the background of a table row or row group,
+/// which is laid out against the whole row (or group) and painted once per cell.
+pub fn draw_background_clipped(
+    canvas: &mut Canvas<'_, '_>,
+    style: &BlockStyle,
+    clip: (f32, f32, f32, f32),
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) {
+    let Some(clip_path) = build_rect_path(clip.0, clip.1, clip.2, clip.3) else {
+        return;
+    };
+    canvas
+        .surface
+        .push_clip_path(&clip_path, &krilla::paint::FillRule::default());
+    draw_background(canvas, style, x, y, w, h);
+    canvas.surface.pop();
+}
+
 fn build_rect_path(x: f32, y: f32, w: f32, h: f32) -> Option<krilla::geom::Path> {
     let rect = krilla::geom::Rect::from_xywh(x, y, w, h)?;
     let mut pb = krilla::geom::PathBuilder::new();

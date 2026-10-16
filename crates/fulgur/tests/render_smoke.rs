@@ -6568,3 +6568,137 @@ fn pdf_ua_table_header_with_link_and_inline_span_repeats_without_panic() {
         assert_eq!(text.matches("HDRCELL").count(), pages);
     }
 }
+
+// ── F19: backgrounds of table rows and row groups ─────────────────────────
+
+/// The decoded content stream of every page, as text.
+fn page_contents(pdf: &[u8]) -> Vec<String> {
+    let doc = lopdf::Document::load_mem(pdf).expect("PDF must parse");
+    doc.get_pages()
+        .values()
+        .map(|&id| {
+            String::from_utf8_lossy(&doc.get_page_content(id).expect("page content")).into_owned()
+        })
+        .collect()
+}
+
+fn render_plain(html: &str) -> Vec<u8> {
+    Engine::builder().build().render(html).expect("render")
+}
+
+/// Cells of 100 x 40 px (75 x 30 pt), no padding, no spacing.
+const ROW_BG_CSS: &str =
+    "<style>table{border-spacing:0}td{width:100px;height:40px;padding:0}</style>";
+
+#[test]
+fn table_row_background_is_painted_once_per_cell() {
+    let pdf = render_plain(&format!(
+        r#"<html><head>{ROW_BG_CSS}</head><body><table>
+        <tr style="background:#ff0000"><td></td><td></td><td></td></tr></table></body></html>"#
+    ));
+    let content = &page_contents(&pdf)[0];
+    assert_eq!(content.matches("1 0 0 rg").count(), 3, "{content}");
+}
+
+#[test]
+fn table_row_without_background_paints_nothing_extra() {
+    let pdf = render_plain(&format!(
+        r#"<html><head>{ROW_BG_CSS}</head><body><table>
+        <tr><td></td></tr></table></body></html>"#
+    ));
+    assert!(!page_contents(&pdf)[0].contains(" rg"));
+}
+
+#[test]
+fn table_row_group_background_is_below_the_row_and_the_cell() {
+    let pdf = render_plain(&format!(
+        r#"<html><head>{ROW_BG_CSS}</head><body><table>
+        <tbody style="background:#00ff00">
+          <tr style="background:#ff0000"><td style="background:#0000ff"></td></tr>
+        </tbody></table></body></html>"#
+    ));
+    let content = &page_contents(&pdf)[0];
+    let at = |op: &str| {
+        content
+            .find(op)
+            .unwrap_or_else(|| panic!("no `{op}` in {content}"))
+    };
+    assert!(
+        at("0 1 0 rg") < at("1 0 0 rg"),
+        "group below row: {content}"
+    );
+    assert!(at("1 0 0 rg") < at("0 0 1 rg"), "row below cell: {content}");
+}
+
+#[test]
+fn table_row_background_inside_an_overflow_hidden_wrapper() {
+    let pdf = render_plain(&format!(
+        r#"<html><head>{ROW_BG_CSS}</head><body><div style="overflow:hidden;width:300px">
+        <table><tr style="background:#ff0000"><td></td></tr></table></div></body></html>"#
+    ));
+    assert_eq!(page_contents(&pdf)[0].matches("1 0 0 rg").count(), 1);
+}
+
+#[test]
+fn table_row_background_inside_an_overflow_hidden_table() {
+    // `draw_under_clip_table` paints the row backgrounds inside the table's clip.
+    let pdf = render_plain(&format!(
+        r#"<html><head>{ROW_BG_CSS}</head><body>
+        <table style="overflow:hidden"><tr style="background:#ff0000"><td></td></tr></table>
+        </body></html>"#
+    ));
+    assert_eq!(page_contents(&pdf)[0].matches("1 0 0 rg").count(), 1);
+}
+
+#[test]
+fn table_row_background_with_a_truncating_cell() {
+    // A Tailwind `truncate` cell clips its own content; the row background still shows behind it.
+    let pdf = render_plain(&format!(
+        r#"<html><head>{ROW_BG_CSS}</head><body><table><tr style="background:#ff0000">
+        <td style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">A long cell text that does not fit</td>
+        </tr></table></body></html>"#
+    ));
+    assert_eq!(page_contents(&pdf)[0].matches("1 0 0 rg").count(), 1);
+}
+
+#[test]
+fn table_row_gradient_background_is_one_gradient_clipped_per_cell() {
+    let pdf = render_plain(&format!(
+        r#"<html><head>{ROW_BG_CSS}</head><body><table>
+        <tr style="background:linear-gradient(to right,#ff0000,#0000ff)"><td></td><td></td></tr>
+        </table></body></html>"#
+    ));
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.contains("/ShadingType"), "no shading in the PDF");
+    // Rendering is deterministic.
+    let again = render_plain(&format!(
+        r#"<html><head>{ROW_BG_CSS}</head><body><table>
+        <tr style="background:linear-gradient(to right,#ff0000,#0000ff)"><td></td><td></td></tr>
+        </table></body></html>"#
+    ));
+    assert_eq!(pdf, again);
+}
+
+#[test]
+fn table_row_background_continues_on_every_page() {
+    let rows: String = (0..150).map(|_| "<tr><td></td></tr>".to_string()).collect();
+    let pdf = render_plain(&format!(
+        r#"<html><head>{ROW_BG_CSS}</head><body><table>
+        <tbody style="background:#00ff00">{rows}</tbody></table></body></html>"#
+    ));
+    let pages = page_contents(&pdf);
+    assert!(pages.len() >= 3, "expected a multi-page table");
+    for (i, content) in pages.iter().enumerate() {
+        assert!(content.contains("0 1 0 rg"), "page {i} has no group fill");
+    }
+}
+
+#[test]
+fn table_row_background_is_deterministic() {
+    let html = format!(
+        r#"<html><head>{ROW_BG_CSS}</head><body><table>
+        <thead style="background:#eee"><tr style="background:#ddd"><td></td></tr></thead>
+        <tr style="background:#ff0000"><td></td></tr></table></body></html>"#
+    );
+    assert_eq!(render_plain(&html), render_plain(&html));
+}

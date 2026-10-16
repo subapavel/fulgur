@@ -821,6 +821,7 @@ fn dispatch_page_node(
         {
             draw_under_clip_table(
                 canvas,
+                node_id,
                 table,
                 geom,
                 frag,
@@ -1214,7 +1215,19 @@ pub(crate) fn dispatch_fragment(
     page_index: u32,
 ) {
     if let Some(table) = drawables.tables.get(&node_id) {
-        draw_table_v2(canvas, table, x_pt, y_pt, frag);
+        draw_table_v2(
+            canvas,
+            node_id,
+            table,
+            x_pt,
+            y_pt,
+            frag,
+            geometry,
+            drawables,
+            margin_left_pt,
+            margin_top_pt,
+            page_index,
+        );
         return;
     }
     // True when this block / list-item / paragraph spans multiple
@@ -1791,6 +1804,7 @@ fn draw_under_transform(
                 // Devin).
                 draw_under_clip_table(
                     canvas,
+                    desc_id,
                     desc_table,
                     desc_geom,
                     desc_frag,
@@ -2215,6 +2229,7 @@ fn draw_under_clip(
                     // (fulgur-bvhw PR #320 Devin)
                     draw_under_clip_table(
                         canvas,
+                        desc_id,
                         desc_table,
                         desc_geom,
                         desc_frag,
@@ -2558,6 +2573,7 @@ fn draw_under_opacity(
                     // opacity scope. (fulgur-bvhw PR #320 Devin)
                     draw_under_clip_table(
                         canvas,
+                        desc_id,
                         desc_table,
                         desc_geom,
                         desc_frag,
@@ -2971,12 +2987,19 @@ fn draw_block_inner_paint(
 /// cell dispatched in the same scope. A repeated `<thead>` on
 /// continuation pages is painted separately, after the page's own
 /// content, by [`paint_repeated_table_headers`].
+#[allow(clippy::too_many_arguments)]
 fn draw_table_v2(
     canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
+    table_id: usize,
     entry: &crate::drawables::TableEntry,
     x: f32,
     y: f32,
     frag: &crate::pagination_layout::Fragment,
+    geometry: &crate::pagination_layout::PaginationGeometryTable,
+    drawables: &Drawables,
+    margin_left_pt: f32,
+    margin_top_pt: f32,
+    page_index: u32,
 ) {
     use crate::draw_primitives::draw_with_opacity;
 
@@ -2985,7 +3008,86 @@ fn draw_table_v2(
         if entry.visible {
             paint_table_outer_frame(canvas, entry, x, y, total_width, total_height);
         }
+        // Row-group and row backgrounds sit above the table's own and below
+        // every cell (CSS 2.1 §17.5.1). Cells are dispatched after the table
+        // because their NodeIds are larger.
+        paint_table_row_backgrounds(
+            canvas,
+            table_id,
+            None,
+            geometry,
+            drawables,
+            margin_left_pt,
+            margin_top_pt,
+            page_index,
+        );
     });
+}
+
+/// F19: paint the backgrounds of a table's row groups and rows behind its
+/// cells on `page_index`.
+///
+/// Blitz gives rows and row groups no box, so each background is painted per
+/// cell, into the cell's border box on this page (CSS Tables 3 / CSS 2.1
+/// §17.5.1: a row background shows only inside the cells of the row, and the
+/// area between cells shows the table's). Colour-only backgrounds fill the
+/// cell rect directly. Images and gradients are laid out against the whole row
+/// (or group) area, shifted by the cell's offset in it, and clipped to the
+/// cell, so one image runs across the row instead of restarting in each cell.
+///
+/// `only_group` restricts the paint to the backgrounds of one row group and its
+/// rows (the repeated header of F12). `margin_*_pt` are the same offsets the
+/// table's cells are dispatched with, so the rects line up with them.
+#[allow(clippy::too_many_arguments)]
+fn paint_table_row_backgrounds(
+    canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
+    table_id: usize,
+    only_group: Option<usize>,
+    geometry: &crate::pagination_layout::PaginationGeometryTable,
+    drawables: &Drawables,
+    margin_left_pt: f32,
+    margin_top_pt: f32,
+    page_index: u32,
+) {
+    let Some(backgrounds) = drawables.table_row_backgrounds.get(&table_id) else {
+        return;
+    };
+    for bg in backgrounds
+        .iter()
+        .filter(|b| only_group.is_none_or(|g| b.source == g || b.group == Some(g)))
+    {
+        for cell in &bg.cells {
+            let Some(cell_geom) = geometry.get(&cell.cell) else {
+                continue;
+            };
+            for frag in cell_geom
+                .fragments
+                .iter()
+                .filter(|f| f.page_index == page_index)
+            {
+                let x = margin_left_pt + frag.x.in_pt().to_f32();
+                let y = margin_top_pt + frag.y.in_pt().to_f32();
+                let w = frag.width.in_pt().to_f32();
+                let h = frag.height.in_pt().to_f32();
+                if w <= 0.0 || h <= 0.0 {
+                    continue;
+                }
+                if bg.style.background_layers.is_empty() {
+                    crate::background::draw_background(canvas, &bg.style, x, y, w, h);
+                } else {
+                    crate::background::draw_background_clipped(
+                        canvas,
+                        &bg.style,
+                        (x, y, w, h),
+                        x - cell.dx.to_f32(),
+                        y - cell.dy.to_f32(),
+                        bg.area.width.to_f32(),
+                        bg.area.height.to_f32(),
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Resolve the table's outer-frame width/height from the cached
@@ -3044,6 +3146,7 @@ fn paint_table_outer_frame(
 #[allow(clippy::too_many_arguments)]
 fn draw_under_clip_table(
     canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
+    table_id: usize,
     table: &crate::drawables::TableEntry,
     geom: &crate::pagination_layout::PaginationGeometry,
     frag: &crate::pagination_layout::Fragment,
@@ -3085,6 +3188,19 @@ fn draw_under_clip_table(
         } else {
             false
         };
+
+        // Row-group and row backgrounds: inside the clip like the cells they
+        // sit behind, above the outer frame painted above.
+        paint_table_row_backgrounds(
+            canvas,
+            table_id,
+            None,
+            geometry,
+            drawables,
+            margin_left_pt,
+            margin_top_pt,
+            page_index,
+        );
 
         // Mirror `draw_under_clip`'s nested-scope skip sets so cells
         // carrying their own `transform` / `overflow:hidden` /
@@ -3184,6 +3300,7 @@ fn draw_under_clip_table(
                 {
                     draw_under_clip_table(
                         canvas,
+                        desc_id,
                         desc_table,
                         desc_geom,
                         desc_frag,
