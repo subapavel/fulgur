@@ -6898,3 +6898,26 @@ fn bundled_svg_img_is_painted_at_its_natural_size() {
     assert_eq!((svg.width.to_f32(), svg.height.to_f32()), (75.0, 37.5));
     assert!(drawables.images.is_empty());
 }
+
+#[test]
+fn paragraph_taller_than_a_page_inside_a_bordered_box_splits_at_lines() {
+    // F30: the paragraph used to keep only the lines that fit its first page and draw the rest below the page.
+    let lines: Vec<String> = (1..=300).map(|i| format!("Line{i:04}")).collect();
+    let html = format!(
+        r#"<!DOCTYPE html><html><body style="margin:0"><div style="border:1px solid #000;padding:16px;border-radius:8px">
+        <p style="margin:0;line-height:20px">{}</p></div><ol><li style="line-height:20px">{}</li></ol></body></html>"#,
+        lines.join("<br>"),
+        lines.join("<br>"),
+    );
+    let pdf = Engine::builder()
+        .build()
+        .render(&html)
+        .expect("render a nested tall paragraph");
+    assert!(pdf.starts_with(b"%PDF"));
+    // 600 lines of 20px on ~A4 pages (about 50 lines each) is more than 11 pages; one page would mean the old behaviour.
+    let pages = page_count(&pdf);
+    assert!(
+        pages >= 11,
+        "expected the paragraphs to span pages, got {pages}"
+    );
+}

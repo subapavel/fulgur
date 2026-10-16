@@ -899,7 +899,7 @@ impl<'a> PaginationLayoutTree<'a> {
             // A first row taller than a page gains nothing from a fresh page
             // (it overflows there too), so such a box is entered where it is.
             if needs_recursion && cursor_y > 0.0 {
-                let leading = leading_block_size(self.doc, child_id, 0);
+                let leading = leading_block_size(self.doc, child_id, 0, page_height_px);
                 if leading <= page_height_px && cursor_y + leading > page_height_px {
                     page_index += 1;
                     cursor_y = 0.0;
@@ -908,7 +908,7 @@ impl<'a> PaginationLayoutTree<'a> {
             }
             if needs_recursion {
                 let child_x_in_body = body_x + layout.location.x;
-                let (new_page, new_cursor) = fragment_block_subtree(
+                let (new_page, new_cursor, _) = fragment_block_subtree(
                     &mut self.geometry,
                     self.doc,
                     self.column_styles,
@@ -1499,10 +1499,19 @@ fn would_split_block_subtree(
 /// - A box without in-flow children with a height (a leaf, an inline root, a
 ///   multicol container) is not entered by the fragmenter and counts whole.
 ///
+/// - A paragraph taller than a page (`page_height_px`) in plain block flow is
+///   split between its line boxes (F30), so it counts its top inset and its first
+///   [`ORPHANS`] lines, not its height.
+///
 /// The result never exceeds the node's own height. It walks the same children
 /// (`layout_children` first, whitespace / out-of-flow / empty skipped) as
 /// [`would_split_block_subtree`] and follows only the first row, so it is cheap.
-fn leading_block_size(doc: &BaseDocument, node_id: usize, depth: usize) -> f32 {
+fn leading_block_size(
+    doc: &BaseDocument,
+    node_id: usize,
+    depth: usize,
+    page_height_px: f32,
+) -> f32 {
     let Some(node) = doc.get_node(node_id) else {
         return 0.0;
     };
@@ -1560,7 +1569,15 @@ fn leading_block_size(doc: &BaseDocument, node_id: usize, depth: usize) -> f32 {
             Some(row_top) if top > row_top + 0.5 => break,
             Some(_) => {}
         }
-        leading = leading.max(top + leading_block_size(doc, child_id, depth + 1));
+        // F30: a paragraph taller than a page is split between its line boxes,
+        // so only its inset and ORPHANS lines have to fit, not all of it.
+        let child_leading = match line_split_candidate(doc, node, child) {
+            Some(split) if split.inset_top + split.span() > page_height_px + 1.0 => {
+                split.leading().min(layout.size.height)
+            }
+            _ => leading_block_size(doc, child_id, depth + 1, page_height_px),
+        };
+        leading = leading.max(top + child_leading);
     }
     if first_row_top.is_none() {
         return own_h;
@@ -1814,7 +1831,7 @@ fn fragment_block_subtree(
     cursor_in: f32,
     page_height_px: f32,
     depth: usize,
-) -> (u32, f32) {
+) -> (u32, f32, bool) {
     if depth >= crate::MAX_DOM_DEPTH {
         // Bailed: emit a single whole-fragment for the parent at its
         // entry coordinates so geometry still has an entry for it.
@@ -1833,10 +1850,10 @@ fn fragment_block_subtree(
                 width: parent_w.as_px(),
                 height: h.as_px(),
             });
-        return (page_in, cursor_in + h);
+        return (page_in, cursor_in + h, false);
     }
     let Some(parent) = doc.get_node(parent_id) else {
-        return (page_in, cursor_in);
+        return (page_in, cursor_in, false);
     };
 
     let mut page_index = page_in;
@@ -1858,6 +1875,17 @@ fn fragment_block_subtree(
     let mut page_taffy_origin: f32 = 0.0;
     let mut origin_pending_target_y: Option<f32> = None;
     let mut origin_pending_same_row: Option<(f32, f32, f32)> = None;
+    // F30: bottom (in parent coordinates) of a paragraph that was just split
+    // between line boxes. The next sibling keeps the gap Taffy left below it
+    // (its margin) instead of starting flush against the last line.
+    let mut origin_pending_prev_bottom: Option<f32> = None;
+    // F30: a paragraph below (this box's child or deeper) was split between
+    // line boxes across pages. The box's frame then has to be closed below its
+    // last child (its bottom padding and border), which the plain block split
+    // leaves out, and the caller gets the cursor below the frame.
+    let mut lines_split_below = false;
+    // Lowest bottom (parent coordinates) of an in-flow child with a height.
+    let mut children_bottom: f32 = 0.0;
     // fulgur-uebl: tracks the previous in-flow sibling's used page-name
     // for implicit forced-break detection; see `fragment_pagination_root`
     // for the rationale and the outer-Option semantics.
@@ -2061,11 +2089,15 @@ fn fragment_block_subtree(
             }
         }
 
+        let pending_prev_bottom = origin_pending_prev_bottom.take();
         if let Some(mut target_y) = origin_pending_target_y.take() {
             if let Some((row_top, row_bottom, same_row_y)) = origin_pending_same_row.take()
                 && this_top_in_parent < row_bottom - 0.5
             {
                 target_y = same_row_y + (this_top_in_parent - row_top);
+            }
+            if let Some(prev_bottom) = pending_prev_bottom {
+                target_y += (this_top_in_parent - prev_bottom).max(0.0);
             }
             page_taffy_origin = this_top_in_parent - (target_y - page_start_y);
         }
@@ -2142,6 +2174,8 @@ fn fragment_block_subtree(
             }
             continue;
         }
+
+        children_bottom = children_bottom.max(this_top_in_parent + child_h);
 
         // fulgur-kv0r: place the child at its Taffy-reported parent-
         // relative y, offset by the parent's start on the current
@@ -2221,7 +2255,19 @@ fn fragment_block_subtree(
                     || has_page_name_change_below(doc, child_id, used_page_names, 0)
                     || would_split_block_subtree(doc, child_id, available_strip, page_height_px, 0))
         };
-        let mut needs_recursion = gate((page_height_px - cursor_y).max(0.0));
+        // F30: a paragraph that does not fit any page whole is split between
+        // its line boxes instead of being placed as one oversized leaf (the
+        // gate sees no overflowing child in it: its children are text).
+        let mut line_split = nested_line_split(
+            doc,
+            parent,
+            child,
+            child_page_y,
+            page_start_y + band,
+            page_height_px,
+        );
+        let mut needs_recursion =
+            line_split.is_none() && gate((page_height_px - cursor_y).max(0.0));
 
         // Strip-overflow page cut (fulgur-7hf5 moved it below the gate; F28
         // moves it back above): the child starts a new page when the part of
@@ -2245,9 +2291,18 @@ fn fragment_block_subtree(
         //
         // A first row taller than a page is not cut: a fresh page would not
         // hold it either.
-        let first_break_h = if needs_recursion {
+        let first_break_h = if let Some(split) = &line_split {
+            // The inset above the first line and ORPHANS lines must fit; a
+            // paragraph that cannot even start here moves to the next page.
+            let leading = split.leading();
+            if leading <= page_height_px {
+                leading
+            } else {
+                0.0
+            }
+        } else if needs_recursion {
             let leading = if first_in_row {
-                leading_block_size(doc, child_id, 0)
+                leading_block_size(doc, child_id, 0, page_height_px)
             } else {
                 0.0
             };
@@ -2287,7 +2342,17 @@ fn fragment_block_subtree(
             // siblings then continue from this point.
             page_taffy_origin = this_top_in_parent - band;
             child_page_y = band;
-            if needs_recursion {
+            if line_split.is_some() {
+                // On a fresh page the paragraph may fit whole after all.
+                line_split = nested_line_split(
+                    doc,
+                    parent,
+                    child,
+                    child_page_y,
+                    page_start_y + band,
+                    page_height_px,
+                );
+            } else if needs_recursion {
                 // The child may fit the new page whole.
                 needs_recursion = gate((page_height_px - cursor_y).max(0.0));
                 // A later cell of this flex / grid row restores the row's
@@ -2303,7 +2368,7 @@ fn fragment_block_subtree(
                 }
             }
         }
-        if needs_recursion {
+        if needs_recursion || line_split.is_some() {
             let pre_recursion_page = page_index;
             let pre_recursion_cursor_y = cursor_y;
             // fulgur-u0p0: enter recursion from `child_page_y` (the rebased
@@ -2316,20 +2381,38 @@ fn fragment_block_subtree(
             // below the previous one instead of beside it. Using
             // `child_page_y` keeps each cell's recursion strip aligned to
             // the row's y on the current page.
-            let (np, nc) = fragment_block_subtree(
-                geometry,
-                doc,
-                column_styles,
-                used_page_names,
-                child_id,
-                child_w,
-                child_x_in_body,
-                page_index,
-                child_page_y,
-                page_height_px,
-                depth + 1,
-            );
+            let (np, nc, split_below) = match &line_split {
+                Some(split) => {
+                    let (np, nc) = fragment_nested_inline_root(
+                        geometry,
+                        doc,
+                        child_id,
+                        child_x_in_body,
+                        child_w,
+                        child_page_y,
+                        page_index,
+                        page_height_px,
+                        split,
+                        depth + 1,
+                    );
+                    (np, nc, np > pre_recursion_page)
+                }
+                None => fragment_block_subtree(
+                    geometry,
+                    doc,
+                    column_styles,
+                    used_page_names,
+                    child_id,
+                    child_w,
+                    child_x_in_body,
+                    page_index,
+                    child_page_y,
+                    page_height_px,
+                    depth + 1,
+                ),
+            };
             page_index = np;
+            lines_split_below |= split_below;
             if is_header_cell {
                 // F12: a header cell whose own content split across pages
                 // cannot be repeated; the header must sit on one page.
@@ -2393,7 +2476,14 @@ fn fragment_block_subtree(
                     // instead would stop short of the page's
                     // margin-area paint that adjacent passing tests
                     // (mo-006/008) expect.
-                    let logical_height = (pre_recursion_cursor_y + child_h - page_start_y).max(0.0);
+                    // F30: a split paragraph is taller than the page, and the
+                    // frame ends at the page bottom, not at the paragraph's
+                    // unsplit height.
+                    let logical_height = if line_split.is_some() {
+                        0.0
+                    } else {
+                        (pre_recursion_cursor_y + child_h - page_start_y).max(0.0)
+                    };
                     let prev_height = logical_height.max((page_height_px - page_start_y).max(0.0));
                     if prev_height > 0.0 {
                         let should_emit = row_state
@@ -2439,6 +2529,7 @@ fn fragment_block_subtree(
                 // gets no repeated header (it would overlap that content).
                 band = 0.0;
                 origin_pending_target_y = Some(cursor_y);
+                origin_pending_prev_bottom = split_below.then_some(this_top_in_parent + child_h);
                 let row_top = this_top_in_parent;
                 let row_bottom = row_top + child_h;
                 origin_pending_same_row =
@@ -2470,6 +2561,7 @@ fn fragment_block_subtree(
                 page_start_y = 0.0;
                 (origin_pending_target_y, origin_pending_same_row) =
                     (Some(page_start_y + band), None);
+                origin_pending_prev_bottom = None;
             }
             if !is_float {
                 prev_used_page = Some(used_end.clone());
@@ -2575,6 +2667,22 @@ fn fragment_block_subtree(
         }
     }
 
+    // F30: below the last child of a box with a paragraph split across pages
+    // there is its bottom padding and border (and any space Taffy left under
+    // the child): the last fragment of the frame includes them, and the cursor
+    // handed back is below the frame so the next sibling does not start inside
+    // it. Other splits keep closing at the last child, as before.
+    let closing = if lines_split_below && !allow_same_row_rebase {
+        let parent_h = parent.final_layout.size.height;
+        if parent_h.is_finite() {
+            (parent_h - children_bottom).max(0.0)
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
     // Close the parent's fragment for the final page span. Always
     // emit at least one fragment so the parent is represented in
     // geometry — `collect_counter_states` and friends look up nodes
@@ -2592,10 +2700,10 @@ fn fragment_block_subtree(
             x: parent_x_in_body.as_px(),
             y: page_start_y.as_px(),
             width: parent_w.as_px(),
-            height: (cursor_y - page_start_y).as_px(),
+            height: (cursor_y - page_start_y + closing).as_px(),
         });
 
-    (page_index, cursor_y)
+    (page_index, cursor_y + closing, lines_split_below)
 }
 
 /// F12: a table's first `table-header-group`, repeated at the top of every
@@ -2850,11 +2958,9 @@ fn collect_inline_line_metrics(node: &blitz_dom::Node) -> Vec<(f32, f32)> {
 /// CSS 3 Fragmentation default for `orphans`: lines kept at the bottom of a
 /// page before a break between line boxes (css-break-3 §4.4). The properties
 /// themselves are not read.
-#[allow(dead_code)]
 const ORPHANS: usize = 2;
 /// CSS 3 Fragmentation default for `widows`: lines carried to the top of the
 /// next page after a break between line boxes.
-#[allow(dead_code)]
 const WIDOWS: usize = 2;
 
 /// F30: where to break the lines of an inline root that spans pages, as
@@ -2875,7 +2981,6 @@ const WIDOWS: usize = 2;
 ///
 /// `max_strips` bounds the number of ranges (the last one takes all the rest and
 /// overflows), so that a huge paragraph cannot create unbounded pages.
-#[allow(dead_code)] // used by the nested paragraph splitter (next commit)
 fn plan_line_breaks(
     lines: &[(f32, f32)],
     first_room: f32,
@@ -2908,6 +3013,250 @@ fn plan_line_breaks(
         room = page_room;
     }
     ranges
+}
+
+/// F30: an inline root (a paragraph: `<p>`, `<li>`, `<pre>`, a `div` with text)
+/// nested in a block, with the line geometry needed to split it between line
+/// boxes.
+struct LineSplit {
+    /// `(top, bottom)` of each line box, paragraph-local (content box).
+    lines: Vec<(f32, f32)>,
+    /// Border + padding above the first line: reserved on every strip, because
+    /// the renderer paints the lines at `fragment.y + inset_top`.
+    inset_top: f32,
+    /// Border + padding below the last line.
+    inset_bottom: f32,
+}
+
+impl LineSplit {
+    /// Block-size of the lines alone.
+    fn span(&self) -> f32 {
+        match (self.lines.first(), self.lines.last()) {
+            (Some(first), Some(last)) => last.1 - first.0,
+            _ => 0.0,
+        }
+    }
+
+    /// How much of the paragraph has to fit below its placement for starting it
+    /// there to make progress: its inset and [`ORPHANS`] lines.
+    fn leading(&self) -> f32 {
+        let keep = ORPHANS.min(self.lines.len());
+        match keep.checked_sub(1).and_then(|i| self.lines.get(i)) {
+            Some(last) => self.inset_top + last.1 - self.lines[0].0,
+            None => 0.0,
+        }
+    }
+}
+
+/// F30: whether a child of `parent` is an inline root that the fragmenter may
+/// split between its line boxes, and if so its lines — whatever its height.
+///
+/// Only paragraphs in plain block flow qualify. Anything the fragmenter treats as
+/// one unit stays one: flex / grid items, atomic inlines, orthogonal flows,
+/// multicol containers, transformed or clipping boxes, floats, and table cells (a
+/// cell with direct text is F30b).
+fn line_split_candidate(
+    doc: &BaseDocument,
+    parent: &blitz_dom::Node,
+    child: &blitz_dom::Node,
+) -> Option<LineSplit> {
+    use ::style::values::specified::box_::DisplayInside;
+    let lines = collect_inline_line_metrics(child);
+    if lines.len() < 2 {
+        return None;
+    }
+    let parent_orthogonal = parent
+        .parent
+        .and_then(|gp| doc.get_node(gp))
+        .is_some_and(|gp| crate::blitz_adapter::is_orthogonal_to_parent(gp, parent));
+    let inside_of = |n: &blitz_dom::Node| n.primary_styles().map(|s| s.clone_display().inside());
+    if crate::blitz_adapter::is_flex_or_grid_container_node(parent)
+        || crate::blitz_adapter::is_atomic_inline_container_node(parent)
+        || crate::blitz_adapter::is_multicol_container(parent)
+        || parent_orthogonal
+        || clips_overflow(parent)
+        || inside_of(parent) == Some(DisplayInside::Table)
+        || crate::blitz_adapter::is_atomic_inline_container_node(child)
+        || crate::blitz_adapter::is_orthogonal_to_parent(parent, child)
+        || crate::blitz_adapter::is_multicol_container(child)
+        || crate::blitz_adapter::node_is_floating(child)
+        || clips_overflow(child)
+        || inside_of(child) == Some(DisplayInside::TableCell)
+        || child
+            .primary_styles()
+            .is_some_and(|s| !s.get_box().transform.0.is_empty())
+    {
+        return None;
+    }
+    let layout = &child.final_layout;
+    Some(LineSplit {
+        lines,
+        inset_top: layout.border.top + layout.padding.top,
+        inset_bottom: layout.border.bottom + layout.padding.bottom,
+    })
+}
+
+/// F30: the split to apply to `child` when it is placed at `child_page_y` on a
+/// strip that starts at `strip_top`, or `None` to place it as before.
+///
+/// A paragraph is split when it cannot fit any page whole (taller than a page),
+/// or when it is the first thing on its strip and overflows it. A paragraph that
+/// fits a page keeps moving whole to the next one when it does not fit the rest
+/// of this one (splitting those, as body level does, is F30c).
+fn nested_line_split(
+    doc: &BaseDocument,
+    parent: &blitz_dom::Node,
+    child: &blitz_dom::Node,
+    child_page_y: f32,
+    strip_top: f32,
+    page_height_px: f32,
+) -> Option<LineSplit> {
+    let split = line_split_candidate(doc, parent, child)?;
+    let total = split.inset_top + split.span();
+    let taller_than_a_page = total > page_height_px + 1.0;
+    let first_and_overflowing =
+        child_page_y <= strip_top + 0.5 && child_page_y + total > page_height_px + 1.0;
+    (taller_than_a_page || first_and_overflowing).then_some(split)
+}
+
+/// F30: split a paragraph nested in a block across pages at line boxes.
+///
+/// One fragment per range from [`plan_line_breaks`]: the first at `y_in`, the
+/// others at the top of their page. Each fragment's height is the span of its
+/// lines; the renderer paints the lines at `fragment.y + inset_top`, so that
+/// inset is reserved on every strip, and the box's own frame (when it has one)
+/// is painted from `geometry[child].line_split_insets`.
+///
+/// Atomic inlines and images in the paragraph get their fragments on the page
+/// that holds their line.
+///
+/// Returns `(last_page, cursor_y)`: the page of the last fragment and the y below
+/// the paragraph (including its bottom inset) on it.
+#[allow(clippy::too_many_arguments)]
+fn fragment_nested_inline_root(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    child_id: usize,
+    x_in_body: f32,
+    width: f32,
+    y_in: f32,
+    page_in: u32,
+    page_height_px: f32,
+    split: &LineSplit,
+    depth: usize,
+) -> (u32, f32) {
+    let max_strips = crate::MAX_PAGES.saturating_sub(page_in).max(1) as usize;
+    let ranges = plan_line_breaks(
+        &split.lines,
+        page_height_px - y_in - split.inset_top,
+        page_height_px - split.inset_top,
+        max_strips,
+    );
+    let mut placements: Vec<(u32, f32, f32)> = Vec::with_capacity(ranges.len());
+    let mut cursor_y = y_in;
+    for (k, range) in ranges.iter().enumerate() {
+        let top = split.lines[range.start].0;
+        let bottom = split.lines[range.end - 1].1;
+        let (page, y) = if k == 0 {
+            (page_in, y_in)
+        } else {
+            (page_in + k as u32, 0.0)
+        };
+        let entry = geometry.entry(child_id).or_default();
+        entry.fragments.push(Fragment {
+            page_index: page,
+            x: x_in_body.as_px(),
+            y: y.as_px(),
+            width: width.as_px(),
+            height: (bottom - top).as_px(),
+        });
+        // Where the lines of this strip start, so that a descendant can be
+        // placed relative to the strip: `y + (local_y - top)`.
+        placements.push((page, y - top, top));
+        cursor_y = y + split.inset_top + (bottom - top);
+    }
+    cursor_y += split.inset_bottom;
+    geometry.entry(child_id).or_default().line_split_insets =
+        Some((split.inset_top.as_px(), split.inset_bottom.as_px()));
+    record_split_inline_root_descendants(
+        geometry,
+        doc,
+        child_id,
+        x_in_body,
+        0.0,
+        &placements,
+        split.inset_top,
+        depth,
+    );
+    (page_in + ranges.len() as u32 - 1, cursor_y)
+}
+
+/// F30: record the descendants of a split inline root on the page holding
+/// their line (see [`fragment_nested_inline_root`]).
+///
+/// `placements[k]` is `(page, base_y, line_top)` of strip `k`; a descendant at
+/// paragraph-local y lands at `base_y + local_y` on `page` of the last strip whose
+/// first line starts at or above it. Zero-size wrappers (inline elements, text
+/// nodes) are not recorded themselves, as in [`record_subtree_descendants`];
+/// their offsets carry down to what they contain.
+#[allow(clippy::too_many_arguments)]
+fn record_split_inline_root_descendants(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    parent_id: usize,
+    parent_x_in_body: f32,
+    parent_y_in_root: f32,
+    placements: &[(u32, f32, f32)],
+    inset_top: f32,
+    depth: usize,
+) {
+    if depth >= crate::MAX_DOM_DEPTH {
+        return;
+    }
+    let Some(parent) = doc.get_node(parent_id) else {
+        return;
+    };
+    let layout_children_borrow = parent.layout_children.borrow();
+    let walk_children: &[usize] = layout_children_borrow
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .unwrap_or(&parent.children);
+    for &child_id in walk_children {
+        let Some(child) = doc.get_node(child_id) else {
+            continue;
+        };
+        let layout = child.final_layout;
+        let x = parent_x_in_body + layout.location.x;
+        let y_in_root = parent_y_in_root + layout.location.y;
+        if layout.size.height <= 0.0 && layout.size.width <= 0.0 {
+            record_split_inline_root_descendants(
+                geometry,
+                doc,
+                child_id,
+                x,
+                y_in_root,
+                placements,
+                inset_top,
+                depth + 1,
+            );
+            continue;
+        }
+        let local_y = y_in_root - inset_top;
+        let k = placements
+            .iter()
+            .rposition(|&(_, _, top)| top <= local_y + 0.5)
+            .unwrap_or(0);
+        let (page, base_y, _) = placements[k];
+        record_descendant(
+            geometry,
+            doc,
+            child_id,
+            page,
+            base_y + parent_y_in_root,
+            parent_x_in_body,
+            depth + 1,
+        );
+    }
 }
 
 /// fulgur-p55h: split a multi-line inline root across page boundaries
@@ -4555,7 +4904,7 @@ mod tests {
         );
 
         let mut geom = PaginationGeometryTable::new();
-        let (page_out, cursor_out) = fragment_block_subtree(
+        let (page_out, cursor_out, _) = fragment_block_subtree(
             &mut geom,
             &doc, // &BaseDocument via deref coercion
             None, // column_styles
@@ -7713,7 +8062,7 @@ h2 { string-set: chapter-title content(text); }
     fn leading_of(html: &str, id: &str) -> f32 {
         let doc = parse(html, 600.0);
         let node = find_by_id(doc.deref(), id).unwrap();
-        super::leading_block_size(doc.deref(), node, 0)
+        super::leading_block_size(doc.deref(), node, 0, 10_000.0)
     }
 
     #[test]
@@ -8177,5 +8526,215 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(r.last().unwrap().end, 100, "the last strip takes the rest");
         let r = plan_line_breaks(&uniform_lines(5), 20.0, 20.0, 0);
         assert_eq!(r, vec![0..5]);
+    }
+
+    // ── F30: a paragraph taller than a page inside a block ──────────────────
+
+    /// `n` lines of 20px (`<br>`-separated, so the count does not depend on
+    /// font metrics) as the body of a paragraph.
+    fn br_lines(n: usize) -> String {
+        (1..=n)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("<br>")
+    }
+
+    const LINE_CSS: &str = "<style>body{margin:0} p{margin:0;line-height:20px} \
+        div,section,article,li{line-height:20px}</style>";
+
+    fn nested_geometry(
+        body: &str,
+        page_h: f32,
+    ) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        let mut doc = parse(
+            &format!("<html><head>{LINE_CSS}</head><body>{body}</body></html>"),
+            600.0,
+        );
+        let table = run_pass(&mut doc, page_h);
+        (doc, table)
+    }
+
+    fn fragments_of<'t>(
+        doc: &blitz_html::HtmlDocument,
+        table: &'t PaginationGeometryTable,
+        id: &str,
+    ) -> &'t [Fragment] {
+        let node = find_by_id(doc.deref(), id).unwrap();
+        &table[&node].fragments
+    }
+
+    #[test]
+    fn a_tall_paragraph_in_a_div_gets_one_fragment_per_page() {
+        // 30 lines of 20px = 600px on 200px pages: 10 lines per page.
+        let (doc, table) = nested_geometry(
+            &format!("<div><p id=\"p\">{}</p></div>", br_lines(30)),
+            200.0,
+        );
+        let frags = fragments_of(&doc, &table, "p");
+        assert_eq!(frags.len(), 3, "{frags:?}");
+        for (k, f) in frags.iter().enumerate() {
+            assert_eq!(f.page_index, k as u32);
+            assert!((f.height.to_f32() - 200.0).abs() < 0.5, "{f:?}");
+            assert!(f.y.to_f32() + f.height.to_f32() <= 200.5, "{f:?}");
+        }
+        assert!(
+            table[&find_by_id(doc.deref(), "p").unwrap()].is_split(),
+            "the renderer slices lines by fragment"
+        );
+    }
+
+    #[test]
+    fn a_tall_paragraph_fills_the_page_after_other_content() {
+        // 50px of spacer, then 30 lines: 7 lines fit on page 0 (150px).
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div><div style=\"height:50px\"></div><p id=\"p\">{}</p></div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let frags = fragments_of(&doc, &table, "p");
+        assert_eq!(frags.len(), 4, "{frags:?}");
+        assert!((frags[0].y.to_f32() - 50.0).abs() < 0.5);
+        assert!(
+            (frags[0].height.to_f32() - 140.0).abs() < 0.5,
+            "{:?}",
+            frags[0]
+        );
+        assert_eq!(frags[1].y.to_f32(), 0.0);
+    }
+
+    #[test]
+    fn a_paragraph_that_cannot_start_with_two_lines_moves_to_the_next_page() {
+        // Room for one line below the spacer (orphans).
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div><div style=\"height:170px\"></div><p id=\"p\">{}</p></div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let frags = fragments_of(&doc, &table, "p");
+        assert_eq!(frags[0].page_index, 1, "{frags:?}");
+        assert_eq!(frags[0].y.to_f32(), 0.0);
+    }
+
+    #[test]
+    fn padding_and_border_are_reserved_on_every_page_of_a_split_box() {
+        // The box is its own paragraph: border 1 + padding 9 = 10px above the lines.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<section><div id=\"b\" style=\"border:1px solid #000;padding:9px\">{}</div></section>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let node = find_by_id(doc.deref(), "b").unwrap();
+        let geom = &table[&node];
+        let frags = &geom.fragments;
+        assert!(frags.len() >= 4, "{frags:?}");
+        let (top, bottom) = geom.line_split_insets.expect("insets recorded");
+        assert_eq!((top.to_f32(), bottom.to_f32()), (10.0, 10.0));
+        for f in frags {
+            assert!(
+                f.y.to_f32() + 10.0 + f.height.to_f32() <= 200.5,
+                "lines must end inside the page: {f:?}"
+            );
+        }
+        // 600px of lines in 180px strips: 9 lines each (widows pull the last strip up).
+        let total: f32 = frags.iter().map(|f| f.height.to_f32()).sum();
+        assert!((total - 600.0).abs() < 0.5, "{total}");
+    }
+
+    #[test]
+    fn the_frame_of_a_wrapper_closes_below_its_last_child() {
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div id=\"w\" style=\"border:1px solid #000;padding:15px\"><p>{}</p><p id=\"last\">end</p></div><p id=\"next\">next</p>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let w = fragments_of(&doc, &table, "w");
+        let last_frame = w.last().unwrap();
+        let last = &fragments_of(&doc, &table, "last")[0];
+        // The frame ends 16px (padding 15 + border 1) below the last line.
+        let frame_bottom = last_frame.y.to_f32() + last_frame.height.to_f32();
+        let last_bottom = last.y.to_f32() + last.height.to_f32();
+        assert!(
+            (frame_bottom - last_bottom - 16.0).abs() < 0.5,
+            "frame {frame_bottom}, text {last_bottom}"
+        );
+        // And the next sibling starts below the frame.
+        let next = &fragments_of(&doc, &table, "next")[0];
+        assert!(
+            next.y.to_f32() >= frame_bottom - 0.5,
+            "{next:?} vs {frame_bottom}"
+        );
+    }
+
+    #[test]
+    fn the_gap_below_a_split_paragraph_is_kept() {
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div><p id=\"p\">{}</p><div style=\"height:20px\" id=\"after\"></div></div>",
+                br_lines(25)
+            ),
+            200.0,
+        );
+        // 25 lines: strips of 10, 10 (widows are fine: 5 left).
+        let p = fragments_of(&doc, &table, "p");
+        let after = &fragments_of(&doc, &table, "after")[0];
+        let p_last = p.last().unwrap();
+        assert_eq!(after.page_index, p_last.page_index);
+        assert!(
+            (after.y.to_f32() - (p_last.y.to_f32() + p_last.height.to_f32())).abs() < 0.5,
+            "{p_last:?} {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_paragraph_that_fits_a_page_still_moves_whole() {
+        // 8 lines (160px) after a 100px spacer on a 200px page: moved, not split.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div><div style=\"height:100px\"></div><p id=\"p\">{}</p></div>",
+                br_lines(8)
+            ),
+            200.0,
+        );
+        let p = fragments_of(&doc, &table, "p");
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert_eq!(p[0].page_index, 1);
+    }
+
+    #[test]
+    fn paragraphs_in_flex_items_and_table_cells_are_not_split() {
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"display:flex\"><p id=\"f\">{}</p></div>\
+                 <table><tr><td id=\"c\">{}</td></tr></table>",
+                br_lines(30),
+                br_lines(30)
+            ),
+            200.0,
+        );
+        assert_eq!(fragments_of(&doc, &table, "f").len(), 1);
+        assert_eq!(fragments_of(&doc, &table, "c").len(), 1);
+    }
+
+    #[test]
+    fn leading_block_size_counts_two_lines_of_a_paragraph_taller_than_a_page() {
+        let html = format!(
+            "<html><head>{LINE_CSS}</head><body><div id=\"d\"><p>{}</p></div></body></html>",
+            br_lines(30)
+        );
+        let doc = parse(&html, 600.0);
+        let d = find_by_id(doc.deref(), "d").unwrap();
+        let tall = super::leading_block_size(doc.deref(), d, 0, 200.0);
+        assert!((tall - 40.0).abs() < 0.5, "{tall}");
+        // On a page the paragraph fits, it counts whole.
+        let whole = super::leading_block_size(doc.deref(), d, 0, 10_000.0);
+        assert!((whole - 600.0).abs() < 0.5, "{whole}");
     }
 }
