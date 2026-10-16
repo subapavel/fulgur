@@ -1411,9 +1411,10 @@ fn would_split_block_subtree(
 /// a page strip for entering it there to make progress (CSS Fragmentation 3
 /// §4.1, §4.4).
 ///
-/// - A gap between the content edge and the first in-flow child (padding,
-///   border, a margin that did not collapse through) is a class C break point
-///   (§4.1), so the answer is the first child's offset.
+/// - A gap between the content edge and the first in-flow child (a margin
+///   that did not collapse through) is a class C break point (§4.1), so the
+///   answer is the first child's offset. The node's own border and padding are
+///   not that gap.
 /// - Without a gap the only break point before the first row is the class A
 ///   point in front of the box itself, so the box needs its first *row* to fit:
 ///   the maximum over the children that share the first child's `y` (cells of a
@@ -1468,7 +1469,10 @@ fn leading_block_size(doc: &BaseDocument, node_id: usize, depth: usize) -> f32 {
         let top = layout.location.y;
         match first_row_top {
             None => {
-                if top > 0.5 {
+                // The gap is measured from the content edge: the node's own
+                // border and padding are not a gap, they belong to its box.
+                let content_top = node.final_layout.border.top + node.final_layout.padding.top;
+                if top - content_top > 0.5 {
                     // Class C break point: the gap in front of the first child.
                     return top.min(own_h);
                 }
@@ -7596,11 +7600,29 @@ h2 { string-set: chapter-title content(text); }
 
     #[test]
     fn leading_block_size_stops_at_a_gap_before_the_first_child() {
-        // Class C break point: padding is a gap, the child may start a page.
+        // Class C break point: the child's margin did not collapse through the
+        // padded parent, so there is a gap between the content edge and it.
         let html = r#"<html><body style="margin:0"><div id="o" style="padding-top:6px">
+              <div style="margin-top:10px;height:80px">a</div></div></body></html>"#;
+        let leading = leading_of(html, "o");
+        assert!((leading - 16.0).abs() < 0.5, "got {leading}");
+    }
+
+    #[test]
+    fn leading_block_size_does_not_treat_border_or_padding_as_a_gap() {
+        // Border and padding belong to the box; with no gap behind them the
+        // first child cannot start a page on its own.
+        let html = r#"<html><body style="margin:0"><div id="o" style="border-top:5px solid #000;padding-top:6px">
               <div style="height:80px">a</div></div></body></html>"#;
         let leading = leading_of(html, "o");
-        assert!((leading - 6.0).abs() < 0.5, "got {leading}");
+        assert!((leading - 91.0).abs() < 0.5, "got {leading}");
+        let table = r#"<html><body style="margin:0"><table id="t" style="border-collapse:collapse;border:1px solid #333">
+              <tr><td style="height:30px;padding:0">a</td></tr><tr><td style="height:40px;padding:0">b</td></tr></table></body></html>"#;
+        let leading = leading_of(table, "t");
+        assert!(
+            (30.0..=32.0).contains(&leading),
+            "first row plus the border, got {leading}"
+        );
     }
 
     #[test]
@@ -7791,12 +7813,13 @@ h2 { string-set: chapter-title content(text); }
 
     #[test]
     fn a_gap_before_the_first_row_still_breaks_inside_the_wrapper() {
-        // Class C break point: the wrapper's 20px padding fits under the
-        // 170px spacer, the 40px child does not. The child moves alone and
+        // Class C break point: the first child's 10px margin does not collapse
+        // through the wrapper's 10px padding, so the gap (20px) fits under the
+        // 170px spacer and the 40px child does not. The child moves alone and
         // the wrapper's frame continues on the next page.
         let html = r#"<html><body style="margin:0"><div style="height:170px"></div>
-            <div id="w" style="padding-top:20px">
-              <div id="a" style="height:40px">x</div><div id="b" style="height:40px">y</div></div>
+            <div id="w" style="padding-top:10px">
+              <div id="a" style="height:40px;margin-top:10px">x</div><div id="b" style="height:40px">y</div></div>
             </body></html>"#;
         let (doc, geom) = table_geometry(html, 200.0);
         let w = find_by_id(doc.deref(), "w").unwrap();
@@ -7855,5 +7878,38 @@ h2 { string-set: chapter-title content(text); }
             assert_eq!(place(&format!("{p}2")), (1, 40.0), "{p}2");
             assert_eq!(place(&format!("{p}3")), (2, 0.0), "{p}3");
         }
+    }
+
+    #[test]
+    fn bordered_table_that_does_not_fit_moves_whole_without_a_frame_left_behind() {
+        // The table's own border is not a class C gap: the first row cannot
+        // start a page on its own, so the table moves as a whole and leaves no
+        // empty frame on the page it left.
+        let html = r#"<html><body style="margin:0"><div style="height:170px"></div>
+            <table id="t" style="border-collapse:collapse;border:1px solid #333;width:100px">
+              <tr><td id="a" style="height:40px;padding:0">x</td></tr>
+              <tr><td id="b" style="height:40px;padding:0">y</td></tr></table></body></html>"#;
+        let (doc, geom) = table_geometry(html, 200.0);
+        let t = find_by_id(doc.deref(), "t").unwrap();
+        assert_eq!(
+            geom[&t].fragments.len(),
+            1,
+            "frame left behind: {:?}",
+            geom[&t].fragments
+        );
+        assert_eq!(geom[&t].fragments[0].page_index, 1);
+        let a = find_by_id(doc.deref(), "a").unwrap();
+        assert_eq!(geom[&a].fragments[0].page_index, 1);
+    }
+
+    #[test]
+    fn padded_wrapper_that_does_not_fit_moves_whole() {
+        let html = r#"<html><body style="margin:0"><div style="height:170px"></div>
+            <div id="w" style="padding-top:10px;border:1px solid #000">
+              <div id="a" style="height:40px">x</div></div></body></html>"#;
+        let (doc, geom) = table_geometry(html, 200.0);
+        let w = find_by_id(doc.deref(), "w").unwrap();
+        assert_eq!(geom[&w].fragments.len(), 1, "{:?}", geom[&w].fragments);
+        assert_eq!(geom[&w].fragments[0].page_index, 1);
     }
 }
