@@ -50,13 +50,24 @@ fn convert_table(
 
     let mark = clipping.then(|| out.draw_mark());
 
+    // F12: the header group whose cells may be painted again on
+    // continuation pages (the fragmenter decides whether it is).
+    let header_group = crate::blitz_adapter::first_table_header_group(doc, node.id);
+
     // Walk table children to recurse cells.
     for &child_id in &node.children {
         let Some(child_node) = doc.get_node(child_id) else {
             continue;
         };
         let is_thead = is_table_section(child_node, "thead");
+        let header_mark = (Some(child_id) == header_group).then(|| out.draw_mark());
         collect_table_cells(doc, child_id, is_thead, ctx, depth, out);
+        if let Some(mark) = header_mark {
+            let ids = out.drawn_since(mark);
+            if !ids.is_empty() {
+                out.table_header_groups.insert(child_id, ids);
+            }
+        }
     }
 
     if let Some(mark) = mark {

@@ -865,6 +865,35 @@ fn is_flex_or_grid_container(node: &Node) -> bool {
     is_flex_or_grid_container_node(node)
 }
 
+/// F12: NodeId of the first child of `table_id` whose computed display is
+/// `table-header-group`, or `None` when `table_id` is not a table (computed
+/// `display: table` / `inline-table`) or has no such child.
+///
+/// CSS 2.1 §17.2: "If a table contains multiple elements with
+/// 'display: table-header-group', only the first is rendered as a header;
+/// the others are treated as if they had 'display: table-row-group'." The
+/// decision is made on the computed display, not the tag name, so
+/// `display: table-header-group` on any element counts and
+/// `<thead style="display: table-row-group">` does not.
+pub fn first_table_header_group(doc: &BaseDocument, table_id: usize) -> Option<usize> {
+    use ::style::values::specified::box_::{DisplayInside, DisplayOutside};
+    let table = doc.get_node(table_id)?;
+    let is_table = table
+        .primary_styles()
+        .is_some_and(|s| s.clone_display().inside() == DisplayInside::Table);
+    if !is_table {
+        return None;
+    }
+    table.children.iter().copied().find(|&child_id| {
+        doc.get_node(child_id)
+            .and_then(|c| c.primary_styles())
+            .is_some_and(|s| {
+                let d = s.clone_display();
+                d.outside() != DisplayOutside::None && d.inside() == DisplayInside::TableHeaderGroup
+            })
+    })
+}
+
 /// fulgur-uebl: true if `node` establishes a flex / grid formatting
 /// context (its inside display is `Flex` or `Grid`). Children of such
 /// containers are flex / grid items, which the spec excludes from

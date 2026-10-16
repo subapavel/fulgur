@@ -213,9 +213,9 @@ pub struct SvgEntry {
 /// `BlockEntry` / `ParagraphEntry` keyed by the cell's own NodeId
 /// and paints through the standard per-NodeId dispatch.
 ///
-/// Multi-page header repetition (`<thead>` cloned on continuation
-/// pages) is **not** modelled in PR 5; single-page tables byte-eq
-/// already, multi-page tables follow in a later PR.
+/// Header repetition on continuation pages (F12) is not stored here: the
+/// fragmenter records the extra header fragments in the geometry table and
+/// [`Drawables::table_header_groups`] lists what to paint again there.
 #[derive(Debug, Clone)]
 pub struct TableEntry {
     pub style: crate::draw_primitives::BlockStyle,
@@ -447,6 +447,13 @@ pub struct Drawables {
     pub tables: TrackedMap<TableEntry>,
     pub list_items: TrackedMap<ListItemEntry>,
     pub multicol_rules: BTreeMap<NodeId, MulticolRuleEntry>,
+    /// F12: `table-header-group` node → every drawable NodeId (cells, their
+    /// blocks, paragraphs, images, nested tables, ...) converted under it,
+    /// sorted ascending. `render_v2` paints these again on each page where
+    /// the fragmenter recorded a repeat fragment for the group (see
+    /// `pagination_layout::reserve_header_band`). Only the first header
+    /// group of a table is listed; empty when no table has one.
+    pub table_header_groups: BTreeMap<NodeId, Vec<NodeId>>,
     pub transforms: BTreeMap<NodeId, TransformEntry>,
     pub bookmark_anchors: BTreeMap<NodeId, BookmarkAnchorEntry>,
     pub link_spans: Vec<(NodeId, LinkSpanEntry)>,
@@ -497,6 +504,7 @@ impl Default for Drawables {
             tables: TrackedMap::default(),
             list_items: TrackedMap::default(),
             multicol_rules: BTreeMap::new(),
+            table_header_groups: BTreeMap::new(),
             transforms: BTreeMap::new(),
             bookmark_anchors: BTreeMap::new(),
             link_spans: Vec::new(),
