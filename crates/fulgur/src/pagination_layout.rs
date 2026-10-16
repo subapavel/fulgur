@@ -970,7 +970,7 @@ impl<'a> PaginationLayoutTree<'a> {
             }
             if needs_recursion {
                 let child_x_in_body = body_x + layout.location.x;
-                let (new_page, new_cursor, _) = fragment_block_subtree(
+                let (new_page, new_cursor, _, _) = fragment_block_subtree(
                     &mut self.geometry,
                     self.doc,
                     self.column_styles,
@@ -1964,7 +1964,7 @@ fn fragment_block_subtree(
     depth: usize,
     tail_below: f32,
     top_floor: f32,
-) -> (u32, f32, bool) {
+) -> (u32, f32, bool, f32) {
     if depth >= crate::MAX_DOM_DEPTH {
         // Bailed: emit a single whole-fragment for the parent at its
         // entry coordinates so geometry still has an entry for it.
@@ -1983,10 +1983,10 @@ fn fragment_block_subtree(
                 width: parent_w.as_px(),
                 height: h.as_px(),
             });
-        return (page_in, cursor_in + h, false);
+        return (page_in, cursor_in + h, false, 0.0);
     }
     let Some(parent) = doc.get_node(parent_id) else {
-        return (page_in, cursor_in, false);
+        return (page_in, cursor_in, false, 0.0);
     };
 
     let mut page_index = page_in;
@@ -2609,7 +2609,7 @@ fn fragment_block_subtree(
                 Some(r) => r.height,
                 None => top_floor,
             };
-            let (np, nc, split_below) = match &line_split {
+            let (np, nc, split_below, stretch) = match &line_split {
                 Some(split) => {
                     let (np, nc) = fragment_nested_inline_root(
                         geometry,
@@ -2625,7 +2625,7 @@ fn fragment_block_subtree(
                         split,
                         depth + 1,
                     );
-                    (np, nc, np > pre_recursion_page)
+                    (np, nc, np > pre_recursion_page, 0.0)
                 }
                 None => fragment_block_subtree(
                     geometry,
@@ -2786,17 +2786,19 @@ fn fragment_block_subtree(
                     rs.crossed_by_recursion = true;
                 }
                 if parent_is_table && !is_header_cell {
+                    // The row ends where the content of its cells ends: the
+                    // stretch below a shorter cell's last line is not content.
                     let this_row = SplitRow {
                         top: this_top_in_parent,
                         bottom: this_top_in_parent + child_h,
                         start: row_start,
                         end: RowCursor {
                             page_index,
-                            cursor_y,
+                            cursor_y: cursor_y - stretch,
                             page_start_y,
                             page_taffy_origin,
                             band,
-                            pending_target_y: origin_pending_target_y,
+                            pending_target_y: origin_pending_target_y.map(|y| y - stretch),
                             pending_prev_bottom: origin_pending_prev_bottom,
                             pending_same_row: origin_pending_same_row,
                         },
@@ -2997,7 +2999,13 @@ fn fragment_block_subtree(
             .as_px(),
         });
 
-    (page_index, cursor_y + closing, lines_split_below)
+    // What `closing` holds beyond the box's own bottom padding and border: the
+    // room a stretched box (a table cell as tall as its row) has below its last
+    // child. It is part of the frame but not of the content.
+    let stretch = (closing
+        - (parent.final_layout.border.bottom + parent.final_layout.padding.bottom))
+        .max(0.0);
+    (page_index, cursor_y + closing, lines_split_below, stretch)
 }
 
 /// F12: a table's first `table-header-group`, repeated at the top of every
@@ -5358,7 +5366,7 @@ mod tests {
         );
 
         let mut geom = PaginationGeometryTable::new();
-        let (page_out, cursor_out, _) = fragment_block_subtree(
+        let (page_out, cursor_out, _, _) = fragment_block_subtree(
             &mut geom,
             &doc, // &BaseDocument via deref coercion
             None, // column_styles
@@ -9398,6 +9406,47 @@ h2 { string-set: chapter-title content(text); }
                     "{what}: AFTER {after:?} is not below cell {id} ending {last:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_row_of_paragraph_cells_ends_below_the_tallest_cells_content() {
+        // `<td><p>` cells are stretched to the row: the stretch below a shorter cell's last line is
+        // not content and must not decide where what follows the row starts, whatever the order.
+        for (what, n) in [
+            ("tallest last", [18, 12, 24]),
+            ("tallest first", [24, 18, 12]),
+            ("tallest in the middle", [12, 24, 18]),
+        ] {
+            let cells: String = ["pa", "pb", "pc"]
+                .iter()
+                .zip(n)
+                .map(|(id, n)| {
+                    format!(
+                        "<td style=\"line-height:20px;vertical-align:top\"><p id=\"{id}\">{}</p></td>",
+                        br_lines(n)
+                    )
+                })
+                .collect();
+            let (doc, table) = nested_geometry(
+                &format!(
+                    "<table style=\"width:100%\"><tr>{cells}</tr></table><p id=\"after\">AFTER</p>"
+                ),
+                200.0,
+            );
+            let tallest = ["pa", "pb", "pc"][n.iter().position(|&x| x == 24).unwrap()];
+            let last = fragments_of(&doc, &table, tallest).last().unwrap();
+            let after = &fragments_of(&doc, &table, "after")[0];
+            let bottom = last.y.to_f32() + last.height.to_f32();
+            assert_eq!(
+                after.page_index, last.page_index,
+                "{what}: {after:?} vs {last:?}"
+            );
+            assert!(
+                after.y.to_f32() >= bottom - 0.5 && after.y.to_f32() <= bottom + 10.0,
+                "{what}: AFTER at {} but the tallest cell's text ends at {bottom}",
+                after.y.to_f32()
+            );
         }
     }
 
