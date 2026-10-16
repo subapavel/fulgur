@@ -1930,6 +1930,35 @@ fn is_flow_child_with_height(c: &blitz_dom::Node) -> bool {
     !is_blank_text && !is_oof && h.is_finite() && h > 0.0
 }
 
+/// F30b: the margin below node `node_id` that ends up below the last thing in its
+/// parent's content: its own bottom margin, and the margins of its last descendants
+/// that collapse through its bottom edge (no bottom padding or border on the way).
+/// Taffy reports each box's own margin only.
+fn trailing_margin(doc: &BaseDocument, node_id: usize, depth: usize) -> f32 {
+    let Some(node) = doc.get_node(node_id) else {
+        return 0.0;
+    };
+    let own = node.final_layout.margin.bottom.max(0.0);
+    if depth >= crate::MAX_DOM_DEPTH
+        || node.final_layout.border.bottom > 0.0
+        || node.final_layout.padding.bottom > 0.0
+    {
+        return own;
+    }
+    let layout_children = node.layout_children.borrow();
+    let children: &[usize] = layout_children
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .unwrap_or(&node.children);
+    let below = children
+        .iter()
+        .rev()
+        .copied()
+        .find(|&id| doc.get_node(id).is_some_and(is_flow_child_with_height))
+        .map_or(0.0, |id| trailing_margin(doc, id, depth + 1));
+    own.max(below)
+}
+
 /// F30b: whether no two in-flow children of a flex / grid container overlap in
 /// y, i.e. each one starts at or below the bottom of the one before: a column
 /// flex container, a one-column grid, a single item. Such a container
@@ -3002,8 +3031,12 @@ fn fragment_block_subtree(
     // What `closing` holds beyond the box's own bottom padding and border: the
     // room a stretched box (a table cell as tall as its row) has below its last
     // child. It is part of the frame but not of the content.
+    // The margin below the last child is inside a box that contains it (a table
+    // cell), so it is not stretch either.
+    let trailing = last_flow_child.map_or(0.0, |id| trailing_margin(doc, id, 0));
     let stretch = (closing
-        - (parent.final_layout.border.bottom + parent.final_layout.padding.bottom))
+        - (parent.final_layout.border.bottom + parent.final_layout.padding.bottom)
+        - trailing)
         .max(0.0);
     (page_index, cursor_y + closing, lines_split_below, stretch)
 }
@@ -9445,6 +9478,61 @@ h2 { string-set: chapter-title content(text); }
             assert!(
                 after.y.to_f32() >= bottom - 0.5 && after.y.to_f32() <= bottom + 10.0,
                 "{what}: AFTER at {} but the tallest cell's text ends at {bottom}",
+                after.y.to_f32()
+            );
+        }
+    }
+
+    #[test]
+    fn the_last_childs_bottom_margin_stays_part_of_a_split_cells_row() {
+        // A margin below the last child of a cell is inside the cell (a table cell is a block
+        // formatting context): what follows the row starts that far below the last line, also when
+        // the margin sits on a wrapper, collapses through one, or a shorter cell is stretched.
+        for (what, a, margin) in [
+            (
+                "p",
+                format!(
+                    "<p id=\"last\" style=\"margin-bottom:40px\">{}</p>",
+                    br_lines(30)
+                ),
+                40.0,
+            ),
+            (
+                "wrapper",
+                format!(
+                    "<div style=\"margin-bottom:40px\"><p id=\"last\">{}</p></div>",
+                    br_lines(30)
+                ),
+                40.0,
+            ),
+            (
+                "collapsed through a wrapper",
+                format!(
+                    "<div><p id=\"last\" style=\"margin-bottom:40px\">{}</p></div>",
+                    br_lines(30)
+                ),
+                40.0,
+            ),
+        ] {
+            let (doc, table) = nested_geometry(
+                &format!(
+                    "<table style=\"width:100%\"><tr><td style=\"line-height:20px;vertical-align:top\">{a}</td>\
+                     <td style=\"line-height:20px;vertical-align:top\"><p>{}</p></td></tr></table>\
+                     <p id=\"after\">AFTER</p>",
+                    br_lines(12)
+                ),
+                200.0,
+            );
+            let last = fragments_of(&doc, &table, "last").last().unwrap();
+            let after = &fragments_of(&doc, &table, "after")[0];
+            let bottom = last.y.to_f32() + last.height.to_f32();
+            assert_eq!(
+                after.page_index, last.page_index,
+                "{what}: {after:?} vs {last:?}"
+            );
+            assert!(
+                (after.y.to_f32() - (bottom + margin)).abs() < 1.5,
+                "{what}: AFTER at {} but the last line ends at {bottom} and the margin is {margin}",
                 after.y.to_f32()
             );
         }
