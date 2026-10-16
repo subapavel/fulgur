@@ -3623,15 +3623,17 @@ fn inline_lines_below_page(
 }
 
 /// Say so when [`inline_lines_below_page`] finds lines that end below the content
-/// box, rather than leave them unremarked (only paragraphs in plain block flow
-/// are split between line boxes). Whether they are lost depends on the page
-/// margin: what falls outside the page box is not printed.
+/// box, rather than leave them unremarked (paragraphs are split between line
+/// boxes except in clipping, multicol, transformed, atomic-inline and
+/// `display: table` wrappers). Whether they are lost depends on the page margin:
+/// what falls outside the page box is not printed.
 fn warn_unprinted_inline_lines(child: &blitz_dom::Node, child_page_y: f32, page_height_px: f32) {
     if let Some((lines, below)) = inline_lines_below_page(child, child_page_y, page_height_px) {
         log::warn!(
             "pagination: a paragraph of {lines} lines is placed whole and ends {below:.0}px below the \
-             content box; lines that fall outside the page box are not printed (only paragraphs in \
-             plain block flow are split between lines)",
+             content box; lines that fall outside the page box are not printed (paragraphs in \
+             clipping, multicol, transformed, inline-block / inline-flex and `display: table` \
+             wrappers are not split between lines)",
         );
     }
 }

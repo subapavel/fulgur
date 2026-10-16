@@ -7053,3 +7053,32 @@ fn body_margin_shortens_page_zero_instead_of_losing_lines_below_the_page() {
         }
     }
 }
+
+#[test]
+fn paragraphs_that_are_flex_items_and_direct_text_cells_continue_on_the_next_pages() {
+    // F30b: a flex item and a table cell that are inline roots taller than a page are split between
+    // their lines; the cell's row background is painted from its frame on every page it spans.
+    for body in [
+        r#"<div style="display:flex;flex-direction:column"><p>{L}</p><p>after</p></div>"#,
+        r#"<table style="width:100%"><tr style="background:#ffe9a8"><td style="padding:8px">{L}</td></tr></table>"#,
+    ] {
+        let lines: Vec<String> = (1..=150).map(|i| format!("Line{i:04}")).collect();
+        let html = format!(
+            r#"<!DOCTYPE html><html><body style="margin:0"><style>p,td{{margin:0;line-height:20px}}</style>{}</body></html>"#,
+            body.replace("{L}", &lines.join("<br>")),
+        );
+        let pdf = Engine::builder().build().render(&html).expect("render");
+        assert!(pdf.starts_with(b"%PDF"));
+        assert!(page_count(&pdf) >= 3, "got {} page(s)", page_count(&pdf));
+        if let Some(text) = extract_pdf_text(&pdf) {
+            for i in 1..=150 {
+                let word = format!("Line{i:04}");
+                assert_eq!(
+                    text.matches(&word).count(),
+                    1,
+                    "{word} must be printed exactly once: {body}"
+                );
+            }
+        }
+    }
+}

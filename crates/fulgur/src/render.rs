@@ -3137,6 +3137,10 @@ fn paint_table_row_backgrounds(
                 .iter()
                 .filter(|f| f.page_index == page_index)
             {
+                // A cell whose direct text was split between lines (F30b) holds the
+                // span of its lines in the raw fragment; its frame also covers the
+                // padding and border above and below them.
+                let frag = frame_fragment(cell_geom, frag);
                 let x = margin_left_pt + frag.x.in_pt().to_f32();
                 let y = margin_top_pt + frag.y.in_pt().to_f32();
                 let w = frag.width.in_pt().to_f32();
