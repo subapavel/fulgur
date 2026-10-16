@@ -495,6 +495,14 @@ impl<'a> PaginationLayoutTree<'a> {
         // in body's normal-flow height (CSS 2.1 §10.6.3) so per-page
         // walks match the recorded fragment tops.
         let mut prev_bottom_y_in_body: f32 = 0.0;
+        // The previous child when it was placed by the plain path: its top in
+        // body coordinates, its page, the page-local y it was placed at, and
+        // the cursor after it. A following child that starts level with it is
+        // laid out beside it (the side-by-side run Blitz makes of boxes it
+        // treats as inline-level, e.g. tables under `display: contents`) and
+        // must neither move the cursor on again nor be counted as a row of
+        // its own.
+        let mut prev_plain: Option<(f32, u32, f32, f32)> = None;
         // fulgur-uebl: tracks the used page-name of the previously
         // placed in-flow sibling (`Some(Some(name))` named, `Some(None)`
         // auto/unnamed, `None` no previous). When the next sibling's
@@ -668,6 +676,17 @@ impl<'a> PaginationLayoutTree<'a> {
             let this_top_in_body = layout.location.y;
             let gap = (this_top_in_body - prev_bottom_y_in_body).max(0.0);
             cursor_y += gap;
+            let parallel_row = prev_plain
+                .filter(|&(top, page, _, _)| {
+                    page == page_index
+                        && (this_top_in_body - top).abs() < 0.5
+                        && this_top_in_body < prev_bottom_y_in_body - 0.5
+                })
+                .map(|(_, page, placed_y, end)| {
+                    cursor_y = placed_y;
+                    (page, end, prev_bottom_y_in_body)
+                });
+            prev_plain = None;
 
             // fulgur-k0g0: read break-before / break-after / break-inside
             // for this child from the column-style side-table (shared with
@@ -766,6 +785,12 @@ impl<'a> PaginationLayoutTree<'a> {
                 cursor_y = new_cursor_y;
                 emitted += frag_count;
                 prev_bottom_y_in_body = this_top_in_body + child_h;
+                if let Some((row_page, row_end, row_bottom)) = parallel_row {
+                    if page_index == row_page {
+                        cursor_y = cursor_y.max(row_end);
+                    }
+                    prev_bottom_y_in_body = prev_bottom_y_in_body.max(row_bottom);
+                }
                 if !is_float {
                     prev_used_page = Some(used_end.clone());
                 }
@@ -894,6 +919,12 @@ impl<'a> PaginationLayoutTree<'a> {
                 cursor_y = new_cursor;
                 emitted += 1;
                 prev_bottom_y_in_body = this_top_in_body + child_h;
+                if let Some((row_page, row_end, row_bottom)) = parallel_row {
+                    if page_index == row_page {
+                        cursor_y = cursor_y.max(row_end);
+                    }
+                    prev_bottom_y_in_body = prev_bottom_y_in_body.max(row_bottom);
+                }
                 if !is_float {
                     prev_used_page = Some(used_end.clone());
                 }
@@ -1077,6 +1108,12 @@ impl<'a> PaginationLayoutTree<'a> {
                 }
                 emitted += 1;
                 prev_bottom_y_in_body = this_top_in_body + child_h;
+                if let Some((row_page, row_end, row_bottom)) = parallel_row {
+                    if page_index == row_page {
+                        cursor_y = cursor_y.max(row_end);
+                    }
+                    prev_bottom_y_in_body = prev_bottom_y_in_body.max(row_bottom);
+                }
                 if !is_float {
                     prev_used_page = Some(used_end.clone());
                 }
@@ -1126,9 +1163,17 @@ impl<'a> PaginationLayoutTree<'a> {
                 0,
             );
 
+            let placed_y = cursor_y;
             cursor_y += child_h;
             emitted += 1;
             prev_bottom_y_in_body = this_top_in_body + child_h;
+            if let Some((row_page, row_end, row_bottom)) = parallel_row {
+                if page_index == row_page {
+                    cursor_y = cursor_y.max(row_end);
+                }
+                prev_bottom_y_in_body = prev_bottom_y_in_body.max(row_bottom);
+            }
+            prev_plain = Some((this_top_in_body, page_index, placed_y, cursor_y));
             if !is_float {
                 prev_used_page = Some(used_end.clone());
             }
@@ -7946,5 +7991,28 @@ h2 { string-set: chapter-title content(text); }
         let w = find_by_id(doc.deref(), "w").unwrap();
         assert_eq!(geom[&w].fragments.len(), 1, "{:?}", geom[&w].fragments);
         assert_eq!(geom[&w].fragments[0].page_index, 1);
+    }
+
+    #[test]
+    fn tables_under_display_contents_are_not_counted_as_a_column() {
+        // Blitz lays the tables of a `display: contents` wrapper out side by
+        // side (it treats them as inline-level). They share a top, so the
+        // cursor must not advance for each of them: 60 tables of 21px in rows
+        // of seven are ~190px, not 1260px, and nothing may be pushed past the
+        // end of the document's pages.
+        let tables: String = (0..60)
+            .map(|i| {
+                format!(
+                    r#"<table id="t{i}" style="border-spacing:0"><tr><td id="c{i}" style="height:21px;padding:0;width:80px">x</td></tr></table>"#
+                )
+            })
+            .collect();
+        let html = format!(
+            r#"<html><body style="margin:0"><div style="display:contents">{tables}</div></body></html>"#
+        );
+        let (doc, geom) = table_geometry(&html, 400.0);
+        let cells = assert_placed_once_inside_pages(&doc, &geom, &ids("c", 60), 400.0);
+        assert!(cells.iter().all(|&p| p == 0), "{cells:?}");
+        assert_eq!(implied_page_count(&geom), 1);
     }
 }
