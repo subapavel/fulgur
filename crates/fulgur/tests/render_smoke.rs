@@ -6774,3 +6774,36 @@ fn repeated_table_header_with_a_background_only_row_and_empty_cells() {
         );
     }
 }
+
+// ── F28: consecutive one-row tables paginate ────────────────────────────────
+
+#[test]
+fn consecutive_one_row_tables_paginate_instead_of_stacking_on_page_one() {
+    // Each table is a separate block whose first (and only) row sits at its top edge. Before F28 the
+    // first table that did not fit the page was entered where it stood, its row hung below the page,
+    // and every later table was stacked after it on page 1 and clipped.
+    for wrap in [false, true] {
+        let tables: String = (0..120)
+            .map(|i| format!("<table><tr><td>TBLROW{i:03}</td></tr></table>"))
+            .collect();
+        let body = if wrap {
+            format!("<div>{tables}</div>")
+        } else {
+            tables
+        };
+        let html = format!("<!DOCTYPE html><html><body>{body}</body></html>");
+        let pdf = Engine::builder().build().render(&html).expect("render");
+        let pages = page_count(&pdf);
+        assert!(pages >= 2, "wrap={wrap}: got {pages} page(s)");
+        if let Some(text) = extract_pdf_text(&pdf) {
+            for i in 0..120 {
+                let row = format!("TBLROW{i:03}");
+                assert_eq!(
+                    text.matches(&row).count(),
+                    1,
+                    "wrap={wrap}: {row} must be printed exactly once"
+                );
+            }
+        }
+    }
+}

@@ -834,23 +834,44 @@ impl<'a> PaginationLayoutTree<'a> {
                             .is_some_and(crate::blitz_adapter::has_column_span_all)
                     })
                 });
-            let available_strip = (self.page_height_px - cursor_y).max(0.0);
-            let needs_recursion = has_splittable_children
-                && (!is_multicol || multicol_has_span_all)
-                && (has_forced_break_below(self.doc, child_id, self.column_styles, 0)
-                    || has_page_name_change_below(
-                        self.doc,
-                        child_id,
-                        self.used_page_names.as_ref(),
-                        0,
-                    )
-                    || would_split_block_subtree(
-                        self.doc,
-                        child_id,
-                        available_strip,
-                        self.page_height_px,
-                        0,
-                    ));
+            let page_height_px = self.page_height_px;
+            let gate = |doc: &BaseDocument, available_strip: f32| {
+                has_splittable_children
+                    && (!is_multicol || multicol_has_span_all)
+                    && (has_forced_break_below(doc, child_id, self.column_styles, 0)
+                        || has_page_name_change_below(
+                            doc,
+                            child_id,
+                            self.used_page_names.as_ref(),
+                            0,
+                        )
+                        || would_split_block_subtree(
+                            doc,
+                            child_id,
+                            available_strip,
+                            page_height_px,
+                            0,
+                        ))
+            };
+            let mut needs_recursion = gate(self.doc, (page_height_px - cursor_y).max(0.0));
+            // F28: entering a box means placing its first row at the current
+            // cursor. When even that row does not fit below the cursor, the
+            // only break point before it is the class A point in front of the
+            // box (CSS Fragmentation 3 §4.1), so move the whole box to the next
+            // page first. Entering it anyway hangs the row into the bottom
+            // margin, leaves the cursor past the page end, and every following
+            // sibling is then entered past the bottom as well (the page count
+            // stays at one and the rest is clipped). The margin above the box
+            // truncates at the unforced break, as for the non-recursive advance
+            // below.
+            if needs_recursion
+                && cursor_y > 0.0
+                && cursor_y + leading_block_size(self.doc, child_id, 0) > page_height_px
+            {
+                page_index += 1;
+                cursor_y = 0.0;
+                needs_recursion = gate(self.doc, page_height_px);
+            }
             if needs_recursion {
                 let child_x_in_body = body_x + layout.location.x;
                 let (new_page, new_cursor) = fragment_block_subtree(
@@ -1403,7 +1424,6 @@ fn would_split_block_subtree(
 /// The result never exceeds the node's own height. It walks the same children
 /// (`layout_children` first, whitespace / out-of-flow / empty skipped) as
 /// [`would_split_block_subtree`] and follows only the first row, so it is cheap.
-#[cfg_attr(not(test), allow(dead_code))]
 fn leading_block_size(doc: &BaseDocument, node_id: usize, depth: usize) -> f32 {
     let Some(node) = doc.get_node(node_id) else {
         return 0.0;
@@ -1886,6 +1906,9 @@ fn fragment_block_subtree(
         // `page_taffy_origin` against it on page advance).
         let this_top_in_parent = layout.location.y;
         let is_header_cell = repeat.as_ref().is_some_and(|r| r.cells.contains(&child_id));
+        // F28: only the first item of a flex / grid row may start a new page
+        // on its own account; the others are level with it.
+        let mut first_in_row = true;
 
         // fulgur-ysms: row-level co-split for flex/grid containers.
         // Must run BEFORE origin_pending_target_y is consumed so that
@@ -1896,6 +1919,7 @@ fn fragment_block_subtree(
                 .map(|rs| this_top_in_parent < rs.row_bottom - 0.5);
             match same_row {
                 Some(true) => {
+                    first_in_row = false;
                     let rs = row_state.as_ref().unwrap();
                     if rs.crossed_by_recursion {
                         // Co-split: a previous cell in this row crossed a page
@@ -2106,15 +2130,90 @@ fn fragment_block_subtree(
         // against the "parent CSS height > children sum" case where
         // recursion would emit a parent fragment shorter than
         // expected.
-        let available_strip = (page_height_px - cursor_y).max(0.0);
         // fulgur-7hf5: see body-direct branch — multicol containers
         // are atomic from the fragmenter's perspective.
         let is_multicol = crate::blitz_adapter::is_multicol_container(child);
-        let needs_recursion = !child.children.is_empty()
-            && !is_multicol
-            && (has_forced_break_below(doc, child_id, column_styles, 0)
-                || has_page_name_change_below(doc, child_id, used_page_names, 0)
-                || would_split_block_subtree(doc, child_id, available_strip, page_height_px, 0));
+        let gate = |available_strip: f32| {
+            !child.children.is_empty()
+                && !is_multicol
+                && (has_forced_break_below(doc, child_id, column_styles, 0)
+                    || has_page_name_change_below(doc, child_id, used_page_names, 0)
+                    || would_split_block_subtree(doc, child_id, available_strip, page_height_px, 0))
+        };
+        let mut needs_recursion = gate((page_height_px - cursor_y).max(0.0));
+
+        // Strip-overflow page cut (fulgur-7hf5 moved it below the gate; F28
+        // moves it back above): the child starts a new page when the part of
+        // it that cannot be split — the whole child, or for a child the gate
+        // will enter, its first row — does not fit below its placement. Use
+        // `child_page_y` (the actual placement) rather than `cursor_y` so a
+        // parallel sibling returning to a smaller page-local y is checked
+        // correctly.
+        //
+        // `child_page_y > page_start_y + band` keeps the first content of a
+        // strip from being cut again (a row taller than `page - header` would
+        // otherwise advance a page per attempt). `band` is the repeated table
+        // header (F12) reserved at the top of this strip. Entering a child
+        // that sits at the parent's top edge is safe because the parent's own
+        // caller already checked that this first row fits (`leading_block_size`
+        // follows it down), or the parent starts a page.
+        //
+        // Before F28 a child the gate would enter was never cut, so a first
+        // row of a nested box that sat mid-page hung into the bottom margin.
+        // Of a flex / grid row only the first item decides.
+        let first_break_h = if needs_recursion {
+            if first_in_row {
+                leading_block_size(doc, child_id, 0)
+            } else {
+                0.0
+            }
+        } else {
+            child_h
+        };
+        if child_page_y > page_start_y + band && child_page_y + first_break_h > page_height_px {
+            let should_emit = row_state
+                .as_mut()
+                .map(|rs| rs.emitted_parent_pages.insert(page_index))
+                .unwrap_or(true);
+            if should_emit {
+                geometry
+                    .entry(parent_id)
+                    .or_default()
+                    .fragments
+                    .push(Fragment {
+                        page_index,
+                        x: parent_x_in_body.as_px(),
+                        y: page_start_y.as_px(),
+                        width: parent_w.as_px(),
+                        height: (cursor_y - page_start_y).as_px(),
+                    });
+            }
+            page_index += 1;
+            band = reserve_header_band(&mut repeat, is_header_cell, geometry, page_index, child_h);
+            cursor_y = band;
+            page_start_y = 0.0;
+            // Forced to a fresh page: rebase the Taffy origin so the
+            // current child lands at page_start_y (= 0, or just below the
+            // repeated table header band) on the new page. Sequential
+            // siblings then continue from this point.
+            page_taffy_origin = this_top_in_parent - band;
+            child_page_y = band;
+            if needs_recursion {
+                // The child may fit the new page whole.
+                needs_recursion = gate((page_height_px - cursor_y).max(0.0));
+                // A later cell of this flex / grid row restores the row's
+                // start state when the cell recurses across pages; that
+                // start is now the new page.
+                if let Some(rs) = row_state.as_mut() {
+                    rs.start_page = page_index;
+                    rs.start_cursor_y = cursor_y;
+                    rs.start_page_start_y = page_start_y;
+                    rs.start_page_taffy_origin = page_taffy_origin;
+                    rs.max_end_page = page_index;
+                    rs.max_end_cursor_y = cursor_y;
+                }
+            }
+        }
         if needs_recursion {
             let pre_recursion_page = page_index;
             let pre_recursion_cursor_y = cursor_y;
@@ -2295,48 +2394,6 @@ fn fragment_block_subtree(
                 }
             }
             continue;
-        }
-
-        // No recursion — apply the strip-overflow page cut for
-        // children that don't split (non-splittable, or splittable
-        // but all grandchildren fit the available strip — the
-        // parent-CSS-height-vs-children-sum case stays here).
-        // Use `child_page_y + child_h` (the actual placement bottom)
-        // rather than `cursor_y + child_h` so a parallel sibling
-        // returning to a smaller page-local y is checked correctly.
-        //
-        // F12: `band` is the repeated table header reserved at the top of
-        // this strip. A child that starts right below it is the first body
-        // content of the strip and is not cut again (a row taller than
-        // `page - header` would otherwise advance a page per attempt).
-        if child_page_y > page_start_y + band && child_page_y + child_h > page_height_px {
-            let should_emit = row_state
-                .as_mut()
-                .map(|rs| rs.emitted_parent_pages.insert(page_index))
-                .unwrap_or(true);
-            if should_emit {
-                geometry
-                    .entry(parent_id)
-                    .or_default()
-                    .fragments
-                    .push(Fragment {
-                        page_index,
-                        x: parent_x_in_body.as_px(),
-                        y: page_start_y.as_px(),
-                        width: parent_w.as_px(),
-                        height: (cursor_y - page_start_y).as_px(),
-                    });
-            }
-            page_index += 1;
-            band = reserve_header_band(&mut repeat, is_header_cell, geometry, page_index, child_h);
-            cursor_y = band;
-            page_start_y = 0.0;
-            // Forced to a fresh page: rebase the Taffy origin so the
-            // current child lands at page_start_y (= 0, or just below the
-            // repeated table header band) on the new page. Sequential
-            // siblings then continue from this point.
-            page_taffy_origin = this_top_in_parent - band;
-            child_page_y = band;
         }
 
         // Child fits the strip (or is an atomic oversized leaf that
@@ -6794,12 +6851,11 @@ h2 { string-set: chapter-title content(text); }
     }
 
     #[test]
-    fn grid_row_leaf_cells_cosplit_across_page_boundary() {
+    fn grid_row_leaf_cells_move_together_when_the_row_does_not_fit() {
         // 2-col grid, each leaf cell 60px tall.
         // spacer 80px pushes grid to y=80 on a 100px page.
-        // pre-fix: cell 2 pushed to page 1 at y=0 (whole cell).
-        // post-fix: both cells split — page 0 y=80..100 (20px),
-        //           page 1 y=0..40 (40px).
+        // fulgur-ysms: cell 2 must not be pushed to page 1 on its own while
+        // cell 1 stays on page 0; the cells of a row move together.
         let html = r#"
             <html><body style="margin: 0; padding: 0">
               <div style="height: 80px"></div>
@@ -6824,21 +6880,18 @@ h2 { string-set: chapter-title content(text); }
             .collect();
         frags.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-        let on_page0: Vec<_> = frags.iter().filter(|(p, _, _)| *p == 0).collect();
-        assert_eq!(
-            on_page0.len(),
-            2,
-            "both leaf cells must have a fragment on page 0 (co-split); frags={frags:?}"
-        );
-        let ys: Vec<f32> = on_page0.iter().map(|(_, _, y)| *y).collect();
+        // The row (60px) does not fit the 20px left under the spacer and its
+        // cells cannot be split, so the whole row starts page 1 (F28). Before,
+        // both cells were placed hanging below the bottom of page 0.
+        assert_eq!(frags.len(), 2, "frags={frags:?}");
         assert!(
-            (ys[0] - ys[1]).abs() < 0.5,
-            "page-0 fragments must share the same y (parallel row); ys={ys:?}"
+            frags.iter().all(|(p, _, y)| *p == 1 && y.abs() < 0.5),
+            "both cells of the row must move to the top of page 1 together; frags={frags:?}"
         );
     }
 
     #[test]
-    fn flex_row_leaf_cells_cosplit_across_page_boundary() {
+    fn flex_row_leaf_cells_move_together_when_the_row_does_not_fit() {
         let html = r#"
             <html><body style="margin: 0; padding: 0">
               <div style="height: 80px"></div>
@@ -6862,35 +6915,35 @@ h2 { string-set: chapter-title content(text); }
             .collect();
         frags.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-        let on_page0: Vec<_> = frags.iter().filter(|(p, _, _)| *p == 0).collect();
-        assert_eq!(
-            on_page0.len(),
-            2,
-            "both leaf cells must have a fragment on page 0 (co-split); frags={frags:?}"
-        );
-        let ys: Vec<f32> = on_page0.iter().map(|(_, _, y)| *y).collect();
+        // The row (60px) does not fit the 20px left under the spacer and its
+        // cells cannot be split, so the whole row starts page 1 (F28). Before,
+        // both cells were placed hanging below the bottom of page 0.
+        assert_eq!(frags.len(), 2, "frags={frags:?}");
         assert!(
-            (ys[0] - ys[1]).abs() < 0.5,
-            "page-0 fragments must share the same y; ys={ys:?}"
+            frags.iter().all(|(p, _, y)| *p == 1 && y.abs() < 0.5),
+            "both cells of the row must move to the top of page 1 together; frags={frags:?}"
         );
     }
 
     #[test]
     fn grid_row_recursive_cells_cosplit_across_page_boundary() {
         // 2-col grid, each cell has 2 inner divs (40px each) = 80px total.
-        // spacer 70px, page_height 100px → grid starts at y=70.
-        // Row bottom = 70 + 80 = 150 > 100 → crosses page boundary.
+        // spacer 50px, page_height 100px → grid starts at y=50.
+        // The first inner div fits (50..90), the second does not (90..130),
+        // so the row crosses the page boundary between the inner divs.
+        // (Before F28 the spacer was 70px and the first inner div hung below
+        // the page; the fragmenter now moves a row whose first block does
+        // not fit to the next page instead.)
         //
         // pre-fix: cell 2 recursion starts at page 1 cursor=0 (because
         //   cell 1's recursion advanced page_index to 1) → both inner
         //   divs of cell 2 land entirely on page 1.
         // post-fix: both cells start recursion at page 0 cursor=70 →
-        //   first inner div (40px) splits at page boundary, landing
-        //   partly on page 0 (y=70..100) and partly on page 1 (y=0..10).
-        //   Specifically: both columns' first inner divs must appear on page 0.
+        //   first inner div (40px) lands on page 0 (y=50..90), the second
+        //   one on page 1. Both columns' first inner divs must appear on page 0.
         let html = r#"
             <html><body style="margin: 0; padding: 0">
-              <div style="height: 70px"></div>
+              <div style="height: 50px"></div>
               <div style="display: grid; grid-template-columns: 100px 100px; width: 200px;">
                 <div style="width: 100px">
                   <div style="height: 40px; width: 100px"></div>
@@ -6920,19 +6973,19 @@ h2 { string-set: chapter-title content(text); }
 
         // Each column has 2 inner divs (40px each).
         // After the fix, both columns' FIRST inner div must appear on page 0
-        // (at y≈70, since the grid row starts there).
+        // (at y≈50, since the grid row starts there).
         // Pre-fix: only cell 1's first inner div is on page 0; cell 2's
         // recursion starts from page 1 so its inner divs are at y=0,40 on page 1.
         let _first_divs_page0: Vec<_> = inner
             .iter()
-            .filter(|(p, _, y)| *p == 0 && *y > 60.0)
+            .filter(|(p, _, y)| *p == 0 && *y > 40.0)
             .collect();
         // The critical assertion: the RIGHT column's first inner div must also
         // appear on page 0 (at x=100, y≈70). Pre-fix: cell 2's recursion starts
         // from page 1, so its inner divs land at x=100 only on page 1.
         let right_col_page0: Vec<_> = inner
             .iter()
-            .filter(|(p, x, y)| *p == 0 && (x - 100.0).abs() < 0.5 && *y > 60.0)
+            .filter(|(p, x, y)| *p == 0 && (x - 100.0).abs() < 0.5 && *y > 40.0)
             .collect();
         assert!(
             !right_col_page0.is_empty(),
@@ -6944,7 +6997,7 @@ h2 { string-set: chapter-title content(text); }
     fn flex_row_recursive_cells_cosplit_across_page_boundary() {
         let html = r#"
             <html><body style="margin: 0; padding: 0">
-              <div style="height: 70px"></div>
+              <div style="height: 50px"></div>
               <div style="display: flex; width: 200px;">
                 <div style="width: 100px; flex: 0 0 100px">
                   <div style="height: 40px; width: 100px"></div>
@@ -6973,7 +7026,7 @@ h2 { string-set: chapter-title content(text); }
 
         let right_col_page0: Vec<_> = inner
             .iter()
-            .filter(|(p, x, y)| *p == 0 && (x - 100.0).abs() < 0.5 && *y > 60.0)
+            .filter(|(p, x, y)| *p == 0 && (x - 100.0).abs() < 0.5 && *y > 40.0)
             .collect();
         assert!(
             !right_col_page0.is_empty(),
@@ -7564,5 +7617,243 @@ h2 { string-set: chapter-title content(text); }
         let html = r#"<html><body style="margin:0"><div id="o" style="height:10px">
               <div style="height:90px">a</div></div></body></html>"#;
         assert!(leading_of(html, "o") <= 10.5);
+    }
+
+    /// Every `ids` entry has exactly one fragment, inside its page, and the
+    /// pages never go backwards in document order.
+    fn assert_placed_once_inside_pages(
+        doc: &blitz_html::HtmlDocument,
+        geom: &PaginationGeometryTable,
+        ids: &[String],
+        page_h: f32,
+    ) -> Vec<u32> {
+        let mut pages = Vec::new();
+        for id in ids {
+            let node = find_by_id(doc.deref(), id).unwrap_or_else(|| panic!("no #{id}"));
+            let frags = &geom
+                .get(&node)
+                .unwrap_or_else(|| panic!("#{id} has no geometry"))
+                .fragments;
+            assert_eq!(frags.len(), 1, "#{id} is placed exactly once: {frags:?}");
+            let f = &frags[0];
+            assert!(
+                f.y.to_f32() + f.height.to_f32() <= page_h + 0.5,
+                "#{id} hangs below page {}: y={} h={}",
+                f.page_index,
+                f.y.to_f32(),
+                f.height.to_f32()
+            );
+            pages.push(f.page_index);
+        }
+        assert!(pages.windows(2).all(|w| w[0] <= w[1]), "pages {pages:?}");
+        pages
+    }
+
+    fn ids(prefix: &str, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{prefix}{i}")).collect()
+    }
+
+    #[test]
+    fn consecutive_one_row_tables_each_land_on_one_page() {
+        // 15 tables of one 30px row on 200px pages: 6 per page.
+        let tables: String = (0..15)
+            .map(|i| {
+                format!(
+                    r#"<table id="t{i}" style="border-spacing:0;width:100px">
+                         <tr><td id="c{i}" style="height:30px;padding:0">x</td></tr></table>"#
+                )
+            })
+            .collect();
+        let html = format!(r#"<html><body style="margin:0">{tables}</body></html>"#);
+        let (doc, geom) = table_geometry(&html, 200.0);
+        let cells = assert_placed_once_inside_pages(&doc, &geom, &ids("c", 15), 200.0);
+        assert_eq!(cells[5], 0);
+        assert_eq!(cells[6], 1, "row 7 opens page 2");
+        assert_eq!(*cells.last().unwrap(), 2);
+        // A table that moved has no fragment left on the page it left.
+        let tabs = assert_placed_once_inside_pages(&doc, &geom, &ids("t", 15), 200.0);
+        assert_eq!(tabs, cells, "each table sits on its cell's page");
+        assert_eq!(implied_page_count(&geom), 3);
+    }
+
+    #[test]
+    fn consecutive_one_row_tables_inside_a_div_each_land_on_one_page() {
+        let tables: String = (0..15)
+            .map(|i| {
+                format!(
+                    r#"<table id="t{i}" style="border-spacing:0;width:100px">
+                         <tr><td id="c{i}" style="height:30px;padding:0">x</td></tr></table>"#
+                )
+            })
+            .collect();
+        let html =
+            format!(r#"<html><body style="margin:0"><div id="w">{tables}</div></body></html>"#);
+        let (doc, geom) = table_geometry(&html, 200.0);
+        let cells = assert_placed_once_inside_pages(&doc, &geom, &ids("c", 15), 200.0);
+        assert_eq!(cells[6], 1);
+        let tabs = assert_placed_once_inside_pages(&doc, &geom, &ids("t", 15), 200.0);
+        assert_eq!(tabs, cells);
+        // The wrapper has one fragment per page it spans.
+        let w = find_by_id(doc.deref(), "w").unwrap();
+        let wp: Vec<u32> = geom[&w].fragments.iter().map(|f| f.page_index).collect();
+        assert_eq!(wp, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn consecutive_nested_divs_each_land_on_one_page() {
+        let rows: String = (0..15)
+            .map(|i| format!(r#"<div><div><div id="c{i}" style="height:30px">x</div></div></div>"#))
+            .collect();
+        let html = format!(r#"<html><body style="margin:0">{rows}</body></html>"#);
+        let (doc, geom) = table_geometry(&html, 200.0);
+        let cells = assert_placed_once_inside_pages(&doc, &geom, &ids("c", 15), 200.0);
+        assert_eq!((cells[5], cells[6], cells[14]), (0, 1, 2));
+    }
+
+    #[test]
+    fn consecutive_flex_and_grid_rows_each_land_on_one_page() {
+        for display in ["flex", "grid"] {
+            let rows: String = (0..15)
+                .map(|i| {
+                    format!(
+                        r#"<div style="display:{display};grid-template-columns:80px 80px"><div id="c{i}" style="height:30px;width:80px">x</div>
+                             <div id="d{i}" style="height:20px;width:80px">y</div></div>"#
+                    )
+                })
+                .collect();
+            let html = format!(r#"<html><body style="margin:0"><div>{rows}</div></body></html>"#);
+            let (doc, geom) = table_geometry(&html, 200.0);
+            let cells = assert_placed_once_inside_pages(&doc, &geom, &ids("c", 15), 200.0);
+            let mates = assert_placed_once_inside_pages(&doc, &geom, &ids("d", 15), 200.0);
+            assert_eq!(cells, mates, "{display}: items of a row stay together");
+            assert_eq!((cells[5], cells[6], cells[14]), (0, 1, 2), "{display}");
+        }
+    }
+
+    #[test]
+    fn table_with_room_for_one_of_two_rows_splits_between_them() {
+        let html = r#"<html><body style="margin:0"><div style="height:130px"></div>
+            <table id="t" style="border-spacing:0;width:100px">
+              <tr><td id="a" style="height:40px;padding:0">x</td></tr>
+              <tr><td id="b" style="height:40px;padding:0">y</td></tr></table></body></html>"#;
+        let (doc, geom) = table_geometry(html, 200.0);
+        let a = find_by_id(doc.deref(), "a").unwrap();
+        let b = find_by_id(doc.deref(), "b").unwrap();
+        assert_eq!(geom[&a].fragments[0].page_index, 0);
+        assert_eq!(geom[&b].fragments[0].page_index, 1);
+        assert!(geom[&b].fragments[0].y.to_f32().abs() < 0.5);
+        let t = find_by_id(doc.deref(), "t").unwrap();
+        let tp: Vec<u32> = geom[&t].fragments.iter().map(|f| f.page_index).collect();
+        assert_eq!(tp, vec![0, 1], "the table frame continues on page 2");
+    }
+
+    #[test]
+    fn table_with_no_room_for_its_first_row_moves_whole() {
+        let html = r#"<html><body style="margin:0"><div style="height:170px"></div>
+            <table id="t" style="border-spacing:0;width:100px">
+              <tr><td id="a" style="height:40px;padding:0">x</td></tr>
+              <tr><td id="b" style="height:40px;padding:0">y</td></tr></table></body></html>"#;
+        let (doc, geom) = table_geometry(html, 200.0);
+        let t = find_by_id(doc.deref(), "t").unwrap();
+        assert_eq!(
+            geom[&t].fragments.len(),
+            1,
+            "no empty table frame is left on page 1: {:?}",
+            geom[&t].fragments
+        );
+        assert_eq!(geom[&t].fragments[0].page_index, 1);
+        assert!(geom[&t].fragments[0].y.to_f32().abs() < 0.5);
+        for id in ["a", "b"] {
+            let n = find_by_id(doc.deref(), id).unwrap();
+            assert_eq!(geom[&n].fragments[0].page_index, 1, "#{id}");
+        }
+    }
+
+    #[test]
+    fn table_taller_than_a_page_with_no_room_for_its_first_row_starts_a_page() {
+        // 12 rows of 40px (480px) on 200px pages after a 170px spacer: the
+        // first row cannot fit under the spacer, so the table starts page 2
+        // and then paginates 5 rows per page.
+        let rows: String = (0..12)
+            .map(|i| format!(r#"<tr><td id="r{i}" style="height:40px;padding:0">x</td></tr>"#))
+            .collect();
+        let html = format!(
+            r#"<html><body style="margin:0"><div style="height:170px"></div>
+               <table style="border-spacing:0;width:100px">{rows}</table></body></html>"#
+        );
+        let (doc, geom) = table_geometry(&html, 200.0);
+        let pages = assert_placed_once_inside_pages(&doc, &geom, &ids("r", 12), 200.0);
+        assert_eq!(pages[0], 1);
+        assert_eq!(pages[4], 1);
+        assert_eq!(pages[5], 2);
+        assert_eq!(pages[11], 3);
+    }
+
+    #[test]
+    fn a_gap_before_the_first_row_still_breaks_inside_the_wrapper() {
+        // Class C break point: the wrapper's 20px padding fits under the
+        // 170px spacer, the 40px child does not. The child moves alone and
+        // the wrapper's frame continues on the next page.
+        let html = r#"<html><body style="margin:0"><div style="height:170px"></div>
+            <div id="w" style="padding-top:20px">
+              <div id="a" style="height:40px">x</div><div id="b" style="height:40px">y</div></div>
+            </body></html>"#;
+        let (doc, geom) = table_geometry(html, 200.0);
+        let w = find_by_id(doc.deref(), "w").unwrap();
+        let wp: Vec<u32> = geom[&w].fragments.iter().map(|f| f.page_index).collect();
+        assert_eq!(wp, vec![0, 1]);
+        let a = find_by_id(doc.deref(), "a").unwrap();
+        assert_eq!(geom[&a].fragments[0].page_index, 1);
+        assert!(geom[&a].fragments[0].y.to_f32().abs() < 0.5);
+    }
+
+    #[test]
+    fn flex_row_recursive_cells_with_a_fitting_first_line_still_cosplit() {
+        // The first inner block fits under the spacer, the second does not:
+        // both cells of the row split at the same place.
+        let html = r#"<html><body style="margin:0"><div style="height:50px"></div>
+            <div style="display:flex;width:200px">
+              <div style="width:100px"><div id="a1" style="height:40px">a</div><div id="a2" style="height:40px">b</div></div>
+              <div style="width:100px"><div id="b1" style="height:40px">c</div><div id="b2" style="height:40px">d</div></div>
+            </div></body></html>"#;
+        let (doc, geom) = table_geometry(html, 100.0);
+        let page_of = |id: &str| {
+            let n = find_by_id(doc.deref(), id).unwrap();
+            geom[&n].fragments[0].page_index
+        };
+        assert_eq!((page_of("a1"), page_of("b1")), (0, 0));
+        assert_eq!((page_of("a2"), page_of("b2")), (1, 1));
+    }
+
+    #[test]
+    fn grid_row_that_moves_to_the_next_page_still_cosplits_when_it_is_taller_than_a_page() {
+        // Row 1 is 70px; the first block of row 2 does not fit under it, so
+        // the first cell of row 2 starts page 1 (F28). Each cell of row 2 is
+        // 120px and splits between its blocks. The second cell must restart
+        // from the row's new start on page 1, not from page 0.
+        let cell = |p: &str| {
+            format!(
+                r#"<div><div id="{p}1" style="height:40px">a</div>
+                   <div id="{p}2" style="height:40px">b</div><div id="{p}3" style="height:40px">c</div></div>"#
+            )
+        };
+        let html = format!(
+            r#"<html><body style="margin:0">
+               <div style="display:grid;grid-template-columns:100px 100px;width:200px">
+                 <div style="height:70px">x</div><div style="height:70px">y</div>{}{}</div></body></html>"#,
+            cell("a"),
+            cell("b")
+        );
+        let (doc, geom) = table_geometry(&html, 100.0);
+        let place = |id: &str| {
+            let n = find_by_id(doc.deref(), id).unwrap();
+            let f = &geom[&n].fragments[0];
+            (f.page_index, f.y.to_f32())
+        };
+        for p in ["a", "b"] {
+            assert_eq!(place(&format!("{p}1")), (1, 0.0), "{p}1");
+            assert_eq!(place(&format!("{p}2")), (1, 40.0), "{p}2");
+            assert_eq!(place(&format!("{p}3")), (2, 0.0), "{p}3");
+        }
     }
 }
