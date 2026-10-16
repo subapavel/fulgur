@@ -2417,7 +2417,7 @@ fn fragment_block_subtree(
             page_index,
         );
         let mut needs_recursion =
-            line_split.is_none() && gate((strips.fresh() - cursor_y).max(0.0));
+            line_split.is_none() && gate((strips.bottom(page_index) - cursor_y).max(0.0));
 
         // Strip-overflow page cut (fulgur-7hf5 moved it below the gate; F28
         // moves it back above): the child starts a new page when the part of
@@ -2446,7 +2446,7 @@ fn fragment_block_subtree(
             // paragraph that cannot even start here moves to the next page.
             let leading = split.leading();
             if leading <= strips.fresh() {
-                leading + strips.fresh() - strips.bottom(page_index)
+                leading
             } else {
                 0.0
             }
@@ -2471,7 +2471,9 @@ fn fragment_block_subtree(
         } else {
             child_h
         };
-        if child_page_y > page_start_y + band && child_page_y + first_break_h > strips.fresh() {
+        if child_page_y > page_start_y + band
+            && child_page_y + first_break_h > strips.bottom(page_index)
+        {
             let should_emit = row_state
                 .as_mut()
                 .map(|rs| rs.emitted_parent_pages.insert(page_index))
@@ -2513,7 +2515,7 @@ fn fragment_block_subtree(
                 );
             } else if needs_recursion {
                 // The child may fit the new page whole.
-                needs_recursion = gate((strips.fresh() - cursor_y).max(0.0));
+                needs_recursion = gate((strips.bottom(page_index) - cursor_y).max(0.0));
                 // A later cell of this flex / grid row restores the row's
                 // start state when the cell recurses across pages; that
                 // start is now the new page.
@@ -9406,5 +9408,72 @@ h2 { string-set: chapter-title content(text); }
         // With an offset of 0 the row fits where it is (140 + 30 <= 200).
         let (doc, table) = offset_geometry("body{margin:0}", &body, 200.0);
         assert_eq!(fragments_of(&doc, &table, "r0")[0].page_index, 0);
+    }
+
+    #[test]
+    fn a_table_under_a_body_margin_breaks_its_rows_at_the_shortened_page_zero() {
+        // 10 rows of 30px on 200px pages, 40px body margin: 5 rows (150px; the 6th would end at 180 > 160) on
+        // page 0, the rest on page 1 from y = 0.
+        let rows: String = (0..10)
+            .map(|i| format!("<tr><td id=\"r{i}\" style=\"height:30px;padding:0\">x</td></tr>"))
+            .collect();
+        let body = format!("<table style=\"border-spacing:0;width:100%\">{rows}</table>");
+        let (doc, table) = offset_geometry("body{margin:40px}", &body, 200.0);
+        let pages: Vec<u32> = (0..10)
+            .map(|i| fragments_of(&doc, &table, &format!("r{i}"))[0].page_index)
+            .collect();
+        assert_eq!(pages, vec![0, 0, 0, 0, 0, 1, 1, 1, 1, 1]);
+        let r5 = &fragments_of(&doc, &table, "r5")[0];
+        assert!(r5.y.to_f32().abs() < 0.5, "{r5:?}");
+    }
+
+    #[test]
+    fn nested_monolithic_blocks_under_a_body_margin_do_not_share_page_zero() {
+        let body = "<main><div id=\"a\" style=\"height:50px\"></div><div id=\"b\" style=\"height:50px\"></div>\
+                    <div id=\"c\" style=\"height:50px\"></div><div id=\"d\" style=\"height:50px\"></div></main>";
+        // 40 + 4 x 50 > 200 (the last block would end 20px past the content box): `d` moves to page 1.
+        let (doc, table) = offset_geometry("body{margin:40px}", body, 200.0);
+        let pages: Vec<u32> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|id| fragments_of(&doc, &table, id)[0].page_index)
+            .collect();
+        assert_eq!(pages, vec![0, 0, 0, 1]);
+        assert!(fragments_of(&doc, &table, "d")[0].y.to_f32().abs() < 0.5);
+        let (doc, table) = offset_geometry("body{margin:0}", body, 200.0);
+        assert_eq!(fragments_of(&doc, &table, "d")[0].page_index, 0);
+    }
+
+    #[test]
+    fn a_nested_box_whose_first_row_does_not_fit_page_zero_moves_to_page_one() {
+        // As at body level, one box deeper: 140px spacer + 30px row > 160px.
+        let rows: String = (0..5)
+            .map(|i| format!("<div id=\"r{i}\" style=\"height:30px\"></div>"))
+            .collect();
+        let body = format!(
+            "<main><div style=\"height:140px\"></div><section id=\"s\">{rows}</section></main>"
+        );
+        let (doc, table) = offset_geometry("body{margin:40px}", &body, 200.0);
+        let r0 = &fragments_of(&doc, &table, "r0")[0];
+        assert_eq!(r0.page_index, 1, "{r0:?}");
+        assert!(r0.y.to_f32().abs() < 0.5, "{r0:?}");
+        let (doc, table) = offset_geometry("body{margin:0}", &body, 200.0);
+        assert_eq!(fragments_of(&doc, &table, "r0")[0].page_index, 0);
+    }
+
+    #[test]
+    fn a_nested_paragraph_after_a_spacer_starts_at_the_shortened_page_zero() {
+        // 100px spacer, 40px offset: 60px are left on page 0 (3 lines), the paragraph of 30 lines is taller
+        // than a page and splits there (F30) instead of hanging 3 lines below the content box.
+        let body = format!(
+            "<main><div style=\"height:100px\"></div><p id=\"p\">{}</p></main>",
+            br_lines(30)
+        );
+        let (doc, table) = offset_geometry("body{margin:40px}", &body, 200.0);
+        let f = fragments_of(&doc, &table, "p");
+        assert_eq!(f[0].page_index, 0, "{f:?}");
+        assert!(
+            f[0].y.to_f32() + f[0].height.to_f32() <= 160.5,
+            "page 0 ends at 160px: {f:?}"
+        );
     }
 }

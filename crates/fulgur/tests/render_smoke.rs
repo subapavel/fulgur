@@ -6921,3 +6921,27 @@ fn paragraph_taller_than_a_page_inside_a_bordered_box_splits_at_lines() {
         "expected the paragraphs to span pages, got {pages}"
     );
 }
+
+#[test]
+fn body_margin_shortens_page_zero_instead_of_losing_lines_below_the_page() {
+    // F29: page 0 is painted down by the body margin; its lines used to be broken against the full page height,
+    // so the last ones of the page were drawn below the page box and lost.
+    let lines: Vec<String> = (1..=120).map(|i| format!("Line{i:04}")).collect();
+    let html = format!(
+        r#"<!DOCTYPE html><html><body style="margin:300px 0 0"><p style="margin:0;line-height:20px">{}</p></body></html>"#,
+        lines.join("<br>"),
+    );
+    let pdf = Engine::builder().build().render(&html).expect("render");
+    assert!(pdf.starts_with(b"%PDF"));
+    assert!(page_count(&pdf) >= 3, "got {} page(s)", page_count(&pdf));
+    if let Some(text) = extract_pdf_text(&pdf) {
+        for i in 1..=120 {
+            let word = format!("Line{i:04}");
+            assert_eq!(
+                text.matches(&word).count(),
+                1,
+                "{word} must be printed exactly once"
+            );
+        }
+    }
+}
