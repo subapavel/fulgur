@@ -1195,6 +1195,76 @@ fn render_v2_smoke_outside_symbol_markers_with_bundled_font() {
 }
 
 #[test]
+fn render_v2_smoke_outside_marker_missing_from_the_font_paints_no_notdef() {
+    // Noto Sans has no U+25E6 / U+25AA: an outside `circle` / `square` marker shaped with
+    // the item's font would be GID 0 (a visible box with no Unicode mapping). It must not
+    // be painted at all; the `disc` marker, which the face has, still is.
+    let html = r##"<!doctype html><html><body>
+<ul><li>disc</li><li style="list-style-type: circle">circle</li>
+<li style="list-style-type: square">square</li></ul>
+</body></html>"##;
+    let font_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/.fonts/NotoSans-Regular.ttf");
+    let mut assets = AssetBundle::default();
+    assets
+        .add_font_file(&font_path)
+        .unwrap_or_else(|e| panic!("failed to load Noto Sans from {}: {e}", font_path.display()));
+    assets.add_css("body { font-family: 'Noto Sans'; }");
+    let pdf = Engine::builder()
+        .assets(assets)
+        .system_fonts(false)
+        .build()
+        .render(html)
+        .expect("outside markers render");
+    assert_eq!(
+        count_notdef_cids(&pdf),
+        0,
+        "a marker painted the .notdef glyph"
+    );
+    if let Some(text) = extract_pdf_text(&pdf) {
+        assert!(
+            text.contains("• disc"),
+            "the disc marker is still painted: {text:?}"
+        );
+    }
+}
+
+/// Count 2-byte CIDs equal to 0 (`.notdef`) in the text-showing strings of every page.
+fn count_notdef_cids(pdf: &[u8]) -> usize {
+    fn zeros(bytes: &[u8]) -> usize {
+        bytes.chunks_exact(2).filter(|c| c == &[0, 0]).count()
+    }
+    let doc = lopdf::Document::load_mem(pdf).expect("PDF must parse");
+    let mut count = 0;
+    for (_, page_id) in doc.get_pages() {
+        let bytes = doc
+            .get_page_content(page_id)
+            .expect("page content stream readable");
+        let content = lopdf::content::Content::decode(&bytes).expect("content decodes");
+        for op in content
+            .operations
+            .iter()
+            .filter(|op| op.operator == "TJ" || op.operator == "Tj")
+        {
+            for operand in &op.operands {
+                match operand {
+                    lopdf::Object::String(s, _) => count += zeros(s),
+                    lopdf::Object::Array(items) => {
+                        for item in items {
+                            if let lopdf::Object::String(s, _) = item {
+                                count += zeros(s);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    count
+}
+
+#[test]
 fn render_v2_smoke_multicol_rule_inside_transform() {
     // Regression for PR #305 follow-up Devin: a multicol container
     // with `column-rule` nested inside a `transform` ancestor needs

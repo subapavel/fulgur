@@ -266,7 +266,32 @@ pub(super) fn extract_marker_lines(
         });
     }
 
+    if drop_notdef_marker(&mut shaped_lines) {
+        log::warn!(
+            "list marker {marker_text:?}: the item's font has no glyph for it; the marker is not painted"
+        );
+        max_width = crate::units::Pt::ZERO;
+    }
+
     (shaped_lines, max_width, line_height_pt)
+}
+
+/// Clears every glyph run of a marker that contains a `.notdef` glyph (id 0) and returns
+/// whether it did. The marker is shaped with the item's own font; when that face lacks the
+/// symbol (e.g. U+25E6 / U+25AA), painting GID 0 would show a box with no Unicode mapping
+/// (PDF/A-2 §6.2.11.8, PDF/UA-1 §7.21.8). The lines are kept so the marker's line height
+/// still sizes image markers.
+fn drop_notdef_marker(lines: &mut [ShapedLine]) -> bool {
+    let has_notdef = lines.iter().flat_map(|l| &l.items).any(|item| match item {
+        LineItem::Text(run) => run.glyphs.iter().any(|g| g.id == 0),
+        _ => false,
+    });
+    if has_notdef {
+        for line in lines {
+            line.items.clear();
+        }
+    }
+    has_notdef
 }
 
 /// Search for a font that covers the marker's non-whitespace characters.
@@ -417,6 +442,51 @@ mod tests {
         let mut bundle = AssetBundle::new();
         bundle.add_font_bytes(woff2).expect("WOFF2 decode failed");
         Arc::clone(&bundle.fonts[0])
+    }
+
+    // ── drop_notdef_marker ───────────────────────────────────────────────────
+
+    fn marker_line(glyph_ids: &[u32]) -> ShapedLine {
+        let glyphs = glyph_ids
+            .iter()
+            .map(|&id| ShapedGlyph {
+                id,
+                x_advance: 0.5,
+                x_offset: 0.0,
+                y_offset: 0.0,
+                text_range: 0..1,
+            })
+            .collect();
+        ShapedLine {
+            height: 12.0.as_pt(),
+            baseline: 9.0.as_pt(),
+            items: vec![LineItem::Text(ShapedGlyphRun {
+                font_data: load_noto_sans_ttf(),
+                font_index: 0,
+                font_size: 12.0.as_pt(),
+                color: [0, 0, 0, 255],
+                decoration: Default::default(),
+                glyphs,
+                text: Arc::from("\u{25e6} "),
+                x_offset: crate::units::Pt::ZERO,
+                link: None,
+            })],
+        }
+    }
+
+    #[test]
+    fn drop_notdef_marker_keeps_a_marker_with_real_glyphs() {
+        let mut lines = vec![marker_line(&[77, 7])];
+        assert!(!drop_notdef_marker(&mut lines));
+        assert_eq!(lines[0].items.len(), 1);
+    }
+
+    #[test]
+    fn drop_notdef_marker_clears_a_marker_with_a_notdef_glyph() {
+        let mut lines = vec![marker_line(&[0, 7])];
+        assert!(drop_notdef_marker(&mut lines));
+        assert_eq!(lines.len(), 1, "the line is kept for its height");
+        assert!(lines[0].items.is_empty());
     }
 
     // ── size_raster_marker ────────────────────────────────────────────────────
