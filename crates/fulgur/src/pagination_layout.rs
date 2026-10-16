@@ -1385,6 +1385,88 @@ fn would_split_block_subtree(
     false
 }
 
+/// F28: block-size from the top border edge of `node_id` to the first place
+/// the fragmenter can break inside it, i.e. how much of the box has to fit on
+/// a page strip for entering it there to make progress (CSS Fragmentation 3
+/// §4.1, §4.4).
+///
+/// - A gap between the content edge and the first in-flow child (padding,
+///   border, a margin that did not collapse through) is a class C break point
+///   (§4.1), so the answer is the first child's offset.
+/// - Without a gap the only break point before the first row is the class A
+///   point in front of the box itself, so the box needs its first *row* to fit:
+///   the maximum over the children that share the first child's `y` (cells of a
+///   table row, items of a flex / grid row) of `y + leading_block_size(item)`.
+/// - A box without in-flow children with a height (a leaf, an inline root, a
+///   multicol container) is not entered by the fragmenter and counts whole.
+///
+/// The result never exceeds the node's own height. It walks the same children
+/// (`layout_children` first, whitespace / out-of-flow / empty skipped) as
+/// [`would_split_block_subtree`] and follows only the first row, so it is cheap.
+#[cfg_attr(not(test), allow(dead_code))]
+fn leading_block_size(doc: &BaseDocument, node_id: usize, depth: usize) -> f32 {
+    let Some(node) = doc.get_node(node_id) else {
+        return 0.0;
+    };
+    let own_h = if node.final_layout.size.height.is_finite() {
+        node.final_layout.size.height.max(0.0)
+    } else {
+        0.0
+    };
+    if depth >= crate::MAX_DOM_DEPTH || crate::blitz_adapter::is_multicol_container(node) {
+        return own_h;
+    }
+    let layout_children_borrow = node.layout_children.borrow();
+    let walk_children: &[usize] = layout_children_borrow
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .unwrap_or(&node.children);
+    let mut first_row_top: Option<f32> = None;
+    let mut leading: f32 = 0.0;
+    for &child_id in walk_children {
+        let Some(child) = doc.get_node(child_id) else {
+            continue;
+        };
+        if let Some(text) = child.text_data()
+            && text.content.chars().all(char::is_whitespace)
+        {
+            continue;
+        }
+        {
+            use ::style::properties::longhands::position::computed_value::T as Pos;
+            let is_oof = child.primary_styles().is_some_and(|s| {
+                matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed)
+            });
+            if is_oof {
+                continue;
+            }
+        }
+        let layout = child.final_layout;
+        if !layout.size.height.is_finite() || layout.size.height <= 0.0 {
+            continue;
+        }
+        let top = layout.location.y;
+        match first_row_top {
+            None => {
+                if top > 0.5 {
+                    // Class C break point: the gap in front of the first child.
+                    return top.min(own_h);
+                }
+                first_row_top = Some(top);
+            }
+            // Later children that are not level with the first one start a
+            // later row.
+            Some(row_top) if top > row_top + 0.5 => break,
+            Some(_) => {}
+        }
+        leading = leading.max(top + leading_block_size(doc, child_id, depth + 1));
+    }
+    if first_row_top.is_none() {
+        return own_h;
+    }
+    leading.min(own_h)
+}
+
 /// fulgur-a36m (Phase 3.1.5b): true if any descendant of `node_id`
 /// declares `break-before: page` or `break-after: page` in
 /// `column_styles`. Walks the entire DOM subtree, bails at
@@ -7419,5 +7501,68 @@ h2 { string-set: chapter-title content(text); }
             crate::blitz_adapter::first_table_header_group(doc.deref(), d),
             None
         );
+    }
+
+    // ── F28: boxes whose first row sits at their top edge ───────────────────
+
+    fn leading_of(html: &str, id: &str) -> f32 {
+        let doc = parse(html, 600.0);
+        let node = find_by_id(doc.deref(), id).unwrap();
+        super::leading_block_size(doc.deref(), node, 0)
+    }
+
+    #[test]
+    fn leading_block_size_of_a_leaf_is_its_height() {
+        let html =
+            r#"<html><body style="margin:0"><div id="a" style="height:37px">x</div></body></html>"#;
+        assert!((leading_of(html, "a") - 37.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn leading_block_size_of_a_table_is_its_first_row() {
+        let html = r#"<html><body style="margin:0"><table id="t" style="border-spacing:0;width:200px">
+              <tr><td style="height:30px;padding:0">a</td><td style="height:50px;padding:0">b</td></tr>
+              <tr><td style="height:40px;padding:0">c</td><td style="padding:0">d</td></tr></table></body></html>"#;
+        let leading = leading_of(html, "t");
+        assert!(
+            (leading - 50.0).abs() < 0.5,
+            "first row = tallest cell of row 1, got {leading}"
+        );
+    }
+
+    #[test]
+    fn leading_block_size_sees_through_gapless_wrappers() {
+        let html = r#"<html><body style="margin:0"><div id="o"><div><div style="height:20px">a</div>
+              <div style="height:90px">b</div></div><div style="height:100px">c</div></div></body></html>"#;
+        let leading = leading_of(html, "o");
+        assert!(
+            (leading - 20.0).abs() < 0.5,
+            "first leaf of the first chain, got {leading}"
+        );
+    }
+
+    #[test]
+    fn leading_block_size_stops_at_a_gap_before_the_first_child() {
+        // Class C break point: padding is a gap, the child may start a page.
+        let html = r#"<html><body style="margin:0"><div id="o" style="padding-top:6px">
+              <div style="height:80px">a</div></div></body></html>"#;
+        let leading = leading_of(html, "o");
+        assert!((leading - 6.0).abs() < 0.5, "got {leading}");
+    }
+
+    #[test]
+    fn leading_block_size_of_a_flex_row_is_its_tallest_item() {
+        let html = r#"<html><body style="margin:0"><div id="f" style="display:flex">
+              <div style="height:30px;width:50px">a</div><div style="height:45px;width:50px">b</div></div>
+              <div style="height:100px">after</div></body></html>"#;
+        let leading = leading_of(html, "f");
+        assert!((leading - 45.0).abs() < 0.5, "got {leading}");
+    }
+
+    #[test]
+    fn leading_block_size_never_exceeds_the_node_height() {
+        let html = r#"<html><body style="margin:0"><div id="o" style="height:10px">
+              <div style="height:90px">a</div></div></body></html>"#;
+        assert!(leading_of(html, "o") <= 10.5);
     }
 }
