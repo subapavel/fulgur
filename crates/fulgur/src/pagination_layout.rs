@@ -9372,21 +9372,13 @@ h2 { string-set: chapter-title content(text); }
         // Cells of one row split across pages: the row ends where its tallest cell ends, whichever
         // cell is processed last (F30b: direct text; the same holds for `<td><p>`).
         for (what, a, b) in [
-            (
-                "direct text",
-                format!("{}", br_lines(30)),
-                format!("{}", br_lines(20)),
-            ),
+            ("direct text", br_lines(30), br_lines(20)),
             (
                 "paragraphs",
                 format!("<p>{}</p>", br_lines(30)),
                 format!("<p>{}</p>", br_lines(20)),
             ),
-            (
-                "taller last",
-                format!("{}", br_lines(20)),
-                format!("{}", br_lines(30)),
-            ),
+            ("taller last", br_lines(20), br_lines(30)),
         ] {
             let (doc, table) = nested_geometry(
                 &format!(
