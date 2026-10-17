@@ -866,7 +866,7 @@ mod tests {
         assert_eq!(claim(5000, 5000), None, "over it: header only");
         assert_eq!(claim(12000, 12000), None);
         // The PNG / GIF limit stays 128 Mi: see `validate_refuses_huge_headers_before_decoding`.
-        assert!(MAX_IMAGE_PIXELS > MAX_JPEG_VALIDATION_PIXELS);
+        const { assert!(MAX_IMAGE_PIXELS > MAX_JPEG_VALIDATION_PIXELS) };
     }
 
     #[test]
