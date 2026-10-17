@@ -722,8 +722,9 @@ pub(crate) fn extract_column_style_table(
     //    project-wide "no panic on bad CSS" invariant.
     let rules = crate::column_css::parse_stylesheet(&css);
 
-    // 3. Build the side-table (cascade: stylesheets folded in source order,
-    //    inline `style` attributes applied last, per-node).
+    // 3. Build the side-table (cascade: stylesheets folded in the order
+    //    `parse_stylesheet` returns them, which is layer order and then source
+    //    order; inline `style` attributes applied last, per-node).
     crate::column_css::build_column_style_table(doc, &rules)
 }
 
@@ -6620,6 +6621,52 @@ mod tests {
         assert_eq!(
             props.break_inside,
             Some(crate::draw_primitives::BreakInside::Avoid)
+        );
+    }
+
+    /// F87: the break / column reader and Stylo read the same `@media` blocks. The reader matches
+    /// `column_css::READER_MEDIA_TYPE`; Blitz builds its Stylo device as a screen (`make_device`). Stylo colours `#a`
+    /// (inside `@media screen`) and not `#b` (inside `@media print`), and the table holds `#a` only. If Blitz gets a
+    /// print device this fails: flip `READER_MEDIA_TYPE` together with the print/screen swap in `htmltopdf`'s
+    /// `media.rs`.
+    #[test]
+    fn column_reader_media_type_agrees_with_stylo_device() {
+        let html = r#"<!doctype html><html><head><style>
+            @media screen { #a { color: rgb(1,2,3); break-before: page } }
+            @media print { #b { color: rgb(1,2,3); break-before: page } }
+        </style></head><body><p id="a">a</p><p id="b">b</p></body></html>"#;
+        let mut doc = parse(html, 400.0, &[]);
+        resolve(&mut doc);
+        use std::ops::Deref;
+        let a = find_element_by_attr_id(doc.deref(), "a");
+        let b = find_element_by_attr_id(doc.deref(), "b");
+        let coloured = |id: usize| {
+            doc.get_node(id)
+                .and_then(|n| n.primary_styles())
+                .is_some_and(|s| {
+                    let c = s.clone_color().into_srgb_legacy();
+                    let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    [q(c.components.0), q(c.components.1), q(c.components.2)] == [1, 2, 3]
+                })
+        };
+        assert!(
+            coloured(a),
+            "Stylo applies @media screen: the device is not a screen any more"
+        );
+        assert!(
+            !coloured(b),
+            "Stylo applies @media print: the device is a print one now"
+        );
+        let table = extract_column_style_table(&doc);
+        assert!(
+            table.get(&a).is_some_and(|p| p.break_before.is_some()),
+            "the reader skipped @media {} although Stylo applies it ({})",
+            crate::column_css::READER_MEDIA_TYPE,
+            "READER_MEDIA_TYPE"
+        );
+        assert!(
+            !table.contains_key(&b),
+            "the reader applied @media print although Stylo does not; READER_MEDIA_TYPE must follow the device"
         );
     }
 

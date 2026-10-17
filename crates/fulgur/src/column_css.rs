@@ -17,12 +17,21 @@
 //! - `<style media="...">` blocks whose media excludes `all` / `print` are
 //!   skipped by the harvester (`extract_column_style_table` in
 //!   `blitz_adapter.rs`). Full CSS media-query evaluation is deferred.
+//! - `@layer` and `@media` blocks are read (F87): Tailwind v4 puts every
+//!   utility in `@layer utilities { … }`. Rules are folded in cascade order,
+//!   which is layer order first (CSS Cascade 5 §6.4: a later layer beats an
+//!   earlier one, a layer's own rules beat its sub-layers, unlayered rules
+//!   beat every layer) and source order inside a layer. `@media` is read when
+//!   the query is `[only|not]? all|screen` (see [`READER_MEDIA_TYPE`]); a query
+//!   with a feature does not match. `@supports` and every other at-rule are
+//!   skipped, and so are blocks nested deeper than `MAX_AT_RULE_DEPTH`.
 //! - The selector grammar is intentionally tiny: type (`div`), class
 //!   (`.foo`), id (`#bar`), universal (`*`), compound (`div.foo#bar`) and
 //!   comma-separated lists. Unsupported combinators or pseudo-classes cause
 //!   the whole rule to be dropped silently.
-//! - Source order wins (no specificity, no `!important`). Inline style is
-//!   folded last so it beats stylesheet rules.
+//! - Layer order, then source order wins (no specificity, no `!important`).
+//!   Inline style is folded last so it beats stylesheet rules in every layer
+//!   (Cascade 5 §6.1: element-attached styles come before layers).
 //! - Length units: `pt` passes through, `px` is converted to `pt` using the
 //!   canonical CSS factor `72 / 96`. `em` and `rem` resolve against a fixed
 //!   `DEFAULT_EM_PX = 16.0` basis (Phase B will replace this with the
@@ -170,6 +179,8 @@ pub(crate) type ColumnStyleTable = BTreeMap<usize, ColumnStyleProps>;
 pub(crate) struct StyleRule {
     pub selectors: Vec<ComplexSelector>,
     pub props: ColumnStyleProps,
+    /// Cascade layer the rule was written in; `0` for unlayered rules.
+    pub layer: LayerId,
 }
 
 /// One simple selector — a single unqualified component of a compound
@@ -920,31 +931,236 @@ fn previous_element_sibling<'a>(
 // Stylesheet parser
 // ---------------------------------------------------------------------------
 
-/// Parse a top-level CSS source into [`StyleRule`]s. `@`-rules are skipped
-/// entirely (returning `Err` from `parse_prelude` — cssparser's
-/// `StyleSheetParser` then consumes and discards the block without calling
-/// `parse_block`). Qualified rules whose prelude contains an unsupported
-/// selector are dropped. Empty property blocks are kept out of the result
-/// to save memory.
+/// Media type of the device Stylo is given, as the reader sees it in the CSS text it receives.
+///
+/// Blitz builds its Stylo device as `MediaType::screen()` (`blitz-dom` `document.rs`, `make_device`), so the
+/// `@media` blocks Stylo applies are `all` and `screen`. The embedding crate (`htmltopdf`) turns the author's
+/// `print` into `screen` and back in every `@media` prelude before this crate sees the CSS, so the author's `print`
+/// rules reach it as `screen` ones. The reader must read exactly the blocks Stylo applies, otherwise a break rule and
+/// the other declarations of its `@media` block would switch separately. Evaluating `print` here would apply the
+/// author's screen rules for that embedder.
+///
+/// When Blitz gets a print device, and the swap goes away, this constant flips with it.
+/// `blitz_adapter::tests::column_reader_media_type_agrees_with_stylo_device` fails the day that happens.
+pub(crate) const READER_MEDIA_TYPE: &str = "screen";
+
+/// Deepest nesting of `@layer` / `@media` blocks the reader descends into; deeper blocks are skipped like any other
+/// unknown at-rule. Descending recurses, and a stack overflow aborts the process (a panic guard cannot catch it).
+/// Real documents nest 3 deep at most (Tailwind: `@layer utilities { @media print { … } }`).
+const MAX_AT_RULE_DEPTH: usize = 32;
+
+/// Index of a cascade layer in a [`LayerTree`]; `0` is the root (unlayered styles).
+pub(crate) type LayerId = usize;
+
+/// The cascade layers of one stylesheet, in order of first appearance (CSS Cascade 5 §6.4.1–§6.4.2).
+///
+/// Node `0` is the root: the unlayered styles. A layer's children are its sub-layers in the order they were first
+/// named. [`LayerTree::ranks`] flattens the tree into the order in which layers are sorted for normal declarations.
+#[derive(Debug)]
+pub(crate) struct LayerTree {
+    nodes: Vec<LayerNode>,
+}
+
+#[derive(Debug, Default)]
+struct LayerNode {
+    /// Sub-layers in order of first appearance, anonymous ones included.
+    children: Vec<LayerId>,
+    /// Named sub-layers. `BTreeMap`, not `HashMap`: determinism is a project-wide invariant.
+    named: BTreeMap<String, LayerId>,
+}
+
+impl LayerTree {
+    pub(crate) fn new() -> Self {
+        Self {
+            nodes: vec![LayerNode::default()],
+        }
+    }
+
+    /// The sub-layer of `parent` called `name`, created on first use. `None` is an anonymous layer, and every
+    /// anonymous layer is a new one (§6.4.1).
+    pub(crate) fn child(&mut self, parent: LayerId, name: Option<&str>) -> LayerId {
+        if let Some(&id) = name.and_then(|n| self.nodes[parent].named.get(n)) {
+            return id;
+        }
+        let id = self.nodes.len();
+        self.nodes.push(LayerNode::default());
+        self.nodes[parent].children.push(id);
+        if let Some(name) = name {
+            self.nodes[parent].named.insert(name.to_string(), id);
+        }
+        id
+    }
+
+    /// `rank[layer]`: the position of the layer in the cascade, ascending, so that a normal declaration of a higher
+    /// rank beats a lower one. Post-order: a layer's sub-layers come first, then its own rules (§6.4.2, "implicit
+    /// final sub-layer"), and the root, the unlayered styles, last (§6.4.3). Iterative: a dotted name can be long.
+    pub(crate) fn ranks(&self) -> Vec<usize> {
+        let mut rank = vec![0; self.nodes.len()];
+        let mut next = 0;
+        // (layer, index of the next child to visit)
+        let mut stack: Vec<(LayerId, usize)> = vec![(0, 0)];
+        while let Some(&mut (id, ref mut at)) = stack.last_mut() {
+            if let Some(&child) = self.nodes[id].children.get(*at) {
+                *at += 1;
+                stack.push((child, 0));
+            } else {
+                rank[id] = next;
+                next += 1;
+                stack.pop();
+            }
+        }
+        rank
+    }
+}
+
+/// Does a media query list match the device? CSS Conditional 3 §5, Media Queries 4 §2.1–§2.3.
+///
+/// A query matches when it is `[only | not]? <media-type>` with nothing after the type and the type is `all` or
+/// [`READER_MEDIA_TYPE`]; `not` negates. A query with a feature (`and (hover: hover)`, `(width >= 40rem)`), a
+/// deprecated type, or any syntax the reader does not know does not match: the block is skipped, which leaves today's
+/// value. A comma separates queries, any one of which may match. An empty list matches (§2.1).
+pub(crate) fn media_query_list_matches(input: &mut Parser<'_, '_>) -> bool {
+    use cssparser::Delimiter;
+    let mut any = input.is_exhausted();
+    while !input.is_exhausted() {
+        let query = input.parse_until_before(Delimiter::Comma, |i| {
+            Ok::<bool, ParseError<'_, ()>>(media_query_matches(i))
+        });
+        any |= query.unwrap_or(false);
+        // Consume the comma; at the end of the input there is none.
+        let _ = input.next();
+    }
+    any
+}
+
+fn media_query_matches(input: &mut Parser<'_, '_>) -> bool {
+    let Ok(first) = input.expect_ident_cloned() else {
+        return false;
+    };
+    let (negated, media_type) = if first.eq_ignore_ascii_case("not") {
+        match input.expect_ident_cloned() {
+            Ok(t) => (true, t),
+            Err(_) => return false,
+        }
+    } else if first.eq_ignore_ascii_case("only") {
+        match input.expect_ident_cloned() {
+            Ok(t) => (false, t),
+            Err(_) => return false,
+        }
+    } else {
+        (false, first)
+    };
+    if !input.is_exhausted() {
+        return false;
+    }
+    let is_all = media_type.eq_ignore_ascii_case("all");
+    let is_device = media_type.eq_ignore_ascii_case(READER_MEDIA_TYPE);
+    // `not` negates a known type only: `not speech` is not "matches everything".
+    let is_other_known =
+        media_type.eq_ignore_ascii_case("print") || media_type.eq_ignore_ascii_case("screen");
+    if !(is_all || is_device || is_other_known) {
+        return false;
+    }
+    (is_all || is_device) != negated
+}
+
+/// Parse a top-level CSS source into [`StyleRule`]s, in ascending cascade order. Qualified rules whose prelude
+/// contains an unsupported selector are dropped. Empty property blocks are kept out of the result to save memory.
+///
+/// At-rules:
+///
+/// - `@layer` (block) is descended into with the rules assigned to that layer; `@layer a, b;` only names layers;
+/// - `@media` is descended into at the same layer when [`media_query_list_matches`];
+/// - every other at-rule (`@supports`, `@font-face`, `@property`, `@page`, `@import`, …) is skipped, and so is a
+///   block nested deeper than [`MAX_AT_RULE_DEPTH`]: returning `Err` from `parse_prelude` makes cssparser consume
+///   and discard the block.
+///
+/// The order of the result is the cascade for normal declarations: a stable sort by layer rank
+/// ([`LayerTree::ranks`], unlayered rules last), so source order holds inside a layer and
+/// [`build_column_style_table`] folding the rules in order gives last-wins per field.
 pub(crate) fn parse_stylesheet(source: &str) -> Vec<StyleRule> {
     let mut rules = Vec::new();
+    let mut layers = LayerTree::new();
     let mut input = ParserInput::new(source);
     let mut parser = Parser::new(&mut input);
 
-    let mut sheet = SheetParser { rules: &mut rules };
+    let mut sheet = SheetParser {
+        rules: &mut rules,
+        layers: &mut layers,
+        layer: 0,
+        depth: 0,
+    };
     let iter = StyleSheetParser::new(&mut parser, &mut sheet);
     for item in iter {
         let _ = item;
+    }
+    if layers.nodes.len() > 1 {
+        let ranks = layers.ranks();
+        rules.sort_by_key(|r| ranks[r.layer]);
     }
     rules
 }
 
 struct SheetParser<'a> {
     rules: &'a mut Vec<StyleRule>,
+    layers: &'a mut LayerTree,
+    /// Layer the rules of this (sub-)sheet belong to.
+    layer: LayerId,
+    /// Nesting depth of this (sub-)sheet; the top level is `0`.
+    depth: usize,
+}
+
+/// What an at-rule prelude parsed to.
+enum AtPrelude {
+    /// `@layer` with its comma-separated names; each name is its dotted path. An empty list is an anonymous layer.
+    Layer(Vec<Vec<String>>),
+    /// A matching `@media`.
+    Media,
+}
+
+/// `<layer-name> = <ident> [ '.' <ident> ]*` (Cascade 5 §6.4.2).
+fn parse_layer_name(input: &mut Parser<'_, '_>) -> Option<Vec<String>> {
+    let mut path = vec![input.expect_ident().ok()?.as_ref().to_string()];
+    // `a.b` tokenises as an ident and a `.b` pair: no whitespace is allowed around the dot.
+    while input.try_parse(|i| i.expect_delim('.')).is_ok() {
+        path.push(
+            input
+                .next_including_whitespace()
+                .ok()
+                .and_then(|t| match t {
+                    Token::Ident(n) => Some(n.as_ref().to_string()),
+                    _ => None,
+                })?,
+        );
+    }
+    Some(path)
+}
+
+impl SheetParser<'_> {
+    /// Rules of `block` belong to `layer`, one level deeper.
+    fn parse_nested<'i>(
+        &mut self,
+        layer: LayerId,
+        input: &mut Parser<'i, '_>,
+    ) -> Result<(), ParseError<'i, ()>> {
+        if self.depth >= MAX_AT_RULE_DEPTH {
+            return Err(input.new_error(BasicParseErrorKind::AtRuleBodyInvalid));
+        }
+        let mut nested = SheetParser {
+            rules: &mut *self.rules,
+            layers: &mut *self.layers,
+            layer,
+            depth: self.depth + 1,
+        };
+        for item in StyleSheetParser::new(input, &mut nested) {
+            let _ = item;
+        }
+        Ok(())
+    }
 }
 
 impl<'i, 'a> AtRuleParser<'i> for SheetParser<'a> {
-    type Prelude = ();
+    type Prelude = AtPrelude;
     type AtRule = ();
     type Error = ();
 
@@ -953,10 +1169,74 @@ impl<'i, 'a> AtRuleParser<'i> for SheetParser<'a> {
         name: CowRcStr<'i>,
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::Prelude, ParseError<'i, ()>> {
-        // Terminate every at-rule at the prelude — `StyleSheetParser` will
-        // then skip the associated block. GCPM's parser takes `@page` but
-        // we are strictly after qualified rules.
-        Err(input.new_error(BasicParseErrorKind::AtRuleInvalid(name)))
+        // Anything but `@layer` and `@media` ends at the prelude with `Err`: `StyleSheetParser` then skips the
+        // block (or the statement) without calling `parse_block`.
+        if name.eq_ignore_ascii_case("layer") {
+            // An empty prelude is an anonymous layer (a block) or an error (a statement, see `rule_without_block`).
+            let names = if input.is_exhausted() {
+                Vec::new()
+            } else {
+                input.parse_comma_separated(|i| {
+                    parse_layer_name(i)
+                        .ok_or_else(|| i.new_error(BasicParseErrorKind::QualifiedRuleInvalid))
+                })?
+            };
+            Ok(AtPrelude::Layer(names))
+        } else if name.eq_ignore_ascii_case("media") {
+            if media_query_list_matches(input) {
+                Ok(AtPrelude::Media)
+            } else {
+                Err(input.new_error(BasicParseErrorKind::AtRuleInvalid(name)))
+            }
+        } else {
+            Err(input.new_error(BasicParseErrorKind::AtRuleInvalid(name)))
+        }
+    }
+
+    fn rule_without_block(
+        &mut self,
+        prelude: Self::Prelude,
+        _start: &cssparser::ParserState,
+    ) -> Result<Self::AtRule, ()> {
+        // `@layer a, b.c;` names layers without rules, which fixes their order. A statement with no name is invalid.
+        match prelude {
+            AtPrelude::Layer(names) if !names.is_empty() => {
+                for path in &names {
+                    let mut at = self.layer;
+                    for part in path {
+                        at = self.layers.child(at, Some(part));
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(()),
+        }
+    }
+
+    fn parse_block<'t>(
+        &mut self,
+        prelude: Self::Prelude,
+        _start: &cssparser::ParserState,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::AtRule, ParseError<'i, ()>> {
+        match prelude {
+            AtPrelude::Layer(names) => {
+                // A block takes at most one name: `@layer a, b { … }` is invalid.
+                let layer = match names.as_slice() {
+                    [] => self.layers.child(self.layer, None),
+                    [path] => {
+                        let mut at = self.layer;
+                        for part in path {
+                            at = self.layers.child(at, Some(part));
+                        }
+                        at
+                    }
+                    _ => return Err(input.new_error(BasicParseErrorKind::AtRuleBodyInvalid)),
+                };
+                self.parse_nested(layer, input)
+            }
+            AtPrelude::Media => self.parse_nested(self.layer, input),
+        }
     }
 }
 
@@ -996,7 +1276,11 @@ impl<'i, 'a> QualifiedRuleParser<'i> for SheetParser<'a> {
             let _ = item;
         }
         if !props.is_empty() {
-            self.rules.push(StyleRule { selectors, props });
+            self.rules.push(StyleRule {
+                selectors,
+                props,
+                layer: self.layer,
+            });
         }
         Ok(())
     }
@@ -1006,8 +1290,8 @@ impl<'i, 'a> QualifiedRuleParser<'i> for SheetParser<'a> {
 // Cascade driver
 // ---------------------------------------------------------------------------
 
-/// Build the per-document side-table by folding stylesheet rules (in source
-/// order) and then inline `style` attributes (last — they beat the
+/// Build the per-document side-table by folding stylesheet rules (in the
+/// order given: cascade order, see [`parse_stylesheet`]) and then inline `style` attributes (last — they beat the
 /// stylesheet) into each node's entry. Nodes with no matching rule and no
 /// inline declaration are skipped entirely.
 pub(crate) fn build_column_style_table(
@@ -1502,16 +1786,55 @@ mod tests {
     }
 
     #[test]
-    fn stylesheet_skips_at_rules() {
+    fn stylesheet_skips_unmatched_at_rules() {
+        // `@media print` does not match the device (`READER_MEDIA_TYPE` is `screen`; the embedder swaps the two),
+        // `@supports` is never evaluated: only the bare `.mc` rule remains.
         let css = r#"
             @media print { .mc { column-rule: 1pt solid red; } }
+            @supports (display: grid) { .mc { column-rule: 1pt solid red; } }
             .mc { column-fill: auto; }
         "#;
         let rules = parse_stylesheet(css);
-        // The `@media` block is skipped entirely — only the bare `.mc`
-        // rule remains.
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].props.fill, Some(ColumnFill::Auto));
+        assert_eq!(rules[0].layer, 0);
+    }
+
+    #[test]
+    fn stylesheet_reads_matching_media_and_layers_in_cascade_order() {
+        let css = r#"
+            .z { column-fill: auto; }
+            @layer late { .y { column-fill: auto; } }
+            @media screen { .x { column-fill: auto; } }
+            @layer early { .w { column-fill: auto; } }
+        "#;
+        let rules = parse_stylesheet(css);
+        let class = |r: &StyleRule| match &r.selectors[0].subject.parts[0] {
+            SimpleSelector::Class(c) => c.clone(),
+            other => panic!("{other:?}"),
+        };
+        // Layers by first appearance (`late` < `early`), then unlayered rules (`.z`, `.x`) in source order.
+        let order: Vec<String> = rules.iter().map(class).collect();
+        assert_eq!(order, ["y", "w", "z", "x"]);
+    }
+
+    #[test]
+    fn layer_ranks_are_post_order() {
+        let mut t = LayerTree::new();
+        let a = t.child(0, Some("a"));
+        let ax = t.child(a, Some("x"));
+        let b = t.child(0, Some("b"));
+        let anon1 = t.child(0, None);
+        let anon2 = t.child(0, None);
+        assert_ne!(anon1, anon2);
+        assert_eq!(t.child(0, Some("a")), a, "a name is the same layer");
+        assert_eq!(t.child(a, Some("x")), ax);
+        let r = t.ranks();
+        // a.x < a < b < anon1 < anon2 < root.
+        let order = [ax, a, b, anon1, anon2, 0];
+        assert!(order.windows(2).all(|w| r[w[0]] < r[w[1]]), "{r:?}");
+        // The root is last, however many layers there are.
+        assert_eq!(r[0], r.len() - 1);
     }
 
     #[test]
@@ -2261,5 +2584,257 @@ mod tests {
     fn selector_leading_plus_drops_list() {
         // A `+` with no preceding compound (current.parts empty) is invalid.
         assert!(parse_selector_list("+div").is_empty());
+    }
+    // -------- cascade layers and conditional rules (F87) --------
+
+    /// `break-inside` the cascade gives the element `id="k"` of `<p id="k" class="k">` for the stylesheet `css`.
+    fn break_inside_of(css: &str, inline: &str) -> Option<crate::draw_primitives::BreakInside> {
+        let html =
+            format!(r#"<html><body><p id="k" class="k" style="{inline}">x</p></body></html>"#);
+        let doc = build_doc(&html);
+        let table = build_column_style_table(&doc, &parse_stylesheet(css));
+        let id = find_node_with(&doc, |n| {
+            n.element_data()
+                .and_then(|e| crate::blitz_adapter::get_attr(e, "id"))
+                == Some("k")
+        })
+        .expect("k");
+        table.get(&id).and_then(|p| p.break_inside)
+    }
+
+    use crate::draw_primitives::BreakInside::{Auto, Avoid};
+
+    #[test]
+    fn a_rule_inside_a_layer_is_read() {
+        assert_eq!(
+            break_inside_of("@layer utilities{.k{break-inside:avoid}}", ""),
+            Some(Avoid)
+        );
+    }
+
+    #[test]
+    fn unlayered_rule_beats_a_layer_whatever_the_order() {
+        // Case A. Cascade 5 §6.4: unlayered styles form an implicit final layer.
+        let layered = "@layer utilities{.k{break-inside:avoid}}";
+        let unlayered = "p{break-inside:auto}";
+        assert_eq!(
+            break_inside_of(&format!("{unlayered}{layered}"), ""),
+            Some(Auto)
+        );
+        assert_eq!(
+            break_inside_of(&format!("{layered}{unlayered}"), ""),
+            Some(Auto)
+        );
+    }
+
+    #[test]
+    fn an_earlier_layer_loses_to_a_later_one_whatever_the_source_order() {
+        // Case B: `base` is declared before `utilities` by the statement, so it loses although its rule comes last.
+        assert_eq!(
+            break_inside_of(
+                "@layer base, utilities;@layer utilities{.k{break-inside:avoid}}@layer base{p{break-inside:auto}}",
+                ""
+            ),
+            Some(Avoid)
+        );
+        // Case C: `overrides` is declared after `utilities` and wins although its rule comes first.
+        assert_eq!(
+            break_inside_of(
+                "@layer utilities, overrides;@layer overrides{.k{break-inside:auto}}@layer utilities{.k{break-inside:avoid}}",
+                ""
+            ),
+            Some(Auto)
+        );
+    }
+
+    #[test]
+    fn a_layer_beats_its_own_sublayers() {
+        // Case D. Cascade 5 §6.4: a layer's own rules are an implicit final sub-layer.
+        assert_eq!(
+            break_inside_of(
+                "@layer a{.k{break-inside:auto}@layer b{.k{break-inside:avoid}}}",
+                ""
+            ),
+            Some(Auto)
+        );
+        assert_eq!(
+            break_inside_of(
+                "@layer a{@layer b{.k{break-inside:avoid}}.k{break-inside:auto}}",
+                ""
+            ),
+            Some(Auto)
+        );
+    }
+
+    #[test]
+    fn a_dotted_layer_name_is_the_nested_layer() {
+        let dotted = "@layer a.b{.k{break-inside:avoid}}@layer a{.k{break-inside:auto}}";
+        let nested = "@layer a{@layer b{.k{break-inside:avoid}}}@layer a{.k{break-inside:auto}}";
+        assert_eq!(break_inside_of(dotted, ""), Some(Auto));
+        assert_eq!(break_inside_of(nested, ""), Some(Auto));
+        // `a.b` after `a.c` ranks above it; both below `a`'s own rules.
+        assert_eq!(
+            break_inside_of(
+                "@layer a.c{.k{break-inside:auto}}@layer a.b{.k{break-inside:avoid}}",
+                ""
+            ),
+            Some(Avoid)
+        );
+    }
+
+    #[test]
+    fn anonymous_layers_are_distinct_and_ordered() {
+        assert_eq!(
+            break_inside_of(
+                "@layer{.k{break-inside:avoid}}@layer{.k{break-inside:auto}}",
+                ""
+            ),
+            Some(Auto)
+        );
+        assert_eq!(
+            break_inside_of(
+                "@layer{.k{break-inside:auto}}@layer{.k{break-inside:avoid}}",
+                ""
+            ),
+            Some(Avoid)
+        );
+    }
+
+    #[test]
+    fn a_layer_statement_fixes_the_order_without_rules() {
+        let rules = "@layer a{.k{break-inside:auto}}@layer b{.k{break-inside:avoid}}";
+        assert_eq!(break_inside_of(rules, ""), Some(Avoid));
+        assert_eq!(
+            break_inside_of(&format!("@layer b, a;{rules}"), ""),
+            Some(Auto)
+        );
+    }
+
+    #[test]
+    fn the_style_attribute_beats_layered_and_unlayered_rules() {
+        assert_eq!(
+            break_inside_of("@layer u{.k{break-inside:avoid}}", "break-inside:auto"),
+            Some(Auto)
+        );
+        assert_eq!(
+            break_inside_of(".k{break-inside:avoid}", "break-inside:auto"),
+            Some(Auto)
+        );
+        assert_eq!(
+            break_inside_of("@layer u{.k{break-inside:auto}}", "break-inside:avoid"),
+            Some(Avoid)
+        );
+    }
+
+    #[test]
+    fn media_blocks_are_read_when_the_query_matches_the_device() {
+        // The device is a screen (Blitz `make_device`, see `READER_MEDIA_TYPE`).
+        let read = |q: &str| {
+            break_inside_of(&format!("@media {q}{{.k{{break-inside:avoid}}}}"), "") == Some(Avoid)
+        };
+        assert!(read("screen"));
+        assert!(read("all"));
+        assert!(read("SCREEN"));
+        assert!(read("only screen"));
+        assert!(read("not print"));
+        assert!(read("print, screen"));
+        assert!(!read("print"));
+        assert!(!read("not screen"));
+        assert!(!read("only print"));
+        assert!(!read("screen and (min-width:1px)"));
+        assert!(!read("(hover:hover)"));
+        assert!(!read("(width >= 40rem)"));
+        assert!(!read("speech"));
+    }
+
+    #[test]
+    fn a_media_block_nests_in_a_layer_and_in_a_media_block() {
+        assert_eq!(
+            break_inside_of("@layer u{@media screen{.k{break-inside:avoid}}}", ""),
+            Some(Avoid)
+        );
+        assert_eq!(
+            break_inside_of(
+                "@media screen{@layer u{@media all{.k{break-inside:avoid}}}}",
+                ""
+            ),
+            Some(Avoid)
+        );
+        assert_eq!(
+            break_inside_of("@layer u{@media print{.k{break-inside:avoid}}}", ""),
+            None
+        );
+    }
+
+    #[test]
+    fn supports_blocks_stay_skipped() {
+        // Tailwind puts only custom properties and colour fallbacks there; evaluating conditions is out of scope.
+        assert_eq!(
+            break_inside_of("@supports (display:grid){.k{break-inside:avoid}}", ""),
+            None
+        );
+        assert_eq!(
+            break_inside_of(
+                "@layer u{@supports not (display:grid){.k{break-inside:avoid}}}",
+                ""
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn other_at_rules_stay_skipped_and_do_not_swallow_the_next_rule() {
+        let css = "@font-face{font-family:x}@property --a{syntax:'*';inherits:false}@import 'x.css';\
+                   @page{margin:0}@keyframes k{from{opacity:0}}.k{break-inside:avoid}";
+        assert_eq!(break_inside_of(css, ""), Some(Avoid));
+    }
+
+    #[test]
+    fn an_escaped_class_selector_matches_the_class() {
+        let html = r#"<html><body><p id="k" class="print:break-before-page">x</p></body></html>"#;
+        let doc = build_doc(html);
+        let rules = parse_stylesheet(r"@layer u{.print\:break-before-page{break-before:page}}");
+        let table = build_column_style_table(&doc, &rules);
+        let id = find_node_with(&doc, |n| {
+            n.element_data()
+                .and_then(|e| crate::blitz_adapter::get_attr(e, "id"))
+                == Some("k")
+        })
+        .expect("k");
+        assert_eq!(
+            table.get(&id).and_then(|p| p.break_before),
+            Some(BreakBefore::Page)
+        );
+    }
+
+    #[test]
+    fn deeply_nested_blocks_do_not_overflow_the_stack() {
+        // A stack overflow aborts the process, `catch_unwind` cannot catch it.
+        for open in ["@layer{", "@media screen{", "@layer a.b.c{@media all{"] {
+            let css = format!("{}.k{{break-inside:avoid}}", open.repeat(10_000));
+            assert_eq!(break_inside_of(&css, ""), None, "{open}");
+        }
+        let dotted = format!(
+            "@layer {}{{.k{{break-inside:avoid}}}}",
+            vec!["a"; 10_000].join(".")
+        );
+        assert_eq!(break_inside_of(&dotted, ""), Some(Avoid));
+    }
+
+    #[test]
+    fn nesting_up_to_the_cap_is_read() {
+        let n = MAX_AT_RULE_DEPTH;
+        let css = format!(
+            "{}.k{{break-inside:avoid}}{}",
+            "@layer{".repeat(n),
+            "}".repeat(n)
+        );
+        assert_eq!(break_inside_of(&css, ""), Some(Avoid));
+        let css = format!(
+            "{}.k{{break-inside:avoid}}{}",
+            "@layer{".repeat(n + 1),
+            "}".repeat(n + 1)
+        );
+        assert_eq!(break_inside_of(&css, ""), None);
     }
 }

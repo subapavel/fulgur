@@ -8514,6 +8514,28 @@ h2 { string-set: chapter-title content(text); }
         assert!(!avoid_inside_holds(true, 7000.0, 1000.0), "taller");
     }
 
+    /// F87: a `break-before` inside `@layer` (Tailwind v4's shape) reaches the fragmenter: the second paragraph
+    /// starts page index 1. The same rule outside a layer gave the same result before; the layered one was dropped
+    /// by the reader.
+    #[test]
+    fn break_before_inside_a_layer_starts_a_page() {
+        for css in [
+            "@layer u{.b{break-before:page}}",
+            "@layer base,u;@layer u{.b{break-before:page}}@layer base{p{break-before:auto}}",
+            ".b{break-before:page}",
+        ] {
+            let html = format!(
+                "<!doctype html><html><head><style>body{{margin:0;font-size:16px;line-height:20px}}p{{margin:0}}{css}\
+                 </style></head><body><p class=\"a\">one</p><p class=\"b\">two</p></body></html>"
+            );
+            let mut doc = parse(&html, 600.0);
+            let table = blitz_adapter::extract_column_style_table(&doc);
+            let geom = run_pass_with_break_styles(doc.deref_mut(), 200.0_f32.as_px(), &table);
+            let page = |class: &str| geom[&node_by_class(&doc, class)].fragments[0].page_index;
+            assert_eq!((page("a"), page("b")), (0, 1), "{css}");
+        }
+    }
+
     #[test]
     fn line_slices_tile_rejects_gaps_overlaps_and_short_cover() {
         let s = |first, end| super::LineSlice {
