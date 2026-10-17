@@ -1587,7 +1587,15 @@ fn paint_multicol_paragraph_slices(
                 if slice_page == page_index {
                     let abs_x = container_x_pt + slice.origin_pt.0;
                     let abs_y = container_y_pt + slice.origin_pt.1;
-                    crate::paragraph::draw_shaped_lines(canvas, &slice.lines, abs_x, abs_y, None);
+                    draw_slice_tagged(
+                        canvas,
+                        drawables,
+                        source_node_id,
+                        use_run_tagging,
+                        slice,
+                        abs_x,
+                        abs_y,
+                    );
                 }
                 continue;
             }
@@ -1612,12 +1620,42 @@ fn paint_multicol_paragraph_slices(
             }
             let abs_x = container_x_pt + slice.origin_pt.0;
             let abs_y = container_y_pt + slice_top.as_pt();
-            crate::paragraph::draw_shaped_lines(canvas, &slice.lines, abs_x, abs_y, None);
+            draw_slice_tagged(
+                canvas,
+                drawables,
+                source_node_id,
+                use_run_tagging,
+                slice,
+                abs_x,
+                abs_y,
+            );
         }
     });
     if use_run_tagging {
         canvas.link_run_node_id = None;
     }
+}
+
+/// Paint one multicol paragraph slice. Unless per-run link tagging is on (it tags the runs itself), the slice is
+/// one marked-content sequence of its source's tag, like a paragraph painted by `draw_paragraph_v2`: a paragraph
+/// cut over columns and pages is several sequences under the same structure element (F30d review: its text was
+/// outside any marked content and its `/P` elements were empty).
+fn draw_slice_tagged(
+    canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
+    drawables: &Drawables,
+    source_node_id: usize,
+    use_run_tagging: bool,
+    slice: &crate::drawables::ParagraphSlice,
+    abs_x: crate::units::Pt,
+    abs_y: crate::units::Pt,
+) {
+    let tag_info = if use_run_tagging {
+        None
+    } else {
+        try_start_tagged(canvas, source_node_id, drawables)
+    };
+    crate::paragraph::draw_shaped_lines(canvas, &slice.lines, abs_x, abs_y, None);
+    finish_tagged(canvas, tag_info);
 }
 
 /// Collect the inline-box subtrees that paragraphs drawn *inside a scope*

@@ -662,14 +662,14 @@ pub(super) fn extract_paragraph(
 /// not before the end of the previous one. Right for gaps below 64 KiB between clusters, which is every
 /// document: a gap that large would be an unshaped item that long.
 #[derive(Default)]
-struct ClusterUnwrap {
+pub(super) struct ClusterUnwrap {
     prev_end: usize,
 }
 
 impl ClusterUnwrap {
     const PERIOD: usize = 1 << 16;
 
-    fn fix(&mut self, r: Range<usize>) -> Range<usize> {
+    pub(super) fn fix(&mut self, r: Range<usize>) -> Range<usize> {
         let len = r.end.saturating_sub(r.start);
         let start = if r.start >= self.prev_end {
             r.start

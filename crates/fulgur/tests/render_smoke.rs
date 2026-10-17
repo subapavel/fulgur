@@ -7456,3 +7456,161 @@ fn render_v2_smoke_multicol_text_taller_than_a_page_prints_every_word() {
         assert_eq!(missing, 0, "{missing} of 4000 words are missing or doubled");
     }
 }
+
+#[test]
+fn render_v2_smoke_multicol_paragraph_over_64_kib_keeps_its_text_ranges() {
+    // F30d review H1: Parley keeps the offset of a cluster in its run as `u16`, so in a paragraph over 65 535 bytes
+    // the text ranges of the later glyphs wrapped and the text layer repeated earlier words in place of them. Multicol
+    // shapes its paragraphs itself (`shape_paragraph_glyph_runs`) and has to undo the wrap like `extract_paragraph`:
+    // in a container cut over pages and in one that fits (1 px text). Checked on the glyphs' text ranges (pdftotext
+    // drops tiny text): every glyph of the Latin text has a range of its own, the last one ends at the text's end.
+    for (what, style, paged) in [
+        ("over pages", "", true),
+        ("in one piece", "font-size:1px;", false),
+    ] {
+        let words: Vec<String> = (0..13_000).map(|i| format!("w{i:05}")).collect();
+        let html = format!(
+            "<!doctype html><html><body style=\"margin:0;{style}\">\
+             <div style=\"column-count:2\"><p style=\"margin:0\">{}</p></div></body></html>",
+            words.join(" ")
+        );
+        let drawables = noto_engine().build_drawables_for_testing_no_gcpm(&html);
+        let entry = drawables
+            .paragraph_slices
+            .values()
+            .next()
+            .unwrap_or_else(|| panic!("{what}: no paragraph slices"));
+        assert_eq!(
+            entry.slices.iter().all(|s| s.page_index.is_some()),
+            paged,
+            "{what}: paged slices"
+        );
+        let mut starts = std::collections::BTreeSet::new();
+        let mut glyphs = 0usize;
+        let mut text_len = 0usize;
+        for slice in &entry.slices {
+            for line in &slice.lines {
+                for item in &line.items {
+                    if let fulgur::paragraph::LineItem::Text(run) = item {
+                        text_len = run.text.len();
+                        for g in &run.glyphs {
+                            glyphs += 1;
+                            starts.insert(g.text_range.start);
+                            assert!(g.text_range.end <= text_len, "{what}: range past the text");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            text_len > 65_535,
+            "{what}: the paragraph is {text_len} bytes"
+        );
+        assert_eq!(
+            starts.len(),
+            glyphs,
+            "{what}: glyphs share text ranges (wrapped offsets)"
+        );
+        assert_eq!(
+            *starts.last().unwrap(),
+            text_len - 1,
+            "{what}: the last glyph is the last character"
+        );
+    }
+}
+
+/// `(text-show operators outside any marked-content sequence, `/P` structure elements without content)` of a
+/// tagged PDF.
+fn untagged_text_and_empty_p(pdf: &[u8]) -> (usize, usize) {
+    use lopdf::Object;
+    let doc = lopdf::Document::load_mem(pdf).expect("PDF must parse");
+    let mut outside = 0;
+    for (_, page_id) in doc.get_pages() {
+        let bytes = doc.get_page_content(page_id).expect("page content");
+        let content = lopdf::content::Content::decode(&bytes).expect("content decodes");
+        let mut depth = 0usize;
+        for op in &content.operations {
+            match op.operator.as_str() {
+                "BDC" | "BMC" => depth += 1,
+                "EMC" => depth = depth.saturating_sub(1),
+                "Tj" | "TJ" | "'" | "\"" if depth == 0 => outside += 1,
+                _ => {}
+            }
+        }
+    }
+    fn has_content(doc: &lopdf::Document, o: &Object) -> bool {
+        match o {
+            Object::Reference(id) => doc
+                .get_object(*id)
+                .map(|o| has_content(doc, o))
+                .unwrap_or(false),
+            Object::Array(a) => a.iter().any(|o| has_content(doc, o)),
+            Object::Dictionary(d) => {
+                matches!(d.get(b"Type"), Ok(Object::Name(n)) if n == b"MCR" || n == b"OBJR")
+                    || d.get(b"K").map(|k| has_content(doc, k)).unwrap_or(false)
+            }
+            Object::Integer(_) => true,
+            _ => false,
+        }
+    }
+    fn count_empty_p(doc: &lopdf::Document, o: &Object, empty: &mut usize) {
+        match o {
+            Object::Reference(id) => {
+                if let Ok(o) = doc.get_object(*id) {
+                    count_empty_p(doc, o, empty);
+                }
+            }
+            Object::Array(a) => a.iter().for_each(|o| count_empty_p(doc, o, empty)),
+            Object::Dictionary(d) => {
+                if matches!(d.get(b"S"), Ok(Object::Name(n)) if n == b"P")
+                    && !d.get(b"K").map(|k| has_content(doc, k)).unwrap_or(false)
+                {
+                    *empty += 1;
+                }
+                if let Ok(k) = d.get(b"K") {
+                    count_empty_p(doc, k, empty);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut empty = 0;
+    let root = doc.catalog().expect("catalog");
+    let st = root.get(b"StructTreeRoot").expect("StructTreeRoot");
+    count_empty_p(&doc, st, &mut empty);
+    (outside, empty)
+}
+
+#[test]
+fn render_v2_smoke_tagged_multicol_paragraphs_are_marked_content() {
+    // F30d review: with `tagged(true)` the text of `<p>` children of a multicol container was not marked content
+    // (their `/P` elements stayed empty and the text-show operators sat outside any BDC), over pages and in one
+    // piece alike: `paint_multicol_paragraph_slices` tagged a slice only for per-run link tagging.
+    let words: Vec<String> = (0..1500).map(|i| format!("w{i:04}")).collect();
+    let text = words.join(" ");
+    for (what, html) in [
+        (
+            "over pages, <p> children",
+            format!(
+                "<!doctype html><html><body style=\"margin:0\"><div style=\"column-count:2\">\
+                 <p>{}</p><p>{}</p></div></body></html>",
+                &text[..text.len() / 2],
+                &text[text.len() / 2..]
+            ),
+        ),
+        (
+            "in one piece, <p> child",
+            "<!doctype html><html><body><div style=\"column-count:2\"><p>one two three four \
+             five six seven eight nine ten</p></div></body></html>"
+                .to_string(),
+        ),
+    ] {
+        let pdf = tagged_render_with_noto(&html);
+        let (outside, empty) = untagged_text_and_empty_p(&pdf);
+        assert_eq!(
+            outside, 0,
+            "{what}: text-show operators outside marked content"
+        );
+        assert_eq!(empty, 0, "{what}: /P elements without content");
+    }
+}

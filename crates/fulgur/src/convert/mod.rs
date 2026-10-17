@@ -1067,6 +1067,14 @@ fn shape_paragraph_glyph_runs(
     ctx: &mut ConvertContext<'_>,
 ) -> Vec<ShapedLine> {
     let mut shaped_lines = Vec::new();
+    // Parley keeps a cluster's offset within its run as `u16`, so in a paragraph over 65 535 bytes the glyphs'
+    // text ranges wrap (F70, `extract_paragraph`): the text layer would repeat earlier words in place of the
+    // later ones. Undone here the same way, for left-to-right text; the clusters of a run are visited in text
+    // order, once per run on a line, as the un-wrapping needs.
+    let mut unwrap = (text.len() > u16::MAX as usize
+        && !parley_layout.lines().any(|l| l.runs().any(|r| r.is_rtl())))
+    .then(inline_root::ClusterUnwrap::default);
+    let mut run_ranges: Vec<std::ops::Range<usize>> = Vec::new();
     for line in parley_layout.lines() {
         let metrics = line.metrics();
         let mut items = Vec::new();
@@ -1090,13 +1098,21 @@ fn shape_paragraph_glyph_runs(
                 if run_key != prev_run_key {
                     prev_run_key = run_key;
                     run_glyph_offset = 0;
+                    if let Some(u) = unwrap.as_mut() {
+                        run_ranges.clear();
+                        run_ranges.extend(run.visual_clusters().map(|c| u.fix(c.text_range())));
+                    }
                 }
                 let glyph_start = run_glyph_offset;
 
                 let mut annotated = run
                     .visual_clusters()
-                    .flat_map(|cluster| {
-                        let r = cluster.text_range();
+                    .enumerate()
+                    .flat_map(|(i, cluster)| {
+                        let r = match unwrap {
+                            Some(_) => run_ranges[i].clone(),
+                            None => cluster.text_range(),
+                        };
                         cluster.glyphs().map(move |g| (r.clone(), g))
                     })
                     .skip(glyph_start);
