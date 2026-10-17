@@ -7299,3 +7299,23 @@ fn render_smoke_whitespace_zero_width_and_inline_boxes_are_not_dropped_text() {
         .render(html)
         .expect("nothing visible is left out");
 }
+
+#[test]
+fn render_smoke_ligatures_marks_and_sequences_are_not_dropped_text() {
+    // A cluster's own text range stops at its first character: the second `f` of a ligature, a combining
+    // mark, the rest of a ZWJ emoji sequence, a regional-indicator pair and decomposed Hangul have no range
+    // of their own although they are shaped (and drawn) with the run. Measured with Noto Sans, which has
+    // `ffi` and marks and no emoji, Thai or Hangul (the run gets notdef glyphs, as before).
+    let html = "<!doctype html><html><body>\
+        <p>office ff fi \u{fb01} e\u{301} a\u{308} a\u{300}\u{301}\u{302}b</p>\
+        <p>\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} \u{1F1E8}\u{1F1FF} 1\u{fe0f}\u{20e3} \u{1F44D}\u{1F3FD}</p>\
+        <p>\u{0e01}\u{0e33} \u{1112}\u{1161}\u{11ab} \u{0915}\u{094D}\u{0937}</p>\
+        <p>Příliš žluťoučký kůň úpěl ďábelské ódy</p></body></html>";
+    Engine::builder()
+        .system_fonts(false)
+        .strict_text(true)
+        .assets(noto_bundle())
+        .build()
+        .render(html)
+        .expect("everything shaped with a face is covered");
+}

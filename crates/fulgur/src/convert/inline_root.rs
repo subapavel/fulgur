@@ -476,6 +476,10 @@ pub(super) fn extract_paragraph(
             match item {
                 parley::PositionedLayoutItem::GlyphRun(glyph_run) => {
                     let run = glyph_run.run();
+                    // The run's whole text on this line is shaped with a face: ligature continuations,
+                    // combining marks and the rest of a ZWJ sequence have no glyph (or text range) of their
+                    // own in a cluster, so the glyphs' ranges alone would flag them.
+                    note_covered(&mut covered, &run.text_range());
                     let font_ref = run.font();
                     let font_index = font_ref.index;
                     let font_arc = ctx.get_or_insert_font(font_ref);
@@ -518,7 +522,6 @@ pub(super) fn extract_paragraph(
                             )
                         });
                         run_glyph_offset += 1;
-                        note_covered(&mut covered, &text_range);
                         glyphs.push(ShapedGlyph {
                             id: g.id,
                             x_advance: ShapedGlyph::normalize_by_font_size(
