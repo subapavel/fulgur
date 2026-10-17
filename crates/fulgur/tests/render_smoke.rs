@@ -7413,6 +7413,37 @@ fn render_smoke_an_avoid_paragraph_over_many_a4_pages_loses_no_line() {
 }
 
 #[test]
+fn render_smoke_avoid_wrapper_moves_whole_to_the_next_page() {
+    // F83b: a `break-inside: avoid` wrapper that does not fit the room under the spacer but fits a page moves whole to
+    // page 2. It used to be entered and split between its paragraphs (the first fit), leaving ALPHA on page 1.
+    let html = "<!doctype html><html><head><style>@page{size:A4;margin:0}\
+        body{margin:0;line-height:20px}p{margin:0}</style></head><body>\
+        <div style=\"height:1050px\"></div>\
+        <div style=\"break-inside:avoid\">\
+        <p>ALPHA one<br>ALPHA two</p><p>BRAVO one<br>BRAVO two</p><p>CHARLIE one<br>CHARLIE two</p>\
+        </div></body></html>";
+    let pdf = Engine::builder()
+        .system_fonts(false)
+        .strict_text(true)
+        .assets(noto_bundle())
+        .build()
+        .render(html)
+        .expect("every word has a face");
+    assert_eq!(page_count(&pdf), 2);
+    if let Some(text) = extract_pdf_text(&pdf) {
+        let pages: Vec<&str> = text.split('\x0c').collect();
+        for word in ["ALPHA", "BRAVO", "CHARLIE"] {
+            assert!(!pages[0].contains(word), "{word} on page 1: {:?}", pages[0]);
+            assert!(
+                pages[1].contains(word),
+                "{word} not on page 2: {:?}",
+                pages[1]
+            );
+        }
+    }
+}
+
+#[test]
 fn render_smoke_dropped_text_after_64_kib_is_found_once_and_only_it() {
     // `monospace` is unmapped here, so the `<code>` gets no glyph run (a named family inside a root that has a
     // face is drawn by Parley's fallback).

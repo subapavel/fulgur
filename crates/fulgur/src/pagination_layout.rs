@@ -53,7 +53,12 @@
 //! - `break-before` / `break-after` / `break-inside: avoid` from the
 //!   shared [`crate::column_css::ColumnStyleTable`] side-table.
 //!   `break-inside: avoid` holds while the box fits a page and is relaxed
-//!   past that ([`avoid_inside_holds`]).
+//!   past that ([`avoid_inside_holds`]). A kept-whole avoid box in block
+//!   flow (a body child, or a child of a block) moves whole to the next
+//!   page when it does not fit and content precedes it; one taller than a
+//!   page starts the next page when content precedes it and then breaks
+//!   like an `auto` one ([`avoid_keeps_whole`], [`starts_with_relaxed_avoid`],
+//!   F83b).
 //!
 //! # Production extension points
 //!
@@ -411,6 +416,204 @@ fn avoid_inside_holds(avoid_inside: bool, height: f32, fresh: f32) -> bool {
     avoid_inside && height <= fresh + 1.0
 }
 
+/// F83b: the block-size the `break-inside: avoid` rules measure for `node`: the line extent of an inline root with
+/// two or more lines (the F83 / F83c rule: a box taller than a page only through `height` or padding keeps its lines
+/// on one page), the border-box height of any other box (css-break-3 §4.4 counts the whole box, its bottom padding
+/// and border included).
+fn avoid_extent(node: &blitz_dom::Node) -> f32 {
+    let lines = collect_inline_line_metrics(node);
+    if let (Some(first), Some(last)) = (lines.first(), lines.last())
+        && lines.len() >= 2
+    {
+        return last.1 - first.0;
+    }
+    if node.final_layout.size.height.is_finite() {
+        node.final_layout.size.height.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+/// F83b: whether an avoid box of block-size `extent` is kept whole where it is placed: `avoid` holds
+/// ([`avoid_inside_holds`], it fits a fresh page of `fresh`) and the box either fits the `room` left below its
+/// placement or can move to the next page (`content_above`: in-flow content precedes it on this one, so the class A
+/// break point in front of it exists and is perfect, css-break-3 §4.5). A box that does not fit, with nothing
+/// above it, is entered as before: Chrome does not break at the start of a fragmentainer either, and a page of
+/// nothing is not an improvement.
+fn avoid_keeps_whole(
+    avoid_inside: bool,
+    extent: f32,
+    room: f32,
+    fresh: f32,
+    content_above: bool,
+) -> bool {
+    avoid_inside_holds(avoid_inside, extent, fresh) && (extent <= room + 1.0 || content_above)
+}
+
+/// F83b: whether `node`'s children are laid out in block flow, i.e. the places where a child's `break-inside: avoid`
+/// is honoured by moving the child whole: not a flex / grid container (its items are not class A break points, and
+/// moving one would desynchronise the row state), not an atomic inline, not an orthogonal flow, not a table (its
+/// rows and cells have their own handling, F83d), not a multicol container.
+fn is_block_flow_container(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
+    use ::style::values::specified::box_::DisplayInside;
+    !crate::blitz_adapter::is_flex_or_grid_container_node(node)
+        && !crate::blitz_adapter::is_atomic_inline_container_node(node)
+        && !crate::blitz_adapter::is_multicol_container(node)
+        && !node
+            .parent
+            .and_then(|gp| doc.get_node(gp))
+            .is_some_and(|gp| crate::blitz_adapter::is_orthogonal_to_parent(gp, node))
+        && !node
+            .primary_styles()
+            .is_some_and(|s| s.clone_display().inside() == DisplayInside::Table)
+}
+
+/// F83b: whether `node_id` has `break-inside: avoid` in `column_styles`.
+fn has_avoid(column_styles: Option<&crate::column_css::ColumnStyleTable>, node_id: usize) -> bool {
+    column_styles
+        .and_then(|t| t.get(&node_id))
+        .is_some_and(|p| {
+            matches!(
+                p.break_inside,
+                Some(crate::draw_primitives::BreakInside::Avoid)
+            )
+        })
+}
+
+/// F83b: block-size from the top border edge of `node_id` to the first forced break inside it (the top of a
+/// descendant with `break-before: page`, the bottom of one with `break-after: page`), or the node's own height when
+/// there is none. This is the piece of an avoid box that has to be kept together: a forced break wins over `avoid`
+/// (css-break-3 §4.3), and what follows it starts a page of its own. Walks the DOM children like
+/// [`has_forced_break_below`].
+fn avoid_piece_size(
+    doc: &BaseDocument,
+    node_id: usize,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    depth: usize,
+) -> f32 {
+    let Some(node) = doc.get_node(node_id) else {
+        return 0.0;
+    };
+    let own_h = if node.final_layout.size.height.is_finite() {
+        node.final_layout.size.height.max(0.0)
+    } else {
+        0.0
+    };
+    let Some(table) = column_styles else {
+        return own_h;
+    };
+    first_forced_break_offset(doc, node_id, table, 0.0, depth)
+        .map_or(own_h, |y| y.clamp(0.0, own_h))
+}
+
+/// Smallest offset (from the top of the node `avoid_piece_size` started at; `base` is the top of `node_id` in that
+/// frame) of a forced break below `node_id`.
+fn first_forced_break_offset(
+    doc: &BaseDocument,
+    node_id: usize,
+    table: &crate::column_css::ColumnStyleTable,
+    base: f32,
+    depth: usize,
+) -> Option<f32> {
+    if depth >= crate::MAX_DOM_DEPTH {
+        return None;
+    }
+    let node = doc.get_node(node_id)?;
+    let mut best: Option<f32> = None;
+    let mut keep = |y: f32| best = Some(best.map_or(y, |b| b.min(y)));
+    for &child_id in &node.children {
+        let Some(child) = doc.get_node(child_id) else {
+            continue;
+        };
+        let top = base + child.final_layout.location.y;
+        let props = table.get(&child_id);
+        if props.is_some_and(|p| {
+            matches!(
+                p.break_before,
+                Some(crate::draw_primitives::BreakBefore::Page)
+            )
+        }) {
+            keep(top);
+        }
+        if let Some(y) = first_forced_break_offset(doc, child_id, table, top, depth + 1) {
+            keep(y);
+        }
+        if props.is_some_and(|p| {
+            matches!(
+                p.break_after,
+                Some(crate::draw_primitives::BreakAfter::Page)
+            )
+        }) {
+            keep(top + child.final_layout.size.height.max(0.0));
+        }
+    }
+    best
+}
+
+/// F83b: whether `node_id`, or its first in-flow descendant reached with no gap (the walk of
+/// [`leading_block_size`]), is an avoid box that does not hold because it is taller than a page. Such a box breaks
+/// like an `auto` one, but the break before it is still preferred to one inside it (css-break-3 §4.5): when content
+/// precedes it, it starts the next page.
+fn starts_with_relaxed_avoid(
+    doc: &BaseDocument,
+    node_id: usize,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    fresh: f32,
+    depth: usize,
+) -> bool {
+    if depth >= crate::MAX_DOM_DEPTH {
+        return false;
+    }
+    let Some(node) = doc.get_node(node_id) else {
+        return false;
+    };
+    if crate::blitz_adapter::is_multicol_container(node) {
+        return false;
+    }
+    if has_avoid(column_styles, node_id) && !avoid_inside_holds(true, avoid_extent(node), fresh) {
+        return true;
+    }
+    if !is_block_flow_container(doc, node) {
+        return false;
+    }
+    let layout_children_borrow = node.layout_children.borrow();
+    let walk_children: &[usize] = layout_children_borrow
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .unwrap_or(&node.children);
+    for &child_id in walk_children {
+        let Some(child) = doc.get_node(child_id) else {
+            continue;
+        };
+        if let Some(text) = child.text_data()
+            && text.content.chars().all(char::is_whitespace)
+        {
+            continue;
+        }
+        {
+            use ::style::properties::longhands::position::computed_value::T as Pos;
+            let is_oof = child.primary_styles().is_some_and(|s| {
+                matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed)
+            });
+            if is_oof {
+                continue;
+            }
+        }
+        let layout = child.final_layout;
+        if !layout.size.height.is_finite() || layout.size.height <= 0.0 {
+            continue;
+        }
+        // A gap between the content edge and the first child is a class C break point: the box is entered, not
+        // moved. Border and padding are not a gap.
+        let content_top = node.final_layout.border.top + node.final_layout.padding.top;
+        if layout.location.y - content_top > 0.5 {
+            return false;
+        }
+        return starts_with_relaxed_avoid(doc, child_id, column_styles, fresh, depth + 1);
+    }
+    false
+}
+
 /// F30d: cut the multi-column container `container_id` over pages from `(page_in, cursor_in)` and record
 /// what each page holds.
 ///
@@ -741,7 +944,9 @@ pub fn run_pass(doc: &mut BaseDocument, page_height_px: f32) -> PaginationGeomet
 /// fragmenter. `break-before: page` and `break-after: page` force
 /// page boundaries; `break-inside: avoid` defers a child that does not
 /// fit the remaining strip rather than splitting it, as long as the
-/// child fits a page ([`avoid_inside_holds`]).
+/// child fits a page ([`avoid_inside_holds`]); an avoid block wrapper in block
+/// flow moves whole instead of being entered and split between its children
+/// ([`avoid_keeps_whole`], F83b).
 pub fn run_pass_with_break_styles<'a>(
     doc: &'a mut BaseDocument,
     page_height_px: crate::units::Px,
@@ -1053,6 +1258,12 @@ impl<'a> PaginationLayoutTree<'a> {
         let mut page_index: u32 = 0;
         let mut cursor_y: f32 = 0.0;
         let mut emitted = 0usize;
+        // F83b: `break-inside: avoid` on a child is honoured by moving it whole
+        // only where its siblings are laid out in block flow.
+        let body_block_flow = self
+            .doc
+            .get_node(body_id)
+            .is_some_and(|b| is_block_flow_container(self.doc, b));
         // Tracks the bottom edge of the previously emitted in-flow child
         // in body-content-box coordinates. Used to pick up inter-child
         // gaps (collapsed margins, padding) that Blitz baked into each
@@ -1492,12 +1703,16 @@ impl<'a> PaginationLayoutTree<'a> {
             // existing whole-emit path and avoids the children-sum
             // parent-height bug.
             //
-            // The gate does not read `break-inside` at all: a block with
-            // several children that does not fit the strip is entered and
-            // split in place whether or not it is `avoid` and whether or
-            // not it would fit a fresh page (F83b: Chrome moves such a
-            // box to the next page). An inline root with text children
-            // only never passes it (text nodes have no height).
+            // F83b: an `avoid` box that is kept whole (`avoid_keeps_whole`: it
+            // fits a page, and either fits the room below the cursor or can
+            // move to the next page) drops the `would_split_block_subtree`
+            // term, so it is not entered and split between its children: it
+            // takes the "move whole" advance below like any child the gate
+            // skips. A forced break inside it still wins (css-break-3 §4.3).
+            // A block that does not hold (taller than a page) is entered as
+            // an `auto` one, but when content precedes it, it starts the next
+            // page first (the rule above the gate). An inline root with text
+            // children only never passes the gate (text nodes have no height).
             let child_node = self.doc.get_node(child_id);
             let has_splittable_children = child_node.is_some_and(|n| !n.children.is_empty());
             // fulgur-7hf5: multicol containers (`column-count > 1` /
@@ -1527,7 +1742,47 @@ impl<'a> PaginationLayoutTree<'a> {
                 });
             let strips = self.strips;
             let page_height_px = strips.fresh();
-            let gate = |doc: &BaseDocument, available_strip: f32| {
+            // F83b: in-flow content precedes this child on the page: the
+            // cursor before the child's own margin gap. After a page advance
+            // it is 0.
+            let mut content_above = cursor_y - gap > 0.5;
+            if content_above
+                && body_block_flow
+                && starts_with_relaxed_avoid(
+                    self.doc,
+                    child_id,
+                    self.column_styles,
+                    page_height_px,
+                    0,
+                )
+            {
+                // An avoid box taller than a page breaks like `auto`, but the
+                // break before it (a perfect class A point) is preferred to
+                // one inside it (css-break-3 §4.5): it starts the next page,
+                // where it is entered from the top. The margin above it
+                // truncates at the unforced break.
+                page_index += 1;
+                cursor_y = 0.0;
+                content_above = false;
+            }
+            let avoid_extent_h = if avoid_inside && body_block_flow && !is_multicol {
+                child_node.map_or(0.0, avoid_extent)
+            } else {
+                0.0
+            };
+            let keeps_whole_at = |page: u32, cursor: f32, above: bool| {
+                avoid_inside
+                    && body_block_flow
+                    && !is_multicol
+                    && avoid_keeps_whole(
+                        true,
+                        avoid_extent_h,
+                        strips.bottom(page) - cursor,
+                        page_height_px,
+                        above,
+                    )
+            };
+            let gate = |doc: &BaseDocument, available_strip: f32, keeps_whole: bool| {
                 has_splittable_children
                     && (!is_multicol || multicol_has_span_all)
                     && (has_forced_break_below(doc, child_id, self.column_styles, 0)
@@ -1537,16 +1792,21 @@ impl<'a> PaginationLayoutTree<'a> {
                             self.used_page_names.as_ref(),
                             0,
                         )
-                        || would_split_block_subtree(
-                            doc,
-                            child_id,
-                            available_strip,
-                            page_height_px,
-                            0,
-                        ))
+                        || (!keeps_whole
+                            && would_split_block_subtree(
+                                doc,
+                                child_id,
+                                available_strip,
+                                page_height_px,
+                                0,
+                            )))
             };
-            let mut needs_recursion =
-                gate(self.doc, (strips.bottom(page_index) - cursor_y).max(0.0));
+            let mut keeps_whole = keeps_whole_at(page_index, cursor_y, content_above);
+            let mut needs_recursion = gate(
+                self.doc,
+                (strips.bottom(page_index) - cursor_y).max(0.0),
+                keeps_whole,
+            );
             // F28: entering a box means placing its first row at the current
             // cursor. When even that row does not fit below the cursor, the
             // only break point before it is the class A point in front of the
@@ -1560,12 +1820,22 @@ impl<'a> PaginationLayoutTree<'a> {
             //
             // A first row taller than a page gains nothing from a fresh page
             // (it overflows there too), so such a box is entered where it is.
+            //
+            // F83b: a kept-whole avoid box that a forced break inside makes the
+            // gate enter counts the piece before the first forced break; the
+            // break itself wins, what follows it starts a page of its own.
             if needs_recursion && cursor_y > 0.0 {
-                let leading = leading_block_size(self.doc, child_id, 0, page_height_px);
+                let leading = if keeps_whole {
+                    avoid_piece_size(self.doc, child_id, self.column_styles, 0).min(child_h)
+                } else {
+                    leading_block_size(self.doc, child_id, self.column_styles, 0, page_height_px)
+                };
                 if leading <= page_height_px && cursor_y + leading > strips.bottom(page_index) {
                     page_index += 1;
                     cursor_y = 0.0;
-                    needs_recursion = gate(self.doc, strips.bottom(page_index));
+                    content_above = false;
+                    keeps_whole = keeps_whole_at(page_index, cursor_y, content_above);
+                    needs_recursion = gate(self.doc, strips.bottom(page_index), keeps_whole);
                 }
             }
             if needs_recursion {
@@ -1585,6 +1855,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     0,
                     0.0,
                     0.0,
+                    content_above,
                 );
                 page_index = new_page;
                 cursor_y = new_cursor;
@@ -1614,7 +1885,9 @@ impl<'a> PaginationLayoutTree<'a> {
             // `break-inside: avoid` collapses to this path via
             // `avoid_inside_holds` above (it just suppresses the inline
             // split branch; remaining-strip overflow handling is
-            // identical), and only for a box that fits a page. A taller
+            // identical), and only for a box that fits a page. F83b: a
+            // block wrapper that is kept whole (`avoid_keeps_whole`) takes
+            // this path too, because the gate no longer enters it. A taller
             // inline root has gone through the line path above (F83); a
             // taller box without lines is cut into strips below.
             if cursor_y > 0.0 && cursor_y + child_h > strips.bottom(page_index) {
@@ -2170,12 +2443,20 @@ fn would_split_block_subtree(
 ///   split between its line boxes (F30), so it counts its top inset and its first
 ///   [`ORPHANS`] lines, not its height.
 ///
+/// - F83b: a first-row child in block flow whose `break-inside: avoid` holds
+///   ([`avoid_inside_holds`]) is kept whole by the fragmenter, so it counts the piece of it before its first forced
+///   break ([`avoid_piece_size`]), not its own first row. Without this a parent whose first row is such a box
+///   would be entered at a page top it cannot use, and the box would overflow it. The node's own `avoid` is for the
+///   caller to decide: it knows whether anything precedes the node. `column_styles` is `None` where
+///   `break-inside` does not apply (table cells, F83d).
+///
 /// The result never exceeds the node's own height. It walks the same children
 /// (`layout_children` first, whitespace / out-of-flow / empty skipped) as
 /// [`would_split_block_subtree`] and follows only the first row, so it is cheap.
 fn leading_block_size(
     doc: &BaseDocument,
     node_id: usize,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
     depth: usize,
     page_height_px: f32,
 ) -> f32 {
@@ -2195,6 +2476,7 @@ fn leading_block_size(
         .as_deref()
         .filter(|v| !v.is_empty())
         .unwrap_or(&node.children);
+    let avoid_applies = column_styles.is_some() && is_block_flow_container(doc, node);
     let mut first_row_top: Option<f32> = None;
     let mut leading: f32 = 0.0;
     for &child_id in walk_children {
@@ -2242,7 +2524,13 @@ fn leading_block_size(
             Some(split) if split.inset_top + split.span() > page_height_px + 1.0 => {
                 split.leading().min(layout.size.height)
             }
-            _ => leading_block_size(doc, child_id, depth + 1, page_height_px),
+            _ if avoid_applies
+                && has_avoid(column_styles, child_id)
+                && avoid_inside_holds(true, avoid_extent(child), page_height_px) =>
+            {
+                avoid_piece_size(doc, child_id, column_styles, depth + 1).min(layout.size.height)
+            }
+            _ => leading_block_size(doc, child_id, column_styles, depth + 1, page_height_px),
         };
         leading = leading.max(top + child_leading);
     }
@@ -2597,6 +2885,7 @@ fn fragment_block_subtree(
     depth: usize,
     tail_below: f32,
     top_floor: f32,
+    content_above: bool,
 ) -> (u32, f32, bool, f32) {
     if depth >= crate::MAX_DOM_DEPTH {
         // Bailed: emit a single whole-fragment for the parent at its
@@ -2996,6 +3285,14 @@ fn fragment_block_subtree(
         // this places them at the same page-local y; for sequential
         // block flow, it matches Taffy's stacked positions exactly.
         let mut child_page_y = page_start_y + (this_top_in_parent - page_taffy_origin);
+        // F83b: in-flow content precedes this child on its strip: the cursor
+        // before the child, past the top of the strip (and the repeated
+        // header band), or, on the page the parent was entered on, content
+        // above the parent. The parent's own border, padding and margin
+        // never count as content.
+        let cursor_before = cursor_y;
+        let mut content_above_child =
+            (page_index == page_in && content_above) || cursor_before > page_start_y + band + 0.5;
         // Update the cursor only when the child's bottom advances
         // past it. For block flow this matches cursor advancing by
         // `gap + child_h`; for grid parallel siblings the cursor
@@ -3024,6 +3321,7 @@ fn fragment_block_subtree(
             band = band.max(top_floor);
             cursor_y = band;
             page_start_y = 0.0;
+            content_above_child = false;
             // The breaking child is the first in-flow child on the
             // new page strip. Rebase the Taffy origin to its
             // `this_top_in_parent` so it lands at `page_start_y` (= 0,
@@ -3059,12 +3357,45 @@ fn fragment_block_subtree(
         // fulgur-7hf5: see body-direct branch — multicol containers
         // are atomic from the fragmenter's perspective.
         let is_multicol = crate::blitz_adapter::is_multicol_container(child);
-        let gate = |available_strip: f32| {
+        // F83b: an avoid box in block flow that is kept whole is not entered
+        // for want of room (`avoid_keeps_whole`); the cut below moves it, as
+        // it moves any unsplittable child. A forced break inside it still
+        // enters it.
+        let block_parent = !suppress_page_check && !parent_is_table;
+        let avoid_inside_child = matches!(
+            break_props.break_inside,
+            Some(crate::draw_primitives::BreakInside::Avoid)
+        );
+        let avoid_extent_c = if avoid_inside_child && block_parent && !is_multicol {
+            avoid_extent(child)
+        } else {
+            0.0
+        };
+        let keeps_whole_at = |page: u32, y: f32, above: bool| {
+            avoid_inside_child
+                && block_parent
+                && !is_multicol
+                && avoid_keeps_whole(
+                    true,
+                    avoid_extent_c,
+                    strips.bottom(page) - y,
+                    strips.fresh(),
+                    above,
+                )
+        };
+        let gate = |available_strip: f32, keeps_whole: bool| {
             !child.children.is_empty()
                 && !is_multicol
                 && (has_forced_break_below(doc, child_id, column_styles, 0)
                     || has_page_name_change_below(doc, child_id, used_page_names, 0)
-                    || would_split_block_subtree(doc, child_id, available_strip, strips.fresh(), 0))
+                    || (!keeps_whole
+                        && would_split_block_subtree(
+                            doc,
+                            child_id,
+                            available_strip,
+                            strips.fresh(),
+                            0,
+                        )))
         };
         // F30: a paragraph that does not fit any page whole is split between
         // its line boxes instead of being placed as one oversized leaf (the
@@ -3081,11 +3412,6 @@ fn fragment_block_subtree(
         // F30d: a multi-column container that does not fit the room below it is distributed over the
         // pages (plain block flow only: in a flex / grid box, a table or an atomic inline it stays one
         // box, F30d-b).
-        let block_parent = !suppress_page_check && !parent_is_table;
-        let avoid_inside_child = matches!(
-            break_props.break_inside,
-            Some(crate::draw_primitives::BreakInside::Avoid)
-        );
         let mc_for = |page: u32, y: f32| -> Option<McContainer<'_>> {
             if !block_parent {
                 return None;
@@ -3104,8 +3430,17 @@ fn fragment_block_subtree(
         } else {
             None
         };
-        let mut needs_recursion =
-            line_split.is_none() && gate((strips.bottom(page_index) - cursor_y).max(0.0));
+        let mut keeps_whole =
+            keeps_whole_at(page_index, child_page_y, child_page_y > page_start_y + band);
+        let mut needs_recursion = line_split.is_none()
+            && gate((strips.bottom(page_index) - cursor_y).max(0.0), keeps_whole);
+        // F83b: an avoid box taller than a page breaks like `auto`, but when
+        // content precedes it (or something that starts with it) the break
+        // before it is preferred to one inside it (css-break-3 §4.5): it
+        // starts the next page, where it is split as before.
+        let relaxed_start = block_parent
+            && content_above_child
+            && starts_with_relaxed_avoid(doc, child_id, column_styles, strips.fresh(), 0);
 
         // Strip-overflow page cut (fulgur-7hf5 moved it below the gate; F28
         // moves it back above): the child starts a new page when the part of
@@ -3129,7 +3464,9 @@ fn fragment_block_subtree(
         //
         // A first row taller than a page is not cut: a fresh page would not
         // hold it either.
-        let first_break_h = if let Some(split) = &line_split {
+        let first_break_h = if relaxed_start {
+            strips.fresh()
+        } else if let Some(split) = &line_split {
             // The inset above the first line and ORPHANS lines must fit; a
             // paragraph that cannot even start here moves to the next page.
             let leading = split.leading();
@@ -3150,10 +3487,13 @@ fn fragment_block_subtree(
                 0.0
             }
         } else if needs_recursion {
-            let leading = if first_in_row {
-                leading_block_size(doc, child_id, 0, strips.fresh())
-            } else {
+            let leading = if !first_in_row {
                 0.0
+            } else if keeps_whole {
+                // A kept-whole avoid box a forced break inside makes the gate enter: the piece before the break.
+                avoid_piece_size(doc, child_id, column_styles, 0).min(child_h)
+            } else {
+                leading_block_size(doc, child_id, column_styles, 0, strips.fresh())
             };
             if leading <= strips.fresh() {
                 leading
@@ -3219,8 +3559,11 @@ fn fragment_block_subtree(
                 );
             } else if needs_recursion {
                 // The child may fit the new page whole.
-                needs_recursion = gate((strips.bottom(page_index) - cursor_y).max(0.0));
+                keeps_whole = keeps_whole_at(page_index, child_page_y, false);
+                needs_recursion =
+                    gate((strips.bottom(page_index) - cursor_y).max(0.0), keeps_whole);
             }
+            content_above_child = false;
             if was_entered {
                 // A later cell of this flex / grid row restores the row's
                 // start state when the cell recurses across pages; that
@@ -3330,6 +3673,7 @@ fn fragment_block_subtree(
                     depth + 1,
                     child_tail,
                     child_floor,
+                    content_above_child,
                 ),
             };
             page_index = np;
@@ -4164,7 +4508,7 @@ fn row_mate_can_split(
                 m.element_data().is_some()
                     && (m.final_layout.location.y - top).abs() < 0.5
                     && m.final_layout.size.height > page_height_px
-                    && (leading_block_size(doc, id, 0, page_height_px) <= page_height_px
+                    && (leading_block_size(doc, id, None, 0, page_height_px) <= page_height_px
                         || line_split_candidate(doc, parent, m)
                             .is_some_and(|split| split.leading() <= page_height_px))
             })
@@ -6125,6 +6469,7 @@ mod tests {
             crate::MAX_DOM_DEPTH, // depth → trips the guard immediately
             0.0,                  // tail_below
             0.0,                  // top_floor
+            false,                // content_above
         );
 
         // The bail pushes exactly ONE whole fragment for parent_id at its
@@ -8514,6 +8859,269 @@ h2 { string-set: chapter-title content(text); }
         assert!(!avoid_inside_holds(true, 7000.0, 1000.0), "taller");
     }
 
+    // ── F83b: `break-inside: avoid` on a block wrapper ───────────────────────
+
+    /// `count` paragraphs of `lines` lines of 20 px each.
+    fn paragraphs_20px(count: usize, lines: usize) -> String {
+        (0..count)
+            .map(|_| format!("<p>{}</p>", lines_20px(lines)))
+            .collect()
+    }
+
+    /// `(page, y)` of the first fragment of `class`.
+    fn first_fragment(
+        doc: &blitz_html::HtmlDocument,
+        geom: &PaginationGeometryTable,
+        class: &str,
+    ) -> (u32, f32) {
+        let f = &geom[&node_by_class(doc, class)].fragments[0];
+        (f.page_index, f.y.to_f32())
+    }
+
+    /// A wrapper that does not fit the 50 px left under the spacer but fits a page moves whole to the next page
+    /// (css-break-3 §4.5: the class A break point in front of it is preferred to one inside it). The gate used to
+    /// enter it and split it between its paragraphs, because its first one fit.
+    #[test]
+    fn avoid_wrapper_that_fits_a_fresh_page_moves_whole() {
+        let (doc, geom) = avoid_fragments(&format!(
+            "<div style=\"height:150px\"></div><div class=\"av\">{}</div>",
+            paragraphs_20px(3, 2)
+        ));
+        let g = &geom[&node_by_class(&doc, "av")];
+        assert_eq!(g.fragments.len(), 1, "{:?}", g.fragments);
+        assert_eq!(first_fragment(&doc, &geom, "av"), (1, 0.0));
+    }
+
+    /// A wrapper taller than a page is relaxed, but the break before it is still preferred: after content it starts the
+    /// next page and breaks between its children from there, like an `auto` box.
+    #[test]
+    fn avoid_wrapper_taller_than_a_page_after_content_starts_on_the_next_page() {
+        let (doc, geom) = avoid_fragments(&format!(
+            "<p>before</p><div class=\"av\">{}</div>",
+            paragraphs_20px(3, 4)
+        ));
+        assert_eq!(first_fragment(&doc, &geom, "av"), (1, 0.0));
+    }
+
+    /// The same inside a block (`fragment_block_subtree`).
+    #[test]
+    fn nested_avoid_wrapper_moves_whole() {
+        let (doc, geom) = avoid_fragments(&format!(
+            "<div class=\"o\"><div style=\"height:150px\"></div><div class=\"av\">{}</div></div>",
+            paragraphs_20px(3, 2)
+        ));
+        let g = &geom[&node_by_class(&doc, "av")];
+        assert_eq!(g.fragments.len(), 1, "{:?}", g.fragments);
+        assert_eq!(first_fragment(&doc, &geom, "av"), (1, 0.0));
+    }
+
+    /// A relaxed avoid paragraph in a block starts a fresh page when something precedes it (Chrome: probe 2 of F83).
+    #[test]
+    fn nested_relaxed_avoid_paragraph_starts_a_page() {
+        let (doc, geom) = avoid_fragments(&format!(
+            "<div><p>before</p><p class=\"av\">{}</p></div>",
+            lines_20px(40)
+        ));
+        assert_eq!(first_fragment(&doc, &geom, "av"), (1, 0.0));
+        let g = &geom[&node_by_class(&doc, "av")];
+        assert!(line_slices_tile(&g.line_slices, 40), "{:?}", g.line_slices);
+    }
+
+    /// A forced break inside an avoid box wins (css-break-3 §4.3); the piece before it is what has to be kept
+    /// together, and it moves whole to the next page when it does not fit here.
+    #[test]
+    fn forced_break_piece_of_an_avoid_box_moves_whole() {
+        let (doc, geom) = avoid_fragments(&format!(
+            "<div style=\"height:150px\"></div><div class=\"av\">\
+             <p class=\"a1\">{}</p><p>{}</p><p class=\"b\" style=\"break-before:page\">after</p></div>",
+            lines_20px(2),
+            lines_20px(2)
+        ));
+        assert_eq!(first_fragment(&doc, &geom, "a1"), (1, 0.0));
+        assert_eq!(first_fragment(&doc, &geom, "b").0, 2);
+    }
+
+    /// Guard: first in the body there is no better break point, so a wrapper taller than a page is entered where it is.
+    #[test]
+    fn avoid_wrapper_first_on_its_page_is_entered() {
+        let (doc, geom) = avoid_fragments(&format!(
+            "<div class=\"av\">{}</div>",
+            paragraphs_20px(3, 4)
+        ));
+        let g = &geom[&node_by_class(&doc, "av")];
+        assert_eq!(first_fragment(&doc, &geom, "av"), (0, 0.0));
+        assert!(g.fragments.len() >= 2, "{:?}", g.fragments);
+    }
+
+    /// Guard: page 0 starts 60 px down (the body's top margin), so its strip is 140 px. A wrapper of 160 px fits a fresh
+    /// page and not that strip, but nothing precedes it, so it is entered where it is, not moved to leave page 0 blank
+    /// (Chrome does not break at the start of a fragmentainer either).
+    #[test]
+    fn avoid_box_on_a_short_first_strip_is_split() {
+        let html = format!(
+            "<!doctype html><html><head><style>body{{margin:60px 0 0;font-size:16px;line-height:20px}}\
+             p{{margin:0}}.av{{break-inside:avoid}}</style></head><body>\
+             <div class=\"av\">{}</div></body></html>",
+            paragraphs_20px(4, 2)
+        );
+        let mut doc = parse(&html, 600.0);
+        let table = blitz_adapter::extract_column_style_table(&doc);
+        let geom = run_pass_with_break_styles(doc.deref_mut(), 200.0_f32.as_px(), &table);
+        let g = &geom[&node_by_class(&doc, "av")];
+        assert_eq!(first_fragment(&doc, &geom, "av").0, 0);
+        assert!(g.fragments.len() >= 2, "{:?}", g.fragments);
+    }
+
+    /// F83b: kept whole when `avoid` holds and the box fits the room or can move; the six combinations.
+    #[test]
+    fn avoid_keeps_whole_combinations() {
+        // (avoid, extent, room, fresh, content_above)
+        assert!(!avoid_keeps_whole(false, 100.0, 50.0, 200.0, true), "auto");
+        assert!(
+            avoid_keeps_whole(true, 100.0, 50.0, 200.0, true),
+            "does not fit, can move"
+        );
+        assert!(
+            !avoid_keeps_whole(true, 100.0, 50.0, 200.0, false),
+            "does not fit, nothing above: entered as before"
+        );
+        assert!(
+            avoid_keeps_whole(true, 40.0, 50.0, 200.0, false),
+            "fits here"
+        );
+        assert!(
+            avoid_keeps_whole(true, 100.0, 99.5, 200.0, false),
+            "within the 1 px slack"
+        );
+        assert!(
+            !avoid_keeps_whole(true, 300.0, 50.0, 200.0, true),
+            "taller than a page: relaxed"
+        );
+    }
+
+    /// The document of `body` (the page style of [`avoid_fragments`]) with its break table.
+    fn avoid_doc(
+        body: &str,
+    ) -> (
+        blitz_html::HtmlDocument,
+        crate::column_css::ColumnStyleTable,
+    ) {
+        let html = format!(
+            "<!doctype html><html><head><style>body{{margin:0;font-size:16px;line-height:20px}}\
+             p{{margin:0}}.av{{break-inside:avoid}}</style></head><body>{body}</body></html>"
+        );
+        let doc = parse(&html, 600.0);
+        let table = blitz_adapter::extract_column_style_table(&doc);
+        (doc, table)
+    }
+
+    /// F83b: the piece of an avoid box before its first forced break: its own height without one, the top of a
+    /// descendant with `break-before: page`, the bottom of one with `break-after: page`, at any depth.
+    #[test]
+    fn avoid_piece_size_stops_at_the_first_forced_break() {
+        let two = lines_20px(2);
+        let piece = |inner: &str| {
+            let (doc, table) = avoid_doc(&format!("<div class=\"av\">{inner}</div>"));
+            avoid_piece_size(
+                doc.deref(),
+                node_by_class(doc.deref(), "av"),
+                Some(&table),
+                0,
+            )
+        };
+        let p = |style: &str| format!("<p style=\"{style}\">{two}</p>");
+        assert_eq!(piece(&format!("{}{}", p(""), p(""))), 80.0, "none");
+        assert_eq!(
+            piece(&format!("{}{}{}", p(""), p("break-before:page"), p(""))),
+            40.0,
+            "before the second paragraph"
+        );
+        assert_eq!(
+            piece(&format!("{}{}{}", p(""), p("break-after:page"), p(""))),
+            80.0,
+            "after the second paragraph"
+        );
+        assert_eq!(
+            piece(&format!(
+                "{}<div>{}{}</div>{}",
+                p(""),
+                p(""),
+                p("break-before:page"),
+                p("")
+            )),
+            80.0,
+            "nested: before the second paragraph of the inner div"
+        );
+        let (doc, _) = avoid_doc(&format!("<div class=\"av\">{}</div>", p("")));
+        assert_eq!(
+            avoid_piece_size(doc.deref(), node_by_class(doc.deref(), "av"), None, 0),
+            40.0,
+            "without a table"
+        );
+    }
+
+    /// F83b: the walk of `starts_with_relaxed_avoid` follows the first in-flow child while no gap separates it from
+    /// the content edge: padding does not stop it, a margin that did not collapse through does.
+    #[test]
+    fn starts_with_relaxed_avoid_follows_the_first_child_without_a_gap() {
+        // 12 lines: 240 px, taller than the 200 px page.
+        let tall = format!("<div class=\"av\"><p>{}</p></div>", lines_20px(12));
+        let check = |outer_style: &str, inner: &str| {
+            let (doc, table) = avoid_doc(&format!(
+                "<div class=\"o\" style=\"{outer_style}\">{inner}</div>"
+            ));
+            starts_with_relaxed_avoid(
+                doc.deref(),
+                node_by_class(doc.deref(), "o"),
+                Some(&table),
+                200.0,
+                0,
+            )
+        };
+        assert!(check("", &tall), "first child");
+        assert!(check("padding:10px", &tall), "padding is not a gap");
+        assert!(
+            check("border-top:2px solid red", &tall),
+            "border is not a gap"
+        );
+        assert!(
+            !check("", &format!("<p>x</p>{tall}")),
+            "not the first child"
+        );
+        assert!(
+            !check("display:flex", &tall),
+            "flex items are not block flow"
+        );
+        let fits = format!("<div class=\"av\"><p>{}</p></div>", lines_20px(3));
+        assert!(!check("", &fits), "avoid holds: not relaxed");
+        // A gap between the content edge and the first child (a margin on the child inside a parent with padding
+        // collapses to nothing, but a spacer is one) stops the walk.
+        assert!(!check(
+            "",
+            &format!("<div style=\"height:5px\"></div>{tall}")
+        ));
+    }
+
+    /// F83b: a parent whose first row is an avoid box that holds counts the whole box (to its first forced break), not
+    /// the first row of it, so it is moved before it is entered; without the table it counts the first row as before.
+    #[test]
+    fn leading_block_size_counts_an_avoid_first_row_whole() {
+        let (doc, table) = avoid_doc(&format!(
+            "<div class=\"o\"><div class=\"av\">{}</div></div>",
+            paragraphs_20px(3, 2)
+        ));
+        let o = node_by_class(doc.deref(), "o");
+        assert_eq!(
+            super::leading_block_size(doc.deref(), o, Some(&table), 0, 200.0),
+            120.0
+        );
+        assert_eq!(
+            super::leading_block_size(doc.deref(), o, None, 0, 200.0),
+            40.0,
+            "no table: the first row"
+        );
+    }
+
     /// F87: a `break-before` inside `@layer` (Tailwind v4's shape) reaches the fragmenter: the second paragraph
     /// starts page index 1. The same rule outside a layer gave the same result before; the layered one was dropped
     /// by the reader.
@@ -9592,7 +10200,7 @@ h2 { string-set: chapter-title content(text); }
     fn leading_of(html: &str, id: &str) -> f32 {
         let doc = parse(html, 600.0);
         let node = find_by_id(doc.deref(), id).unwrap();
-        super::leading_block_size(doc.deref(), node, 0, 10_000.0)
+        super::leading_block_size(doc.deref(), node, None, 0, 10_000.0)
     }
 
     #[test]
@@ -10645,10 +11253,10 @@ h2 { string-set: chapter-title content(text); }
         );
         let doc = parse(&html, 600.0);
         let d = find_by_id(doc.deref(), "d").unwrap();
-        let tall = super::leading_block_size(doc.deref(), d, 0, 200.0);
+        let tall = super::leading_block_size(doc.deref(), d, None, 0, 200.0);
         assert!((tall - 40.0).abs() < 0.5, "{tall}");
         // On a page the paragraph fits, it counts whole.
-        let whole = super::leading_block_size(doc.deref(), d, 0, 10_000.0);
+        let whole = super::leading_block_size(doc.deref(), d, None, 0, 10_000.0);
         assert!((whole - 600.0).abs() < 0.5, "{whole}");
     }
 
