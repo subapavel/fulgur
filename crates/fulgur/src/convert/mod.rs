@@ -88,6 +88,24 @@ fn css_text_align_to_parley_alignment(
     }
 }
 
+/// Text that no glyph run covers: it is laid out but left out of the PDF, because no registered font face
+/// matched its `font-family` (or, with host fonts off, a generic family resolved to nothing).
+/// `ConvertContext` collects one per distinct (element, text) pair; the engine logs them or, with
+/// `EngineBuilder::strict_text(true)`, fails with `Error::TextWithoutFont`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedText {
+    /// The element whose text it is: tag name, plus `#id` when it has one (`p`, `td#total`).
+    pub element: String,
+    /// The uncovered text, whitespace and invisible characters left out, shortened to a few words.
+    pub excerpt: String,
+}
+
+impl std::fmt::Display for DroppedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{}> \"{}\"", self.element, self.excerpt)
+    }
+}
+
 /// Context for DOM-to-Drawables conversion, bundling all shared state.
 pub struct ConvertContext<'a> {
     pub running_store: &'a RunningElementStore,
@@ -130,9 +148,30 @@ pub struct ConvertContext<'a> {
     /// `position: fixed` resolves its containing block against the viewport
     /// (CSS 2.1 §10.1.5). See `positioned::resolve_cb_for_absolute`.
     pub viewport_size_px: Option<(f32, f32)>,
+    /// Text found in inline formatting contexts that no glyph run covers, in document order, each
+    /// (element, excerpt) pair once. Filled by `extract_paragraph`; read by the engine after conversion.
+    pub dropped_text: Vec<DroppedText>,
 }
 
 impl ConvertContext<'_> {
+    /// Remember `text` of `node` as dropped, unless the same element and text were recorded already.
+    fn record_dropped_text(&mut self, node: &Node, excerpt: String) {
+        let element = node
+            .element_data()
+            .map(|e| {
+                let name = e.name.local.as_ref();
+                match e.id.as_ref() {
+                    Some(id) => format!("{name}#{id}"),
+                    None => name.to_string(),
+                }
+            })
+            .unwrap_or_default();
+        let dropped = DroppedText { element, excerpt };
+        if !self.dropped_text.contains(&dropped) {
+            self.dropped_text.push(dropped);
+        }
+    }
+
     /// Return a shared Arc for the given font data, caching by data pointer + index.
     ///
     /// Safety assumption: Parley font data pointers remain stable for the lifetime of
@@ -1224,6 +1263,7 @@ mod semantics_tests {
             multicol_geometry,
             pagination_geometry,
             link_cache: Default::default(),
+            dropped_text: Vec::new(),
             viewport_size_px: Some((595.0, 842.0)),
         };
         super::dom_to_drawables(&doc, &mut ctx)

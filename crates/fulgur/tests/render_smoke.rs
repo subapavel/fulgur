@@ -7225,3 +7225,77 @@ fn render_smoke_jpeg_with_fill_bytes_is_painted() {
         .expect("render");
     assert_eq!(image_xobjects(&pdf), 1);
 }
+
+fn noto_bundle() -> AssetBundle {
+    let font_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/.fonts/NotoSans-Regular.ttf");
+    let mut assets = AssetBundle::default();
+    assets
+        .add_font_file(&font_path)
+        .unwrap_or_else(|e| panic!("failed to load Noto Sans from {}: {e}", font_path.display()));
+    assets.add_css("html { font-family: 'Noto Sans'; }");
+    assets
+}
+
+const UA_MONO_HTML: &str = "<!doctype html><html><body><p>Prose</p><pre>F70PRE</pre>\
+    <p>a <code>F70CODE</code> b</p></body></html>";
+
+#[test]
+fn render_smoke_ua_monospace_is_drawn_when_the_generic_is_mapped() {
+    // The UA sheet gives `pre` / `code` `font-family: monospace`; without host fonts that resolved to
+    // nothing and the text was left out (F70). `AssetBundle::set_generic_family` resolves it.
+    let mut assets = noto_bundle();
+    assets.set_generic_family("monospace", "Noto Sans");
+    let pdf = Engine::builder()
+        .system_fonts(false)
+        .strict_text(true)
+        .assets(assets)
+        .build()
+        .render(UA_MONO_HTML)
+        .expect("every piece of text has a face");
+    if let Some(text) = extract_pdf_text(&pdf) {
+        assert!(
+            text.contains("F70PRE") && text.contains("F70CODE"),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn render_smoke_text_without_a_face_is_an_error_in_strict_text_mode_and_a_pdf_otherwise() {
+    let render = |strict: bool| {
+        Engine::builder()
+            .system_fonts(false)
+            .strict_text(strict)
+            .assets(noto_bundle())
+            .build()
+            .render(UA_MONO_HTML)
+    };
+    match render(true) {
+        Err(fulgur::Error::TextWithoutFont(found)) => {
+            let elements: Vec<&str> = found.iter().map(|d| d.element.as_str()).collect();
+            // The element is the inline root: the `<p>` that holds the `<code>`.
+            assert_eq!(elements, ["pre", "p"], "{found:?}");
+            assert_eq!(found[0].excerpt, "F70PRE");
+            assert_eq!(found[1].excerpt, "F70CODE");
+            assert!(found[0].to_string().contains("F70PRE"));
+        }
+        other => panic!("expected TextWithoutFont, got {:?}", other.map(|p| p.len())),
+    }
+    let pdf = render(false).expect("not strict: a PDF without the text");
+    assert!(pdf.starts_with(b"%PDF-"));
+}
+
+#[test]
+fn render_smoke_whitespace_zero_width_and_inline_boxes_are_not_dropped_text() {
+    let html = "<!doctype html><html><body><p>Faktura\u{200b}2026 <b> </b>  \
+        <span style=\"display:inline-block;width:10px;height:10px\"></span>\n</p>\
+        <p> </p><div>\n</div><p>a<br>b</p><pre>\n\n</pre><ul><li>item</li></ul></body></html>";
+    Engine::builder()
+        .system_fonts(false)
+        .strict_text(true)
+        .assets(noto_bundle())
+        .build()
+        .render(html)
+        .expect("nothing visible is left out");
+}

@@ -29,6 +29,7 @@ pub fn render_v2(
     running_store: &RunningElementStore,
     font_data: &[Arc<Vec<u8>>],
     system_fonts: bool,
+    generics: &BTreeMap<String, String>,
     string_set_by_node: &HashMap<usize, Vec<(String, String)>>,
     counter_ops_by_node: &BTreeMap<usize, Vec<crate::gcpm::CounterOp>>,
     html_title: Option<String>,
@@ -139,6 +140,7 @@ pub fn render_v2(
         running_store,
         font_data,
         system_fonts,
+        generics,
         geometry,
         string_set_by_node,
         counter_ops_by_node,
@@ -3960,6 +3962,7 @@ pub(crate) struct MarginBoxRenderer<'a> {
     pub running_store: &'a RunningElementStore,
     pub font_data: &'a [Arc<Vec<u8>>],
     pub system_fonts: bool,
+    pub generics: &'a BTreeMap<String, String>,
     pub margin_css: String,
     pub string_set_states: Vec<BTreeMap<String, crate::pagination_layout::StringSetPageState>>,
     pub running_states: Vec<BTreeMap<String, crate::pagination_layout::PageRunningState>>,
@@ -3983,6 +3986,7 @@ impl<'a> MarginBoxRenderer<'a> {
         running_store: &'a RunningElementStore,
         font_data: &'a [Arc<Vec<u8>>],
         system_fonts: bool,
+        generics: &'a BTreeMap<String, String>,
         pagination_geometry: &crate::pagination_layout::PaginationGeometryTable,
         string_set_by_node: &HashMap<usize, Vec<(String, String)>>,
         counter_ops_by_node: &BTreeMap<usize, Vec<crate::gcpm::CounterOp>>,
@@ -4020,6 +4024,7 @@ impl<'a> MarginBoxRenderer<'a> {
             running_store,
             font_data,
             system_fonts,
+            generics,
             margin_css: strip_display_none(&gcpm.cleaned_css),
             string_set_states,
             running_states,
@@ -4169,12 +4174,13 @@ impl<'a> MarginBoxRenderer<'a> {
                     "<html><head><style>{}</style></head><body style=\"margin:0;padding:0;\"><div style=\"display:inline-block\">{}</div></body></html>",
                     self.margin_css, html
                 );
-                let measure_doc = crate::blitz_adapter::parse_and_layout(
+                let measure_doc = crate::blitz_adapter::parse_and_layout_with_generics(
                     &measure_html,
                     content_width.as_pt().in_px(),
                     page_size.height.as_pt().in_px(),
                     self.font_data,
                     self.system_fonts,
+                    self.generics,
                 );
                 get_body_child_dimension(&measure_doc, true)
             });
@@ -4204,12 +4210,13 @@ impl<'a> MarginBoxRenderer<'a> {
                     "<html><head><style>{}</style></head><body style=\"margin:0;padding:0;\"><div>{}</div></body></html>",
                     self.margin_css, html
                 );
-                let measure_doc = crate::blitz_adapter::parse_and_layout(
+                let measure_doc = crate::blitz_adapter::parse_and_layout_with_generics(
                     &measure_html,
                     fixed_width.as_pt().in_px(),
                     page_size.height.as_pt().in_px(),
                     self.font_data,
                     self.system_fonts,
+                    self.generics,
                 );
                 get_body_child_dimension(&measure_doc, false)
             });
@@ -4276,12 +4283,13 @@ impl<'a> MarginBoxRenderer<'a> {
                     "<html><head><style>{}</style></head><body style=\"margin:0;padding:0;\">{}</body></html>",
                     self.margin_css, html
                 );
-                let mut render_doc = crate::blitz_adapter::parse_and_layout(
+                let mut render_doc = crate::blitz_adapter::parse_and_layout_with_generics(
                     &render_html,
                     rect.width.in_px(),
                     rect.height.in_px(),
                     self.font_data,
                     self.system_fonts,
+                    self.generics,
                 );
                 let empty_column_styles = crate::column_css::ColumnStyleTable::new();
                 let geometry = crate::pagination_layout::run_pass_with_break_styles(
@@ -4301,6 +4309,7 @@ impl<'a> MarginBoxRenderer<'a> {
                     multicol_geometry: crate::multicol_layout::MulticolGeometryTable::new(),
                     pagination_geometry: geometry,
                     link_cache: Default::default(),
+                    dropped_text: Vec::new(),
                     viewport_size_px: None,
                 };
                 let drawables = crate::convert::dom_to_drawables(&render_doc, &mut dummy_ctx);
@@ -6259,6 +6268,7 @@ mod tests {
             &store,
             &[],
             false,
+            &BTreeMap::new(),
             &geom,
             &HashMap::new(),
             &BTreeMap::new(),
@@ -6286,6 +6296,7 @@ mod tests {
             &store,
             &[],
             false,
+            &BTreeMap::new(),
             &geom,
             &HashMap::new(),
             &BTreeMap::new(),
@@ -6316,6 +6327,7 @@ mod tests {
             &store,
             &[],
             false,
+            &BTreeMap::new(),
             &geom,
             &HashMap::new(),
             &BTreeMap::new(),

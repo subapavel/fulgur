@@ -2,6 +2,7 @@ use super::*;
 use super::{list_marker, positioned, pseudo};
 use crate::paragraph::{InlineBoxItem, ParagraphRender};
 use crate::units::F32Units;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// Dispatcher entry for inline-root nodes (those with `node.flags.is_inline_root()`).
@@ -460,6 +461,8 @@ pub(super) fn extract_paragraph(
 
     let mut shaped_lines = Vec::new();
     let mut accumulated_line_top = crate::units::Pt::ZERO;
+    // Byte ranges of `text` that some glyph run draws, for the dropped-text check below.
+    let mut covered: Vec<Range<usize>> = Vec::new();
 
     for line in parley_layout.lines() {
         let metrics = line.metrics();
@@ -515,6 +518,7 @@ pub(super) fn extract_paragraph(
                             )
                         });
                         run_glyph_offset += 1;
+                        note_covered(&mut covered, &text_range);
                         glyphs.push(ShapedGlyph {
                             id: g.id,
                             x_advance: ShapedGlyph::normalize_by_font_size(
@@ -611,11 +615,99 @@ pub(super) fn extract_paragraph(
         accumulated_line_top += line_height;
     }
 
+    // Text that Parley laid out but gave no glyph run: no registered face matched its `font-family`.
+    // It is not in the PDF, and nothing else would say so.
+    if let Some(excerpt) = uncovered_text(&text, &covered) {
+        ctx.record_dropped_text(node, excerpt);
+    }
+
     if shaped_lines.is_empty() {
         return None;
     }
 
     Some(ParagraphRender::new(shaped_lines).with_id(extract_block_id(node)))
+}
+
+/// Adds `range` to `covered`, merged into the last range when they touch or overlap: glyphs arrive in
+/// text order (reversed for right-to-left runs), so a paragraph ends up with a handful of ranges.
+fn note_covered(covered: &mut Vec<Range<usize>>, range: &Range<usize>) {
+    match covered.last_mut() {
+        Some(last) if range.start <= last.end && range.end >= last.start => {
+            last.start = last.start.min(range.start);
+            last.end = last.end.max(range.end);
+        }
+        _ => covered.push(range.clone()),
+    }
+}
+
+/// Longest excerpt of dropped text kept, in characters.
+const EXCERPT_CHARS: usize = 60;
+
+/// The part of `text` that no range of `covered` (byte ranges, in any order) contains, as an excerpt of at
+/// most [`EXCERPT_CHARS`] characters, or `None` when every character that can be seen is covered.
+/// Whitespace (collapsed or not), control characters and default-ignorable code points (zero-width space
+/// and joiners, soft hyphen, variation selectors, …) have no glyphs to lose and are not reported; gaps are
+/// separated by one space in the excerpt.
+fn uncovered_text(text: &str, covered: &[Range<usize>]) -> Option<String> {
+    let sorted;
+    let covered = if covered.windows(2).all(|w| w[0].start <= w[1].start) {
+        covered
+    } else {
+        let mut v = covered.to_vec();
+        v.sort_unstable_by_key(|r| r.start);
+        sorted = v;
+        &sorted
+    };
+    let mut excerpt = String::new();
+    let mut chars = 0usize;
+    let mut gap = |from: usize, to: usize| {
+        let Some(gap) = text.get(from..to) else {
+            return;
+        };
+        // Gaps and whitespace inside a gap are one space apart in the excerpt.
+        let mut space = true;
+        for c in gap.chars() {
+            if c.is_whitespace() {
+                space = true;
+                continue;
+            }
+            if c.is_control() || is_default_ignorable(c) {
+                continue;
+            }
+            if chars >= EXCERPT_CHARS {
+                if !excerpt.ends_with('\u{2026}') {
+                    excerpt.push('\u{2026}');
+                }
+                return;
+            }
+            if space && !excerpt.is_empty() {
+                excerpt.push(' ');
+                chars += 1;
+            }
+            space = false;
+            excerpt.push(c);
+            chars += 1;
+        }
+    };
+    let mut pos = 0usize;
+    for r in covered {
+        if r.start > pos {
+            gap(pos, r.start);
+        }
+        pos = pos.max(r.end);
+    }
+    gap(pos, text.len());
+    (!excerpt.is_empty()).then_some(excerpt)
+}
+
+/// Unicode `Default_Ignorable_Code_Point` (DerivedCoreProperties.txt): characters a renderer must not
+/// draw even when the font has no glyph for them.
+fn is_default_ignorable(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x034F | 0x061C | 0x115F..=0x1160 | 0x17B4..=0x17B5 | 0x180B..=0x180F
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFE00..=0xFE0F
+        | 0xFEFF | 0xFFA0 | 0xFFF0..=0xFFF8 | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A
+        | 0xE0000..=0xE0FFF)
 }
 
 #[cfg(test)]
@@ -1610,5 +1702,88 @@ mod tests {
             .render(r#"<!doctype html><html><body><p>ok</p></body></html>"#)
             .expect("render failed");
         assert!(pdf.starts_with(b"%PDF"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)] // a slice holding one range is what the function takes
+mod uncovered_text_tests {
+    use super::*;
+
+    #[test]
+    fn nothing_uncovered_is_none() {
+        assert_eq!(uncovered_text("", &[]), None);
+        assert_eq!(uncovered_text("abc", &[0..3]), None);
+        assert_eq!(uncovered_text("ab cd", &[0..2, 3..5]), None);
+    }
+
+    #[test]
+    fn whitespace_and_invisible_characters_are_not_dropped() {
+        // Space, no-break space, newline, tab, ZWSP, ZWJ, soft hyphen, variation selector, BOM, a word joiner.
+        assert_eq!(
+            uncovered_text(
+                "a \u{a0}\n\t\u{200b}\u{200d}\u{ad}\u{fe0f}\u{feff}\u{2060}",
+                &[0..1]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_visible_gap_is_reported() {
+        assert_eq!(uncovered_text("abc", &[]).as_deref(), Some("abc"));
+        assert_eq!(
+            uncovered_text("ab cd ef", &[0..2, 5..8]).as_deref(),
+            Some("cd")
+        );
+        // A leading and a trailing gap, separated by one space in the excerpt.
+        assert_eq!(
+            uncovered_text("ab cd ef", &[3..5]).as_deref(),
+            Some("ab ef")
+        );
+        // Text that is only partly uncovered inside a gap keeps its visible characters only.
+        assert_eq!(
+            uncovered_text("a\u{200b} b c", &[4..5]).as_deref(),
+            Some("a b c")
+        );
+    }
+
+    #[test]
+    fn ranges_may_arrive_in_any_order_and_overlap() {
+        assert_eq!(uncovered_text("abcdef", &[4..6, 0..2, 2..4]), None);
+        assert_eq!(uncovered_text("abcdef", &[3..6, 0..4]), None);
+        assert_eq!(
+            uncovered_text("abcdef", &[3..6, 0..2]).as_deref(),
+            Some("c")
+        );
+    }
+
+    #[test]
+    fn multibyte_text_is_cut_at_character_boundaries() {
+        let t = "Částka Kč";
+        assert_eq!(uncovered_text(t, &[0..t.len()]), None);
+        assert_eq!(
+            uncovered_text(t, &[0.."Částka ".len()]).as_deref(),
+            Some("Kč")
+        );
+        // A range that ends inside a character cannot come from Parley; it must not panic either.
+        let _ = uncovered_text(t, &[0..3]);
+    }
+
+    #[test]
+    fn long_text_is_shortened() {
+        let t = "x".repeat(200);
+        let e = uncovered_text(&t, &[]).unwrap();
+        assert_eq!(e.chars().count(), EXCERPT_CHARS + 1);
+        assert!(e.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn note_covered_merges_touching_ranges_in_either_direction() {
+        let mut c = Vec::new();
+        for r in [0..2, 2..5, 5..6, 9..10, 8..9, 20..22] {
+            note_covered(&mut c, &r);
+        }
+        assert_eq!(c, [0..6, 8..10, 20..22]);
     }
 }

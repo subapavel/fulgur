@@ -2,7 +2,7 @@
 
 use crate::error::Error;
 use crate::error::Result;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -12,6 +12,12 @@ pub struct AssetBundle {
     pub css: Vec<String>,
     pub fonts: Vec<Arc<Vec<u8>>>,
     pub images: HashMap<String, Arc<Vec<u8>>>,
+    /// CSS generic family keyword (`monospace`, `serif`, …) to the registered family it resolves to.
+    /// Without host fonts the engine's generic-family table is empty, so a generic keyword that comes
+    /// from a source the caller does not control (the user-agent sheet gives `pre`, `code`, `kbd`,
+    /// `samp`, `tt` `font-family: monospace`) matches no face and its text is dropped. Empty: the
+    /// engine behaves as before. Ordered, so the result cannot depend on insertion order.
+    pub generic_families: BTreeMap<String, String>,
     base_path_str: Option<String>,
 }
 
@@ -21,8 +27,17 @@ impl AssetBundle {
             css: Vec::new(),
             fonts: Vec::new(),
             images: HashMap::new(),
+            generic_families: BTreeMap::new(),
             base_path_str: None,
         }
+    }
+
+    /// Resolve the CSS generic family `keyword` (`"monospace"`, `"sans-serif"`, …) to the registered
+    /// font family `family`. Keywords the engine does not know, and families that are not registered
+    /// when the document is parsed, are ignored. Replaces an earlier mapping of the same keyword.
+    pub fn set_generic_family(&mut self, keyword: &str, family: impl Into<String>) {
+        self.generic_families
+            .insert(keyword.to_string(), family.into());
     }
 
     pub fn add_css(&mut self, css: impl Into<String>) {

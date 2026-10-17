@@ -8,6 +8,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 
+/// Most `log::warn!` lines for text without a font face per render; the rest is counted in one more line.
+const MAX_DROPPED_TEXT_WARNINGS: usize = 20;
+
 /// Reusable PDF generation engine.
 pub struct Engine {
     config: Config,
@@ -17,6 +20,7 @@ pub struct Engine {
     data: Option<serde_json::Value>,
     serialize_settings: SerializeSettings,
     system_fonts: bool,
+    strict_text: bool,
 }
 
 /// Renderer-agnostic layout result produced by [`Engine::layout`].
@@ -82,6 +86,7 @@ impl Engine {
             data: None,
             serialize_settings: SerializeSettings::default(),
             system_fonts: true,
+            strict_text: false,
         }
     }
 
@@ -105,6 +110,16 @@ impl Engine {
             .as_ref()
             .map(|a| a.fonts.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Generic font families the caller mapped to registered families (see
+    /// [`AssetBundle::generic_families`]); empty without an asset bundle.
+    fn generics(&self) -> &BTreeMap<String, String> {
+        static NONE: BTreeMap<String, String> = BTreeMap::new();
+        self.assets
+            .as_ref()
+            .map(|a| &a.generic_families)
+            .unwrap_or(&NONE)
     }
 
     /// Render HTML string to PDF bytes.
@@ -194,14 +209,16 @@ impl Engine {
         // the margin-box renderer, so headers/footers would appear in
         // default browser styles even though their content resolved
         // correctly.
-        let (mut doc, link_gcpm) = crate::blitz_adapter::parse_html_with_local_resources(
-            &html,
-            self.config.content_width().as_pt().in_px().to_f32(),
-            self.config.page_height().as_pt().in_px().to_f32() as u32,
-            fonts,
-            self.system_fonts,
-            self.base_path.as_deref(),
-        );
+        let (mut doc, link_gcpm) =
+            crate::blitz_adapter::parse_html_with_local_resources_and_generics(
+                &html,
+                self.config.content_width().as_pt().in_px().to_f32(),
+                self.config.page_height().as_pt().in_px().to_f32() as u32,
+                fonts,
+                self.system_fonts,
+                self.generics(),
+                self.base_path.as_deref(),
+            );
         // Bundled images are invisible to Blitz's layout until told: give every `<img>` its
         // natural size before anything resolves (F9).
         if let Some(assets) = &self.assets {
@@ -662,6 +679,7 @@ impl Engine {
             multicol_geometry,
             pagination_geometry,
             link_cache: Default::default(),
+            dropped_text: Vec::new(),
             // Use the resolved `@page` content box so percentage-based
             // fixed/abs descendants size against the same viewport that
             // pagination geometry and `relayout_position_fixed` use.
@@ -674,7 +692,23 @@ impl Engine {
         // `convert_ctx`, then drop it so its `&running_store` borrow ends and
         // `running_store` can be moved into the artifacts.
         let pagination_geometry = std::mem::take(&mut convert_ctx.pagination_geometry);
+        let dropped_text = std::mem::take(&mut convert_ctx.dropped_text);
         drop(convert_ctx);
+        // Pass 2 (`anchor_map` is `Some`) lays out the same text again; report it once.
+        if anchor_map.is_none() && !dropped_text.is_empty() {
+            if self.strict_text {
+                return Err(crate::error::Error::TextWithoutFont(dropped_text));
+            }
+            for d in dropped_text.iter().take(MAX_DROPPED_TEXT_WARNINGS) {
+                log::warn!("text has no font face and is left out of the PDF: {d}");
+            }
+            if dropped_text.len() > MAX_DROPPED_TEXT_WARNINGS {
+                log::warn!(
+                    "... and {} more pieces of text without a font face",
+                    dropped_text.len() - MAX_DROPPED_TEXT_WARNINGS
+                );
+            }
+        }
         Ok(LayoutArtifacts {
             drawables,
             pagination_geometry,
@@ -722,6 +756,7 @@ impl Engine {
             &running_store,
             fonts,
             self.system_fonts,
+            self.generics(),
             &string_set_for_render,
             &counter_ops_for_render,
             html_title,
@@ -850,14 +885,16 @@ impl Engine {
     pub fn build_drawables_for_testing_no_gcpm(&self, html: &str) -> crate::drawables::Drawables {
         let fonts = self.fonts();
 
-        let (mut doc, _link_gcpm) = crate::blitz_adapter::parse_html_with_local_resources(
-            html,
-            self.config.content_width().as_pt().in_px().to_f32(),
-            self.config.page_height().as_pt().in_px().to_f32() as u32,
-            fonts,
-            self.system_fonts,
-            self.base_path.as_deref(),
-        );
+        let (mut doc, _link_gcpm) =
+            crate::blitz_adapter::parse_html_with_local_resources_and_generics(
+                html,
+                self.config.content_width().as_pt().in_px().to_f32(),
+                self.config.page_height().as_pt().in_px().to_f32() as u32,
+                fonts,
+                self.system_fonts,
+                self.generics(),
+                self.base_path.as_deref(),
+            );
         if let Some(assets) = &self.assets {
             crate::blitz_adapter::seed_image_natural_sizes(&mut doc, assets);
         }
@@ -892,6 +929,7 @@ impl Engine {
             multicol_geometry,
             pagination_geometry,
             link_cache: Default::default(),
+            dropped_text: Vec::new(),
             viewport_size_px: Some((
                 self.config.content_width().as_pt().in_px().to_f32(),
                 self.config.content_height().as_pt().in_px().to_f32(),
@@ -918,14 +956,16 @@ impl Engine {
     ) {
         let fonts = self.fonts();
 
-        let (mut doc, _link_gcpm) = crate::blitz_adapter::parse_html_with_local_resources(
-            html,
-            self.config.content_width().as_pt().in_px().to_f32(),
-            self.config.page_height().as_pt().in_px().to_f32() as u32,
-            fonts,
-            self.system_fonts,
-            self.base_path.as_deref(),
-        );
+        let (mut doc, _link_gcpm) =
+            crate::blitz_adapter::parse_html_with_local_resources_and_generics(
+                html,
+                self.config.content_width().as_pt().in_px().to_f32(),
+                self.config.page_height().as_pt().in_px().to_f32() as u32,
+                fonts,
+                self.system_fonts,
+                self.generics(),
+                self.base_path.as_deref(),
+            );
         if let Some(assets) = &self.assets {
             crate::blitz_adapter::seed_image_natural_sizes(&mut doc, assets);
         }
@@ -996,6 +1036,7 @@ impl Engine {
             multicol_geometry,
             pagination_geometry,
             link_cache: Default::default(),
+            dropped_text: Vec::new(),
             viewport_size_px: Some((content_w_px, content_h_px)),
         };
         let drawables = crate::convert::dom_to_drawables(&doc, &mut convert_ctx);
@@ -1249,6 +1290,7 @@ pub struct EngineBuilder {
     data: Option<serde_json::Value>,
     serialize_settings: SerializeSettings,
     system_fonts: bool,
+    strict_text: bool,
 }
 
 impl EngineBuilder {
@@ -1337,6 +1379,16 @@ impl EngineBuilder {
         self
     }
 
+    /// Whether text that no font face covers is an error ([`crate::Error::TextWithoutFont`]) instead of a
+    /// `log::warn!` per distinct (element, text). Such text is laid out but left out of the PDF: the
+    /// element's `font-family` list matched no registered face, or named a generic family the collection
+    /// does not resolve (see [`AssetBundle::generic_families`]). Whitespace and invisible characters are
+    /// never reported. Only text in the document body is checked, not `@page` margin boxes. Default: off.
+    pub fn strict_text(mut self, strict: bool) -> Self {
+        self.strict_text = strict;
+        self
+    }
+
     pub fn base_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.base_path = Some(path.into());
         self
@@ -1375,6 +1427,7 @@ impl EngineBuilder {
             data: self.data,
             serialize_settings: self.serialize_settings,
             system_fonts: self.system_fonts,
+            strict_text: self.strict_text,
         }
     }
 }

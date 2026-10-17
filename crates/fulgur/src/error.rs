@@ -24,8 +24,19 @@ pub enum Error {
     #[error("Unsupported font format: {0}")]
     UnsupportedFontFormat(String),
 
+    /// Text that no registered font face covers (`EngineBuilder::strict_text`): `<element> "excerpt"` each.
+    #[error("text without a font face: {}", join_dropped(.0))]
+    TextWithoutFont(Vec<crate::convert::DroppedText>),
+
     #[error("{0}")]
     Other(String),
+}
+
+fn join_dropped(list: &[crate::convert::DroppedText]) -> String {
+    list.iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 impl From<minijinja::Error> for Error {

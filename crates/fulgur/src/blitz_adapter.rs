@@ -148,12 +148,33 @@ pub fn parse_and_layout(
     font_data: &[Arc<Vec<u8>>],
     system_fonts: bool,
 ) -> HtmlDocument {
+    parse_and_layout_with_generics(
+        html,
+        viewport_width,
+        viewport_height,
+        font_data,
+        system_fonts,
+        &BTreeMap::new(),
+    )
+}
+
+/// [`parse_and_layout`] with the generic font families resolved as
+/// [`AssetBundle::generic_families`](crate::asset::AssetBundle::generic_families) says.
+pub fn parse_and_layout_with_generics(
+    html: &str,
+    viewport_width: crate::units::Px,
+    viewport_height: crate::units::Px,
+    font_data: &[Arc<Vec<u8>>],
+    system_fonts: bool,
+    generics: &BTreeMap<String, String>,
+) -> HtmlDocument {
     let mut doc = parse_inner(
         html,
         viewport_width.to_f32(),
         viewport_height.to_f32() as u32,
         font_data,
         system_fonts,
+        generics,
         None,
         None,
     );
@@ -179,7 +200,16 @@ pub trait DomPass {
 /// [`parse_html_with_local_resources`] instead, which wires fulgur's
 /// own [`crate::net::FulgurNetProvider`] into Blitz.
 pub fn parse(html: &str, viewport_width: f32, font_data: &[Arc<Vec<u8>>]) -> HtmlDocument {
-    parse_inner(html, viewport_width, 10000, font_data, true, None, None)
+    parse_inner(
+        html,
+        viewport_width,
+        10000,
+        font_data,
+        true,
+        &BTreeMap::new(),
+        None,
+        None,
+    )
 }
 
 /// Parse HTML and load any `<link rel="stylesheet">` / `@import` files
@@ -240,6 +270,28 @@ pub fn parse_html_with_local_resources(
     system_fonts: bool,
     base_path: Option<&Path>,
 ) -> (HtmlDocument, crate::gcpm::GcpmContext) {
+    parse_html_with_local_resources_and_generics(
+        html,
+        viewport_width,
+        viewport_height_px,
+        font_data,
+        system_fonts,
+        &BTreeMap::new(),
+        base_path,
+    )
+}
+
+/// [`parse_html_with_local_resources`] with the generic font families resolved as
+/// [`AssetBundle::generic_families`](crate::asset::AssetBundle::generic_families) says.
+pub fn parse_html_with_local_resources_and_generics(
+    html: &str,
+    viewport_width: f32,
+    viewport_height_px: u32,
+    font_data: &[Arc<Vec<u8>>],
+    system_fonts: bool,
+    generics: &BTreeMap<String, String>,
+    base_path: Option<&Path>,
+) -> (HtmlDocument, crate::gcpm::GcpmContext) {
     use std::collections::HashSet;
 
     let net_provider = Arc::new(crate::net::FulgurNetProvider::new(
@@ -254,6 +306,7 @@ pub fn parse_html_with_local_resources(
         viewport_height_px,
         font_data,
         system_fonts,
+        generics,
         Some(provider),
         base_url,
     );
@@ -300,12 +353,14 @@ pub fn parse_html_with_local_resources(
 
 /// The single primitive that actually constructs an `HtmlDocument`.
 /// All other `parse*` functions in this module funnel through here.
+#[allow(clippy::too_many_arguments)]
 fn parse_inner(
     html: &str,
     viewport_width: f32,
     viewport_height_px: u32,
     font_data: &[Arc<Vec<u8>>],
     system_fonts: bool,
+    generics: &BTreeMap<String, String>,
     net_provider: Option<Arc<dyn NetProvider<Resource>>>,
     base_url: Option<String>,
 ) -> HtmlDocument {
@@ -316,7 +371,7 @@ fn parse_inner(
         ColorScheme::Light,
     );
 
-    let font_ctx = if font_data.is_empty() && system_fonts {
+    let font_ctx = if font_data.is_empty() && system_fonts && generics.is_empty() {
         // No bundled fonts and system fonts allowed: let Blitz use its own
         // default FontContext (system fonts enabled).
         None
@@ -333,6 +388,7 @@ fn parse_inner(
             let blob: parley::fontique::Blob<u8> = (**data).clone().into();
             ctx.collection.register_fonts(blob, None);
         }
+        apply_generic_families(&mut ctx.collection, generics);
         Some(ctx)
     };
 
@@ -345,6 +401,26 @@ fn parse_inner(
     };
 
     HtmlDocument::from_html(html, config)
+}
+
+/// Point each CSS generic family in `generics` (keyword → family name) at the registered family of that
+/// name. Without host fonts fontique's generic-family table is empty, so a generic keyword matches no face
+/// and Parley gives the text no glyph run: it is left out of the PDF. Keywords fontique does not know and
+/// families that are not registered are skipped (the generic then stays empty, as before). An empty map
+/// leaves the collection untouched.
+fn apply_generic_families(
+    collection: &mut parley::fontique::Collection,
+    generics: &BTreeMap<String, String>,
+) {
+    for (keyword, family) in generics {
+        let Some(generic) = parley::fontique::GenericFamily::parse(keyword) else {
+            continue;
+        };
+        let Some(id) = collection.family_id(family) else {
+            continue;
+        };
+        collection.set_generic_families(generic, std::iter::once(id));
+    }
 }
 
 /// Apply a sequence of DOM passes to a parsed document.
@@ -7585,6 +7661,69 @@ mod seed_image_natural_size_tests {
             data.text.clone(),
             data.layout.lines().map(|l| l.metrics().advance).collect(),
         )
+    }
+
+    /// Number of glyph runs in the first inline formatting context of `html`, parsed with only Noto Sans
+    /// registered and `generics` as the generic-family map.
+    fn glyph_runs(html: &str, generics: &[(&str, &str)]) -> usize {
+        let generics: BTreeMap<String, String> = generics
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let (mut doc, _gcpm) = parse_html_with_local_resources_and_generics(
+            html,
+            400.0,
+            10000,
+            &noto(),
+            false,
+            &generics,
+            None,
+        );
+        resolve(&mut doc);
+        let root = doc
+            .tree()
+            .iter()
+            .find(|(_, n)| {
+                n.element_data()
+                    .is_some_and(|e| e.inline_layout_data.is_some())
+            })
+            .map(|(id, _)| id)
+            .expect("no inline root");
+        let layout = &doc
+            .get_node(root)
+            .unwrap()
+            .element_data()
+            .unwrap()
+            .inline_layout_data
+            .as_ref()
+            .unwrap()
+            .layout;
+        layout
+            .lines()
+            .flat_map(|l| l.items())
+            .filter(|i| matches!(i, parley::PositionedLayoutItem::GlyphRun(_)))
+            .count()
+    }
+
+    /// F70: the user-agent sheet gives `pre`, `code`, `kbd`, `samp` and `tt` `font-family: monospace`. With
+    /// host fonts off, fontique's generic-family table is empty, Parley finds no face for the item and the
+    /// text gets no glyph run. `AssetBundle::generic_families` fills the table.
+    #[test]
+    fn ua_monospace_has_glyph_runs_only_when_the_generic_is_mapped() {
+        let pre = r#"<body style="font-family:Noto Sans"><pre>one two
+three</pre></body>"#;
+        assert_eq!(glyph_runs(pre, &[]), 0, "upstream behaviour without a map");
+        assert!(glyph_runs(pre, &[("monospace", "Noto Sans")]) >= 2);
+        // `code` inside a paragraph: the surrounding text keeps its run either way.
+        let code = r#"<body style="font-family:Noto Sans"><p>a <code>b</code> c</p></body>"#;
+        let without = glyph_runs(code, &[]);
+        let with = glyph_runs(code, &[("monospace", "Noto Sans")]);
+        assert_eq!(with, without + 1, "{without} runs without, {with} with");
+        // Keywords and families the engine cannot use are skipped; the generic stays unresolved.
+        assert_eq!(glyph_runs(pre, &[("monospace", "Not Registered")]), 0);
+        assert_eq!(glyph_runs(pre, &[("not-a-generic", "Noto Sans")]), 0);
+        // Another generic does not resolve `monospace`.
+        assert_eq!(glyph_runs(pre, &[("serif", "Noto Sans")]), 0);
     }
 
     const LONG_TEXT: &str = "The quick brown fox jumps over the lazy dog and runs far away";
