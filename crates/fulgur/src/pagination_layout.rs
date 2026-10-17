@@ -837,7 +837,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     cursor_y = 0.0;
                 }
                 let para_x = layout.location.x;
-                let (new_page_index, new_cursor_y, frag_count) = fragment_inline_root(
+                let (new_page_index, new_cursor_y, frag_count, placements) = fragment_inline_root(
                     &mut self.geometry,
                     child_id,
                     body_x + para_x,
@@ -846,6 +846,20 @@ impl<'a> PaginationLayoutTree<'a> {
                     page_index,
                     self.strips,
                     &line_metrics,
+                );
+                // Atomic inlines and images in the paragraph get their fragments on the page that
+                // holds their line. Without them the paragraph's `InlineBox` items find no geometry
+                // and the content is never drawn (F32a): an `<img>` or `inline-block` in any
+                // paragraph of two or more lines vanished.
+                record_split_inline_root_descendants(
+                    &mut self.geometry,
+                    self.doc,
+                    child_id,
+                    body_x + para_x,
+                    0.0,
+                    &placements,
+                    layout.border.top + layout.padding.top,
+                    0,
                 );
                 page_index = new_page_index;
                 cursor_y = new_cursor_y;
@@ -3734,6 +3748,9 @@ fn warn_unprinted_inline_lines(child: &blitz_dom::Node, child_page_y: f32, page_
 /// Edge case: if the very first line on a fresh page is taller than
 /// the page strip, the line is emitted as an oversized fragment (no
 /// further mid-line split) — same fallback as the block branch.
+///
+/// The fourth element is one `(page, y - top, top)` per emitted fragment: where
+/// its first line starts, for placing the paragraph's descendants (F32a).
 #[allow(clippy::too_many_arguments)]
 fn fragment_inline_root(
     geometry: &mut PaginationGeometryTable,
@@ -3744,14 +3761,14 @@ fn fragment_inline_root(
     initial_page_index: u32,
     strips: PageStrips,
     line_metrics: &[(f32, f32)],
-) -> (u32, f32, usize) {
+) -> (u32, f32, usize, Vec<(u32, f32, f32)>) {
     /// CSS 3 Fragmentation default for `orphans`.
     const ORPHANS_MIN: usize = 2;
     /// CSS 3 Fragmentation default for `widows`.
     const WIDOWS_MIN: usize = 2;
 
     if line_metrics.is_empty() {
-        return (initial_page_index, initial_cursor_y, 0);
+        return (initial_page_index, initial_cursor_y, 0, Vec::new());
     }
 
     let mut page_index = initial_page_index;
@@ -3759,6 +3776,8 @@ fn fragment_inline_root(
     let mut fragment_start_idx: usize = 0;
     let mut emitted = 0usize;
     let total_lines = line_metrics.len();
+    // `(page, y - top, top)` per fragment, as `record_split_inline_root_descendants` takes them.
+    let mut placements: Vec<(u32, f32, f32)> = Vec::new();
 
     for (i, &(_line_top_local, line_bottom_local)) in line_metrics.iter().enumerate() {
         let frag_top_local = line_metrics[fragment_start_idx].0;
@@ -3793,6 +3812,11 @@ fn fragment_inline_root(
                 height: frag_h.as_px(),
             };
             geometry.entry(child_id).or_default().fragments.push(frag);
+            placements.push((
+                page_index,
+                paragraph_top_in_body - frag_top_local,
+                frag_top_local,
+            ));
             emitted += 1;
 
             page_index += 1;
@@ -3813,10 +3837,15 @@ fn fragment_inline_root(
         height: frag_h.as_px(),
     };
     geometry.entry(child_id).or_default().fragments.push(frag);
+    placements.push((
+        page_index,
+        paragraph_top_in_body - frag_top_local,
+        frag_top_local,
+    ));
     emitted += 1;
 
     let cursor_y = paragraph_top_in_body + frag_h;
-    (page_index, cursor_y, emitted)
+    (page_index, cursor_y, emitted, placements)
 }
 
 /// Per-page state for a named string emitted by `string-set:`.
@@ -7524,7 +7553,7 @@ h2 { string-set: chapter-title content(text); }
         // Page strip = 200, so naturally we'd split at line 2 (bottom
         // 225 > 200), leaving 1 line in the tail — widow violated.
         let lines = vec![(0.0, 75.0), (75.0, 150.0), (150.0, 225.0)];
-        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+        let (new_page, new_cursor, emitted, _) = super::fragment_inline_root(
             &mut geom,
             /*child_id=*/ 1,
             /*paragraph_x=*/ 0.0,
@@ -7555,7 +7584,7 @@ h2 { string-set: chapter-title content(text); }
         // Page strip = 200 → natural split at line 2 (bottom 225 > 200).
         // first_size = 2 ≥ orphans, remaining_size = 2 ≥ widows. Split OK.
         let lines = vec![(0.0, 75.0), (75.0, 150.0), (150.0, 225.0), (225.0, 300.0)];
-        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+        let (new_page, new_cursor, emitted, _) = super::fragment_inline_root(
             &mut geom,
             1,
             0.0,
@@ -7590,7 +7619,7 @@ h2 { string-set: chapter-title content(text); }
         // Page strip = 100 → natural split at line 1 (bottom 150 > 100).
         // first_size = 1 < orphans=2. Don't split.
         let lines = vec![(0.0, 75.0), (75.0, 150.0), (150.0, 225.0)];
-        let (new_page, _new_cursor, emitted) = super::fragment_inline_root(
+        let (new_page, _new_cursor, emitted, _) = super::fragment_inline_root(
             &mut geom,
             1,
             0.0,
@@ -7606,6 +7635,71 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(frags.len(), 1);
         assert_eq!(frags[0].page_index, 0);
         assert!((frags[0].height.to_f32() - 225.0).abs() < 0.01);
+    }
+
+    /// Node id of the element with `id="..."`.
+    fn node_with_id(doc: &blitz_html::HtmlDocument, id: &str) -> usize {
+        doc.tree()
+            .iter()
+            .find(|(_, n)| {
+                n.element_data().is_some_and(|e| {
+                    e.attrs()
+                        .iter()
+                        .any(|a| a.name.local.as_ref() == "id" && a.value == id)
+                })
+            })
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| panic!("no #{id}"))
+    }
+
+    /// F32a: a paragraph of two or more lines took the line-splitting path, which recorded the
+    /// paragraph but none of its inline boxes. `paragraph.rs` draws an `InlineBox` item only when
+    /// the box has a fragment on the page, so an `<img>` or `inline-block` in such a paragraph was
+    /// never drawn.
+    #[test]
+    fn multi_line_paragraph_records_its_inline_boxes() {
+        let html = r#"
+            <html><body style="margin: 0">
+              <p style="margin: 0">one<br>two <span id="box" style="display:inline-block;width:20px;height:10px"></span></p>
+              <p style="margin: 0">three<br>four<br>five <span id="late" style="display:inline-block;width:20px;height:10px"></span></p>
+            </body></html>
+        "#;
+        let mut doc = parse(html, 600.0);
+        let table = run_pass(&mut doc, 800.0);
+        for id in ["box", "late"] {
+            let node = node_with_id(&doc, id);
+            let frags = &table
+                .get(&node)
+                .unwrap_or_else(|| panic!("#{id} has no geometry"))
+                .fragments;
+            assert_eq!(frags.len(), 1, "#{id}");
+            assert_eq!(frags[0].page_index, 0);
+            assert_eq!(frags[0].width.to_f32(), 20.0);
+        }
+    }
+
+    /// F32a: an inline box on the second page of a paragraph that splits between lines lands on
+    /// that page.
+    #[test]
+    fn split_paragraph_places_inline_boxes_on_their_lines_page() {
+        // Six 30 px lines (`<br>`); the page strip holds four, so lines 4-5 go to page 1 (widows
+        // = 2 satisfied). The box is on the last line.
+        let html = r#"
+            <html><body style="margin: 0">
+              <p style="margin: 0; line-height: 30px; font-size: 20px">a<br>b<br>c<br>d<br>e<br><span id="last" style="display:inline-block;width:20px;height:10px"></span></p>
+            </body></html>
+        "#;
+        let mut doc = parse(html, 600.0);
+        let table = run_pass(&mut doc, 130.0);
+        let last = node_with_id(&doc, "last");
+        let frags = &table
+            .get(&last)
+            .expect("no geometry for the inline box")
+            .fragments;
+        assert_eq!(
+            frags[0].page_index, 1,
+            "the box is on the last line: {frags:?}"
+        );
     }
 
     #[test]
