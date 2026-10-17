@@ -33,6 +33,10 @@ taffy = "0.9"
 parley = "0.6"
 skrifa = "0.44"
 stylo = "0.8.0"
+# The selector matcher and the URL type Stylo's selector parser takes, at the versions Blitz / Stylo already lock: the break
+# reader matches rules the way the engine does (F87 review).
+selectors = "0.32"
+url = "2"
 woff2-patched = "0.4"
 thiserror = "2"
 minijinja = { version = "=2.21.0", features = ["unstable_machinery"] }

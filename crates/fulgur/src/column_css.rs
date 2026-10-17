@@ -41,6 +41,14 @@
 
 use std::collections::BTreeMap;
 
+use selectors::SelectorList;
+use selectors::matching::{
+    MatchingContext, MatchingForInvalidation, MatchingMode, NeedsSelectorFlags, QuirksMode,
+    SelectorCaches, matches_selector,
+};
+use style::selector_parser::{SelectorImpl, SelectorParser};
+use style::stylesheets::UrlExtraData;
+
 use cssparser::{
     AtRuleParser, BasicParseErrorKind, CowRcStr, DeclarationParser, ParseError, Parser,
     ParserInput, QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, StyleSheetParser, Token,
@@ -177,7 +185,9 @@ pub(crate) type ColumnStyleTable = BTreeMap<usize, ColumnStyleProps>;
 /// that apply when any of them matches.
 #[derive(Clone, Debug)]
 pub(crate) struct StyleRule {
-    pub selectors: Vec<ComplexSelector>,
+    /// The selector list, parsed by Stylo's own parser (the one Blitz uses), so the reader supports exactly the
+    /// selectors the engine does: combinators, attributes, `:not()`, `:is()`, `:where()`, structural pseudo-classes.
+    pub selectors: SelectorList<SelectorImpl>,
     /// The normal declarations.
     pub props: ColumnStyleProps,
     /// The `!important` declarations (Cascade 5 §6.1: a separate, higher tier of the cascade).
@@ -187,63 +197,6 @@ pub(crate) struct StyleRule {
     /// Position of `layer` in the cascade ([`LayerTree::ranks`]): higher beats lower for normal declarations,
     /// unlayered rules are highest.
     pub rank: usize,
-}
-
-/// Specificity of a selector (Selectors 4 §17): ids, classes, types. Compared lexicographically.
-pub(crate) type Specificity = (u32, u32, u32);
-
-fn compound_specificity(c: &CompoundSelector) -> Specificity {
-    c.parts
-        .iter()
-        .fold((0, 0, 0), |(a, b, t), part| match part {
-            SimpleSelector::Id(_) => (a + 1, b, t),
-            SimpleSelector::Class(_) => (a, b + 1, t),
-            SimpleSelector::Type(_) => (a, b, t + 1),
-            SimpleSelector::Universal => (a, b, t),
-        })
-}
-
-/// Specificity of one complex selector: the sum over its compounds (`A + B` counts both).
-pub(crate) fn specificity(sel: &ComplexSelector) -> Specificity {
-    let (a, b, c) = compound_specificity(&sel.subject);
-    let (pa, pb, pc) = sel
-        .prev_sibling
-        .as_ref()
-        .map_or((0, 0, 0), compound_specificity);
-    (a + pa, b + pb, c + pc)
-}
-
-/// One simple selector — a single unqualified component of a compound
-/// selector. `Universal` matches every element; the other variants match
-/// against the corresponding attribute / tag.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SimpleSelector {
-    /// Lowercased tag name (e.g. `div`).
-    Type(String),
-    /// Class name without the leading `.`.
-    Class(String),
-    /// Id without the leading `#`.
-    Id(String),
-    /// `*`.
-    Universal,
-}
-
-/// Compound selector — multiple [`SimpleSelector`] parts that must all match
-/// the same element (logical AND). `div.foo#bar` is a compound of three
-/// parts.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct CompoundSelector {
-    pub parts: Vec<SimpleSelector>,
-}
-
-/// One leg of a complex selector. `subject` is the element that must match
-/// the rule target. `prev_sibling` (if `Some`) is a compound selector that
-/// must match the element immediately preceding `subject` in the DOM.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ComplexSelector {
-    pub subject: CompoundSelector,
-    /// Adjacent-sibling context (`E + F` → F is subject, E is prev_sibling).
-    pub prev_sibling: Option<CompoundSelector>,
 }
 
 // ---------------------------------------------------------------------------
@@ -866,193 +819,6 @@ fn parse_column_rule_shorthand(input: &mut Parser<'_, '_>) -> Option<ColumnRuleS
 }
 
 // ---------------------------------------------------------------------------
-// Selector parser
-// ---------------------------------------------------------------------------
-
-/// Parse a comma-separated selector list. Returns an empty `Vec` when any
-/// selector uses unsupported syntax (pseudo-classes, attribute selectors,
-/// descendant/child/general-sibling combinators) — per Phase A scope
-/// discipline the whole rule is dropped silently so authors do not get a
-/// half-applied result. The adjacent-sibling combinator (`+`) is supported.
-pub(crate) fn parse_selector_list(input: &str) -> Vec<ComplexSelector> {
-    let mut parser_input = ParserInput::new(input);
-    let mut parser = Parser::new(&mut parser_input);
-
-    let mut selectors: Vec<ComplexSelector> = Vec::new();
-    let mut current = CompoundSelector::default();
-    let mut prev_sibling: Option<CompoundSelector> = None;
-    // `just_saw_whitespace` is true when the previous real token completed a
-    // compound and whitespace followed: the next real token must be `,`, `+`,
-    // or EOF, otherwise we have a descendant combinator which is not supported.
-    let mut just_saw_whitespace = false;
-
-    loop {
-        let tok = match parser.next_including_whitespace() {
-            Ok(t) => t.clone(),
-            Err(_) => break,
-        };
-
-        if matches!(tok, Token::WhiteSpace(_)) {
-            just_saw_whitespace = !current.parts.is_empty();
-            continue;
-        }
-
-        match tok {
-            Token::Comma => {
-                if current.parts.is_empty() {
-                    return Vec::new();
-                }
-                selectors.push(ComplexSelector {
-                    subject: std::mem::take(&mut current),
-                    prev_sibling: prev_sibling.take(),
-                });
-                just_saw_whitespace = false;
-            }
-            Token::Delim('+') => {
-                if current.parts.is_empty() || prev_sibling.is_some() {
-                    return Vec::new();
-                }
-                prev_sibling = Some(std::mem::take(&mut current));
-                just_saw_whitespace = false;
-            }
-            Token::Delim('.') => {
-                if just_saw_whitespace {
-                    return Vec::new();
-                }
-                match parser.next_including_whitespace() {
-                    Ok(Token::Ident(name)) => {
-                        current
-                            .parts
-                            .push(SimpleSelector::Class(name.as_ref().to_string()));
-                    }
-                    _ => return Vec::new(),
-                }
-                just_saw_whitespace = false;
-            }
-            Token::Delim('*') => {
-                if just_saw_whitespace {
-                    return Vec::new();
-                }
-                current.parts.push(SimpleSelector::Universal);
-                just_saw_whitespace = false;
-            }
-            Token::IDHash(name) | Token::Hash(name) => {
-                if just_saw_whitespace {
-                    return Vec::new();
-                }
-                current
-                    .parts
-                    .push(SimpleSelector::Id(name.as_ref().to_string()));
-                just_saw_whitespace = false;
-            }
-            Token::Ident(name) => {
-                if just_saw_whitespace {
-                    return Vec::new();
-                }
-                current
-                    .parts
-                    .push(SimpleSelector::Type(name.as_ref().to_ascii_lowercase()));
-                just_saw_whitespace = false;
-            }
-            // Unsupported tokens: pseudo-classes (`:`), attribute selectors
-            // (`[`), child/general-sibling combinators (`>`, `~`), numbers,
-            // and anything else the Phase A grammar does not model. Drop the
-            // whole list.
-            _ => return Vec::new(),
-        }
-    }
-
-    if !current.parts.is_empty() {
-        selectors.push(ComplexSelector {
-            subject: std::mem::take(&mut current),
-            prev_sibling: prev_sibling.take(),
-        });
-    } else if selectors.is_empty() || prev_sibling.is_some() {
-        // Either the input was empty (no selectors accepted) or a trailing
-        // combinator like `.a, .b +` left `prev_sibling` without a subject.
-        // Either way, the whole list is invalid — drop it.
-        return Vec::new();
-    }
-    selectors
-}
-
-fn matches_compound(sel: &CompoundSelector, node: &blitz_dom::Node) -> bool {
-    let Some(elem) = node.element_data() else {
-        return false;
-    };
-    if sel.parts.is_empty() {
-        return false;
-    }
-    sel.parts.iter().all(|part| match part {
-        SimpleSelector::Universal => true,
-        SimpleSelector::Type(tag) => elem.name.local.as_ref().eq_ignore_ascii_case(tag),
-        SimpleSelector::Class(want) => crate::blitz_adapter::get_attr(elem, "class")
-            .is_some_and(|classes| classes.split_whitespace().any(|c| c == want)),
-        SimpleSelector::Id(want) => {
-            crate::blitz_adapter::get_attr(elem, "id").is_some_and(|id| id == want)
-        }
-    })
-}
-
-/// Match a complex selector against `node`, given `node`'s previous *element*
-/// sibling (the nearest preceding sibling that is an element, or `None` when
-/// there is none — text/comment siblings are skipped by the caller).
-///
-/// The previous element sibling is supplied by the caller so this stays
-/// O(selector): the cascade [`walk`] threads it in document order, which keeps
-/// a flat sibling list linear. Resolving it here instead — by scanning the
-/// parent's child list on every rule check — is what made a wide sibling list
-/// O(n^2).
-fn matches_complex_with_prev(
-    sel: &ComplexSelector,
-    node: &blitz_dom::Node,
-    previous_element_sibling: Option<&blitz_dom::Node>,
-) -> bool {
-    if !matches_compound(&sel.subject, node) {
-        return false;
-    }
-    match (&sel.prev_sibling, previous_element_sibling) {
-        // No adjacent-sibling constraint: the subject match is sufficient.
-        (None, _) => true,
-        // `E + F` requires an element immediately before the subject.
-        (Some(_), None) => false,
-        (Some(sibling_sel), Some(prev)) => matches_compound(sibling_sel, prev),
-    }
-}
-
-/// Test-only convenience wrapper that resolves `node`'s previous element
-/// sibling from the document (an O(siblings) scan) before delegating to
-/// [`matches_complex_with_prev`]. Production code never takes this path — the
-/// cascade [`walk`] threads the previous element sibling in O(1); this exists
-/// so the matcher's per-node DOM behaviour can be unit-tested in isolation.
-#[cfg(test)]
-pub(crate) fn matches_complex(
-    sel: &ComplexSelector,
-    node: &blitz_dom::Node,
-    doc: &blitz_html::HtmlDocument,
-) -> bool {
-    matches_complex_with_prev(sel, node, previous_element_sibling(node, doc))
-}
-
-/// Resolve `node`'s previous element sibling by scanning its parent's child
-/// list backwards from `node`, skipping non-element (text/comment) siblings.
-/// O(siblings); test-only — the cascade [`walk`] computes this incrementally
-/// in document order instead of rescanning per node.
-#[cfg(test)]
-fn previous_element_sibling<'a>(
-    node: &blitz_dom::Node,
-    doc: &'a blitz_html::HtmlDocument,
-) -> Option<&'a blitz_dom::Node> {
-    let parent = doc.get_node(node.parent?)?;
-    let pos = parent.children.iter().position(|&id| id == node.id)?;
-    parent.children[..pos]
-        .iter()
-        .rev()
-        .filter_map(|&id| doc.get_node(id))
-        .find(|n| n.element_data().is_some())
-}
-
-// ---------------------------------------------------------------------------
 // Stylesheet parser
 // ---------------------------------------------------------------------------
 
@@ -1226,9 +992,13 @@ pub(crate) fn parse_stylesheet(source: &str) -> Vec<StyleRule> {
     let mut input = ParserInput::new(source);
     let mut parser = Parser::new(&mut input);
 
+    // Stylo's selector parser wants the URL the sheet came from; it only asks whether the scheme is `chrome`.
+    let url_data =
+        UrlExtraData::from(url::Url::parse("about:blank").expect("a constant, valid URL"));
     let mut sheet = SheetParser {
         rules: &mut rules,
         layers: &mut layers,
+        url_data: &url_data,
         layer: 0,
         depth: 0,
     };
@@ -1247,6 +1017,7 @@ pub(crate) fn parse_stylesheet(source: &str) -> Vec<StyleRule> {
 struct SheetParser<'a> {
     rules: &'a mut Vec<StyleRule>,
     layers: &'a mut LayerTree,
+    url_data: &'a UrlExtraData,
     /// Layer the rules of this (sub-)sheet belong to.
     layer: LayerId,
     /// Nesting depth of this (sub-)sheet; the top level is `0`.
@@ -1299,6 +1070,7 @@ impl SheetParser<'_> {
         let mut nested = SheetParser {
             rules: &mut *self.rules,
             layers: &mut *self.layers,
+            url_data: self.url_data,
             layer,
             depth: self.depth + 1,
         };
@@ -1391,7 +1163,7 @@ impl<'i, 'a> AtRuleParser<'i> for SheetParser<'a> {
 }
 
 impl<'i, 'a> QualifiedRuleParser<'i> for SheetParser<'a> {
-    type Prelude = Vec<ComplexSelector>;
+    type Prelude = SelectorList<SelectorImpl>;
     type QualifiedRule = ();
     type Error = ();
 
@@ -1399,18 +1171,13 @@ impl<'i, 'a> QualifiedRuleParser<'i> for SheetParser<'a> {
         &mut self,
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::Prelude, ParseError<'i, ()>> {
-        // Slice out the raw selector text and hand it to the standalone
-        // selector parser. This keeps cssparser's error recovery simple:
-        // on an unsupported selector we return an empty list, which the
-        // `parse_block` below checks.
+        // Slice out the raw selector text and hand it to Stylo's selector parser, the one Blitz styles with. A list
+        // with any invalid selector is invalid as a whole (Selectors 4 §3.1), and so is the rule.
         let start = input.position();
         while input.next_including_whitespace().is_ok() {}
         let raw = input.slice_from(start);
-        let selectors = parse_selector_list(raw);
-        if selectors.is_empty() {
-            return Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid));
-        }
-        Ok(selectors)
+        SelectorParser::parse_author_origin_no_namespace(raw, self.url_data)
+            .map_err(|_| input.new_error(BasicParseErrorKind::QualifiedRuleInvalid))
     }
 
     fn parse_block<'t>(
@@ -1446,58 +1213,61 @@ impl<'i, 'a> QualifiedRuleParser<'i> for SheetParser<'a> {
 // Cascade driver
 // ---------------------------------------------------------------------------
 
-/// Build the per-document side-table by folding stylesheet rules (in the
-/// order given: cascade order, see [`parse_stylesheet`]) and then inline `style` attributes (last — they beat the
-/// stylesheet) into each node's entry. Nodes with no matching rule and no
-/// inline declaration are skipped entirely.
+/// Build the per-document side-table: the stylesheet rules and the `style` attributes folded into each element's
+/// entry by the cascade of CSS Cascade 5 §6.1 (see [`walk`]). Elements with no matching rule and no inline
+/// declaration are skipped entirely.
 pub(crate) fn build_column_style_table(
     doc: &blitz_html::HtmlDocument,
     stylesheet_rules: &[StyleRule],
 ) -> ColumnStyleTable {
     let mut table = ColumnStyleTable::new();
     let root = doc.root_element();
-    // The root element has no previous sibling.
-    walk(doc, root.id, None, stylesheet_rules, &mut table, 0);
+    let mut caches = SelectorCaches::default();
+    walk(doc, root.id, stylesheet_rules, &mut caches, &mut table, 0);
     table
 }
 
 /// Recurse into `node_id`, folding matching rules into `table`.
 ///
-/// Returns whether the visited node is an element, so the caller's child loop
-/// can advance its previous-element-sibling marker without re-fetching the
-/// child (the loop already pays for the `get_node` inside this call). A node
-/// skipped by the depth guard or an unresolved id returns `false`; that only
-/// diverges from "is this really an element" at `depth == MAX_DOM_DEPTH`, where
-/// every sibling is likewise cut off before it could consume the marker, so
-/// the marker value is never observed and the result is unchanged.
+/// Rules are matched with Stylo's own matcher (`selectors::matching`) against Blitz's `selectors::Element`
+/// implementation, the one the engine's cascade uses: no bloom filter, quirks mode as Blitz builds its `Stylist`
+/// (`NoQuirks`), links unvisited, no selector flags. Pseudo-classes of interactive state (`:hover`, `:focus`) are
+/// false, and a selector with a pseudo-element matches no element.
 fn walk(
     doc: &blitz_html::HtmlDocument,
     node_id: usize,
-    previous_element_sibling_id: Option<usize>,
     rules: &[StyleRule],
+    caches: &mut SelectorCaches,
     table: &mut ColumnStyleTable,
     depth: usize,
-) -> bool {
+) {
     if depth >= crate::MAX_DOM_DEPTH {
-        return false;
+        return;
     }
     let Some(node) = doc.get_node(node_id) else {
-        return false;
+        return;
     };
 
-    let is_element = node.element_data().is_some();
-    if is_element {
-        let previous_element_sibling = previous_element_sibling_id.and_then(|id| doc.get_node(id));
+    if node.element_data().is_some() {
         let mut props = ColumnStyleProps::default();
         // The rules that match, with what orders them. Specificity is that of the selector that matched: the
         // highest one of a selector list (Selectors 4 §17).
-        let mut hits: Vec<(usize, Specificity, usize)> = Vec::new();
+        let mut hits: Vec<(usize, u32, usize)> = Vec::new();
+        let mut context = MatchingContext::new(
+            MatchingMode::Normal,
+            None,
+            caches,
+            QuirksMode::NoQuirks,
+            NeedsSelectorFlags::No,
+            MatchingForInvalidation::No,
+        );
         for (index, rule) in rules.iter().enumerate() {
             let matched = rule
                 .selectors
+                .slice()
                 .iter()
-                .filter(|sel| matches_complex_with_prev(sel, node, previous_element_sibling))
-                .map(specificity)
+                .filter(|sel| matches_selector(sel, 0, None, &node, &mut context))
+                .map(|sel| sel.specificity())
                 .max();
             if let Some(spec) = matched {
                 hits.push((rule.rank, spec, index));
@@ -1527,25 +1297,10 @@ fn walk(
         }
     }
 
-    // Recurse in document order, carrying each child's previous *element*
-    // sibling forward. Non-element children (text/comment) do not advance the
-    // marker, so `E + F` skips them exactly as the old backward scan did — but
-    // without rescanning the child list per node.
-    let mut prev_child_element_id = None;
+    // Recurse in document order.
     for &child_id in &node.children {
-        if walk(
-            doc,
-            child_id,
-            prev_child_element_id,
-            rules,
-            table,
-            depth + 1,
-        ) {
-            prev_child_element_id = Some(child_id);
-        }
+        walk(doc, child_id, rules, caches, table, depth + 1);
     }
-
-    is_element
 }
 
 // ---------------------------------------------------------------------------
@@ -1762,71 +1517,6 @@ mod tests {
 
     // -------- selector parsing --------
 
-    #[test]
-    fn selector_parses_type_class_id_universal_and_compound() {
-        let list = parse_selector_list("div.foo#bar");
-        assert_eq!(list.len(), 1);
-        assert_eq!(
-            list[0].subject.parts,
-            vec![
-                SimpleSelector::Type("div".into()),
-                SimpleSelector::Class("foo".into()),
-                SimpleSelector::Id("bar".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn selector_universal() {
-        let list = parse_selector_list("*");
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].subject.parts, vec![SimpleSelector::Universal]);
-    }
-
-    #[test]
-    fn selector_comma_list_parsed_as_multiple_compounds() {
-        let list = parse_selector_list(".a, div, #x");
-        assert_eq!(list.len(), 3);
-        assert_eq!(
-            list[0].subject.parts,
-            vec![SimpleSelector::Class("a".into())]
-        );
-        assert_eq!(
-            list[1].subject.parts,
-            vec![SimpleSelector::Type("div".into())]
-        );
-        assert_eq!(list[2].subject.parts, vec![SimpleSelector::Id("x".into())]);
-    }
-
-    #[test]
-    fn selector_unsupported_pseudo_drops_list() {
-        assert!(parse_selector_list("a:hover").is_empty());
-    }
-
-    #[test]
-    fn selector_unsupported_descendant_drops_list() {
-        assert!(parse_selector_list("a b").is_empty());
-    }
-
-    #[test]
-    fn selector_unsupported_child_combinator_drops_list() {
-        assert!(parse_selector_list("a > b").is_empty());
-    }
-
-    #[test]
-    fn selector_unsupported_attribute_drops_list() {
-        assert!(parse_selector_list("input[type=x]").is_empty());
-    }
-
-    #[test]
-    fn selector_tag_lowercased() {
-        let list = parse_selector_list("DIV");
-        assert_eq!(
-            list[0].subject.parts,
-            vec![SimpleSelector::Type("div".into())]
-        );
-    }
-
     // -------- end-to-end matcher (via blitz_adapter::parse) --------
 
     fn build_doc(html: &str) -> blitz_html::HtmlDocument {
@@ -1887,63 +1577,6 @@ mod tests {
         out
     }
 
-    #[test]
-    fn matches_node_by_tag_class_and_id() {
-        let doc = build_doc(
-            r#"<html><body>
-                <div class="mc" id="one"></div>
-                <p class="other"></p>
-              </body></html>"#,
-        );
-        let div_id = find_node_with(&doc, |n| {
-            n.element_data()
-                .is_some_and(|e| e.name.local.as_ref() == "div")
-        })
-        .expect("div");
-        let div = doc.get_node(div_id).unwrap();
-
-        let t = CompoundSelector {
-            parts: vec![SimpleSelector::Type("div".into())],
-        };
-        let c = CompoundSelector {
-            parts: vec![SimpleSelector::Class("mc".into())],
-        };
-        let i = CompoundSelector {
-            parts: vec![SimpleSelector::Id("one".into())],
-        };
-        let compound = CompoundSelector {
-            parts: vec![
-                SimpleSelector::Type("div".into()),
-                SimpleSelector::Class("mc".into()),
-                SimpleSelector::Id("one".into()),
-            ],
-        };
-        let not_match = CompoundSelector {
-            parts: vec![SimpleSelector::Class("other".into())],
-        };
-
-        assert!(matches_compound(&t, div));
-        assert!(matches_compound(&c, div));
-        assert!(matches_compound(&i, div));
-        assert!(matches_compound(&compound, div));
-        assert!(!matches_compound(&not_match, div));
-    }
-
-    #[test]
-    fn universal_selector_matches_every_element() {
-        let doc = build_doc("<html><body><span></span></body></html>");
-        let span_id = find_node_with(&doc, |n| {
-            n.element_data()
-                .is_some_and(|e| e.name.local.as_ref() == "span")
-        })
-        .expect("span");
-        let span = doc.get_node(span_id).unwrap();
-        let u = CompoundSelector {
-            parts: vec![SimpleSelector::Universal],
-        };
-        assert!(matches_compound(&u, span));
-    }
-
     // -------- stylesheet parsing --------
 
     #[test]
@@ -1954,7 +1587,7 @@ mod tests {
         "#;
         let rules = parse_stylesheet(css);
         assert_eq!(rules.len(), 2);
-        assert_eq!(rules[0].selectors[0].subject.parts.len(), 1);
+        assert_eq!(rules[0].selectors.slice().len(), 1);
         assert!(rules[0].props.rule.is_some());
         assert_eq!(rules[1].props.fill, Some(ColumnFill::Auto));
     }
@@ -1976,20 +1609,20 @@ mod tests {
 
     #[test]
     fn stylesheet_reads_matching_media_and_layers_in_cascade_order() {
+        // The rule's `column-rule-width` (in pt) names it.
         let css = r#"
-            .z { column-fill: auto; }
-            @layer late { .y { column-fill: auto; } }
-            @media screen { .x { column-fill: auto; } }
-            @layer early { .w { column-fill: auto; } }
+            .z { column-rule-width: 1pt; }
+            @layer late { .y { column-rule-width: 2pt; } }
+            @media screen { .x { column-rule-width: 3pt; } }
+            @layer early { .w { column-rule-width: 4pt; } }
         "#;
         let rules = parse_stylesheet(css);
-        let class = |r: &StyleRule| match &r.selectors[0].subject.parts[0] {
-            SimpleSelector::Class(c) => c.clone(),
-            other => panic!("{other:?}"),
-        };
+        let order: Vec<f32> = rules
+            .iter()
+            .map(|r| r.props.rule.expect("rule").width.to_f32())
+            .collect();
         // Layers by first appearance (`late` < `early`), then unlayered rules (`.z`, `.x`) in source order.
-        let order: Vec<String> = rules.iter().map(class).collect();
-        assert_eq!(order, ["y", "w", "z", "x"]);
+        assert_eq!(order, [2.0, 4.0, 1.0, 3.0]);
     }
 
     #[test]
@@ -2009,20 +1642,6 @@ mod tests {
         assert!(order.windows(2).all(|w| r[w[0]] < r[w[1]]), "{r:?}");
         // The root is last, however many layers there are.
         assert_eq!(r[0], r.len() - 1);
-    }
-
-    #[test]
-    fn stylesheet_drops_unsupported_selector() {
-        let css = r#"
-            a:hover { column-fill: auto; }
-            .mc { column-fill: balance; }
-        "#;
-        let rules = parse_stylesheet(css);
-        assert_eq!(rules.len(), 1);
-        assert_eq!(
-            rules[0].selectors[0].subject.parts[0],
-            SimpleSelector::Class("mc".into())
-        );
     }
 
     #[test]
@@ -2310,152 +1929,7 @@ mod tests {
         assert!(!table.contains_key(&b_id));
     }
 
-    #[test]
-    fn adjacent_sibling_selector_parsed() {
-        let selectors = parse_selector_list("div + div");
-        assert_eq!(selectors.len(), 1);
-        let sel = &selectors[0];
-        assert_eq!(sel.subject.parts, vec![SimpleSelector::Type("div".into())]);
-        let prev = sel
-            .prev_sibling
-            .as_ref()
-            .expect("prev_sibling should be Some");
-        assert_eq!(prev.parts, vec![SimpleSelector::Type("div".into())]);
-    }
-
-    #[test]
-    fn combinator_gt_drops_rule() {
-        assert!(parse_selector_list("div > p").is_empty());
-    }
-
-    #[test]
-    fn combinator_tilde_drops_rule() {
-        assert!(parse_selector_list("div ~ p").is_empty());
-    }
-
-    #[test]
-    fn simple_selector_no_sibling() {
-        let selectors = parse_selector_list("div");
-        assert_eq!(selectors.len(), 1);
-        assert!(selectors[0].prev_sibling.is_none());
-    }
-
-    #[test]
-    fn descendant_after_plus_drops_rule() {
-        assert!(parse_selector_list("div + div .foo").is_empty());
-    }
-
-    /// `a + b + c` can't be represented by the one-leg ComplexSelector model,
-    /// so it must be dropped rather than silently degrading to `b + c`.
-    #[test]
-    fn chained_adjacent_sibling_drops_rule() {
-        assert!(parse_selector_list("div + p + span").is_empty());
-    }
-
-    /// Trailing `+` in a comma-separated list (`.a, .b +`) must invalidate
-    /// the whole list rather than silently returning only `.a`.
-    #[test]
-    fn trailing_plus_in_comma_list_drops_rule() {
-        assert!(parse_selector_list(".a, .b +").is_empty());
-    }
-
     // -------- matches_complex DOM behaviour --------
-
-    /// `div + div` matches the second div but not the first.
-    #[test]
-    fn matches_complex_adjacent_sibling_matches_second_not_first() {
-        let doc = build_doc(
-            r#"<html><body>
-                <div id="first"></div>
-                <div id="second"></div>
-            </body></html>"#,
-        );
-
-        let first_id = find_node_with(&doc, |n| {
-            n.element_data()
-                .and_then(|e| crate::blitz_adapter::get_attr(e, "id"))
-                == Some("first")
-        })
-        .expect("first");
-        let second_id = find_node_with(&doc, |n| {
-            n.element_data()
-                .and_then(|e| crate::blitz_adapter::get_attr(e, "id"))
-                == Some("second")
-        })
-        .expect("second");
-
-        // `div + div`: prev_sibling = div, subject = div
-        let div_compound = CompoundSelector {
-            parts: vec![SimpleSelector::Type("div".into())],
-        };
-        let sel = ComplexSelector {
-            subject: div_compound.clone(),
-            prev_sibling: Some(div_compound),
-        };
-
-        let first = doc.get_node(first_id).unwrap();
-        let second = doc.get_node(second_id).unwrap();
-
-        // The second div has a div immediately before it → should match.
-        assert!(matches_complex(&sel, second, &doc));
-        // The first div has no element before it → should not match.
-        assert!(!matches_complex(&sel, first, &doc));
-    }
-
-    /// A `ComplexSelector` with `prev_sibling: None` matches the first element.
-    #[test]
-    fn matches_complex_no_sibling_context_matches_first_element() {
-        let doc = build_doc(
-            r#"<html><body>
-                <div id="only"></div>
-            </body></html>"#,
-        );
-
-        let only_id = find_node_with(&doc, |n| {
-            n.element_data()
-                .and_then(|e| crate::blitz_adapter::get_attr(e, "id"))
-                == Some("only")
-        })
-        .expect("only");
-
-        let sel = ComplexSelector {
-            subject: CompoundSelector {
-                parts: vec![SimpleSelector::Type("div".into())],
-            },
-            prev_sibling: None,
-        };
-
-        let only = doc.get_node(only_id).unwrap();
-        assert!(matches_complex(&sel, only, &doc));
-    }
-
-    /// Text nodes between siblings must not prevent the adjacent-sibling match.
-    #[test]
-    fn matches_complex_adjacent_sibling_skips_text_nodes() {
-        // Explicit text between the two divs guarantees a text node in the DOM.
-        let doc =
-            build_doc(r#"<html><body><div id="a"></div>some text<div id="b"></div></body></html>"#);
-
-        let b_id = find_node_with(&doc, |n| {
-            n.element_data()
-                .and_then(|e| crate::blitz_adapter::get_attr(e, "id"))
-                == Some("b")
-        })
-        .expect("b");
-
-        let div_compound = CompoundSelector {
-            parts: vec![SimpleSelector::Type("div".into())],
-        };
-        let sel = ComplexSelector {
-            subject: div_compound.clone(),
-            prev_sibling: Some(div_compound),
-        };
-
-        let b = doc.get_node(b_id).unwrap();
-        // Text node between #a and #b must be skipped; #a is still the
-        // adjacent element sibling of #b.
-        assert!(matches_complex(&sel, b, &doc));
-    }
 
     // -------- break-before --------
 
@@ -2722,47 +2196,6 @@ mod tests {
 
     // -------- selector parser edge cases --------
 
-    #[test]
-    fn selector_leading_comma_drops_list() {
-        // A leading comma means `current.parts` is empty when the first comma
-        // is encountered — the whole list is immediately invalid.
-        assert!(parse_selector_list(",div").is_empty());
-    }
-
-    #[test]
-    fn selector_dot_followed_by_non_ident_drops_list() {
-        // `..foo`: the outer `.` triggers the Delim('.') arm; the inner
-        // `next_including_whitespace()` yields another `.` (not an ident),
-        // so the `_ => return Vec::new()` arm fires.
-        assert!(parse_selector_list("..foo").is_empty());
-    }
-
-    #[test]
-    fn selector_star_after_whitespace_drops_list() {
-        // `div *` is a descendant-star combinator — unsupported. The `*` token
-        // arrives while `just_saw_whitespace` is true, triggering the early return.
-        assert!(parse_selector_list("div *").is_empty());
-    }
-
-    #[test]
-    fn selector_hash_after_whitespace_drops_list() {
-        // `div #id` is a descendant combinator with an id — unsupported.
-        // The IDHash token arrives while `just_saw_whitespace` is true.
-        assert!(parse_selector_list("div #id").is_empty());
-    }
-
-    #[test]
-    fn selector_dot_after_whitespace_drops_list() {
-        // `div .foo` is a descendant combinator with a class — unsupported.
-        // The Delim('.') token arrives while `just_saw_whitespace` is true.
-        assert!(parse_selector_list("div .foo").is_empty());
-    }
-
-    #[test]
-    fn selector_leading_plus_drops_list() {
-        // A `+` with no preceding compound (current.parts empty) is invalid.
-        assert!(parse_selector_list("+div").is_empty());
-    }
     // -------- cascade layers and conditional rules (F87) --------
 
     /// `break-inside` the cascade gives the element `id="k"` of `<p id="k" class="k">` for the stylesheet `css`.
@@ -3294,5 +2727,182 @@ mod tests {
                 "{v}"
             );
         }
+    }
+    // -------- selectors: the engine's own parser and matcher (F87 review) --------
+
+    /// Ids of the elements of `html` (those with an `id`, in document order) that `selector{break-before:page}`
+    /// reaches.
+    fn matched_ids(selector: &str, html: &str) -> Vec<String> {
+        let doc = build_doc(html);
+        let table = build_column_style_table(
+            &doc,
+            &parse_stylesheet(&format!("{selector}{{break-before:page}}")),
+        );
+        collect_in_document_order(&doc, |n| {
+            n.element_data()
+                .and_then(|e| crate::blitz_adapter::get_attr(e, "id"))
+                .is_some()
+        })
+        .into_iter()
+        .filter(|id| table.get(id).is_some_and(|p| p.break_before.is_some()))
+        .map(|id| {
+            let n = doc.get_node(id).expect("node");
+            crate::blitz_adapter::get_attr(n.element_data().expect("element"), "id")
+                .expect("id")
+                .to_string()
+        })
+        .collect()
+    }
+
+    const TREE: &str = r#"<html><body id="body">
+        <div id="d1" class="invoice a" data-x="abc b">
+          <table id="t"><tbody><tr id="r1" class="k"><td id="c1">x</td></tr><tr id="r2"><td id="c2"></td></tr></tbody></table>
+          <p id="p1" class="k">one</p><p id="p2" class="b">two</p><p id="p3" class="k a">three</p>
+        </div>
+        <div id="d2" class="a"><p id="p4" class="k">four</p></div>
+      </body></html>"#;
+
+    #[test]
+    fn descendant_and_child_combinators_are_matched() {
+        assert_eq!(matched_ids("body .k", TREE), ["r1", "p1", "p3", "p4"]);
+        assert_eq!(matched_ids("#d1 .k", TREE), ["r1", "p1", "p3"]);
+        assert_eq!(matched_ids(".invoice tr", TREE), ["r1", "r2"]);
+        assert_eq!(
+            matched_ids("html body div .k", TREE),
+            ["r1", "p1", "p3", "p4"]
+        );
+        assert_eq!(matched_ids("div > .k", TREE), ["p1", "p3", "p4"]);
+        assert_eq!(matched_ids("body>div>.k", TREE), ["p1", "p3", "p4"]);
+        assert_eq!(matched_ids("tbody > tr", TREE), ["r1", "r2"]);
+        assert_eq!(matched_ids("table tr > td", TREE), ["c1", "c2"]);
+        assert_eq!(matched_ids("#d2 tr", TREE), Vec::<String>::new());
+    }
+
+    #[test]
+    fn sibling_combinators_are_matched() {
+        assert_eq!(matched_ids("#p1 ~ p", TREE), ["p2", "p3"]);
+        assert_eq!(matched_ids(".k + p", TREE), ["p2"]);
+        assert_eq!(matched_ids("p + p + p", TREE), ["p3"]);
+        assert_eq!(matched_ids("tr + tr", TREE), ["r2"]);
+    }
+
+    #[test]
+    fn attribute_selectors_are_matched() {
+        assert_eq!(matched_ids("[data-x]", TREE), ["d1"]);
+        assert_eq!(matched_ids("[data-x=\"abc b\"]", TREE), ["d1"]);
+        assert_eq!(matched_ids("[data-x~=b]", TREE), ["d1"]);
+        assert_eq!(matched_ids("[data-x~=ab]", TREE), Vec::<String>::new());
+        assert_eq!(matched_ids("[data-x^=ab]", TREE), ["d1"]);
+        assert_eq!(matched_ids("[data-x$=\" b\"]", TREE), ["d1"]);
+        assert_eq!(matched_ids("[data-x*=\"c \"]", TREE), ["d1"]);
+        assert_eq!(matched_ids("[class=\"k\"]", TREE), ["r1", "p1", "p4"]);
+        assert_eq!(matched_ids("p[class~=a]", TREE), ["p3"]);
+    }
+
+    #[test]
+    fn not_is_where_and_structural_pseudo_classes_are_matched() {
+        assert_eq!(matched_ids(".k:not(.a)", TREE), ["r1", "p1", "p4"]);
+        assert_eq!(matched_ids("p:not(.k):not(.a)", TREE), ["p2"]);
+        assert_eq!(matched_ids("p:is(.a, .b)", TREE), ["p2", "p3"]);
+        assert_eq!(matched_ids("p:where(.b)", TREE), ["p2"]);
+        assert_eq!(matched_ids(":is(td, th)", TREE), ["c1", "c2"]);
+        assert_eq!(matched_ids("p:first-child", TREE), ["p4"]);
+        assert_eq!(matched_ids("#d1 > :first-child", TREE), ["t"]);
+        assert_eq!(matched_ids("#d1 > :last-child", TREE), ["p3"]);
+        assert_eq!(matched_ids("p:nth-child(2n+1)", TREE), ["p2", "p4"]);
+        assert_eq!(matched_ids("#d1 > p:nth-child(odd)", TREE), ["p2"]);
+        assert_eq!(matched_ids("#d1 > p:nth-child(even)", TREE), ["p1", "p3"]);
+        assert_eq!(matched_ids("tr:nth-child(2)", TREE), ["r2"]);
+        assert_eq!(matched_ids("td:empty", TREE), ["c2"]);
+        assert_eq!(matched_ids(":root", TREE), Vec::<String>::new()); // the root `<html>` has no id
+        assert_eq!(matched_ids("html > body", TREE), ["body"]);
+    }
+
+    #[test]
+    fn interactive_pseudo_classes_pseudo_elements_and_bad_selectors_match_nothing() {
+        for sel in [
+            ".k:hover",
+            ".k:focus",
+            ".k:active",
+            ".k::before",
+            ".k::after",
+            ".k:bogus",
+            ".k:not(",
+            ".k,,.a",
+            ".k,.a:bogus",
+            "..k",
+            "> .k",
+            "",
+        ] {
+            assert_eq!(matched_ids(sel, TREE), Vec::<String>::new(), "{sel:?}");
+        }
+        // One valid selector of a list that is valid as a whole still matches.
+        assert_eq!(matched_ids(".k:hover, #p1", TREE), ["p1"]);
+        // A bad selector drops its rule and nothing else.
+        let rules = parse_stylesheet(".k:bogus{break-before:page}.a{break-before:page}");
+        assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn selector_specificity_comes_from_the_parsed_selector() {
+        // Selectors 4 §17: a descendant combinator adds its compounds; `:where()` is 0; `:is()` and `:not()` take
+        // their most specific argument; an attribute counts as a class.
+        for (css, want) in [
+            // `body .k` (0,1,1) beats `.k` whatever the order.
+            ("body .k{break-inside:auto}.k{break-inside:avoid}", Auto),
+            (".k{break-inside:avoid}body .k{break-inside:auto}", Auto),
+            (
+                "html body div p.k{break-inside:auto}#k{break-inside:avoid}",
+                Avoid,
+            ),
+            ("body>.k{break-inside:auto}.k{break-inside:avoid}", Auto),
+            // `:where()` adds nothing: equal specificity, the later wins.
+            (
+                ":where(div) .k{break-inside:auto}.k{break-inside:avoid}",
+                Avoid,
+            ),
+            (
+                ":where(#k).k{break-inside:auto}.k{break-inside:avoid}",
+                Avoid,
+            ),
+            // `:is()` and `:not()` take the maximum of their arguments.
+            (
+                ":is(#k, .zz){break-inside:auto}.k.k.k{break-inside:avoid}",
+                Auto,
+            ),
+            (
+                ".k:not(#zz){break-inside:auto}.k.k{break-inside:avoid}",
+                Auto,
+            ),
+            (
+                ".k:not(.zz){break-inside:auto}.k.k{break-inside:avoid}",
+                Avoid,
+            ),
+            // An attribute selector is a class, and so is a pseudo-class.
+            ("[class]{break-inside:auto}.k{break-inside:avoid}", Avoid),
+            (
+                "[class].k{break-inside:auto}.k.k{break-inside:avoid}",
+                Avoid,
+            ),
+            (
+                "p:first-child{break-inside:auto}.k{break-inside:avoid}",
+                Auto,
+            ),
+        ] {
+            assert_eq!(break_inside_of(css, ""), Some(want), "{css}");
+        }
+        // An unlayered descendant rule beats a layered utility (the validator's H1).
+        assert_eq!(
+            break_inside_of(
+                "@layer utilities{.k{break-inside:avoid}}body .k{break-inside:auto}",
+                ""
+            ),
+            Some(Auto)
+        );
+        // The highest matching selector of a list counts.
+        assert_eq!(
+            break_inside_of("body .k, .zz{break-inside:auto}.k{break-inside:avoid}", ""),
+            Some(Auto)
+        );
     }
 }
