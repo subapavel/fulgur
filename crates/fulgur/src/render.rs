@@ -1313,6 +1313,7 @@ pub(crate) fn dispatch_fragment(
             y_pt,
             frag,
             &geom.fragments,
+            &geom.line_slices,
             page_index,
             is_split,
             drawables,
@@ -1372,6 +1373,7 @@ pub(crate) fn dispatch_fragment(
                 y_pt,
                 frag,
                 &geom.fragments,
+                &geom.line_slices,
                 page_index,
                 is_split,
                 drawables,
@@ -1434,6 +1436,7 @@ pub(crate) fn dispatch_fragment(
             x_pt,
             y_pt,
             &geom.fragments,
+            &geom.line_slices,
             page_index,
             is_split,
             drawables,
@@ -2137,6 +2140,7 @@ fn draw_under_clip(
                 inner_x,
                 inner_y,
                 &geom.fragments,
+                &geom.line_slices,
                 page_index,
                 is_split,
                 drawables,
@@ -2514,6 +2518,7 @@ fn draw_under_opacity(
                     inner_x,
                     inner_y,
                     &geom.fragments,
+                    &geom.line_slices,
                     page_index,
                     is_split,
                     drawables,
@@ -3501,6 +3506,7 @@ fn draw_block_with_inner_content(
     y: f32,
     frag: &crate::pagination_layout::Fragment,
     fragments: &[crate::pagination_layout::Fragment],
+    line_slices: &[crate::pagination_layout::LineSlice],
     page_index: u32,
     is_split: bool,
     drawables: &Drawables,
@@ -3531,6 +3537,7 @@ fn draw_block_with_inner_content(
                 inner_x,
                 inner_y,
                 fragments,
+                line_slices,
                 page_index,
                 is_split,
                 drawables,
@@ -3572,6 +3579,7 @@ fn draw_list_item_with_block(
     y: f32,
     frag: &crate::pagination_layout::Fragment,
     fragments: &[crate::pagination_layout::Fragment],
+    line_slices: &[crate::pagination_layout::LineSlice],
     page_index: u32,
     is_split: bool,
     drawables: &Drawables,
@@ -3618,6 +3626,7 @@ fn draw_list_item_with_block(
                 inner_x,
                 inner_y,
                 fragments,
+                line_slices,
                 page_index,
                 is_split,
                 drawables,
@@ -3721,6 +3730,7 @@ fn draw_paragraph_v2(
     x: f32,
     y: f32,
     fragments: &[crate::pagination_layout::Fragment],
+    line_slices: &[crate::pagination_layout::LineSlice],
     page_index: u32,
     is_split: bool,
     drawables: &Drawables,
@@ -3736,6 +3746,7 @@ fn draw_paragraph_v2(
             x,
             y,
             fragments,
+            line_slices,
             page_index,
             is_split,
             drawables,
@@ -3758,6 +3769,7 @@ fn draw_paragraph_inner_paint(
     x: f32,
     y: f32,
     fragments: &[crate::pagination_layout::Fragment],
+    line_slices: &[crate::pagination_layout::LineSlice],
     page_index: u32,
     is_split: bool,
     drawables: &Drawables,
@@ -3768,7 +3780,8 @@ fn draw_paragraph_inner_paint(
     if !entry.visible {
         return;
     }
-    let Some(slice) = paragraph_lines_for_page(&entry.lines, fragments, page_index, is_split)
+    let Some(slice) =
+        paragraph_lines_for_page(&entry.lines, fragments, line_slices, page_index, is_split)
     else {
         return;
     };
@@ -3798,10 +3811,21 @@ fn draw_paragraph_inner_paint(
 /// represents per-page repetition (`is_repeat=true`, e.g.
 /// `position: fixed`). Either case means each fragment carries the
 /// full content, so the function returns every line unmodified.
-/// `true` triggers the cumulative-height slicing logic.
+/// `true` slices the lines.
+///
+/// F78: a fragmenter that split the paragraph between line boxes recorded which
+/// lines each fragment holds (`line_slices`, parallel to `fragments`); those
+/// are painted as given, moved up by the slice's offset, which puts the first
+/// line of every page where line 0 sits on the first. Measuring the lines again
+/// from float heights cannot be exact: Blitz quantises line boxes but Parley
+/// advances by the unrounded line height, so boxes overlap or leave gaps and a
+/// whole line is skipped or painted twice after a few dozen pages. Only
+/// fragments from some other emitter (no or non-matching slices) are still
+/// measured that way, with a warning.
 fn paragraph_lines_for_page(
     all_lines: &[crate::paragraph::ShapedLine],
     fragments: &[crate::pagination_layout::Fragment],
+    line_slices: &[crate::pagination_layout::LineSlice],
     page_index: u32,
     is_split: bool,
 ) -> Option<Vec<crate::paragraph::ShapedLine>> {
@@ -3810,6 +3834,31 @@ fn paragraph_lines_for_page(
     if !is_split {
         return Some(all_lines.to_vec());
     }
+
+    // The slices describe these lines: one per fragment, ending at the last line.
+    if line_slices.len() == fragments.len()
+        && line_slices
+            .last()
+            .is_some_and(|last| last.end as usize == all_lines.len())
+    {
+        let slice = &line_slices[target_pos];
+        let (first, end) = (slice.first as usize, slice.end as usize);
+        if first >= end || end > all_lines.len() {
+            return None;
+        }
+        return Some(rebase_lines(&all_lines[first..end], slice.offset.in_pt()));
+    }
+
+    log::warn!(
+        "paragraph \"{}\" is split over {} pages but its fragmenter recorded no matching line ranges \
+         ({} slices for {} fragments, {} lines); measuring its lines from the fragment heights, \
+         which can skip or repeat a line",
+        paragraph_start(all_lines),
+        fragments.len(),
+        line_slices.len(),
+        fragments.len(),
+        all_lines.len()
+    );
 
     let target_h = fragments[target_pos].height.in_pt();
     let consumed: crate::units::Pt = fragments[..target_pos]
@@ -3845,23 +3894,47 @@ fn paragraph_lines_for_page(
         return None;
     }
 
-    let sliced: Vec<crate::paragraph::ShapedLine> = all_lines[start_idx..end_idx]
+    Some(rebase_lines(&all_lines[start_idx..end_idx], consumed))
+}
+
+/// Copies of `lines` moved up by `by`: paragraph-absolute coords (baseline +
+/// inline image `computed_y`) become fragment-local. Mirror
+/// `ParagraphRender::slice_for_page` exactly.
+fn rebase_lines(
+    lines: &[crate::paragraph::ShapedLine],
+    by: crate::units::Pt,
+) -> Vec<crate::paragraph::ShapedLine> {
+    lines
         .iter()
         .cloned()
         .map(|mut line| {
-            // Rebase paragraph-absolute coords (baseline + inline
-            // image `computed_y`) to fragment-local. Mirror
-            // `ParagraphRender::slice_for_page` exactly.
-            line.baseline -= consumed;
+            line.baseline -= by;
             for item in &mut line.items {
                 if let crate::paragraph::LineItem::Image(img) = item {
-                    img.computed_y -= consumed;
+                    img.computed_y -= by;
                 }
             }
             line
         })
-        .collect();
-    Some(sliced)
+        .collect()
+}
+
+/// The first words of a paragraph, to name it in a warning.
+fn paragraph_start(lines: &[crate::paragraph::ShapedLine]) -> String {
+    let mut text = String::new();
+    for item in lines.iter().flat_map(|l| &l.items) {
+        if let crate::paragraph::LineItem::Text(run) = item {
+            text.push_str(&run.text);
+            if text.chars().count() >= 40 {
+                break;
+            }
+        }
+    }
+    let mut start: String = text.chars().take(40).collect();
+    if text.chars().count() > 40 {
+        start.push_str("...");
+    }
+    start
 }
 
 /// Build krilla Metadata from Config.
@@ -5363,7 +5436,7 @@ mod tests {
         let lines = vec![make_line(16.0, 12.0)];
         let fragments = vec![make_fragment(0, 16.0)];
         // Ask for page 1, which has no fragment.
-        let result = paragraph_lines_for_page(&lines, &fragments, 1, false);
+        let result = paragraph_lines_for_page(&lines, &fragments, &[], 1, false);
         assert!(result.is_none());
     }
 
@@ -5377,7 +5450,7 @@ mod tests {
             make_line(16.0, 44.0),
         ];
         let fragments = vec![make_fragment(0, 64.0)];
-        let result = paragraph_lines_for_page(&lines, &fragments, 0, false);
+        let result = paragraph_lines_for_page(&lines, &fragments, &[], 0, false);
         assert!(result.is_some());
         let sliced = result.unwrap();
         assert_eq!(sliced.len(), 3);
@@ -5397,7 +5470,7 @@ mod tests {
             make_fragment(0, 16.0), // 16px = 12pt → first line
             make_fragment(1, 16.0),
         ];
-        let result = paragraph_lines_for_page(&lines, &fragments, 0, true);
+        let result = paragraph_lines_for_page(&lines, &fragments, &[], 0, true);
         assert!(result.is_some());
         let sliced = result.unwrap();
         assert_eq!(sliced.len(), 1, "page 0 should contain exactly one line");
@@ -5416,7 +5489,7 @@ mod tests {
             make_fragment(0, 16.0), // 16px = 12pt → first line
             make_fragment(1, 16.0),
         ];
-        let result = paragraph_lines_for_page(&lines, &fragments, 1, true);
+        let result = paragraph_lines_for_page(&lines, &fragments, &[], 1, true);
         assert!(result.is_some());
         let sliced = result.unwrap();
         assert_eq!(sliced.len(), 1, "page 1 should contain exactly one line");
@@ -5434,8 +5507,195 @@ mod tests {
             make_fragment(0, 100.0), // page 0 gets the line
             make_fragment(1, 0.0),   // page 1 has zero height
         ];
-        let result = paragraph_lines_for_page(&lines, &fragments, 1, true);
+        let result = paragraph_lines_for_page(&lines, &fragments, &[], 1, true);
         assert!(result.is_none());
+    }
+
+    // --- paragraph_lines_for_page: F78, lines decided once by the fragmenter ---
+
+    /// `n` lines that advance by `advance_px` while their quantised boxes are `box_px` tall: what Parley lays out
+    /// (`ShapedLine`s, in pt) and what the fragmenter measures (`(top, bottom)` of the boxes, in px). Baselines
+    /// are paragraph-absolute and 11px below the box top.
+    fn synthetic_paragraph(
+        n: usize,
+        advance_px: f32,
+        box_px: f32,
+    ) -> (Vec<crate::paragraph::ShapedLine>, Vec<(f32, f32)>) {
+        let tops: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * advance_px).round() - 1.0)
+            .collect();
+        let lines = tops
+            .iter()
+            .map(|top| make_line(advance_px * 0.75, (top + 11.0) * 0.75))
+            .collect();
+        let boxes = tops.iter().map(|top| (*top, top + box_px)).collect();
+        (lines, boxes)
+    }
+
+    /// Every page's slice of `lines` against what the fragmenter decided: the same lines, each once, and the
+    /// first line of every page where line 0 sits on page 0.
+    fn assert_pages_hold_the_planned_lines(
+        lines: &[crate::paragraph::ShapedLine],
+        boxes: &[(f32, f32)],
+    ) {
+        let mut geom = crate::pagination_layout::PaginationGeometryTable::new();
+        let (last_page, ..) = crate::pagination_layout::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            0.0,
+            0,
+            crate::pagination_layout::PageStrips::new(1000.0, 0.0),
+            boxes,
+        );
+        let g = &geom[&1];
+        assert!(last_page >= 50, "about 60 pages, got {}", last_page + 1);
+        let mut printed = 0;
+        for (k, (frag, planned)) in g.fragments.iter().zip(&g.line_slices).enumerate() {
+            let page = paragraph_lines_for_page(
+                lines,
+                &g.fragments,
+                &g.line_slices,
+                frag.page_index,
+                true,
+            )
+            .unwrap_or_else(|| panic!("page {k}: no lines, planned {planned:?}"));
+            let want = (planned.end - planned.first) as usize;
+            assert_eq!(
+                page.len(),
+                want,
+                "page {k}: planned lines {}..{}, painted {}",
+                planned.first,
+                planned.end,
+                page.len()
+            );
+            let drift = page[0].baseline.to_f32() - lines[0].baseline.to_f32();
+            assert!(
+                drift.abs() < 0.01,
+                "page {k}: its first line sits {drift}pt from where line 0 sits on page 0"
+            );
+            // The slice is the planned one: line `first + j` rebased by the offset.
+            for (j, line) in page.iter().enumerate() {
+                let orig = &lines[planned.first as usize + j];
+                let want_baseline = orig.baseline.to_f32() - planned.offset.in_pt().to_f32();
+                assert!(
+                    (line.baseline.to_f32() - want_baseline).abs() < 0.01,
+                    "page {k} line {j}: baseline {} want {want_baseline}",
+                    line.baseline.to_f32()
+                );
+            }
+            printed += page.len();
+        }
+        assert_eq!(printed, lines.len(), "every line is painted exactly once");
+    }
+
+    #[test]
+    fn paragraph_lines_for_page_boxes_taller_than_the_advance_lose_no_line() {
+        // A 16px Inter line at `line-height: normal`: advances 19.2px, box 20px (they overlap by 0.8px). The
+        // renderer used to count 0.8px too much per page, skipping a line after about 24 pages.
+        let (lines, boxes) = synthetic_paragraph(3000, 19.2, 20.0);
+        assert_pages_hold_the_planned_lines(&lines, &boxes);
+    }
+
+    #[test]
+    fn paragraph_lines_for_page_boxes_shorter_than_the_advance_repeat_no_line() {
+        // The mirror: positive leading (advance 20.4px, box 20px). Walking the advance from the boxes' heights
+        // counted too little per page and painted a line on two pages.
+        let (lines, boxes) = synthetic_paragraph(3000, 20.4, 20.0);
+        assert_pages_hold_the_planned_lines(&lines, &boxes);
+    }
+
+    #[test]
+    fn paragraph_lines_for_page_slices_that_do_not_match_the_lines_fall_back_to_measuring() {
+        // Two 12pt lines, fragments of one line each, but slices that end at line 5: they describe some other
+        // paragraph, so the lines are measured from the fragment heights (and a warning names the paragraph).
+        let lines = vec![make_line(12.0, 9.0), make_line(12.0, 21.0)];
+        let fragments = vec![make_fragment(0, 16.0), make_fragment(1, 16.0)];
+        let stale = vec![
+            crate::pagination_layout::LineSlice {
+                first: 0,
+                end: 3,
+                offset: 0.0_f32.as_px(),
+            },
+            crate::pagination_layout::LineSlice {
+                first: 3,
+                end: 5,
+                offset: 99.0_f32.as_px(),
+            },
+        ];
+        let page = paragraph_lines_for_page(&lines, &fragments, &stale, 1, true).expect("measured");
+        assert_eq!(page.len(), 1);
+        assert!(
+            (page[0].baseline.to_f32() - 9.0).abs() < 0.01,
+            "rebased by the consumed height"
+        );
+    }
+
+    /// F78 on a real document: 7000 numbered words in Noto Sans over A4 pages (about 14), where the line
+    /// boxes do not tile (`normal` line height: advance 1.2 em, box 1.4 em rounded). Every line is painted
+    /// on exactly one page, in order.
+    #[test]
+    fn a_long_paragraph_paints_every_line_on_exactly_one_page() {
+        let font = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/.fonts/NotoSans-Regular.ttf");
+        let mut assets = crate::asset::AssetBundle::default();
+        assets.add_font_file(&font).expect("Noto Sans");
+        let engine = crate::engine::Engine::builder()
+            .system_fonts(false)
+            .assets(assets)
+            .build();
+        let words: Vec<String> = (0..7000).map(|i| format!("w{i:05}")).collect();
+        let html = format!(
+            "<!doctype html><html><body style=\"font-family:'Noto Sans'\"><p>{}</p></body></html>",
+            words.join(" ")
+        );
+        let (drawables, geometry) = engine.build_drawables_and_geometry_for_testing_no_gcpm(&html);
+        let (id, para) = drawables
+            .paragraphs
+            .iter()
+            .max_by_key(|(_, p)| p.lines.len())
+            .expect("a paragraph");
+        let geom = &geometry[id];
+        assert!(geom.is_split() && geom.fragments.len() >= 10, "{geom:?}");
+        assert_eq!(geom.line_slices.len(), geom.fragments.len());
+
+        let mut printed: Vec<String> = Vec::new();
+        let mut lines_printed = 0;
+        for frag in &geom.fragments {
+            let page = paragraph_lines_for_page(
+                &para.lines,
+                &geom.fragments,
+                &geom.line_slices,
+                frag.page_index,
+                true,
+            )
+            .expect("every page has lines");
+            lines_printed += page.len();
+            for line in &page {
+                let mut line_text = String::new();
+                for item in &line.items {
+                    if let crate::paragraph::LineItem::Text(run) = item {
+                        // A run's text is the whole paragraph; its glyphs cover this line's part.
+                        line_text.extend(
+                            run.glyphs
+                                .iter()
+                                .filter_map(|g| run.text.get(g.text_range.clone())),
+                        );
+                    }
+                }
+                printed.extend(line_text.split_whitespace().map(str::to_string));
+            }
+        }
+        assert_eq!(lines_printed, para.lines.len(), "each line on one page");
+        let first_diff = printed.iter().zip(&words).position(|(a, b)| a != b);
+        assert!(
+            printed == words,
+            "every word once, in order: {} printed of {}, first difference at {first_diff:?} ({:?})",
+            printed.len(),
+            words.len(),
+            first_diff.map(|i| (&printed[i], &words[i]))
+        );
     }
 
     // --- build_page_skip_sets ---
@@ -5982,7 +6242,7 @@ mod tests {
             make_fragment(0, 16.0), // 16px → 12pt
             make_fragment(1, 16.0),
         ];
-        let result = paragraph_lines_for_page(&[line0, line1], &fragments, 1, true);
+        let result = paragraph_lines_for_page(&[line0, line1], &fragments, &[], 1, true);
         assert!(result.is_some(), "page 1 should yield Some");
         let sliced = result.unwrap();
         assert_eq!(sliced.len(), 1, "one line on page 1");

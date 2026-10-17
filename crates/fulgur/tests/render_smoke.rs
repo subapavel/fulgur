@@ -7368,6 +7368,28 @@ fn render_smoke_paragraph_over_64_kib_has_text_and_is_not_dropped_text() {
 }
 
 #[test]
+fn render_smoke_a_paragraph_over_many_a4_pages_loses_no_line_at_a_page_break() {
+    // F78: 7000 words in Noto Sans over about 14 A4 pages. The line boxes (1.4 em, rounded) overlap the
+    // 1.2 em advance, and the renderer used to drift by that overlap until it skipped a whole line
+    // (`w03490` .. `w03509` were missing at the break between pages 7 and 8).
+    let html = format!(
+        "<!doctype html><html><head><style>p{{margin:0}}</style></head><body><p>{}</p></body></html>",
+        numbered_words(7000)
+    );
+    let pdf = Engine::builder()
+        .system_fonts(false)
+        .strict_text(true)
+        .assets(noto_bundle())
+        .build()
+        .render(&html)
+        .expect("every word has a face");
+    assert!(page_count(&pdf) >= 10, "{} pages", page_count(&pdf));
+    if let Some(text) = extract_pdf_text(&pdf) {
+        assert_words_once_in_order(&text, 7000);
+    }
+}
+
+#[test]
 fn render_smoke_dropped_text_after_64_kib_is_found_once_and_only_it() {
     // `monospace` is unmapped here, so the `<code>` gets no glyph run (a named family inside a root that has a
     // face is drawn by Parley's fallback).
