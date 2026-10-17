@@ -1,7 +1,5 @@
 //! Background rendering: color fills and image layers.
 
-use std::sync::Arc;
-
 use krilla::mask::{Mask, MaskType};
 
 use crate::draw_primitives::{
@@ -819,8 +817,7 @@ fn draw_background_layer(
             }
         }
         BgImageContent::Raster { data, format } => {
-            let data: krilla::Data = Arc::clone(data).into();
-            let Ok(image) = format.to_krilla_image(data) else {
+            let Some(image) = crate::image::krilla_image(&canvas.images, data, *format) else {
                 canvas.surface.pop();
                 return;
             };
@@ -2425,6 +2422,7 @@ mod tests {
     use super::*;
     use crate::image::ImageFormat;
     use crate::units::F32Units;
+    use std::sync::Arc;
 
     fn make_layer(iw: f32, ih: f32, size: BgSize) -> BackgroundLayer {
         BackgroundLayer {

@@ -182,6 +182,9 @@ pub fn render_v2(
         }
     }
 
+    // Raster images are validated once per render, not once per draw (F32a).
+    let images = crate::image::ImageCache::default();
+
     for (page_idx, page_node_ids) in per_page_node_ids.iter().enumerate() {
         let page_num = page_idx + 1;
         // Pass the full `gcpm.page_settings` (including selector
@@ -220,6 +223,7 @@ pub fn render_v2(
                     tag_collector: tag_collector.as_mut(),
                     link_run_node_id: None,
                     in_marked_content: false,
+                    images: images.clone(),
                 };
                 // Root `<html>` + `<body>` background pre-pass. Root
                 // `<html>` / `<body>` backgrounds repeat per page
@@ -323,6 +327,7 @@ pub fn render_v2(
                 tag_collector: None,
                 link_run_node_id: None,
                 in_marked_content: false,
+                images: images.clone(),
             };
             let page_content_width = content_area.width.to_f32();
             let any_margin_box_painted = margin_box_renderer.render_page(
@@ -637,6 +642,7 @@ fn paint_repeated_table_headers(
                 tag_collector: None,
                 link_run_node_id: None,
                 in_marked_content: false,
+                images: canvas.images.clone(),
             };
             if tagging {
                 copy_canvas
@@ -2821,7 +2827,7 @@ fn draw_image_inner_paint(
     if !entry.visible {
         return;
     }
-    let Some(image) = decode_image_for_v2(entry) else {
+    let Some(image) = decode_image_for_v2(&canvas.images, entry) else {
         return;
     };
     let Some(size) = krilla::geom::Size::from_wh(entry.width.to_f32(), entry.height.to_f32())
@@ -2834,16 +2840,11 @@ fn draw_image_inner_paint(
     canvas.surface.pop();
 }
 
-fn decode_image_for_v2(entry: &crate::drawables::ImageEntry) -> Option<krilla::image::Image> {
-    use crate::image::ImageFormat;
-    use krilla::image::Image;
-    let data: krilla::Data = entry.image_data.clone().into();
-    let image_result = match entry.format {
-        ImageFormat::Png => Image::from_png(data, true),
-        ImageFormat::Jpeg => Image::from_jpeg(data, true),
-        ImageFormat::Gif => Image::from_gif(data, true),
-    };
-    image_result.ok()
+fn decode_image_for_v2(
+    cache: &crate::image::ImageCache,
+    entry: &crate::drawables::ImageEntry,
+) -> Option<krilla::image::Image> {
+    crate::image::krilla_image(cache, &entry.image_data, entry.format)
 }
 
 /// v2 SVG draw. Mirrors `svg::SvgRender::draw`.
@@ -6178,14 +6179,14 @@ mod tests {
     #[test]
     fn decode_image_for_v2_jpeg_invalid_data_returns_none() {
         let entry = make_image_entry(crate::image::ImageFormat::Jpeg, vec![0xFF, 0xD8, 0xFF]);
-        let result = decode_image_for_v2(&entry);
+        let result = decode_image_for_v2(&Default::default(), &entry);
         assert!(result.is_none(), "invalid JPEG bytes should return None");
     }
 
     #[test]
     fn decode_image_for_v2_gif_invalid_data_returns_none() {
         let entry = make_image_entry(crate::image::ImageFormat::Gif, b"GIF89a".to_vec());
-        let result = decode_image_for_v2(&entry);
+        let result = decode_image_for_v2(&Default::default(), &entry);
         assert!(result.is_none(), "invalid GIF bytes should return None");
     }
 

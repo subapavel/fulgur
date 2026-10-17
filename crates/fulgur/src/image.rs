@@ -1,5 +1,8 @@
 //! ImageRender — renders images in PDF via Krilla's Image API.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// Image format detected from data.
@@ -61,6 +64,141 @@ impl AssetKind {
         }
         AssetKind::Unknown
     }
+}
+
+/// Largest raster, in pixels, that [`validate`] accepts. An A4 scan at 600 dpi is 35 Mpx; the limit is
+/// checked from the header before any pixel is decoded, so a hostile header cannot make us allocate
+/// gigabytes (a 20000 × 20000 RGB PNG is 1.2 GB of output buffer).
+pub const MAX_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
+
+/// Why an image is not drawn.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ImageError {
+    /// Not a PNG, JPEG, GIF or SVG.
+    #[error("not a PNG, JPEG, GIF or SVG image")]
+    Unsupported,
+    /// The header declares more than [`MAX_IMAGE_PIXELS`].
+    #[error("{w} x {h} pixels is more than the {MAX_IMAGE_PIXELS} pixel limit")]
+    TooLarge { w: u32, h: u32 },
+    /// The header or the pixel data does not decode.
+    #[error("{0}")]
+    Corrupt(String),
+}
+
+fn check_size(w: u32, h: u32) -> Result<(), ImageError> {
+    if u64::from(w) * u64::from(h) > MAX_IMAGE_PIXELS {
+        Err(ImageError::TooLarge { w, h })
+    } else {
+        Ok(())
+    }
+}
+
+/// Decodes `data` completely and says whether it can be drawn.
+///
+/// Krilla reads only the header of a PNG or GIF when an image is created and decodes the pixels in
+/// `Document::finish()`, where a failure aborts the whole document; a JPEG is passed through after a
+/// header check without ever being decoded. This runs the decoders Krilla uses (`png`, `gif`) with the
+/// calls it makes, and `zune-jpeg` in strict mode (a truncated JPEG decodes without complaint
+/// otherwise), so that the verdict is known before the image reaches Krilla (HTML §4.8.4.1: an image
+/// "corrupted in some fatal way" is broken). SVG is parsed with `usvg` and no font database. The pixel
+/// count is checked against [`MAX_IMAGE_PIXELS`] from the header first.
+///
+/// Costs one extra decode of the image.
+pub fn validate(data: &[u8]) -> Result<AssetKind, ImageError> {
+    let kind = AssetKind::detect(data);
+    match kind {
+        AssetKind::Unknown => Err(ImageError::Unsupported),
+        AssetKind::Svg => usvg::Tree::from_data(data, &usvg::Options::default())
+            .map(|_| kind)
+            .map_err(|e| ImageError::Corrupt(e.to_string())),
+        AssetKind::Raster(ImageFormat::Png) => validate_png(data).map(|()| kind),
+        AssetKind::Raster(ImageFormat::Jpeg) => validate_jpeg(data).map(|()| kind),
+        AssetKind::Raster(ImageFormat::Gif) => validate_gif(data).map(|()| kind),
+    }
+}
+
+fn validate_png(data: &[u8]) -> Result<(), ImageError> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
+    // The transformation Krilla applies (`PNG_TRANSFORMATIONS`).
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| ImageError::Corrupt(e.to_string()))?;
+    let (w, h) = (reader.info().width, reader.info().height);
+    check_size(w, h)?;
+    let mut pixels = vec![0; reader.output_buffer_size()];
+    reader
+        .next_frame(&mut pixels)
+        .map_err(|e| ImageError::Corrupt(e.to_string()))?;
+    Ok(())
+}
+
+fn validate_jpeg(data: &[u8]) -> Result<(), ImageError> {
+    use zune_jpeg::zune_core::options::DecoderOptions;
+    let corrupt = |e: zune_jpeg::errors::DecodeErrors| ImageError::Corrupt(e.to_string());
+    let options = DecoderOptions::default().set_strict_mode(true);
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(data), options);
+    decoder.decode_headers().map_err(corrupt)?;
+    let (w, h) = decoder
+        .dimensions()
+        .ok_or_else(|| ImageError::Corrupt("failed to read image dimensions".into()))?;
+    check_size(w as u32, h as u32)?;
+    decoder.decode().map_err(corrupt)?;
+    Ok(())
+}
+
+fn validate_gif(data: &[u8]) -> Result<(), ImageError> {
+    let corrupt = |e: gif::DecodingError| ImageError::Corrupt(e.to_string());
+    let mut options = gif::DecodeOptions::new();
+    options.set_color_output(gif::ColorOutput::RGBA);
+    let mut decoder = options.read_info(data).map_err(corrupt)?;
+    check_size(u32::from(decoder.width()), u32::from(decoder.height()))?;
+    decoder
+        .read_next_frame()
+        .map_err(corrupt)?
+        .ok_or_else(|| ImageError::Corrupt("GIF image seems to be empty".into()))?;
+    Ok(())
+}
+
+/// What [`krilla_image`] knows about the images of one render, keyed by the address of the bundle's
+/// `Arc` (the cache holds the `Arc`, so an address is never reused). Lookup only: nothing iterates it,
+/// so it cannot influence the order of anything in the PDF.
+#[derive(Clone, Default)]
+pub struct ImageCache(Rc<RefCell<BTreeMap<(usize, u8), CachedImage>>>);
+
+/// The bytes kept alive for their address, and the image if it passed [`validate`].
+type CachedImage = (Arc<Vec<u8>>, Option<krilla::image::Image>);
+
+/// The Krilla image for `data`, or `None` when the image cannot be drawn.
+///
+/// The one place a raster image reaches Krilla. An image that fails [`validate`] is not drawn (and
+/// logged at debug level) instead of failing `Document::finish()` for the whole document; the layout
+/// box it occupies is unaffected. `cache` makes the validation and the creation of the Krilla image
+/// happen once per bundled image, however often or on however many pages it is drawn.
+pub fn krilla_image(
+    cache: &ImageCache,
+    data: &Arc<Vec<u8>>,
+    format: ImageFormat,
+) -> Option<krilla::image::Image> {
+    let key = (Arc::as_ptr(data) as usize, format as u8);
+    if let Some((_, image)) = cache.0.borrow().get(&key) {
+        return image.clone();
+    }
+    let image = match validate(data) {
+        Ok(_) => format
+            .to_krilla_image(Arc::clone(data).into())
+            .map_err(|()| log::debug!("image not drawn: Krilla refused it"))
+            .ok(),
+        Err(e) => {
+            log::debug!("image not drawn: {e}");
+            None
+        }
+    };
+    cache
+        .0
+        .borrow_mut()
+        .insert(key, (Arc::clone(data), image.clone()));
+    image
 }
 
 /// An image element that renders an image at its computed size.
@@ -434,5 +572,193 @@ mod tests {
         // the whitespace-skipping loop inside AssetKind::detect.
         let svg = b"  \n\t<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>";
         assert!(matches!(AssetKind::detect(svg), AssetKind::Svg));
+    }
+
+    // --- validate / krilla_image (F32a) ---
+
+    const JPEG: &[u8] = include_bytes!("../tests/fixtures/images/gradient64.jpg");
+    const JPEG_PROGRESSIVE: &[u8] =
+        include_bytes!("../tests/fixtures/images/gradient64-progressive.jpg");
+    const JPEG_GRAY: &[u8] = include_bytes!("../tests/fixtures/images/gradient64-gray.jpg");
+    const JPEG_CMYK: &[u8] = include_bytes!("../tests/fixtures/images/gradient64-cmyk.jpg");
+    const JPEG_SUBSAMPLED: &[u8] =
+        include_bytes!("../tests/fixtures/images/gradient64-subsampled.jpg");
+    const GIF: &[u8] = include_bytes!("../tests/fixtures/images/gradient32.gif");
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let img = ::image::RgbImage::from_fn(w, h, |x, y| ::image::Rgb([x as u8, y as u8, 7]));
+        let mut out = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut out),
+            ::image::ImageFormat::Png,
+        )
+        .unwrap();
+        out
+    }
+
+    /// `png` with its first IDAT chunk's payload cut to `keep` bytes (CRC recomputed): a well-formed
+    /// container with too few pixels.
+    fn png_with_short_idat(png: &[u8], keep: usize) -> Vec<u8> {
+        let mut out = png[..8].to_vec();
+        let mut i = 8;
+        let mut cut = false;
+        while i + 12 <= png.len() {
+            let len = u32::from_be_bytes(png[i..i + 4].try_into().unwrap()) as usize;
+            let kind = &png[i + 4..i + 8];
+            let data = &png[i + 8..i + 8 + len];
+            if kind == b"IDAT" && !cut {
+                cut = true;
+                let data = &data[..keep.min(len)];
+                out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                let mut body = kind.to_vec();
+                body.extend_from_slice(data);
+                out.extend_from_slice(&body);
+                out.extend_from_slice(&crc32(&body).to_be_bytes());
+            } else if kind != b"IDAT" {
+                out.extend_from_slice(&png[i..i + 12 + len]);
+            }
+            i += 12 + len;
+        }
+        out
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    fn is_corrupt(r: Result<AssetKind, ImageError>) -> bool {
+        matches!(r, Err(ImageError::Corrupt(_)))
+    }
+
+    #[test]
+    fn validate_accepts_what_krilla_draws() {
+        for (what, data, format) in [
+            ("png", png(40, 30), ImageFormat::Png),
+            ("jpeg", JPEG.to_vec(), ImageFormat::Jpeg),
+            (
+                "progressive jpeg",
+                JPEG_PROGRESSIVE.to_vec(),
+                ImageFormat::Jpeg,
+            ),
+            ("gray jpeg", JPEG_GRAY.to_vec(), ImageFormat::Jpeg),
+            ("cmyk jpeg", JPEG_CMYK.to_vec(), ImageFormat::Jpeg),
+            (
+                "subsampled jpeg",
+                JPEG_SUBSAMPLED.to_vec(),
+                ImageFormat::Jpeg,
+            ),
+            ("gif", GIF.to_vec(), ImageFormat::Gif),
+        ] {
+            assert_eq!(validate(&data), Ok(AssetKind::Raster(format)), "{what}");
+            let data = Arc::new(data);
+            assert!(
+                krilla_image(&ImageCache::default(), &data, format).is_some(),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_svg_and_rejects_broken_svg() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="5" height="5"/></svg>"#;
+        assert_eq!(validate(svg), Ok(AssetKind::Svg));
+        assert!(is_corrupt(validate(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100"><rect"#
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_truncated_pngs() {
+        let full = png(64, 64);
+        assert_eq!(validate(&full), Ok(AssetKind::Raster(ImageFormat::Png)));
+        // The file ends inside the pixel data.
+        assert!(is_corrupt(validate(&full[..full.len() / 2])));
+        // Well-formed chunks, half the pixel data.
+        let idat = png_with_short_idat(&full, usize::MAX);
+        assert_eq!(validate(&idat), Ok(AssetKind::Raster(ImageFormat::Png)));
+        assert!(is_corrupt(validate(&png_with_short_idat(&full, 50))));
+        // Only the header.
+        assert!(is_corrupt(validate(&full[..40])));
+    }
+
+    #[test]
+    fn validate_rejects_truncated_jpeg_and_gif() {
+        let sos = JPEG.windows(2).position(|w| w == [0xff, 0xda]).unwrap();
+        assert!(is_corrupt(validate(&JPEG[..sos + (JPEG.len() - sos) / 2])));
+        assert!(is_corrupt(validate(&JPEG[..10])));
+        let sos = JPEG_PROGRESSIVE
+            .windows(2)
+            .position(|w| w == [0xff, 0xda])
+            .unwrap();
+        assert!(is_corrupt(validate(
+            &JPEG_PROGRESSIVE[..sos + (JPEG_PROGRESSIVE.len() - sos) / 2]
+        )));
+        assert!(is_corrupt(validate(&GIF[..GIF.len() / 2])));
+        // A header and nothing else.
+        assert!(is_corrupt(validate(MINIMAL_GIF)));
+    }
+
+    #[test]
+    fn validate_refuses_huge_headers_before_decoding() {
+        // 20000 x 20000 RGB would be 1.2 GB of output; the IDAT holds a few bytes.
+        let huge = png_with_short_idat(&png(16, 16), usize::MAX);
+        let mut huge = huge;
+        huge[16..20].copy_from_slice(&20000u32.to_be_bytes());
+        huge[20..24].copy_from_slice(&20000u32.to_be_bytes());
+        // The IHDR CRC no longer matches; `png` checks it, so recompute.
+        let crc = crc32(&huge[12..29]);
+        huge[29..33].copy_from_slice(&crc.to_be_bytes());
+        assert_eq!(
+            validate(&huge),
+            Err(ImageError::TooLarge { w: 20000, h: 20000 })
+        );
+        // A JPEG whose SOF says 10000 x 10000: within zune-jpeg's own 16384 limit, over ours.
+        let mut jpeg = JPEG.to_vec();
+        let sof = jpeg.windows(2).position(|w| w == [0xff, 0xc0]).unwrap();
+        jpeg[sof + 5..sof + 9].copy_from_slice(&[0x27, 0x10, 0x27, 0x10]);
+        assert_eq!(
+            validate(&jpeg),
+            Err(ImageError::TooLarge { w: 10000, h: 10000 })
+        );
+        // Wider than zune-jpeg decodes at all: refused as well (Krilla's header check says the same).
+        jpeg[sof + 5..sof + 9].copy_from_slice(&[0xea, 0x60, 0xea, 0x60]);
+        assert!(validate(&jpeg).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_garbage_and_empty() {
+        assert_eq!(
+            validate(b"not an image at all"),
+            Err(ImageError::Unsupported)
+        );
+        assert_eq!(validate(b""), Err(ImageError::Unsupported));
+    }
+
+    #[test]
+    fn krilla_image_skips_what_does_not_validate_and_remembers_the_verdict() {
+        let cache = ImageCache::default();
+        let full = png(64, 64);
+        let bad = Arc::new(full[..full.len() / 2].to_vec());
+        let good = Arc::new(full);
+        for _ in 0..2 {
+            assert!(krilla_image(&cache, &bad, ImageFormat::Png).is_none());
+            assert!(krilla_image(&cache, &good, ImageFormat::Png).is_some());
+        }
+        assert_eq!(
+            cache.0.borrow().len(),
+            2,
+            "one entry per image, not per draw"
+        );
     }
 }

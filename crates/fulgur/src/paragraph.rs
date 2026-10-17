@@ -840,8 +840,9 @@ pub fn draw_shaped_lines(
                         continue;
                     }
                     crate::draw_primitives::draw_with_opacity(canvas, img.opacity, |canvas| {
-                        let data: krilla::Data = Arc::clone(&img.data).into();
-                        let Ok(image) = img.format.to_krilla_image(data) else {
+                        let Some(image) =
+                            crate::image::krilla_image(&canvas.images, &img.data, img.format)
+                        else {
                             return;
                         };
                         let Some(size) =
@@ -1177,6 +1178,7 @@ mod tests {
                 tag_collector: None,
                 link_run_node_id: None,
                 in_marked_content: false,
+                images: Default::default(),
             };
             // Draw origin (5, 7) pt; rect must land at (5+2, 7+3, 20, 10).
             draw_shaped_lines(&mut canvas, &[line], 5.0_f32.as_pt(), 7.0_f32.as_pt(), None);

@@ -669,6 +669,9 @@ pub struct Canvas<'a, 'b> {
     /// `render::try_start_tagged`, `render::draw_list_item_marker_tagged`, and
     /// `paragraph::RunRegionTracker::transition_to`.
     pub in_marked_content: bool,
+    /// Validated Krilla images of this render (see [`crate::image::krilla_image`]). Shared by every
+    /// canvas of a render, so an image is checked once however many pages draw it.
+    pub images: crate::image::ImageCache,
 }
 
 /// Run a draw closure wrapped in opacity guards.
@@ -2860,6 +2863,7 @@ mod dp_unit_tests {
             tag_collector: None,
             link_run_node_id: None,
             in_marked_content: false,
+            images: Default::default(),
         };
         f(&mut canvas);
     }

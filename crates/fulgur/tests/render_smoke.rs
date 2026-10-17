@@ -7105,3 +7105,102 @@ fn table_parts_with_a_non_table_display_are_wrapped_and_printed() {
         }
     }
 }
+
+// ── F32a: oversized and undecodable images ────────────────────────────────
+
+/// Number of image XObjects in a PDF produced by krilla (`/Subtype /Image`).
+fn image_xobjects(pdf: &[u8]) -> usize {
+    let needle = b"/Subtype /Image";
+    pdf.windows(needle.len()).filter(|w| *w == needle).count()
+}
+
+/// A 1 x 1 PNG whose zlib stream is cut: a valid container that cannot be decoded.
+fn undecodable_png() -> Vec<u8> {
+    // 4 x 4 RGB with an IDAT of two bytes.
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let chunk = |png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]| {
+        png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend_from_slice(data);
+        png.extend_from_slice(&body);
+        let mut crc = !0u32;
+        for &b in &body {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        png.extend_from_slice(&(!crc).to_be_bytes());
+    };
+    chunk(&mut png, b"IHDR", &[0, 0, 0, 4, 0, 0, 0, 4, 8, 2, 0, 0, 0]);
+    chunk(&mut png, b"IDAT", &[0x78, 0x01]);
+    chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+const DOT_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+    0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
+    0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
+    0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+#[test]
+fn render_smoke_undecodable_png_is_skipped_everywhere_it_is_used() {
+    // `<img>`, `background-image` and `content: url()` all reach Krilla through `krilla_image`; an
+    // image that does not decode used to fail `Document::finish()` for the whole render.
+    let mut bundle = AssetBundle::default();
+    bundle.add_image("bad.png", undecodable_png());
+    bundle.add_css(
+        "body { margin: 0 } .bg { width: 80px; height: 40px; background-image: url(bad.png) } \
+         .pc::before { content: url(bad.png) }",
+    );
+    let html = r#"<!doctype html><html><body>
+        <img src="bad.png" width="20" height="20">
+        <div class="bg"></div>
+        <p class="pc">text</p>
+    </body></html>"#;
+    let pdf = Engine::builder()
+        .assets(bundle)
+        .build()
+        .render(html)
+        .expect("an undecodable image must not fail the render");
+    assert!(pdf.starts_with(b"%PDF"));
+    assert_eq!(image_xobjects(&pdf), 0);
+}
+
+#[test]
+fn render_smoke_wide_inline_img_is_painted_once() {
+    // Wider than the page content box (A4 default); one line box, one image XObject (F32a).
+    let mut bundle = AssetBundle::default();
+    bundle.add_image("dot.png", DOT_PNG.to_vec());
+    let html = r#"<!doctype html><html><body style="margin:0">
+        <img src="dot.png" style="width:900px;height:40px"><div style="height:10px"></div>
+    </body></html>"#;
+    let pdf = Engine::builder()
+        .assets(bundle)
+        .build()
+        .render(html)
+        .expect("render");
+    assert_eq!(image_xobjects(&pdf), 1);
+}
+
+#[test]
+fn render_smoke_img_in_a_multi_line_paragraph_is_painted() {
+    let mut bundle = AssetBundle::default();
+    bundle.add_image("dot.png", DOT_PNG.to_vec());
+    let html = r#"<!doctype html><html><body style="margin:0">
+        <p style="margin:0">first line<br>second line <img src="dot.png" style="width:30px;height:30px"></p>
+    </body></html>"#;
+    let pdf = Engine::builder()
+        .assets(bundle)
+        .build()
+        .render(html)
+        .expect("render");
+    assert_eq!(image_xobjects(&pdf), 1);
+}

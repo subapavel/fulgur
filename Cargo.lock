@@ -1105,6 +1105,7 @@ dependencies = [
  "blitz-traits",
  "cssparser 0.37.0",
  "getrandom 0.4.3",
+ "gif",
  "image",
  "krilla",
  "krilla-svg",
@@ -1112,6 +1113,7 @@ dependencies = [
  "lopdf",
  "minijinja",
  "parley",
+ "png",
  "rayon",
  "serde",
  "serde_json",
@@ -1125,6 +1127,7 @@ dependencies = [
  "unicode-segmentation",
  "usvg",
  "woff2-patched",
+ "zune-jpeg 0.5.15",
 ]
 
 [[package]]
