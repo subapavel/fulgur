@@ -66,10 +66,11 @@ impl AssetKind {
     }
 }
 
-/// Largest raster, in pixels, that [`validate`] accepts. An A4 scan at 600 dpi is 35 Mpx; the limit is
-/// checked from the header before any pixel is decoded, so a hostile header cannot make us allocate
-/// gigabytes (a 20000 × 20000 RGB PNG is 1.2 GB of output buffer).
-pub const MAX_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
+/// Largest raster, in pixels, that [`validate`] accepts: 128 Mi (134 Mpx). An A4 scan at 600 dpi is 35 Mpx,
+/// an A3 one 70 Mpx, 8193 × 8192 is 67 Mpx. The limit is checked from the header before any pixel is
+/// decoded, so a hostile header cannot make us allocate gigabytes (a 20000 × 20000 = 400 Mpx RGB PNG is
+/// 1.2 GB of output buffer).
+pub const MAX_IMAGE_PIXELS: u64 = 128 * 1024 * 1024;
 
 /// Why an image is not drawn.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -134,17 +135,83 @@ fn validate_png(data: &[u8]) -> Result<(), ImageError> {
 }
 
 fn validate_jpeg(data: &[u8]) -> Result<(), ImageError> {
+    match decode_jpeg_strictly(data) {
+        Err((_, true)) => {
+            // Strict mode refuses padding between header segments, which libjpeg skips with a warning
+            // and viewers draw. Take the padding out and decode strictly again: the entropy-coded data
+            // is still held to the strict standard, so a truncated file stays refused.
+            match strip_jpeg_header_padding(data) {
+                Some(clean) => decode_jpeg_strictly(&clean).map_err(|(e, _)| e),
+                None => decode_jpeg_strictly(data).map_err(|(e, _)| e),
+            }
+        }
+        result => result.map_err(|(e, _)| e),
+    }
+}
+
+/// `zune-jpeg` in strict mode. The `bool` of an error says it is the header-padding refusal that
+/// [`strip_jpeg_header_padding`] repairs, as opposed to a refusal of the image data.
+fn decode_jpeg_strictly(data: &[u8]) -> Result<(), (ImageError, bool)> {
+    use zune_jpeg::errors::DecodeErrors;
     use zune_jpeg::zune_core::options::DecoderOptions;
-    let corrupt = |e: zune_jpeg::errors::DecodeErrors| ImageError::Corrupt(e.to_string());
+    let corrupt = |e: DecodeErrors| {
+        // The one strict-mode error that concerns the headers only: "Extra bytes between headers"
+        // (zune-jpeg 0.5 `decoder.rs`, `parse_marker`). Everything else, "Exhausted data" and
+        // "Premature end of buffer" among them, is about the data and stays fatal. Matched on the
+        // text because the library has no variant for it.
+        let padding = matches!(&e, DecodeErrors::FormatStatic(m) if m.starts_with("[strict-mode]: Extra bytes"));
+        (ImageError::Corrupt(e.to_string()), padding)
+    };
     let options = DecoderOptions::default().set_strict_mode(true);
     let mut decoder = zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(data), options);
     decoder.decode_headers().map_err(corrupt)?;
-    let (w, h) = decoder
-        .dimensions()
-        .ok_or_else(|| ImageError::Corrupt("failed to read image dimensions".into()))?;
-    check_size(w as u32, h as u32)?;
+    let (w, h) = decoder.dimensions().ok_or_else(|| {
+        (
+            ImageError::Corrupt("failed to read image dimensions".into()),
+            false,
+        )
+    })?;
+    check_size(w as u32, h as u32).map_err(|e| (e, false))?;
     decoder.decode().map_err(corrupt)?;
     Ok(())
+}
+
+/// `data` without the bytes between its header segments that are not part of a segment (ITU-T T.81
+/// §B.1.1.2 allows `0xFF` fill before a marker; other padding is what some writers leave), up to the
+/// start of the first scan, which and everything after it is copied unchanged. `None` when `data` is
+/// not a JPEG that reaches a scan through well-formed segments.
+fn strip_jpeg_header_padding(data: &[u8]) -> Option<Vec<u8>> {
+    if !data.starts_with(&[0xff, 0xd8]) {
+        return None;
+    }
+    let mut out = vec![0xff, 0xd8];
+    let mut i = 2;
+    loop {
+        while *data.get(i)? != 0xff {
+            i += 1;
+        }
+        while *data.get(i + 1)? == 0xff {
+            i += 1;
+        }
+        match *data.get(i + 1)? {
+            0x00 => i += 2,
+            0xda => {
+                out.extend_from_slice(&data[i..]);
+                return Some(out);
+            }
+            0xd9 => return None,
+            0x01 | 0xd0..=0xd8 => {
+                out.extend_from_slice(&data[i..i + 2]);
+                i += 2;
+            }
+            _ => {
+                let len = usize::from(u16::from_be_bytes([*data.get(i + 2)?, *data.get(i + 3)?]));
+                let end = i + 2 + len;
+                out.extend_from_slice(data.get(i..end)?);
+                i = end;
+            }
+        }
+    }
 }
 
 fn validate_gif(data: &[u8]) -> Result<(), ImageError> {
@@ -723,17 +790,26 @@ mod tests {
             validate(&huge),
             Err(ImageError::TooLarge { w: 20000, h: 20000 })
         );
-        // A JPEG whose SOF says 10000 x 10000: within zune-jpeg's own 16384 limit, over ours.
+        // A JPEG whose SOF says 12000 x 12000 (144 Mpx): within zune-jpeg's own 16384 limit, over ours.
         let mut jpeg = JPEG.to_vec();
         let sof = jpeg.windows(2).position(|w| w == [0xff, 0xc0]).unwrap();
-        jpeg[sof + 5..sof + 9].copy_from_slice(&[0x27, 0x10, 0x27, 0x10]);
+        jpeg[sof + 5..sof + 9].copy_from_slice(&[0x2e, 0xe0, 0x2e, 0xe0]);
         assert_eq!(
             validate(&jpeg),
-            Err(ImageError::TooLarge { w: 10000, h: 10000 })
+            Err(ImageError::TooLarge { w: 12000, h: 12000 })
         );
         // Wider than zune-jpeg decodes at all: refused as well (Krilla's header check says the same).
         jpeg[sof + 5..sof + 9].copy_from_slice(&[0xea, 0x60, 0xea, 0x60]);
         assert!(validate(&jpeg).is_err());
+    }
+
+    #[test]
+    fn the_pixel_limit_admits_a_600_dpi_a3_scan() {
+        // 69.6 Mpx; 8193 x 8192 is what main embedded and the 64 Mi limit refused.
+        assert_eq!(check_size(8193, 8192), Ok(()));
+        assert_eq!(check_size(7016, 9933), Ok(()));
+        assert_eq!(check_size(11585, 11585), Ok(()));
+        assert!(check_size(11586, 11586).is_err());
     }
 
     #[test]
@@ -760,5 +836,53 @@ mod tests {
             2,
             "one entry per image, not per draw"
         );
+    }
+
+    /// `data` with `n` zero bytes between its first (APP0) segment and the next marker.
+    fn with_stray_bytes(data: &[u8], n: usize) -> Vec<u8> {
+        let app0_end = 2 + 2 + usize::from(u16::from_be_bytes([data[4], data[5]]));
+        let mut out = data[..app0_end].to_vec();
+        out.extend(std::iter::repeat_n(0u8, n));
+        out.extend_from_slice(&data[app0_end..]);
+        out
+    }
+
+    #[test]
+    fn validate_accepts_jpeg_with_stray_bytes_between_headers() {
+        // libjpeg skips them with a warning, viewers draw the image, and Krilla embeds it; zune-jpeg's
+        // strict mode refuses it ("Extra bytes between headers").
+        for original in [JPEG, JPEG_PROGRESSIVE, JPEG_CMYK, JPEG_GRAY] {
+            for n in [1, 3, 6, 40] {
+                let stray = with_stray_bytes(original, n);
+                assert_eq!(
+                    validate(&stray),
+                    Ok(AssetKind::Raster(ImageFormat::Jpeg)),
+                    "{n} stray bytes"
+                );
+                let stray = Arc::new(stray);
+                assert!(krilla_image(&ImageCache::default(), &stray, ImageFormat::Jpeg).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn stray_header_bytes_do_not_excuse_a_truncated_scan() {
+        for original in [JPEG, JPEG_PROGRESSIVE] {
+            let stray = with_stray_bytes(original, 3);
+            let sos = stray.windows(2).position(|w| w == [0xff, 0xda]).unwrap();
+            let cut = &stray[..sos + (stray.len() - sos) / 2];
+            assert!(is_corrupt(validate(cut)));
+        }
+    }
+
+    #[test]
+    fn jpeg_header_padding_is_removed_up_to_the_scan_only() {
+        let stray = with_stray_bytes(JPEG, 5);
+        assert_eq!(strip_jpeg_header_padding(&stray).as_deref(), Some(JPEG));
+        // Nothing to strip: the same bytes come back.
+        assert_eq!(strip_jpeg_header_padding(JPEG).as_deref(), Some(JPEG));
+        // Not a JPEG, or no scan: nothing to repair.
+        assert_eq!(strip_jpeg_header_padding(b"\xff\xd8"), None);
+        assert_eq!(strip_jpeg_header_padding(b"GIF89a"), None);
     }
 }
