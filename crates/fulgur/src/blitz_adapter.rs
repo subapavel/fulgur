@@ -7746,6 +7746,45 @@ mod seed_image_natural_size_tests {
         assert_eq!(w[0], 82.0);
     }
 
+    /// F66 second review (R1): a percentage column is not narrower than its cells' min-content either, when the
+    /// table's width is definite; with an indefinite one the percentage is `auto` and nothing changes.
+    #[test]
+    fn percentage_cell_width_never_goes_below_the_min_content() {
+        let table = |style: &str, td: &str| {
+            format!(
+                r#"<body style="margin:0;font-family:Noto Sans"><table style="border-spacing:0;{style}"><tr>
+                   <td {td}>12 345 678,00 Kc</td><td>b</td></tr></table></body>"#
+            )
+        };
+        let natural = cell_widths(&table("", r#"style="white-space:nowrap""#))[0];
+        assert!(natural > 60.0, "the text is {natural} px wide");
+        for td in [
+            r#"style="white-space:nowrap;width:10%""#,
+            r#"style="white-space:nowrap;width:calc(1/6 * 100%)""#,
+            r#"nowrap style="width:5%""#,
+        ] {
+            let w = cell_widths(&table("width:400px", td));
+            assert!(
+                w[0] >= natural - 0.5,
+                "{td}: {} px, its text {natural}",
+                w[0]
+            );
+            // Without a definite table width the percentage is `auto`.
+            let w = cell_widths(&table("", td));
+            assert!(
+                w[0] >= natural - 0.5,
+                "{td}: {} px, its text {natural}",
+                w[0]
+            );
+        }
+        // A percentage above the min-content is kept: 50 % of 400 px.
+        let w = cell_widths(&table(
+            "width:400px",
+            r#"style="white-space:nowrap;width:50%""#,
+        ));
+        assert_eq!(w[0], 200.0);
+    }
+
     #[test]
     fn svg_root_size_is_the_natural_size() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="#f00"/></svg>"##;
