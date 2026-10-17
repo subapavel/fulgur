@@ -7552,6 +7552,150 @@ mod seed_image_natural_size_tests {
         }
     }
 
+    /// Noto Sans, bundled, so line breaking in these tests does not depend on the host's fonts.
+    fn noto() -> Vec<Arc<Vec<u8>>> {
+        vec![Arc::new(
+            include_bytes!("../../../examples/.fonts/NotoSans-Regular.ttf").to_vec(),
+        )]
+    }
+
+    /// The Parley layout of the first inline formatting context: its text and each line's advance in CSS px.
+    fn first_ifc(html: &str, viewport: f32) -> (String, Vec<f32>) {
+        let (mut doc, _gcpm) =
+            parse_html_with_local_resources(html, viewport, 10000, &noto(), false, None);
+        resolve(&mut doc);
+        let root = doc
+            .tree()
+            .iter()
+            .find(|(_, n)| {
+                n.element_data()
+                    .is_some_and(|e| e.inline_layout_data.is_some())
+            })
+            .map(|(id, _)| id)
+            .expect("no inline root");
+        let data = doc
+            .get_node(root)
+            .unwrap()
+            .element_data()
+            .unwrap()
+            .inline_layout_data
+            .as_ref()
+            .unwrap();
+        (
+            data.text.clone(),
+            data.layout.lines().map(|l| l.metrics().advance).collect(),
+        )
+    }
+
+    const LONG_TEXT: &str = "The quick brown fox jumps over the lazy dog and runs far away";
+
+    /// F66: Parley 0.6 has no wrap-mode property and Stylo's `text-wrap-mode` was never read, so `nowrap` and
+    /// `pre` text was broken at every opportunity. The fork breaks at an unbounded width for such a root.
+    #[test]
+    fn nowrap_root_breaks_only_at_forced_breaks() {
+        let wrapped = |style: &str, body: &str| {
+            first_ifc(
+                &format!(r#"<body style="margin:0;font-family:Noto Sans"><div style="{style}">{body}</div></body>"#),
+                400.0,
+            )
+            .1
+        };
+        // Control: the same text wraps at 400 px.
+        let normal = wrapped("", LONG_TEXT);
+        assert!(
+            normal.len() >= 2 && normal.iter().all(|a| *a <= 400.0),
+            "{normal:?}"
+        );
+        // `nowrap`: one line wider than the box, start-aligned (the line keeps its natural advance).
+        let nowrap = wrapped("white-space:nowrap", LONG_TEXT);
+        assert_eq!(nowrap.len(), 1, "{nowrap:?}");
+        assert!(nowrap[0] > 400.0, "{nowrap:?}");
+        // `<br>` and a preserved newline still end the line.
+        let br = wrapped("white-space:nowrap", &format!("{LONG_TEXT}<br>{LONG_TEXT}"));
+        assert_eq!(br.len(), 2, "{br:?}");
+        let pre = wrapped("white-space:pre", &format!("{LONG_TEXT}\n{LONG_TEXT}"));
+        assert_eq!(pre.len(), 2, "{pre:?}");
+        // `text-wrap-mode` is what the `white-space` shorthand sets; the longhand alone does it too.
+        let longhand = wrapped("text-wrap-mode:nowrap", LONG_TEXT);
+        assert_eq!(longhand.len(), 1, "{longhand:?}");
+        // `pre-wrap` and `pre-line` wrap.
+        for ws in ["pre-wrap", "pre-line", "break-spaces"] {
+            let l = wrapped(&format!("white-space:{ws}"), LONG_TEXT);
+            assert!(l.len() >= 2, "{ws}: {l:?}");
+        }
+    }
+
+    /// Under `nowrap` there is no soft wrap opportunity, so the min-content width is the max-content width
+    /// (CSS Sizing 3 §5): a shrink-to-fit box is as wide as its text, however narrow its container.
+    #[test]
+    fn nowrap_min_content_is_max_content() {
+        let width = |style: &str, container: &str| {
+            let html = format!(
+                r#"<body style="margin:0;font-family:Noto Sans"><div style="width:{container}"><span id="s" style="display:inline-block;{style}">{LONG_TEXT}</span></div></body>"#
+            );
+            let (mut doc, _gcpm) =
+                parse_html_with_local_resources(&html, 2000.0, 10000, &noto(), false, None);
+            resolve(&mut doc);
+            let id = doc
+                .tree()
+                .iter()
+                .find(|(_, n)| {
+                    n.element_data()
+                        .is_some_and(|e| e.name.local.as_ref() == "span")
+                })
+                .map(|(id, _)| id)
+                .expect("no span");
+            doc.get_node(id).unwrap().final_layout.size.width
+        };
+        let natural = width("white-space:nowrap", "1500px");
+        assert!(natural > 300.0, "the text is {natural} px wide");
+        assert_eq!(width("white-space:nowrap", "100px"), natural);
+        // Control: a wrapping inline-block fits its container (it may be narrower: the widest line).
+        let wrapping = width("", "100px");
+        assert!(wrapping <= 100.0, "{wrapping}");
+    }
+
+    /// `pre-line` collapses spaces and tabs, including the indentation after a newline, and keeps the newline.
+    /// Blitz mapped it to `pre`, which keeps all of them.
+    #[test]
+    fn pre_line_text_has_no_indentation() {
+        let ifc = |style: &str| {
+            first_ifc(
+                &format!(
+                    "<body style=\"margin:0;font-family:Noto Sans\"><div style=\"{style}\">Firma   s.r.o.\n    Ulice 1</div></body>"
+                ),
+                400.0,
+            )
+        };
+        let (text, lines) = ifc("white-space:pre-line");
+        assert_eq!(text, "Firma s.r.o.\nUlice 1");
+        assert_eq!(lines.len(), 2);
+        // Control: `pre` keeps both.
+        let (text, _) = ifc("white-space:pre");
+        assert_eq!(text, "Firma   s.r.o.\n    Ulice 1");
+        // And the default collapses the newline into a space.
+        let (text, lines) = ifc("");
+        assert_eq!(text, "Firma s.r.o. Ulice 1");
+        assert_eq!(lines.len(), 1);
+    }
+
+    /// HTML §15.3.8: `td[nowrap]` and `th[nowrap]` mean `white-space: nowrap` (Blitz's UA sheet had no rule).
+    #[test]
+    fn nowrap_attribute_on_a_cell_does_not_wrap() {
+        let lines = |attr: &str| {
+            first_ifc(
+                &format!(
+                    r#"<body style="margin:0;font-family:Noto Sans"><table style="width:400px"><tr><td {attr}>{LONG_TEXT}</td></tr></table></body>"#
+                ),
+                400.0,
+            )
+            .1
+            .len()
+        };
+        assert!(lines("") >= 2);
+        assert_eq!(lines("nowrap"), 1);
+    }
+
     #[test]
     fn svg_root_size_is_the_natural_size() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="#f00"/></svg>"##;
