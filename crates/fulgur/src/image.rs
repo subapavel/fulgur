@@ -171,6 +171,12 @@ fn validate_jpeg(data: &[u8]) -> Result<Option<String>, ImageError> {
     let (w, h) = headers
         .dimensions()
         .ok_or_else(|| ImageError::Corrupt("failed to read image dimensions".into()))?;
+    // Our own scan gives the natural size to layout; a JPEG it cannot read the way the decoder does has
+    // no box and is not drawn unless CSS gives both sizes, which must not go unsaid.
+    let scanned = ImageRender::decode_dimensions(data, ImageFormat::Jpeg);
+    if let Some(note) = header_size_note(scanned, (w, h)) {
+        return Ok(Some(note));
+    }
     if u64::from(w as u32) * u64::from(h as u32) > MAX_JPEG_VALIDATION_PIXELS {
         // Krilla passes a JPEG through undecoded: the header was all it asked for.
         return Ok(None);
@@ -187,6 +193,23 @@ fn validate_jpeg(data: &[u8]) -> Result<Option<String>, ImageError> {
             Ok(Some(strict_error.to_string().trim_matches('"').to_string()))
         }
     }
+}
+
+/// A reason when the size our header scan found (`scanned`, [`ImageRender::decode_dimensions`]) is not the
+/// one the decoder read (`decoded`, `zune-jpeg`'s `dimensions()`), `None` when they agree.
+fn header_size_note(scanned: Option<(u32, u32)>, decoded: (usize, usize)) -> Option<String> {
+    let (w, h) = decoded;
+    if scanned.is_some_and(|(sw, sh)| sw as usize == w && sh as usize == h) {
+        return None;
+    }
+    let found = match scanned {
+        Some((sw, sh)) => format!("{sw} \u{d7} {sh}"),
+        None => "none".to_string(),
+    };
+    Some(format!(
+        "the size in the header could not be read (scan: {found}; decoder: {w} \u{d7} {h}); \
+         it is drawn only where CSS gives both sizes"
+    ))
 }
 
 fn validate_gif(data: &[u8]) -> Result<(), ImageError> {
@@ -309,6 +332,14 @@ impl ImageRender {
                         i += 1;
                         continue;
                     }
+                    // T.81 §B.1.1.2: a marker may be preceded by any number of 0xFF fill bytes.
+                    // The scan ends at the first SOF, so it never meets entropy-coded data.
+                    while i + 1 < data.len() && data[i + 1] == 0xFF {
+                        i += 1;
+                    }
+                    if i + 1 >= data.len() {
+                        return None;
+                    }
                     let marker = data[i + 1];
                     i += 2;
                     if (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xCC {
@@ -369,6 +400,31 @@ mod tests {
     fn test_png_dimensions() {
         let dims = ImageRender::decode_dimensions(MINIMAL_PNG, ImageFormat::Png);
         assert_eq!(dims, Some((1, 1)));
+    }
+
+    #[test]
+    fn jpeg_decode_dimensions_skips_fill_bytes() {
+        // T.81 §B.1.1.2: any marker may be preceded by any number of 0xFF fill bytes. A synthetic header,
+        // fill bytes before APP0 and before SOF0: 40 wide, 30 high.
+        let jpeg = [
+            &[0xFF, 0xD8][..],
+            &[0xFF, 0xFF, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00],
+            &[
+                0xFF, 0xFF, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x1E, 0x00, 0x28, 0x01, 0x01, 0x11,
+                0x00,
+            ],
+        ]
+        .concat();
+        assert_eq!(
+            ImageRender::decode_dimensions(&jpeg, ImageFormat::Jpeg),
+            Some((40, 30))
+        );
+        // Without them: the same answer.
+        let plain = [&jpeg[..2], &jpeg[4..10], &jpeg[12..]].concat();
+        assert_eq!(
+            ImageRender::decode_dimensions(&plain, ImageFormat::Jpeg),
+            Some((40, 30))
+        );
     }
 
     #[test]
@@ -867,6 +923,36 @@ mod tests {
         assert_eq!(claim(12000, 12000), None);
         // The PNG / GIF limit stays 128 Mi: see `validate_refuses_huge_headers_before_decoding`.
         const { assert!(MAX_IMAGE_PIXELS > MAX_JPEG_VALIDATION_PIXELS) };
+    }
+
+    #[test]
+    fn header_size_note_is_silent_when_the_scan_and_the_decoder_agree() {
+        assert_eq!(header_size_note(Some((64, 48)), (64, 48)), None);
+    }
+
+    #[test]
+    fn header_size_note_names_both_sizes_when_they_differ_or_the_scan_failed() {
+        let wrong = header_size_note(Some((64, 64)), (64, 48)).unwrap();
+        assert!(
+            wrong.contains("64 \u{d7} 64") && wrong.contains("64 \u{d7} 48"),
+            "{wrong}"
+        );
+        let none = header_size_note(None, (64, 48)).unwrap();
+        assert!(
+            none.contains("none") && none.contains("decoder: 64 \u{d7} 48"),
+            "{none}"
+        );
+        assert!(none.contains("both sizes"), "{none}");
+    }
+
+    #[test]
+    fn jpeg_with_fill_bytes_is_valid_and_not_damaged() {
+        let sof = JPEG.windows(2).position(|w| w == [0xff, 0xdb]).unwrap();
+        let mut filled = JPEG.to_vec();
+        filled.splice(sof..sof, [0xFF; 7]);
+        let v = validate_detailed(&filled).unwrap();
+        assert_eq!(v.kind, AssetKind::Raster(ImageFormat::Jpeg));
+        assert_eq!(v.damaged, None);
     }
 
     #[test]

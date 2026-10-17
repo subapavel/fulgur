@@ -7204,3 +7204,24 @@ fn render_smoke_img_in_a_multi_line_paragraph_is_painted() {
         .expect("render");
     assert_eq!(image_xobjects(&pdf), 1);
 }
+
+#[test]
+fn render_smoke_jpeg_with_fill_bytes_is_painted() {
+    // T.81 §B.1.1.2 allows 0xFF fill bytes before any marker; the natural size was lost and the image
+    // not drawn (F60). Three fill bytes in front of the first DQT, size from CSS width and the ratio.
+    let jpeg = include_bytes!("fixtures/images/gradient64.jpg");
+    let dqt = jpeg.windows(2).position(|w| w == [0xFF, 0xDB]).unwrap();
+    let mut filled = jpeg.to_vec();
+    filled.splice(dqt..dqt, [0xFF; 3]);
+    let mut bundle = AssetBundle::default();
+    bundle.add_image("fill.jpg", filled);
+    let html = r#"<!doctype html><html><body style="margin:0">
+        <img src="fill.jpg" style="width:100px"><div style="height:10px"></div>
+    </body></html>"#;
+    let pdf = Engine::builder()
+        .assets(bundle)
+        .build()
+        .render(html)
+        .expect("render");
+    assert_eq!(image_xobjects(&pdf), 1);
+}
