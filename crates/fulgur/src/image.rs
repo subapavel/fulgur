@@ -66,7 +66,7 @@ impl AssetKind {
     }
 }
 
-/// Largest raster, in pixels, that [`validate`] accepts: 128 Mi (134 Mpx). An A4 scan at 600 dpi is 35 Mpx,
+/// Largest PNG or GIF, in pixels, that [`validate`] accepts (a JPEG has its own limit, below): 128 Mi (134 Mpx). An A4 scan at 600 dpi is 35 Mpx,
 /// an A3 one 70 Mpx, 8193 × 8192 is 67 Mpx. The limit is checked from the header before any pixel is
 /// decoded, so a hostile header cannot make us allocate gigabytes (a 20000 × 20000 = 400 Mpx RGB PNG is
 /// 1.2 GB of output buffer).
@@ -85,6 +85,12 @@ pub enum ImageError {
     #[error("{0}")]
     Corrupt(String),
 }
+
+/// Largest JPEG, in pixels, that [`validate_detailed`] decodes. Krilla passes a JPEG through undecoded and a
+/// damaged one is embedded anyway, so decoding it only serves to tell damage from a file nothing can read, and
+/// is not worth its cost on a scan: 16 Mi pixels (a 4000 x 4000 photo) take about 100 ms and 48 MB; a
+/// 72 Mpx scan would take 430 ms and 226 MB where Krilla needs none. Larger JPEGs get the header check only.
+pub const MAX_JPEG_VALIDATION_PIXELS: u64 = 16 * 1024 * 1024;
 
 fn check_size(w: u32, h: u32) -> Result<(), ImageError> {
     if u64::from(w) * u64::from(h) > MAX_IMAGE_PIXELS {
@@ -118,8 +124,8 @@ pub fn validate(data: &[u8]) -> Result<AssetKind, ImageError> {
 /// decoders and calls Krilla uses (`png`, `gif`) and the pixel count checked against [`MAX_IMAGE_PIXELS`]
 /// from the header first. A JPEG is refused only when `zune-jpeg` cannot decode it at all, even leniently
 /// (a garbage header, an unsupported coding); one that decodes only leniently is accepted and reported in
-/// [`Validation::damaged`] (`zune-jpeg`'s strict mode is what notices truncation). A JPEG over the pixel
-/// limit is checked by its header only: nothing of ours decodes it. SVG is parsed with `usvg` and no font
+/// [`Validation::damaged`] (`zune-jpeg`'s strict mode is what notices truncation). A JPEG over
+/// [`MAX_JPEG_VALIDATION_PIXELS`] is checked by its header only: nothing of Krilla's decodes it. SVG is parsed with `usvg` and no font
 /// database.
 ///
 /// Costs one extra decode of the image.
@@ -165,8 +171,8 @@ fn validate_jpeg(data: &[u8]) -> Result<Option<String>, ImageError> {
     let (w, h) = headers
         .dimensions()
         .ok_or_else(|| ImageError::Corrupt("failed to read image dimensions".into()))?;
-    if check_size(w as u32, h as u32).is_err() {
-        // Krilla passes a JPEG through undecoded: only our own decode needs the limit.
+    if u64::from(w as u32) * u64::from(h as u32) > MAX_JPEG_VALIDATION_PIXELS {
+        // Krilla passes a JPEG through undecoded: the header was all it asked for.
         return Ok(None);
     }
     let strict = decoder(DecoderOptions::default().set_strict_mode(true))
@@ -841,14 +847,26 @@ mod tests {
     }
 
     #[test]
-    fn a_jpeg_above_the_pixel_cap_is_checked_by_header_only() {
-        // Krilla passes a JPEG through undecoded, so the cap (which bounds our decode) does not apply:
-        // 12000 x 12000 is 144 Mpx and is embedded as it was before F32a. PNG and GIF, which Krilla
-        // does decode, stay refused (`validate_refuses_huge_headers_before_decoding`).
-        let mut jpeg = JPEG.to_vec();
-        let sof = jpeg.windows(2).position(|w| w == [0xff, 0xc0]).unwrap();
-        jpeg[sof + 5..sof + 9].copy_from_slice(&[0x2e, 0xe0, 0x2e, 0xe0]);
-        assert_eq!(validate(&jpeg), Ok(AssetKind::Raster(ImageFormat::Jpeg)));
+    fn a_large_jpeg_is_checked_by_header_only() {
+        // Krilla passes a JPEG through undecoded, so main embedded any JPEG whose header parses; decoding
+        // 72 Mpx to learn whether it is damaged costs 430 ms and 226 MB. Over
+        // MAX_JPEG_VALIDATION_PIXELS only the header is read. The probe is a JPEG cut in its scan, which a
+        // decode reports as damaged, with the size in its header changed.
+        let sos = JPEG.windows(2).position(|w| w == [0xff, 0xda]).unwrap();
+        let cut = &JPEG[..sos + (JPEG.len() - sos) / 2];
+        let sof = cut.windows(2).position(|w| w == [0xff, 0xc0]).unwrap();
+        let claim = |w: u16, h: u16| {
+            let mut jpeg = cut.to_vec();
+            jpeg[sof + 5..sof + 7].copy_from_slice(&h.to_be_bytes());
+            jpeg[sof + 7..sof + 9].copy_from_slice(&w.to_be_bytes());
+            validate_detailed(&jpeg).unwrap().damaged
+        };
+        assert!(claim(64, 64).is_some(), "within the limit: decoded");
+        assert!(claim(4000, 4000).is_some(), "16 Mpx is the limit itself");
+        assert_eq!(claim(5000, 5000), None, "over it: header only");
+        assert_eq!(claim(12000, 12000), None);
+        // The PNG / GIF limit stays 128 Mi: see `validate_refuses_huge_headers_before_decoding`.
+        assert!(MAX_IMAGE_PIXELS > MAX_JPEG_VALIDATION_PIXELS);
     }
 
     #[test]
