@@ -178,9 +178,39 @@ pub(crate) type ColumnStyleTable = BTreeMap<usize, ColumnStyleProps>;
 #[derive(Clone, Debug)]
 pub(crate) struct StyleRule {
     pub selectors: Vec<ComplexSelector>,
+    /// The normal declarations.
     pub props: ColumnStyleProps,
+    /// The `!important` declarations (Cascade 5 §6.1: a separate, higher tier of the cascade).
+    pub important: ColumnStyleProps,
     /// Cascade layer the rule was written in; `0` for unlayered rules.
     pub layer: LayerId,
+    /// Position of `layer` in the cascade ([`LayerTree::ranks`]): higher beats lower for normal declarations,
+    /// unlayered rules are highest.
+    pub rank: usize,
+}
+
+/// Specificity of a selector (Selectors 4 §17): ids, classes, types. Compared lexicographically.
+pub(crate) type Specificity = (u32, u32, u32);
+
+fn compound_specificity(c: &CompoundSelector) -> Specificity {
+    c.parts
+        .iter()
+        .fold((0, 0, 0), |(a, b, t), part| match part {
+            SimpleSelector::Id(_) => (a + 1, b, t),
+            SimpleSelector::Class(_) => (a, b + 1, t),
+            SimpleSelector::Type(_) => (a, b, t + 1),
+            SimpleSelector::Universal => (a, b, t),
+        })
+}
+
+/// Specificity of one complex selector: the sum over its compounds (`A + B` counts both).
+pub(crate) fn specificity(sel: &ComplexSelector) -> Specificity {
+    let (a, b, c) = compound_specificity(&sel.subject);
+    let (pa, pb, pc) = sel
+        .prev_sibling
+        .as_ref()
+        .map_or((0, 0, 0), compound_specificity);
+    (a + pa, b + pb, c + pc)
 }
 
 /// One simple selector — a single unqualified component of a compound
@@ -546,15 +576,25 @@ fn parse_page_value<'i>(input: &mut Parser<'i, '_>) -> Result<PageName, ParseErr
 // Declaration block parser
 // ---------------------------------------------------------------------------
 
-/// Parse a CSS declaration block (no surrounding braces) into
-/// [`ColumnStyleProps`]. Invalid declarations drop silently; valid ones fill
-/// their field. Last-declaration-wins within a block.
-pub(crate) fn parse_declaration_block(css: &str) -> ColumnStyleProps {
-    let mut props = ColumnStyleProps::default();
+/// The declarations of one block, split by importance (Cascade 5 §6.1).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Declared {
+    pub normal: ColumnStyleProps,
+    pub important: ColumnStyleProps,
+}
+
+/// Parse a CSS declaration block (no surrounding braces) into [`Declared`]. Invalid declarations drop silently;
+/// valid ones fill their field, in the `normal` or the `important` half. Last-declaration-wins within a block and
+/// half.
+pub(crate) fn parse_declarations(css: &str) -> Declared {
+    let mut declared = Declared::default();
     let mut input = ParserInput::new(css);
     let mut parser = Parser::new(&mut input);
 
-    let mut decl_parser = ColumnDeclParser { props: &mut props };
+    let mut decl_parser = ColumnDeclParser {
+        normal: &mut declared.normal,
+        important: &mut declared.important,
+    };
     // `RuleBodyParser` walks `decl; decl; decl;` and feeds each declaration
     // through `DeclarationParser::parse_value`. Errors from one declaration
     // do not abort the block — they surface as `Err` items in the iterator
@@ -563,11 +603,47 @@ pub(crate) fn parse_declaration_block(css: &str) -> ColumnStyleProps {
     for item in iter {
         let _ = item;
     }
-    props
+    declared
+}
+
+/// The normal declarations of a block (tests of the value grammar).
+#[cfg(test)]
+pub(crate) fn parse_declaration_block(css: &str) -> ColumnStyleProps {
+    parse_declarations(css).normal
 }
 
 struct ColumnDeclParser<'a> {
-    props: &'a mut ColumnStyleProps,
+    normal: &'a mut ColumnStyleProps,
+    important: &'a mut ColumnStyleProps,
+}
+
+/// What follows a declaration's value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tail {
+    /// Nothing.
+    Normal,
+    /// `!important` (Syntax 3 §5.4.6: `!`, optional whitespace, the ident `important`, any case).
+    Important,
+    /// Anything else after a `!`: the declaration is invalid.
+    Invalid,
+}
+
+/// Look at what follows the value, without consuming anything.
+fn scan_tail(input: &mut Parser<'_, '_>) -> Tail {
+    let state = input.state();
+    let _ = input.parse_until_before(cssparser::Delimiter::Bang, |i| {
+        while i.next().is_ok() {}
+        Ok::<(), ParseError<'_, ()>>(())
+    });
+    let tail = if input.is_exhausted() {
+        Tail::Normal
+    } else if input.try_parse(cssparser::parse_important).is_ok() && input.is_exhausted() {
+        Tail::Important
+    } else {
+        Tail::Invalid
+    };
+    input.reset(&state);
+    tail
 }
 
 impl<'i, 'a> DeclarationParser<'i> for ColumnDeclParser<'a> {
@@ -580,72 +656,91 @@ impl<'i, 'a> DeclarationParser<'i> for ColumnDeclParser<'a> {
         input: &mut Parser<'i, 't>,
         _decl_start: &cssparser::ParserState,
     ) -> Result<(), ParseError<'i, ()>> {
-        if name.eq_ignore_ascii_case("column-rule") {
-            if let Some(spec) = parse_column_rule_shorthand(input) {
-                // A shorthand with `style: None` is equivalent to "don't
-                // draw" — we store it anyway so a later longhand can read
-                // the width/colour the author still wanted.
-                self.props.rule = Some(spec);
+        let props = match scan_tail(input) {
+            Tail::Normal => &mut *self.normal,
+            Tail::Important => &mut *self.important,
+            Tail::Invalid => {
+                // `a: b !foo` is invalid as a whole.
+                while input.next().is_ok() {}
+                return Ok(());
             }
-        } else if name.eq_ignore_ascii_case("column-rule-width") {
-            if let Ok(w) = input.parse_entirely(parse_length) {
-                let mut spec = self.props.rule.unwrap_or_default();
-                spec.width = w.as_pt();
-                self.props.rule = Some(spec);
-            }
-        } else if name.eq_ignore_ascii_case("column-rule-style") {
-            let result = input.parse_entirely(|input| {
-                let ident = input.expect_ident()?.clone();
-                parse_rule_style_ident(&ident)
-                    .ok_or_else(|| input.new_error::<()>(BasicParseErrorKind::QualifiedRuleInvalid))
-            });
-            if let Ok(style) = result {
-                let mut spec = self.props.rule.unwrap_or_default();
-                spec.style = style;
-                self.props.rule = Some(spec);
-            }
-        } else if name.eq_ignore_ascii_case("column-rule-color") {
-            if let Ok(color) = input.parse_entirely(parse_color) {
-                let mut spec = self.props.rule.unwrap_or_default();
-                spec.color = color;
-                self.props.rule = Some(spec);
-            }
-        } else if name.eq_ignore_ascii_case("column-fill") {
-            if let Ok(fill) = input.parse_entirely(parse_column_fill_value) {
-                self.props.fill = Some(fill);
-            }
-        } else if name.eq_ignore_ascii_case("break-inside") {
-            // `break-inside` (CSS Fragmentation Level 3) maps
-            // `avoid-page` / `avoid-column` / `avoid` all onto
-            // [`BreakInside::Avoid`]: fulgur's fragmentation model only
-            // distinguishes "may split" from "atomic", so the three avoid
-            // flavours collapse into a single lattice point. `auto` is the
-            // initial value; unknown idents drop the declaration silently
-            // so siblings keep applying.
-            if let Ok(bi) = input.parse_entirely(parse_break_inside_value) {
-                self.props.break_inside = Some(bi);
-            }
-        } else if name.eq_ignore_ascii_case("break-after")
-            || name.eq_ignore_ascii_case("page-break-after")
-        {
-            if let Ok(v) = input.parse_entirely(parse_break_after_value) {
-                self.props.break_after = Some(v);
-            }
-        } else if name.eq_ignore_ascii_case("break-before")
-            || name.eq_ignore_ascii_case("page-break-before")
-        {
-            if let Ok(v) = input.parse_entirely(parse_break_before_value) {
-                self.props.break_before = Some(v);
-            }
-        } else if name.eq_ignore_ascii_case("page") {
-            if let Ok(v) = input.parse_entirely(parse_page_value) {
-                self.props.page = Some(v);
-            }
-        } else {
-            // Unknown property — discard its value tokens silently.
-            while input.next().is_ok() {}
-        }
+        };
+        // The value stops before the `!`; `parse_until_before` hands the value parsers an input that ends there.
+        let _ = input.parse_until_before(cssparser::Delimiter::Bang, |input| {
+            parse_value_into(props, &name, input);
+            Ok::<(), ParseError<'i, ()>>(())
+        });
+        // Consume `!important` so that the caller's `parse_entirely` is satisfied.
+        let _ = input.try_parse(cssparser::parse_important);
         Ok(())
+    }
+}
+
+fn parse_value_into(props: &mut ColumnStyleProps, name: &str, input: &mut Parser<'_, '_>) {
+    if name.eq_ignore_ascii_case("column-rule") {
+        if let Some(spec) = parse_column_rule_shorthand(input) {
+            // A shorthand with `style: None` is equivalent to "don't
+            // draw" — we store it anyway so a later longhand can read
+            // the width/colour the author still wanted.
+            props.rule = Some(spec);
+        }
+    } else if name.eq_ignore_ascii_case("column-rule-width") {
+        if let Ok(w) = input.parse_entirely(parse_length) {
+            let mut spec = props.rule.unwrap_or_default();
+            spec.width = w.as_pt();
+            props.rule = Some(spec);
+        }
+    } else if name.eq_ignore_ascii_case("column-rule-style") {
+        let result = input.parse_entirely(|input| {
+            let ident = input.expect_ident()?.clone();
+            parse_rule_style_ident(&ident)
+                .ok_or_else(|| input.new_error::<()>(BasicParseErrorKind::QualifiedRuleInvalid))
+        });
+        if let Ok(style) = result {
+            let mut spec = props.rule.unwrap_or_default();
+            spec.style = style;
+            props.rule = Some(spec);
+        }
+    } else if name.eq_ignore_ascii_case("column-rule-color") {
+        if let Ok(color) = input.parse_entirely(parse_color) {
+            let mut spec = props.rule.unwrap_or_default();
+            spec.color = color;
+            props.rule = Some(spec);
+        }
+    } else if name.eq_ignore_ascii_case("column-fill") {
+        if let Ok(fill) = input.parse_entirely(parse_column_fill_value) {
+            props.fill = Some(fill);
+        }
+    } else if name.eq_ignore_ascii_case("break-inside") {
+        // `break-inside` (CSS Fragmentation Level 3) maps
+        // `avoid-page` / `avoid-column` / `avoid` all onto
+        // [`BreakInside::Avoid`]: fulgur's fragmentation model only
+        // distinguishes "may split" from "atomic", so the three avoid
+        // flavours collapse into a single lattice point. `auto` is the
+        // initial value; unknown idents drop the declaration silently
+        // so siblings keep applying.
+        if let Ok(bi) = input.parse_entirely(parse_break_inside_value) {
+            props.break_inside = Some(bi);
+        }
+    } else if name.eq_ignore_ascii_case("break-after")
+        || name.eq_ignore_ascii_case("page-break-after")
+    {
+        if let Ok(v) = input.parse_entirely(parse_break_after_value) {
+            props.break_after = Some(v);
+        }
+    } else if name.eq_ignore_ascii_case("break-before")
+        || name.eq_ignore_ascii_case("page-break-before")
+    {
+        if let Ok(v) = input.parse_entirely(parse_break_before_value) {
+            props.break_before = Some(v);
+        }
+    } else if name.eq_ignore_ascii_case("page") {
+        if let Ok(v) = input.parse_entirely(parse_page_value) {
+            props.page = Some(v);
+        }
+    } else {
+        // Unknown property — discard its value tokens silently.
+        while input.next().is_ok() {}
     }
 }
 
@@ -1075,9 +1170,9 @@ fn media_query_matches(input: &mut Parser<'_, '_>) -> bool {
 ///   block nested deeper than [`MAX_AT_RULE_DEPTH`]: returning `Err` from `parse_prelude` makes cssparser consume
 ///   and discard the block.
 ///
-/// The order of the result is the cascade for normal declarations: a stable sort by layer rank
-/// ([`LayerTree::ranks`], unlayered rules last), so source order holds inside a layer and
-/// [`build_column_style_table`] folding the rules in order gives last-wins per field.
+/// The result is sorted (stably) by layer rank ([`LayerTree::ranks`], unlayered rules last), so source order holds
+/// inside a layer. [`build_column_style_table`] finishes the cascade per element: importance, then layer rank
+/// (reversed for important declarations), then specificity, then source order.
 pub(crate) fn parse_stylesheet(source: &str) -> Vec<StyleRule> {
     let mut rules = Vec::new();
     let mut layers = LayerTree::new();
@@ -1094,10 +1189,11 @@ pub(crate) fn parse_stylesheet(source: &str) -> Vec<StyleRule> {
     for item in iter {
         let _ = item;
     }
-    if layers.nodes.len() > 1 {
-        let ranks = layers.ranks();
-        rules.sort_by_key(|r| ranks[r.layer]);
+    let ranks = layers.ranks();
+    for rule in &mut rules {
+        rule.rank = ranks[rule.layer];
     }
+    rules.sort_by_key(|r| r.rank);
     rules
 }
 
@@ -1121,8 +1217,15 @@ enum AtPrelude {
 /// `<layer-name> = <ident> [ '.' <ident> ]*` (Cascade 5 §6.4.2).
 fn parse_layer_name(input: &mut Parser<'_, '_>) -> Option<Vec<String>> {
     let mut path = vec![input.expect_ident().ok()?.as_ref().to_string()];
-    // `a.b` tokenises as an ident and a `.b` pair: no whitespace is allowed around the dot.
-    while input.try_parse(|i| i.expect_delim('.')).is_ok() {
+    // `a.b` tokenises as an ident, a `.` and an ident. Whitespace around the dot is invalid (`a .b` is two
+    // tokens of a prelude that is not a name list, so the whole at-rule is invalid).
+    while input
+        .try_parse(|i| match i.next_including_whitespace() {
+            Ok(Token::Delim('.')) => Ok(()),
+            _ => Err(i.new_custom_error::<(), ()>(())),
+        })
+        .is_ok()
+    {
         path.push(
             input
                 .next_including_whitespace()
@@ -1269,17 +1372,23 @@ impl<'i, 'a> QualifiedRuleParser<'i> for SheetParser<'a> {
         _start: &cssparser::ParserState,
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::QualifiedRule, ParseError<'i, ()>> {
-        let mut props = ColumnStyleProps::default();
-        let mut decl_parser = ColumnDeclParser { props: &mut props };
+        let mut declared = Declared::default();
+        let mut decl_parser = ColumnDeclParser {
+            normal: &mut declared.normal,
+            important: &mut declared.important,
+        };
         let iter = RuleBodyParser::new(input, &mut decl_parser);
         for item in iter {
             let _ = item;
         }
-        if !props.is_empty() {
+        if !declared.normal.is_empty() || !declared.important.is_empty() {
             self.rules.push(StyleRule {
                 selectors,
-                props,
+                props: declared.normal,
+                important: declared.important,
                 layer: self.layer,
+                // Set by `parse_stylesheet` once the layer tree is complete.
+                rank: 0,
             });
         }
         Ok(())
@@ -1333,21 +1442,39 @@ fn walk(
     if is_element {
         let previous_element_sibling = previous_element_sibling_id.and_then(|id| doc.get_node(id));
         let mut props = ColumnStyleProps::default();
-        for rule in rules {
-            if rule
+        // The rules that match, with what orders them. Specificity is that of the selector that matched: the
+        // highest one of a selector list (Selectors 4 §17).
+        let mut hits: Vec<(usize, Specificity, usize)> = Vec::new();
+        for (index, rule) in rules.iter().enumerate() {
+            let matched = rule
                 .selectors
                 .iter()
-                .any(|sel| matches_complex_with_prev(sel, node, previous_element_sibling))
-            {
-                props.merge(rule.props.clone());
+                .filter(|sel| matches_complex_with_prev(sel, node, previous_element_sibling))
+                .map(specificity)
+                .max();
+            if let Some(spec) = matched {
+                hits.push((rule.rank, spec, index));
             }
         }
-        if let Some(elem) = node.element_data() {
-            if let Some(inline) = crate::blitz_adapter::get_attr(elem, "style") {
-                let inline_props = parse_declaration_block(inline);
-                props.merge(inline_props);
-            }
+        let inline = node
+            .element_data()
+            .and_then(|elem| crate::blitz_adapter::get_attr(elem, "style"))
+            .map(parse_declarations)
+            .unwrap_or_default();
+        // Cascade 5 §6.1, lowest to highest: normal declarations by layer, then specificity, then order
+        // (unlayered rules are the last layer); the `style` attribute's normal ones; important ones by layer in
+        // *reverse* (§6.4.4: the unlayered ones lose, an earlier layer beats a later one), specificity, order; the
+        // `style` attribute's important ones.
+        hits.sort_by_key(|&(rank, spec, index)| (rank, spec, index));
+        for &(_, _, index) in &hits {
+            props.merge(rules[index].props.clone());
         }
+        props.merge(inline.normal);
+        hits.sort_by_key(|&(rank, spec, index)| (std::cmp::Reverse(rank), spec, index));
+        for &(_, _, index) in &hits {
+            props.merge(rules[index].important.clone());
+        }
+        props.merge(inline.important);
         if !props.is_empty() {
             table.insert(node_id, props);
         }
@@ -2836,5 +2963,201 @@ mod tests {
             "}".repeat(n + 1)
         );
         assert_eq!(break_inside_of(&css, ""), None);
+    }
+    // -------- importance and specificity (F87 review) --------
+
+    #[test]
+    fn important_declarations_are_read() {
+        for css in [
+            ".k{break-inside:avoid!important}",
+            ".k{break-inside:avoid !important}",
+            ".k{break-inside:avoid ! important}",
+            ".k{break-inside:avoid !IMPORTANT}",
+            "@layer u{.k{break-inside:avoid!important}}",
+        ] {
+            assert_eq!(break_inside_of(css, ""), Some(Avoid), "{css}");
+        }
+        // Only a well-formed flag counts, and a malformed tail drops the whole declaration.
+        for css in [
+            ".k{break-inside:avoid !importantx}",
+            ".k{break-inside:avoid !important foo}",
+            ".k{break-inside:avoid !}",
+            ".k{break-inside:avoid ! foo}",
+        ] {
+            assert_eq!(break_inside_of(css, ""), None, "{css}");
+        }
+        // The flag belongs to its own declaration.
+        let html = r#"<html><body><p id="k" class="k">x</p></body></html>"#;
+        let doc = build_doc(html);
+        let table = build_column_style_table(
+            &doc,
+            &parse_stylesheet(".k{break-inside:avoid!important;break-before:page}"),
+        );
+        let id = find_node_with(&doc, |n| {
+            n.element_data()
+                .and_then(|e| crate::blitz_adapter::get_attr(e, "id"))
+                == Some("k")
+        })
+        .expect("k");
+        assert_eq!(table[&id].break_before, Some(BreakBefore::Page));
+        assert_eq!(table[&id].break_inside, Some(Avoid));
+    }
+
+    #[test]
+    fn important_beats_normal_whatever_the_layer_or_the_style_attribute() {
+        // Cascade 5 §6.1: importance first. An important rule beats the `style` attribute's normal declaration.
+        for css in [
+            ".k{break-inside:avoid!important}",
+            "@layer u{.k{break-inside:avoid!important}}",
+        ] {
+            assert_eq!(
+                break_inside_of(css, "break-inside:auto"),
+                Some(Avoid),
+                "{css}"
+            );
+        }
+        // A layered important beats an unlayered normal, in either source order.
+        for css in [
+            "@layer u{.k{break-inside:auto!important}}.k{break-inside:avoid}",
+            ".k{break-inside:avoid}@layer u{.k{break-inside:auto!important}}",
+        ] {
+            assert_eq!(break_inside_of(css, ""), Some(Auto), "{css}");
+        }
+    }
+
+    #[test]
+    fn important_reverses_the_layer_order() {
+        // Cascade 5 §6.4.4: among important declarations an earlier layer beats a later one, and the unlayered
+        // styles lose to every layer.
+        assert_eq!(
+            break_inside_of(
+                "@layer a,b;@layer a{.k{break-inside:avoid!important}}@layer b{.k{break-inside:auto!important}}",
+                ""
+            ),
+            Some(Avoid)
+        );
+        assert_eq!(
+            break_inside_of(
+                "@layer a,b;@layer b{.k{break-inside:auto!important}}@layer a{.k{break-inside:avoid!important}}",
+                ""
+            ),
+            Some(Avoid)
+        );
+        assert_eq!(
+            break_inside_of(
+                "@layer u{.k{break-inside:avoid!important}}.k{break-inside:auto!important}",
+                ""
+            ),
+            Some(Avoid)
+        );
+        // A layer beats its own sub-layers for normal declarations, and loses to them for important ones.
+        assert_eq!(
+            break_inside_of(
+                "@layer a{.k{break-inside:auto!important}@layer b{.k{break-inside:avoid!important}}}",
+                ""
+            ),
+            Some(Avoid)
+        );
+    }
+
+    #[test]
+    fn important_in_the_style_attribute_beats_everything() {
+        for css in [
+            ".k{break-inside:auto!important}",
+            "@layer u{.k{break-inside:auto!important}}",
+            "@layer a,b;@layer a{.k{break-inside:auto!important}}",
+        ] {
+            assert_eq!(
+                break_inside_of(css, "break-inside:avoid!important"),
+                Some(Avoid),
+                "{css}"
+            );
+        }
+    }
+
+    #[test]
+    fn specificity_orders_rules_inside_one_layer_and_unlayered() {
+        // The higher specificity wins whatever the source order.
+        for css in [
+            "@layer u{p.k{break-inside:auto}.k{break-inside:avoid}}",
+            "@layer u{.k{break-inside:avoid}p.k{break-inside:auto}}",
+            "p.k{break-inside:auto}.k{break-inside:avoid}",
+            "@layer u{p#k{break-inside:auto}p.k,.k{break-inside:avoid}}",
+        ] {
+            assert_eq!(break_inside_of(css, ""), Some(Auto), "{css}");
+        }
+        // Same specificity: the later rule wins.
+        assert_eq!(
+            break_inside_of("@layer u{.k{break-inside:auto}.k{break-inside:avoid}}", ""),
+            Some(Avoid)
+        );
+        // A layer outranks specificity: the later layer wins with the weaker selector.
+        assert_eq!(
+            break_inside_of(
+                "@layer a,b;@layer a{p.k{break-inside:auto}}@layer b{.k{break-inside:avoid}}",
+                ""
+            ),
+            Some(Avoid)
+        );
+        // A selector list counts the selector that matched: `p.k` (0,1,1) matches, `.zz` does not.
+        assert_eq!(
+            break_inside_of(
+                "@layer u{p.k,.zz{break-inside:auto}.k{break-inside:avoid}}",
+                ""
+            ),
+            Some(Auto)
+        );
+        // `.zz` is not on the element, so the rule's weakest selector never counts.
+        assert_eq!(
+            break_inside_of(
+                "@layer u{.k{break-inside:avoid}.zz,.k.k.k{break-inside:auto}}",
+                ""
+            ),
+            Some(Auto)
+        );
+        // Important declarations are ordered by specificity too.
+        assert_eq!(
+            break_inside_of(
+                "@layer u{p.k{break-inside:avoid!important}.k{break-inside:auto!important}}",
+                ""
+            ),
+            Some(Avoid)
+        );
+    }
+
+    #[test]
+    fn id_beats_classes_and_types_and_adjacent_siblings_add_up() {
+        assert_eq!(
+            break_inside_of("#k{break-inside:avoid}p.k.k.k.k{break-inside:auto}", ""),
+            Some(Avoid)
+        );
+        assert_eq!(
+            break_inside_of("p.k{break-inside:avoid}.k.k{break-inside:auto}", ""),
+            Some(Auto)
+        );
+    }
+
+    #[test]
+    fn whitespace_inside_a_dotted_layer_name_is_invalid() {
+        // Cascade 5 §6.4.2: `<layer-name> = <ident> [ '.' <ident> ]*`; no whitespace around the dot.
+        for css in [
+            "@layer a .b{.k{break-inside:avoid}}",
+            "@layer a. b{.k{break-inside:avoid}}",
+            "@layer a . b{.k{break-inside:avoid}}",
+        ] {
+            assert_eq!(break_inside_of(css, ""), None, "{css}");
+        }
+        assert_eq!(
+            break_inside_of("@layer a.b{.k{break-inside:avoid}}", ""),
+            Some(Avoid)
+        );
+        // The invalid statement does not register `a` or `b` either: `a` stays after `b`.
+        assert_eq!(
+            break_inside_of(
+                "@layer b,a;@layer a .x;@layer a{.k{break-inside:avoid}}@layer b{.k{break-inside:auto}}",
+                ""
+            ),
+            Some(Avoid)
+        );
     }
 }
