@@ -7442,6 +7442,99 @@ mod seed_image_natural_size_tests {
         assert_eq!(img_size(html, &zero), (0.0, 0.0));
     }
 
+    /// The inline root (a paragraph or anonymous block) holding the first `<img>`: its Parley lines as
+    /// `(top, bottom, boxes)` and the image's box `(x, y, width, height)` in CSS px.
+    fn lines_around_img(
+        html: &str,
+        viewport: f32,
+        assets: &AssetBundle,
+    ) -> (Vec<(f32, f32, usize)>, [f32; 4]) {
+        let (mut doc, _gcpm) =
+            parse_html_with_local_resources(html, viewport, 10000, &[], false, None);
+        seed_image_natural_sizes(&mut doc, assets);
+        resolve(&mut doc);
+        let img = doc
+            .tree()
+            .iter()
+            .find(|(_, n)| {
+                n.element_data()
+                    .is_some_and(|e| e.name.local.as_ref() == "img")
+            })
+            .map(|(id, _)| id)
+            .expect("no <img>");
+        let root = doc
+            .tree()
+            .iter()
+            .find(|(_, n)| {
+                n.element_data()
+                    .is_some_and(|e| e.inline_layout_data.is_some())
+            })
+            .map(|(id, _)| id)
+            .expect("no inline root");
+        let layout = &doc
+            .get_node(root)
+            .unwrap()
+            .element_data()
+            .unwrap()
+            .inline_layout_data
+            .as_ref()
+            .unwrap()
+            .layout;
+        let lines = layout
+            .lines()
+            .map(|l| {
+                let boxes = l
+                    .items()
+                    .filter(|i| matches!(i, parley::PositionedLayoutItem::InlineBox(_)))
+                    .count();
+                (l.metrics().min_coord, l.metrics().max_coord, boxes)
+            })
+            .collect();
+        let f = doc.get_node(img).unwrap().final_layout;
+        (
+            lines,
+            [f.location.x, f.location.y, f.size.width, f.size.height],
+        )
+    }
+
+    /// F32a: an image wider than the line is one unbreakable box that overflows its line box (CSS 2.1
+    /// §9.4.2). Parley 0.6 commits it on line 0 and then adds an empty line after it, which doubled the
+    /// paragraph's height and sent a one-line paragraph down the multi-line fragmentation path.
+    #[test]
+    fn img_wider_than_the_line_takes_one_line() {
+        let b = bundle("a.png", png_header(700, 100));
+        let html = r#"<body style="margin:0"><img src="a.png"></body>"#;
+        let (lines, img) = lines_around_img(html, 400.0, &b);
+        assert_eq!(lines, vec![(0.0, 100.0, 1)], "one line holding the box");
+        assert_eq!(
+            img,
+            [0.0, 0.0, 700.0, 100.0],
+            "the box keeps its natural size and position"
+        );
+        // Where it fits, the same paragraph is the same.
+        let b = bundle("a.png", png_header(300, 100));
+        let (lines, _) = lines_around_img(html, 400.0, &b);
+        assert_eq!(lines, vec![(0.0, 100.0, 1)]);
+    }
+
+    /// The box that overflows still ends its line: what follows starts the next one, and no empty line
+    /// is added on top.
+    #[test]
+    fn img_wider_than_the_line_keeps_its_neighbours_on_their_own_lines() {
+        let b = bundle("a.png", png_header(700, 100));
+        for html in [
+            r#"<body style="margin:0"><img src="a.png"><img src="a.png"></body>"#,
+            r#"<body style="margin:0"><img src="a.png"><br><img src="a.png"></body>"#,
+        ] {
+            let (lines, _) = lines_around_img(html, 400.0, &b);
+            assert_eq!(
+                lines.iter().map(|l| l.2).collect::<Vec<_>>(),
+                vec![1, 1],
+                "each overflowing box takes one line and none is added: {lines:?}"
+            );
+        }
+    }
+
     #[test]
     fn svg_root_size_is_the_natural_size() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="#f00"/></svg>"##;
