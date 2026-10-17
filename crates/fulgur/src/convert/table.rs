@@ -558,7 +558,7 @@ mod tests {
             multicol_geometry,
             pagination_geometry,
             link_cache: Default::default(),
-            dropped_text: Vec::new(),
+            dropped_text: Default::default(),
             viewport_size_px: Some((595.0, 842.0)),
         };
         let drawables = dom_to_drawables(&doc, &mut ctx);

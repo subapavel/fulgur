@@ -563,7 +563,7 @@ pub mod units;
 
 pub use asset::AssetBundle;
 pub use config::{Config, ConfigBuilder, Margin, PageSize};
-pub use convert::DroppedText;
+pub use convert::{DroppedText, DroppedTexts};
 pub use engine::{Engine, EngineBuilder, LayoutOutput};
 pub use error::{Error, Result};
 pub use outline::build_outline;

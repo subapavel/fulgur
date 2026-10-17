@@ -4309,7 +4309,7 @@ impl<'a> MarginBoxRenderer<'a> {
                     multicol_geometry: crate::multicol_layout::MulticolGeometryTable::new(),
                     pagination_geometry: geometry,
                     link_cache: Default::default(),
-                    dropped_text: Vec::new(),
+                    dropped_text: Default::default(),
                     viewport_size_px: None,
                 };
                 let drawables = crate::convert::dom_to_drawables(&render_doc, &mut dummy_ctx);

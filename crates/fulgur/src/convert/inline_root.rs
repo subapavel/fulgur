@@ -463,6 +463,15 @@ pub(super) fn extract_paragraph(
     let mut accumulated_line_top = crate::units::Pt::ZERO;
     // Byte ranges of `text` that some glyph run draws, for the dropped-text check below.
     let mut covered: Vec<Range<usize>> = Vec::new();
+    // Parley keeps a cluster's offset within its run as `u16` (`ClusterData::text_offset`), so in a run longer
+    // than 65 535 bytes the cluster ranges wrap. Left-to-right text is un-wrapped below (glyph text ranges
+    // feed the text layer, cluster ranges the check); for right-to-left text the ranges cannot be trusted and
+    // the check only asks whether any glyph run exists.
+    let long_text = text.len() > u16::MAX as usize;
+    let mut unwrap = (long_text && !parley_layout.lines().any(|l| l.runs().any(|r| r.is_rtl())))
+        .then(ClusterUnwrap::default);
+    let mut run_ranges: Vec<Range<usize>> = Vec::new();
+    let coarse_coverage = long_text && unwrap.is_none();
 
     for line in parley_layout.lines() {
         let metrics = line.metrics();
@@ -479,7 +488,11 @@ pub(super) fn extract_paragraph(
                     // The run's whole text on this line is shaped with a face: ligature continuations,
                     // combining marks and the rest of a ZWJ sequence have no glyph (or text range) of their
                     // own in a cluster, so the glyphs' ranges alone would flag them.
-                    note_covered(&mut covered, &run.text_range());
+                    if coarse_coverage {
+                        note_covered(&mut covered, &(0..text.len()));
+                    } else if unwrap.is_none() {
+                        note_covered(&mut covered, &run.text_range());
+                    }
                     let font_ref = run.font();
                     let font_index = font_ref.index;
                     let font_arc = ctx.get_or_insert_font(font_ref);
@@ -496,6 +509,15 @@ pub(super) fn extract_paragraph(
                     if run_key != prev_run_key {
                         prev_run_key = run_key;
                         run_glyph_offset = 0;
+                        if let Some(u) = unwrap.as_mut() {
+                            // Once per run on this line: the clusters of one run are visited in order, which
+                            // the un-wrapping relies on, and a run split by style changes is several glyph runs.
+                            run_ranges.clear();
+                            run_ranges.extend(run.visual_clusters().map(|c| u.fix(c.text_range())));
+                            for r in &run_ranges {
+                                note_covered(&mut covered, r);
+                            }
+                        }
                     }
                     let glyph_start = run_glyph_offset;
 
@@ -506,8 +528,12 @@ pub(super) fn extract_paragraph(
                     // and advance the offset counter by the number of glyphs consumed.
                     let mut annotated = run
                         .visual_clusters()
-                        .flat_map(|cluster| {
-                            let r = cluster.text_range();
+                        .enumerate()
+                        .flat_map(|(i, cluster)| {
+                            let r = match unwrap {
+                                Some(_) => run_ranges[i].clone(),
+                                None => cluster.text_range(),
+                            };
                             cluster.glyphs().map(move |g| (r.clone(), g))
                         })
                         .skip(glyph_start);
@@ -629,6 +655,30 @@ pub(super) fn extract_paragraph(
     }
 
     Some(ParagraphRender::new(shaped_lines).with_id(extract_block_id(node)))
+}
+
+/// Undoes the `u16` wrap of Parley's cluster offsets for left-to-right text: clusters arrive in text order and
+/// tile it, so a cluster starts at the smallest position congruent to its (wrapped) start modulo 2^16 that is
+/// not before the end of the previous one. Right for gaps below 64 KiB between clusters, which is every
+/// document: a gap that large would be an unshaped item that long.
+#[derive(Default)]
+struct ClusterUnwrap {
+    prev_end: usize,
+}
+
+impl ClusterUnwrap {
+    const PERIOD: usize = 1 << 16;
+
+    fn fix(&mut self, r: Range<usize>) -> Range<usize> {
+        let len = r.end.saturating_sub(r.start);
+        let start = if r.start >= self.prev_end {
+            r.start
+        } else {
+            r.start + (self.prev_end - r.start).div_ceil(Self::PERIOD) * Self::PERIOD
+        };
+        self.prev_end = start + len;
+        start..start + len
+    }
 }
 
 /// Adds `range` to `covered`, merged into the last range when they touch or overlap: glyphs arrive in
@@ -1779,6 +1829,27 @@ mod uncovered_text_tests {
         let e = uncovered_text(&t, &[]).unwrap();
         assert_eq!(e.chars().count(), EXCERPT_CHARS + 1);
         assert!(e.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn cluster_unwrap_restores_offsets_past_64_kib() {
+        let mut u = ClusterUnwrap::default();
+        // Clusters of one byte tile 0..140 000; Parley reports each start modulo 65 536.
+        for true_start in (0..140_000usize).step_by(7) {
+            let wrapped = true_start % 65_536;
+            let fixed = u.fix(wrapped..wrapped + 3);
+            assert_eq!(fixed, true_start..true_start + 3);
+        }
+        // A run that starts late and stays short is already right.
+        let mut u = ClusterUnwrap::default();
+        assert_eq!(u.fix(70_000..70_002), 70_000..70_002);
+        assert_eq!(u.fix(70_002..70_004), 70_002..70_004);
+        // A run longer than 64 KiB that starts at 3: its offsets wrap relative to 3.
+        let mut u = ClusterUnwrap::default();
+        for off in (0..140_000usize).step_by(5) {
+            let wrapped = 3 + off % 65_536;
+            assert_eq!(u.fix(wrapped..wrapped + 2), 3 + off..3 + off + 2);
+        }
     }
 
     #[test]

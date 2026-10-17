@@ -106,6 +106,31 @@ impl std::fmt::Display for DroppedText {
     }
 }
 
+/// The [`DroppedText`]s found so far, in the order they were found, each distinct (element, excerpt) pair once.
+/// The pairs are also kept in a set: a document with thousands of dropped paragraphs must not search the list
+/// for each of them.
+#[derive(Debug, Default)]
+pub struct DroppedTexts {
+    list: Vec<DroppedText>,
+    seen: std::collections::BTreeSet<(String, String)>,
+}
+
+impl DroppedTexts {
+    fn push(&mut self, d: DroppedText) {
+        if self.seen.insert((d.element.clone(), d.excerpt.clone())) {
+            self.list.push(d);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    pub fn into_vec(self) -> Vec<DroppedText> {
+        self.list
+    }
+}
+
 /// Context for DOM-to-Drawables conversion, bundling all shared state.
 pub struct ConvertContext<'a> {
     pub running_store: &'a RunningElementStore,
@@ -150,7 +175,7 @@ pub struct ConvertContext<'a> {
     pub viewport_size_px: Option<(f32, f32)>,
     /// Text found in inline formatting contexts that no glyph run covers, in document order, each
     /// (element, excerpt) pair once. Filled by `extract_paragraph`; read by the engine after conversion.
-    pub dropped_text: Vec<DroppedText>,
+    pub dropped_text: DroppedTexts,
 }
 
 impl ConvertContext<'_> {
@@ -166,10 +191,7 @@ impl ConvertContext<'_> {
                 }
             })
             .unwrap_or_default();
-        let dropped = DroppedText { element, excerpt };
-        if !self.dropped_text.contains(&dropped) {
-            self.dropped_text.push(dropped);
-        }
+        self.dropped_text.push(DroppedText { element, excerpt });
     }
 
     /// Return a shared Arc for the given font data, caching by data pointer + index.
@@ -1263,7 +1285,7 @@ mod semantics_tests {
             multicol_geometry,
             pagination_geometry,
             link_cache: Default::default(),
-            dropped_text: Vec::new(),
+            dropped_text: Default::default(),
             viewport_size_px: Some((595.0, 842.0)),
         };
         super::dom_to_drawables(&doc, &mut ctx)
@@ -1958,5 +1980,38 @@ mod utility_fn_tests {
         );
         assert_eq!(cb.width, crate::units::Px::ZERO);
         assert_eq!(cb.height, crate::units::Px::ZERO);
+    }
+}
+
+#[cfg(test)]
+mod dropped_texts_tests {
+    use super::*;
+
+    fn d(element: &str, excerpt: &str) -> DroppedText {
+        DroppedText {
+            element: element.into(),
+            excerpt: excerpt.into(),
+        }
+    }
+
+    #[test]
+    fn each_distinct_pair_is_kept_once_in_the_order_found() {
+        let mut t = DroppedTexts::default();
+        assert!(t.is_empty());
+        for (e, x) in [("p", "b"), ("p", "a"), ("p", "b"), ("td", "b"), ("p", "a")] {
+            t.push(d(e, x));
+        }
+        assert_eq!(t.into_vec(), [d("p", "b"), d("p", "a"), d("td", "b")]);
+    }
+
+    #[test]
+    fn thousands_of_entries_do_not_search_the_list() {
+        let mut t = DroppedTexts::default();
+        for round in 0..2 {
+            for i in 0..50_000 {
+                t.push(d("p", &format!("text {i}")));
+            }
+            assert_eq!(t.list.len(), 50_000, "round {round}");
+        }
     }
 }

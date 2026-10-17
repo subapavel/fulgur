@@ -24,7 +24,9 @@ pub enum Error {
     #[error("Unsupported font format: {0}")]
     UnsupportedFontFormat(String),
 
-    /// Text that no registered font face covers (`EngineBuilder::strict_text`): `<element> "excerpt"` each.
+    /// Text for which no glyph run was produced (`EngineBuilder::strict_text`): `<element> "excerpt"` each,
+    /// at most 20 in the message. A character the chosen font has no glyph for (`.notdef`) still gets a run
+    /// and is not reported; nor is text in `@page` margin boxes.
     #[error("text without a font face: {}", join_dropped(.0))]
     TextWithoutFont(Vec<crate::convert::DroppedText>),
 
@@ -32,11 +34,23 @@ pub enum Error {
     Other(String),
 }
 
+/// Entries of `Error::TextWithoutFont` named in its message; a document can have thousands.
+const MAX_DROPPED_IN_MESSAGE: usize = 20;
+
 fn join_dropped(list: &[crate::convert::DroppedText]) -> String {
-    list.iter()
+    let mut out = list
+        .iter()
+        .take(MAX_DROPPED_IN_MESSAGE)
         .map(|d| d.to_string())
         .collect::<Vec<_>>()
-        .join("; ")
+        .join("; ");
+    if list.len() > MAX_DROPPED_IN_MESSAGE {
+        out.push_str(&format!(
+            "; ... and {} more",
+            list.len() - MAX_DROPPED_IN_MESSAGE
+        ));
+    }
+    out
 }
 
 impl From<minijinja::Error> for Error {
@@ -50,6 +64,25 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_without_font_message_names_at_most_twenty_entries() {
+        let many: Vec<_> = (0..1000)
+            .map(|i| crate::convert::DroppedText {
+                element: "p".into(),
+                excerpt: format!("t{i}"),
+            })
+            .collect();
+        let msg = Error::TextWithoutFont(many).to_string();
+        assert!(msg.contains("t19") && !msg.contains("t20\""), "{msg}");
+        assert!(msg.ends_with("... and 980 more"), "{msg}");
+        assert!(msg.len() < 1000, "{} bytes", msg.len());
+        let few = Error::TextWithoutFont(vec![crate::convert::DroppedText {
+            element: "p".into(),
+            excerpt: "x".into(),
+        }]);
+        assert_eq!(few.to_string(), "text without a font face: <p> \"x\"");
+    }
 
     #[test]
     fn test_template_error_display() {

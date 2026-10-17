@@ -7319,3 +7319,91 @@ fn render_smoke_ligatures_marks_and_sequences_are_not_dropped_text() {
         .render(html)
         .expect("everything shaped with a face is covered");
 }
+
+/// One page tall enough for the paragraphs below, so that no page break (and its own line handling) is involved.
+const ONE_TALL_PAGE: &str =
+    "@page{size:210mm 3000mm;margin:0} p{margin:0;font-size:7px;line-height:8px}";
+
+/// `n` words `w00000 w00001 …` (7 bytes each with the space).
+fn numbered_words(n: usize) -> String {
+    (0..n).map(|i| format!("w{i:05} ")).collect()
+}
+
+fn assert_words_once_in_order(text: &str, n: usize) {
+    let found: Vec<&str> = text
+        .split_whitespace()
+        .filter(|w| w.starts_with('w') && w.len() == 6)
+        .collect();
+    let expected: Vec<String> = (0..n).map(|i| format!("w{i:05}")).collect();
+    assert_eq!(found.len(), n, "{} words found of {n}", found.len());
+    if let Some(i) = found.iter().zip(&expected).position(|(f, e)| f != e) {
+        panic!(
+            "word {i} is `{}`, expected `{}` (the text layer wraps)",
+            found[i], expected[i]
+        );
+    }
+}
+
+#[test]
+fn render_smoke_paragraph_over_64_kib_has_text_and_is_not_dropped_text() {
+    // Parley stores a cluster's offset within its run as `u16`, so in a run longer than 65 535 bytes every
+    // cluster range wraps (an `<p>` of 70 000 bytes is one run). Glyphs were drawn right, but the text layer
+    // repeated the head for the tail and the dropped-text check reported the tail as text without a font.
+    for words in [10000usize, 20000] {
+        let html = format!(
+            "<!doctype html><html><head><style>{ONE_TALL_PAGE}</style></head><body><p>{}</p></body></html>",
+            numbered_words(words)
+        );
+        let pdf = Engine::builder()
+            .system_fonts(false)
+            .strict_text(true)
+            .assets(noto_bundle())
+            .build()
+            .render(&html)
+            .expect("every word has a face");
+        if let Some(text) = extract_pdf_text(&pdf) {
+            assert_words_once_in_order(&text, words);
+        }
+    }
+}
+
+#[test]
+fn render_smoke_dropped_text_after_64_kib_is_found_once_and_only_it() {
+    // `monospace` is unmapped here, so the `<code>` gets no glyph run (a named family inside a root that has a
+    // face is drawn by Parley's fallback).
+    let tail = "<code>LOSTTAIL</code> end";
+    // At the default font size (an explicit `font-size` on the paragraph makes Parley draw the `<code>`).
+    let html = format!(
+        "<!doctype html><html><head><style>@page{{size:210mm 6000mm;margin:0}} p{{margin:0}}</style></head><body><p>{}{tail}</p></body></html>",
+        numbered_words(10000)
+    );
+    match Engine::builder()
+        .system_fonts(false)
+        .strict_text(true)
+        .assets(noto_bundle())
+        .build()
+        .render(&html)
+    {
+        Err(fulgur::Error::TextWithoutFont(found)) => {
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].excerpt, "LOSTTAIL", "{found:?}");
+        }
+        other => panic!("expected TextWithoutFont, got {:?}", other.map(|p| p.len())),
+    }
+}
+
+#[test]
+fn render_smoke_rtl_paragraph_over_64_kib_is_not_dropped_text() {
+    // Ranges cannot be un-wrapped for right-to-left runs; the check must then say nothing rather than guess.
+    let html = format!(
+        "<!doctype html><html><head><style>{ONE_TALL_PAGE}</style></head><body><p dir=\"rtl\">{}</p></body></html>",
+        numbered_words(10000)
+    );
+    Engine::builder()
+        .system_fonts(false)
+        .strict_text(true)
+        .assets(noto_bundle())
+        .build()
+        .render(&html)
+        .expect("a long RTL paragraph is not reported");
+}

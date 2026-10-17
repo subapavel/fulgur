@@ -679,7 +679,7 @@ impl Engine {
             multicol_geometry,
             pagination_geometry,
             link_cache: Default::default(),
-            dropped_text: Vec::new(),
+            dropped_text: Default::default(),
             // Use the resolved `@page` content box so percentage-based
             // fixed/abs descendants size against the same viewport that
             // pagination geometry and `relayout_position_fixed` use.
@@ -692,7 +692,7 @@ impl Engine {
         // `convert_ctx`, then drop it so its `&running_store` borrow ends and
         // `running_store` can be moved into the artifacts.
         let pagination_geometry = std::mem::take(&mut convert_ctx.pagination_geometry);
-        let dropped_text = std::mem::take(&mut convert_ctx.dropped_text);
+        let dropped_text = std::mem::take(&mut convert_ctx.dropped_text).into_vec();
         drop(convert_ctx);
         // Pass 2 (`anchor_map` is `Some`) lays out the same text again; report it once.
         if anchor_map.is_none() && !dropped_text.is_empty() {
@@ -929,7 +929,7 @@ impl Engine {
             multicol_geometry,
             pagination_geometry,
             link_cache: Default::default(),
-            dropped_text: Vec::new(),
+            dropped_text: Default::default(),
             viewport_size_px: Some((
                 self.config.content_width().as_pt().in_px().to_f32(),
                 self.config.content_height().as_pt().in_px().to_f32(),
@@ -1036,7 +1036,7 @@ impl Engine {
             multicol_geometry,
             pagination_geometry,
             link_cache: Default::default(),
-            dropped_text: Vec::new(),
+            dropped_text: Default::default(),
             viewport_size_px: Some((content_w_px, content_h_px)),
         };
         let drawables = crate::convert::dom_to_drawables(&doc, &mut convert_ctx);
@@ -1379,11 +1379,13 @@ impl EngineBuilder {
         self
     }
 
-    /// Whether text that no font face covers is an error ([`crate::Error::TextWithoutFont`]) instead of a
-    /// `log::warn!` per distinct (element, text). Such text is laid out but left out of the PDF: the
-    /// element's `font-family` list matched no registered face, or named a generic family the collection
-    /// does not resolve (see [`AssetBundle::generic_families`]). Whitespace and invisible characters are
-    /// never reported. Only text in the document body is checked, not `@page` margin boxes. Default: off.
+    /// Whether text for which no glyph run was produced is an error ([`crate::Error::TextWithoutFont`])
+    /// instead of a `log::warn!` per distinct (element, text). Such text is laid out but left out of the PDF:
+    /// the element's `font-family` list matched no registered face, or named a generic family the collection
+    /// does not resolve (see [`AssetBundle::generic_families`]). Whitespace and invisible characters are never
+    /// reported. Not covered: a character the chosen face has no glyph for (it still gets a run, drawn as
+    /// `.notdef`), text in `@page` margin boxes, and, in a paragraph over 64 KiB of right-to-left text, any
+    /// text but a paragraph with no run at all. Default: off.
     pub fn strict_text(mut self, strict: bool) -> Self {
         self.strict_text = strict;
         self
