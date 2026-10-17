@@ -378,6 +378,11 @@ pub struct ParagraphSlice {
     /// Lines of this slice, baseline-rebased so the slice's first line
     /// renders at `y = baseline` from the slice top.
     pub lines: Vec<crate::paragraph::ShapedLine>,
+    /// F30d: the page this slice is painted on, for a multicol container the fragmenter cut over pages
+    /// ([`crate::pagination_layout::McPage`]). Then `origin_pt` is relative to the container's border-box
+    /// top-left *on that page* (below its top padding and border on the first page only) and the renderer
+    /// paints the slice on that page alone. `None` for a container laid out in one piece.
+    pub page_index: Option<u32>,
 }
 
 impl std::fmt::Debug for ParagraphSlice {

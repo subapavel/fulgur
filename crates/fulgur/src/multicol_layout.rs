@@ -62,6 +62,30 @@ pub struct ParagraphSplitEntry {
     pub column_slices: Vec<ColumnLineSlice>,
 }
 
+/// F30d: one thing in the flow of a column group, in source order: what the paginator distributes over
+/// the columns of the pages when the container is taller than the room it has.
+///
+/// The multicol pass records only *what* flows (the heights Blitz measured at the column width); *where* it
+/// goes, as index ranges per (page, column), is decided once by the fragmenter
+/// ([`crate::pagination_layout::plan_multicol_pages`]) and used as given by convert and render, like the
+/// line ranges of F78.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FlowItem {
+    /// A box placed whole in one column: a child that is not a plain paragraph. Its height is the one Taffy
+    /// measured at the column width.
+    Block {
+        node: usize,
+        height: crate::units::Px,
+    },
+    /// A paragraph of glyph runs only (a `<p>`, or the container itself when it is the inline root) that may
+    /// be cut between its lines. `advances` is the line height of every line, in the order of the Parley
+    /// layout of `source` (the line indices of the pieces refer to it).
+    Lines {
+        source: usize,
+        advances: Vec<crate::units::Px>,
+    },
+}
+
 /// Per-`ColumnGroup` geometry recorded by the Taffy multicol hook.
 ///
 /// `layout_column_group` builds one of these every time it balances a run of
@@ -104,6 +128,10 @@ pub struct ColumnGroupGeometry {
     /// Inline-root paragraphs distributed across the columns of this
     /// group. Empty when no child paragraph needed splitting.
     pub paragraph_splits: Vec<ParagraphSplitEntry>,
+    /// F30d: the content of the group as a flow (see [`FlowItem`]). Empty when the group cannot be described
+    /// that way (a text node among its children, a paragraph with inline boxes in Case A); the paginator then
+    /// treats the container as it did before.
+    pub flow: Vec<FlowItem>,
 }
 
 /// Full per-container multicol geometry record.
@@ -878,6 +906,7 @@ fn layout_self_inline_root_container(
                 .map(crate::units::F32Units::as_px)
                 .collect(),
             paragraph_splits: Vec::new(),
+            flow: Vec::new(),
         };
         tree.geometry.insert(
             usize::from(node_id),
@@ -994,6 +1023,14 @@ fn layout_self_inline_root_container(
             .map(crate::units::F32Units::as_px)
             .collect(),
         paragraph_splits,
+        flow: vec![FlowItem::Lines {
+            source: usize::from(node_id),
+            advances: line_heights
+                .iter()
+                .copied()
+                .map(crate::units::F32Units::as_px)
+                .collect(),
+        }],
     };
 
     // 9. Stash the per-container geometry under the container's own
@@ -1359,9 +1396,49 @@ fn layout_column_group(
             .map(crate::units::F32Units::as_px)
             .collect(),
         paragraph_splits,
+        flow: column_flow(tree.doc, &measured),
     };
 
     (placements, geometry)
+}
+
+/// F30d: the children of a column group as a [`FlowItem`] sequence. A plain paragraph (the predicate of the
+/// split above: a `<p>` that is an inline root, glyph runs only) is a [`FlowItem::Lines`] whether or not it
+/// needs splitting in this layout; every other element child is a [`FlowItem::Block`]. A text node among the
+/// children cannot be described that way (nothing paints it from a fragment of its own): the flow is empty.
+fn column_flow(doc: &BaseDocument, measured: &[(NodeId, Size<f32>)]) -> Vec<FlowItem> {
+    let mut flow = Vec::with_capacity(measured.len());
+    for (id, size) in measured {
+        let id_u: usize = (*id).into();
+        let Some(node) = doc.get_node(id_u) else {
+            return Vec::new();
+        };
+        let Some(elem) = node.element_data() else {
+            return Vec::new();
+        };
+        let layout = if node.flags.is_inline_root() && elem.name.local.as_ref() == "p" {
+            elem.inline_layout_data
+                .as_ref()
+                .map(|tl| &tl.layout)
+                .filter(|layout| parley_layout_is_glyph_run_only(layout))
+        } else {
+            None
+        };
+        flow.push(match layout {
+            Some(layout) => FlowItem::Lines {
+                source: id_u,
+                advances: crate::blitz_adapter::parley_line_heights(layout)
+                    .into_iter()
+                    .map(crate::units::F32Units::as_px)
+                    .collect(),
+            },
+            None => FlowItem::Block {
+                node: id_u,
+                height: size.height.as_px(),
+            },
+        });
+    }
+    flow
 }
 
 /// Distribute `line_heights` (per-line total height in CSS px) across

@@ -20,7 +20,7 @@ use crate::paragraph::{
 use crate::units::{F32Units, Pt, Px};
 use blitz_html::HtmlDocument;
 use skrifa::MetadataProvider;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -771,6 +771,17 @@ fn convert_multicol_paragraph_slices(
     let Some(geometry) = ctx.multicol_geometry.get(&node_id).cloned() else {
         return;
     };
+    // F30d: a container the fragmenter cut over pages says itself which lines every column holds on every page.
+    if let Some(pages) = ctx
+        .pagination_geometry
+        .get(&node_id)
+        .map(|g| g.multicol_pages.clone())
+        .filter(|pages| !pages.is_empty())
+        && let [group] = geometry.groups.as_slice()
+    {
+        convert_paged_multicol_slices(doc, node_id, group, &pages, ctx, out);
+        return;
+    }
     for group in &geometry.groups {
         if group.paragraph_splits.is_empty() {
             continue;
@@ -781,65 +792,7 @@ fn convert_multicol_paragraph_slices(
 
         for split in &group.paragraph_splits {
             let source_id = split.source_node_id;
-            let case_a = source_id == node_id;
-
-            // Pull the source `(layout, text)` pair from the source
-            // node's `inline_layout_data`. For Case A we additionally
-            // clone the layout and re-break at `col_w` so the line
-            // indices recorded by `layout_self_inline_root_container`
-            // resolve correctly. (Case B's layout was already re-broken
-            // by Blitz during `compute_child_layout`.)
-            let Some(source_node) = doc.get_node(source_id) else {
-                continue;
-            };
-            let Some(elem) = source_node.element_data() else {
-                continue;
-            };
-            let Some(text_layout) = elem.inline_layout_data.as_ref() else {
-                continue;
-            };
-            let text: std::sync::Arc<str> = std::sync::Arc::from(text_layout.text.as_str());
-
-            // Hold the rebroken clone alive across the per-line loop in
-            // Case A. In Case B the borrowed reference into Blitz is
-            // sufficient because Blitz already broke at `col_w`.
-            //
-            // For alignment: Blitz's own inline layout pass aligns each
-            // inline-root layout with that node's resolved
-            // `text-align`. Case B inherits that alignment for free
-            // because we read the existing parley layout in place. Case
-            // A re-clones + re-breaks here, which would otherwise
-            // discard alignment unless we re-apply it. The container
-            // (which IS the inline root in Case A — `source_id ==
-            // node_id`) supplies the keyword via its primary styles,
-            // matching the mapping at
-            // `blitz-dom-0.2.4/src/layout/inline.rs:142-152`.
-            let owned_layout: Option<parley::Layout<blitz_dom::node::TextBrush>> = if case_a {
-                let alignment = source_node
-                    .primary_styles()
-                    .map(|s| css_text_align_to_parley_alignment(s.clone_text_align()))
-                    .unwrap_or(parley::Alignment::Start);
-                let mut cloned = text_layout.layout.clone();
-                cloned.break_all_lines(Some(group.col_w.to_f32()));
-                cloned.align(
-                    Some(group.col_w.to_f32()),
-                    alignment,
-                    parley::AlignmentOptions::default(),
-                );
-                Some(cloned)
-            } else {
-                None
-            };
-            let layout_ref: &parley::Layout<blitz_dom::node::TextBrush> = match &owned_layout {
-                Some(cloned) => cloned,
-                None => &text_layout.layout,
-            };
-
-            // Materialise one `ShapedLine` per parley line. This is a
-            // simplified version of the per-line shaping in
-            // `inline_root::extract_paragraph` covering only `GlyphRun`s
-            // — see this function's doc comment for scope notes.
-            let all_lines = shape_paragraph_glyph_runs(doc, layout_ref, &text, ctx);
+            let all_lines = shape_multicol_source(doc, node_id, source_id, group.col_w, ctx);
             if all_lines.is_empty() {
                 continue;
             }
@@ -905,6 +858,7 @@ fn convert_multicol_paragraph_slices(
                     origin_pt,
                     size_pt,
                     lines,
+                    page_index: None,
                 });
             }
 
@@ -919,6 +873,177 @@ fn convert_multicol_paragraph_slices(
             }
         }
     }
+}
+
+/// F30d: the paragraph slices of a multicol container the fragmenter cut over pages: one per
+/// [`crate::pagination_layout::McPiece::Lines`], painted on its page and in its column as the plan placed it,
+/// not derived again from heights (the F78 rule).
+///
+/// Each slice holds the lines `[first, end)` of its source, rebased like the continuation fragments of a split
+/// paragraph (by the advances of the lines before `first`), and sits at the column's x and the piece's y, below
+/// the container's top padding and border on the first page and at the top of the fragment on every other.
+fn convert_paged_multicol_slices(
+    doc: &BaseDocument,
+    node_id: usize,
+    group: &crate::multicol_layout::ColumnGroupGeometry,
+    pages: &[(u32, crate::pagination_layout::McPage)],
+    ctx: &mut ConvertContext<'_>,
+    out: &mut crate::drawables::Drawables,
+) {
+    use crate::pagination_layout::McPiece;
+    use crate::units::F32Units;
+    let first_page = pages.first().map_or(0, |(page, _)| *page);
+    let stride = group.col_w.to_f32() + group.gap.to_f32();
+    let col_w_pt = group.col_w.in_pt();
+    let mut shaped: BTreeMap<usize, Vec<ShapedLine>> = BTreeMap::new();
+    let mut slices_by_source: BTreeMap<usize, Vec<crate::drawables::ParagraphSlice>> =
+        BTreeMap::new();
+    for (page, mc_page) in pages {
+        let top = if *page == first_page {
+            group.y_offset.to_f32()
+        } else {
+            0.0
+        };
+        for (col, pieces) in mc_page.columns.iter().enumerate() {
+            for piece in pieces {
+                let McPiece::Lines {
+                    source,
+                    first,
+                    end,
+                    y,
+                } = piece
+                else {
+                    continue;
+                };
+                let all_lines = shaped.entry(*source).or_insert_with(|| {
+                    shape_multicol_source(doc, node_id, *source, group.col_w, ctx)
+                });
+                let (first, end) = (*first as usize, *end as usize);
+                if first >= end || end > all_lines.len() {
+                    debug_assert!(
+                        false,
+                        "multicol piece {first}..{end} exceeds the shaped line count {}",
+                        all_lines.len()
+                    );
+                    continue;
+                }
+                let consumed: crate::units::Pt = all_lines[..first].iter().map(|l| l.height).sum();
+                let mut lines: Vec<ShapedLine> = all_lines[first..end]
+                    .iter()
+                    .cloned()
+                    .map(|mut l| {
+                        l.baseline -= consumed;
+                        l
+                    })
+                    .collect();
+                inline_root::recalculate_paragraph_line_boxes(&mut lines);
+                let height: crate::units::Pt = lines.iter().map(|l| l.height).sum();
+                let origin_pt = (
+                    (group.x_offset.to_f32() + col as f32 * stride)
+                        .as_px()
+                        .in_pt(),
+                    (top + y.to_f32()).as_px().in_pt(),
+                );
+                slices_by_source.entry(*source).or_default().push(
+                    crate::drawables::ParagraphSlice {
+                        origin_pt,
+                        size_pt: (col_w_pt, height),
+                        lines,
+                        page_index: Some(*page),
+                    },
+                );
+            }
+        }
+    }
+    for (source, slices) in slices_by_source {
+        out.paragraph_slices.insert(
+            source,
+            crate::drawables::ParagraphSlicesEntry {
+                container_node_id: node_id,
+                slices,
+            },
+        );
+    }
+}
+
+/// The shaped lines of the paragraph `source_id` of the multicol container `container_id`, at the column
+/// width `col_w`: every line of its Parley layout, baselines measured from the paragraph's top.
+///
+/// Two source-layout sources, distinguished by whether `source_id == container_id`:
+///
+/// - **Case A** (container is itself an inline root): the container's `inline_layout_data.layout` was shaped
+///   at the container's content width; multicol recorded line indices against a clone re-broken at `col_w`.
+///   This reproduces that re-broken clone.
+/// - **Case B** (a child element is the inline root): Blitz already re-broke the child's parley layout at
+///   `col_w` during `compute_child_layout`, so the line indices stored against `inline_layout_data` line up
+///   directly.
+///
+/// Empty when the node has no inline layout.
+fn shape_multicol_source(
+    doc: &BaseDocument,
+    container_id: usize,
+    source_id: usize,
+    col_w: crate::units::Px,
+    ctx: &mut ConvertContext<'_>,
+) -> Vec<ShapedLine> {
+    let case_a = source_id == container_id;
+    // Pull the source `(layout, text)` pair from the source
+    // node's `inline_layout_data`. For Case A we additionally
+    // clone the layout and re-break at `col_w` so the line
+    // indices recorded by `layout_self_inline_root_container`
+    // resolve correctly. (Case B's layout was already re-broken
+    // by Blitz during `compute_child_layout`.)
+    let Some(source_node) = doc.get_node(source_id) else {
+        return Vec::new();
+    };
+    let Some(elem) = source_node.element_data() else {
+        return Vec::new();
+    };
+    let Some(text_layout) = elem.inline_layout_data.as_ref() else {
+        return Vec::new();
+    };
+    let text: std::sync::Arc<str> = std::sync::Arc::from(text_layout.text.as_str());
+
+    // Hold the rebroken clone alive across the per-line loop in
+    // Case A. In Case B the borrowed reference into Blitz is
+    // sufficient because Blitz already broke at `col_w`.
+    //
+    // For alignment: Blitz's own inline layout pass aligns each
+    // inline-root layout with that node's resolved
+    // `text-align`. Case B inherits that alignment for free
+    // because we read the existing parley layout in place. Case
+    // A re-clones + re-breaks here, which would otherwise
+    // discard alignment unless we re-apply it. The container
+    // (which IS the inline root in Case A — `source_id ==
+    // node_id`) supplies the keyword via its primary styles,
+    // matching the mapping at
+    // `blitz-dom-0.2.4/src/layout/inline.rs:142-152`.
+    let owned_layout: Option<parley::Layout<blitz_dom::node::TextBrush>> = if case_a {
+        let alignment = source_node
+            .primary_styles()
+            .map(|s| css_text_align_to_parley_alignment(s.clone_text_align()))
+            .unwrap_or(parley::Alignment::Start);
+        let mut cloned = text_layout.layout.clone();
+        cloned.break_all_lines(Some(col_w.to_f32()));
+        cloned.align(
+            Some(col_w.to_f32()),
+            alignment,
+            parley::AlignmentOptions::default(),
+        );
+        Some(cloned)
+    } else {
+        None
+    };
+    let layout_ref: &parley::Layout<blitz_dom::node::TextBrush> = match &owned_layout {
+        Some(cloned) => cloned,
+        None => &text_layout.layout,
+    };
+
+    // Materialise one `ShapedLine` per parley line. This is a
+    // simplified version of the per-line shaping in
+    // `inline_root::extract_paragraph` covering only `GlyphRun`s
+    // — see this function's doc comment for scope notes.
+    shape_paragraph_glyph_runs(doc, layout_ref, &text, ctx)
 }
 
 /// Shape one `Vec<ShapedLine>` out of a parley layout, covering only

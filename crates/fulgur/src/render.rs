@@ -1581,6 +1581,16 @@ fn paint_multicol_paragraph_slices(
     }
     draw_with_opacity(canvas, opacity, |canvas| {
         for slice in &slices_entry.slices {
+            // F30d: a slice the fragmenter placed on a page is painted on that page alone, at the origin it
+            // was given relative to the container's fragment there. No height arithmetic decides it.
+            if let Some(slice_page) = slice.page_index {
+                if slice_page == page_index {
+                    let abs_x = container_x_pt + slice.origin_pt.0;
+                    let abs_y = container_y_pt + slice.origin_pt.1;
+                    crate::paragraph::draw_shaped_lines(canvas, &slice.lines, abs_x, abs_y, None);
+                }
+                continue;
+            }
             let slice_top = slice.origin_pt.1.to_f32() - consumed;
             let slice_bottom = slice_top + slice.size_pt.1.to_f32();
             if needs_partition {

@@ -543,11 +543,12 @@ impl Engine {
         // here so the fragmenter, fixed-element layout, and viewport
         // sizing all share a single content box — see the resolve block
         // up at the start of this function.
-        let mut pagination_geometry = crate::pagination_layout::run_pass_with_break_and_running(
+        let mut pagination_geometry = crate::pagination_layout::run_pass_with_multicol(
             doc.deref_mut(),
             resolved_content_height_px,
             &column_styles,
-            &running_store,
+            Some(&running_store),
+            &multicol_geometry,
         );
 
         // fulgur-rpvu: append per-page fragments for every `position:
@@ -911,10 +912,12 @@ impl Engine {
         );
         let column_styles = crate::blitz_adapter::extract_column_style_table(&doc);
         let multicol_geometry = crate::multicol_layout::run_pass(doc.deref_mut(), &column_styles);
-        let pagination_geometry = crate::pagination_layout::run_pass_with_break_styles(
+        let pagination_geometry = crate::pagination_layout::run_pass_with_multicol(
             doc.deref_mut(),
-            self.config.content_height().as_pt().in_px(),
+            self.config.content_height().as_pt().in_px().to_f32(),
             &column_styles,
+            None,
+            &multicol_geometry,
         );
 
         let running_store = crate::gcpm::running::RunningElementStore::new();
@@ -982,10 +985,12 @@ impl Engine {
         );
         let column_styles = crate::blitz_adapter::extract_column_style_table(&doc);
         let multicol_geometry = crate::multicol_layout::run_pass(doc.deref_mut(), &column_styles);
-        let mut pagination_geometry = crate::pagination_layout::run_pass_with_break_styles(
+        let mut pagination_geometry = crate::pagination_layout::run_pass_with_multicol(
             doc.deref_mut(),
-            self.config.content_height().as_pt().in_px(),
+            self.config.content_height().as_pt().in_px().to_f32(),
             &column_styles,
+            None,
+            &multicol_geometry,
         );
 
         // Mirror the production `render` path so test callers that

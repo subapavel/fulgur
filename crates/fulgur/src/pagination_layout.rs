@@ -117,6 +117,419 @@ fn line_slices_tile(slices: &[LineSlice], n: usize) -> bool {
     next as usize == n
 }
 
+/// F30d: what one column of a multicol container holds on one page.
+///
+/// `y` is the distance from the top of the column on that page (the top of the container's content box, below
+/// its top padding and border on the first page) to the top of the piece.
+#[derive(Clone, Debug, PartialEq)]
+pub enum McPiece {
+    /// A child box placed whole: its subtree is recorded at the column's x and this y.
+    Block { node: usize, y: crate::units::Px },
+    /// Lines `[first, end)` of the Parley layout of `source`: the renderer paints exactly these lines, whatever
+    /// their heights add up to (the F78 rule).
+    Lines {
+        source: usize,
+        first: u32,
+        end: u32,
+        y: crate::units::Px,
+    },
+}
+
+/// F30d: one page of a fragmented multicol container: the pieces of every column (`columns.len()` is the
+/// used column count; a column without content is empty) and the height of the tallest, the block-size of the
+/// content on that page.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct McPage {
+    pub height: crate::units::Px,
+    pub columns: Vec<Vec<McPiece>>,
+}
+
+/// An indivisible unit of a multicol flow: a box, or one line of a paragraph.
+enum McAtom {
+    Block { node: usize, h: f32 },
+    Line { source: usize, index: u32, h: f32 },
+}
+
+impl McAtom {
+    fn height(&self) -> f32 {
+        match self {
+            Self::Block { h, .. } | Self::Line { h, .. } => *h,
+        }
+    }
+}
+
+/// One page of columns filled greedily by [`fill_multicol_columns`].
+struct McFill {
+    columns: Vec<Vec<McPiece>>,
+    height: f32,
+    /// Index of the first atom that did not fit.
+    next: usize,
+}
+
+/// Slack for the sum of line heights against a column budget (accumulated f32 error).
+const MC_EPS: f32 = 1e-3;
+
+/// Fill `n` columns of `budget` block-size from `atoms[start..]` in order: an atom goes below the previous
+/// one in the same column unless it does not fit, then it opens the next column; the first atom of a column
+/// always goes in (a box or line taller than the column overflows it rather than loop for ever). Stops when
+/// the columns are full or the atoms are used up. A line is never split (css-break-3 §4.1, CSS 2.1 §13.3.3).
+fn fill_multicol_columns(atoms: &[McAtom], start: usize, n: usize, budget: f32) -> McFill {
+    let mut columns: Vec<Vec<McPiece>> = vec![Vec::new(); n];
+    let mut col = 0usize;
+    let mut used = 0.0f32;
+    let mut height = 0.0f32;
+    let mut at = start;
+    while at < atoms.len() {
+        let h = atoms[at].height();
+        if used > 0.0 && used + h > budget + MC_EPS {
+            if col + 1 >= n {
+                break;
+            }
+            col += 1;
+            used = 0.0;
+        }
+        let y = used.as_px();
+        match &atoms[at] {
+            McAtom::Block { node, .. } => columns[col].push(McPiece::Block { node: *node, y }),
+            McAtom::Line { source, index, .. } => match columns[col].last_mut() {
+                Some(McPiece::Lines {
+                    source: s, end: e, ..
+                }) if *s == *source && *e == *index => *e += 1,
+                _ => columns[col].push(McPiece::Lines {
+                    source: *source,
+                    first: *index,
+                    end: *index + 1,
+                    y,
+                }),
+            },
+        }
+        used += h;
+        height = height.max(used);
+        at += 1;
+    }
+    McFill {
+        columns,
+        height,
+        next: at,
+    }
+}
+
+/// F30d: distribute the flow of a multicol container over pages (css-multicol-1 §8.2, css-break-3 §2: a
+/// column box that does not fit the page continues in the columns of the next one).
+///
+/// `first_room` is the block-size of the columns on the first page, `page_room` on every later page.
+/// `last_inset` (the container's bottom padding and border) is kept free on the page that holds the end of the
+/// flow. Every page but the last is filled column after column to its room; the last one is filled the same
+/// way for `column-fill: auto` and balanced (the smallest budget in which the rest fits `n` columns) for
+/// `balance`, the only fragment that is balanced in a fragmented context (css-multicol-1 §7.1). Lines are never
+/// split, every column gets at least one unit, so a box taller than a page is placed alone and overflows.
+pub(crate) fn plan_multicol_pages(
+    flow: &[crate::multicol_layout::FlowItem],
+    n: u32,
+    first_room: f32,
+    page_room: f32,
+    fill: crate::column_css::ColumnFill,
+    last_inset: f32,
+) -> Vec<McPage> {
+    use crate::multicol_layout::FlowItem;
+    let n = n.max(1) as usize;
+    let mut atoms: Vec<McAtom> = Vec::new();
+    for item in flow {
+        match item {
+            FlowItem::Block { node, height } => atoms.push(McAtom::Block {
+                node: *node,
+                h: height.to_f32().max(0.0),
+            }),
+            FlowItem::Lines { source, advances } => {
+                for (index, h) in advances.iter().enumerate() {
+                    atoms.push(McAtom::Line {
+                        source: *source,
+                        index: index as u32,
+                        h: h.to_f32().max(0.0),
+                    });
+                }
+            }
+        }
+    }
+    let mut pages: Vec<McPage> = Vec::new();
+    let mut at = 0usize;
+    while at < atoms.len() {
+        if pages.len() >= crate::MAX_PAGES as usize {
+            log::warn!(
+                "pagination: a multi-column container needs more than {} pages; the rest of its content is dropped",
+                crate::MAX_PAGES
+            );
+            break;
+        }
+        let room = if pages.is_empty() {
+            first_room
+        } else {
+            page_room
+        }
+        .max(0.0);
+        let room_for_end = (room - last_inset).max(0.0);
+        let trial = fill_multicol_columns(&atoms, at, n, room_for_end);
+        let filled = if trial.next >= atoms.len() {
+            // The rest fits on this page: it is the last one.
+            match fill {
+                crate::column_css::ColumnFill::Auto => trial,
+                crate::column_css::ColumnFill::Balance => {
+                    balance_multicol_columns(&atoms, at, n, room_for_end)
+                }
+            }
+        } else {
+            let full = fill_multicol_columns(&atoms, at, n, room);
+            if full.next >= atoms.len() && fill == crate::column_css::ColumnFill::Balance {
+                // The rest fits only when the bottom padding is allowed to hang below the page: balance it
+                // within the room anyway.
+                balance_multicol_columns(&atoms, at, n, room)
+            } else {
+                full
+            }
+        };
+        at = filled.next;
+        pages.push(McPage {
+            height: filled.height.as_px(),
+            columns: filled.columns,
+        });
+    }
+    pages
+}
+
+/// The fill of `atoms[start..]` in `n` columns with the smallest budget (at most `room`) in which all of
+/// them fit. Next-fit never needs more columns for a larger budget, so a bisection finds it.
+fn balance_multicol_columns(atoms: &[McAtom], start: usize, n: usize, room: f32) -> McFill {
+    let rest = &atoms[start..];
+    let total: f32 = rest.iter().map(McAtom::height).sum();
+    let tallest = rest.iter().map(McAtom::height).fold(0.0f32, f32::max);
+    let fits = |budget: f32| fill_multicol_columns(atoms, start, n, budget).next >= atoms.len();
+    let mut lo = tallest.max(total / n as f32);
+    let mut hi = room.max(lo);
+    if fits(lo) {
+        return fill_multicol_columns(atoms, start, n, lo);
+    }
+    // `lo` does not fit, `hi` is the room the rest was already known to fit in (or more, when `room` is below
+    // the tallest atom: then nothing smaller helps either).
+    for _ in 0..32 {
+        let mid = (lo + hi) / 2.0;
+        if fits(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    fill_multicol_columns(atoms, start, n, hi)
+}
+
+/// F30d: a multi-column container the fragmenter can cut over pages, and what it needs to know about it.
+struct McContainer<'a> {
+    group: &'a crate::multicol_layout::ColumnGroupGeometry,
+    fill: crate::column_css::ColumnFill,
+    /// The container's bottom padding and border, px.
+    bottom_inset: f32,
+}
+
+impl McContainer<'_> {
+    /// The container's top padding and border, px: it sits above the columns of the first page only.
+    fn top_inset(&self) -> f32 {
+        self.group.y_offset.to_f32()
+    }
+
+    /// Block-size of the first thing in the flow (a box, or the first line of a paragraph), px.
+    fn first_unit(&self) -> f32 {
+        use crate::multicol_layout::FlowItem;
+        self.group
+            .flow
+            .iter()
+            .find_map(|item| match item {
+                FlowItem::Block { height, .. } => Some(height.to_f32()),
+                FlowItem::Lines { advances, .. } => advances.first().map(|h| h.to_f32()),
+            })
+            .unwrap_or(0.0)
+    }
+}
+
+/// F30d: the container `node_id`, when it is a multi-column container with a flow the fragmenter can place:
+/// the multicol pass recorded one column group for it (no `column-span: all` child: that path is unchanged)
+/// and the group has something in it.
+fn multicol_container<'a>(
+    doc: &BaseDocument,
+    multicol: Option<&'a crate::multicol_layout::MulticolGeometryTable>,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    node_id: usize,
+) -> Option<McContainer<'a>> {
+    use crate::multicol_layout::FlowItem;
+    let node = doc.get_node(node_id)?;
+    if !crate::blitz_adapter::is_multicol_container(node) {
+        return None;
+    }
+    if node.children.iter().any(|&id| {
+        doc.get_node(id)
+            .is_some_and(crate::blitz_adapter::has_column_span_all)
+    }) {
+        return None;
+    }
+    let [group] = multicol?.get(&node_id)?.groups.as_slice() else {
+        return None;
+    };
+    let has_content = group.flow.iter().any(|item| match item {
+        FlowItem::Block { .. } => true,
+        FlowItem::Lines { advances, .. } => !advances.is_empty(),
+    });
+    if !has_content || group.n == 0 {
+        return None;
+    }
+    let fill = column_styles
+        .and_then(|t| t.get(&node_id))
+        .and_then(|p| p.fill)
+        .unwrap_or_default();
+    let layout = node.final_layout;
+    Some(McContainer {
+        group,
+        fill,
+        bottom_inset: layout.border.bottom + layout.padding.bottom,
+    })
+}
+
+/// F30d: whether a multi-column container of block-size `height` is cut over pages when `room` is what is
+/// left of the page below it: it is when it does not fit (the paths that keep it whole either move it to a
+/// page of its own, which is what a container that fits the next page may still do, or cut it into strips
+/// with the text on the first). `break-inside: avoid` is honoured as long as the container fits a page.
+fn multicol_wants_split(height: f32, room: f32, fresh: f32, avoid_inside: bool) -> bool {
+    height.is_finite() && height > room && (!avoid_inside || height > fresh)
+}
+
+/// F30d: cut the multi-column container `container_id` over pages from `(page_in, cursor_in)` and record
+/// what each page holds.
+///
+/// The flow the multicol pass recorded is distributed by [`plan_multicol_pages`]; this records the result:
+/// one fragment of the container per page (the first below `cursor_in` with the container's top padding
+/// and border, the last with its bottom ones), [`PaginationGeometry::multicol_pages`] on the container, a
+/// fragment (and its subtree) of every box at the column and page y the plan gave it, and one fragment per page
+/// of every paragraph that has lines on it, which convert and the renderer paint as given. Returns the page and
+/// the page-local y below the last fragment.
+///
+/// The caller has already moved the container to the next page when its first unit does not fit below the
+/// cursor (F28).
+#[allow(clippy::too_many_arguments)]
+fn fragment_multicol_container(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    c: &McContainer<'_>,
+    container_id: usize,
+    x_in_body: f32,
+    width: f32,
+    page_in: u32,
+    cursor_in: f32,
+    strips: PageStrips,
+) -> (u32, f32) {
+    use crate::multicol_layout::FlowItem;
+    let group = c.group;
+    let top_inset = c.top_inset();
+    let first_room = (strips.bottom(page_in) - cursor_in - top_inset).max(0.0);
+    let plan = plan_multicol_pages(
+        &group.flow,
+        group.n,
+        first_room,
+        strips.fresh(),
+        c.fill,
+        c.bottom_inset,
+    );
+    let advances: BTreeMap<usize, &[crate::units::Px]> = group
+        .flow
+        .iter()
+        .filter_map(|item| match item {
+            FlowItem::Lines { source, advances } => Some((*source, advances.as_slice())),
+            FlowItem::Block { .. } => None,
+        })
+        .collect();
+    let col_w = group.col_w.to_f32();
+    let stride = col_w + group.gap.to_f32();
+    let mut end = (page_in, cursor_in);
+    for (k, page) in plan.iter().enumerate() {
+        let abs_page = page_in + k as u32;
+        let last = k + 1 == plan.len();
+        let y = if k == 0 { cursor_in } else { 0.0 };
+        let top = if k == 0 { top_inset } else { 0.0 };
+        let height = top + page.height.to_f32() + if last { c.bottom_inset } else { 0.0 };
+        let entry = geometry.entry(container_id).or_default();
+        entry.fragments.push(Fragment {
+            page_index: abs_page,
+            x: x_in_body.as_px(),
+            y: y.as_px(),
+            width: width.as_px(),
+            height: height.as_px(),
+        });
+        entry.multicol_pages.push((abs_page, page.clone()));
+        end = (abs_page, y + height);
+        let mut paragraphs_on_page: BTreeSet<usize> = BTreeSet::new();
+        for (col, pieces) in page.columns.iter().enumerate() {
+            let col_x = x_in_body + group.x_offset.to_f32() + col as f32 * stride;
+            for piece in pieces {
+                match piece {
+                    McPiece::Block { node, y: piece_y } => {
+                        let piece_y = y + top + piece_y.to_f32();
+                        let Some(n) = doc.get_node(*node) else {
+                            continue;
+                        };
+                        if n.final_layout.size.height > strips.fresh() + 1.0 {
+                            log::warn!(
+                                "pagination: a <{}> {}px tall inside a multi-column container is taller than a \
+                                 page; it is placed whole in its column and overflows the page",
+                                n.element_data().map_or("box", |e| e.name.local.as_ref()),
+                                n.final_layout.size.height
+                            );
+                        }
+                        // `record_descendant` adds the box's own offset in its parent: take it off, the plan
+                        // placed the box.
+                        record_descendant(
+                            geometry,
+                            doc,
+                            *node,
+                            abs_page,
+                            piece_y - n.final_layout.location.y,
+                            col_x - n.final_layout.location.x,
+                            0,
+                        );
+                    }
+                    McPiece::Lines {
+                        source,
+                        first,
+                        end: end_line,
+                        y: piece_y,
+                    } => {
+                        // A container that is itself the paragraph is painted from its own fragments.
+                        if *source == container_id || !paragraphs_on_page.insert(*source) {
+                            continue;
+                        }
+                        let h: f32 = advances
+                            .get(source)
+                            .map(|a| {
+                                a[*first as usize..*end_line as usize]
+                                    .iter()
+                                    .map(|h| h.to_f32())
+                                    .sum()
+                            })
+                            .unwrap_or(0.0);
+                        geometry
+                            .entry(*source)
+                            .or_default()
+                            .fragments
+                            .push(Fragment {
+                                page_index: abs_page,
+                                x: col_x.as_px(),
+                                y: (y + top + piece_y.to_f32()).as_px(),
+                                width: col_w.as_px(),
+                                height: h.as_px(),
+                            });
+                    }
+                }
+            }
+        }
+    }
+    end
+}
+
 /// Per-source-node geometry: every page on which the node has a placement.
 ///
 /// For the block-only fragmenter the vector is normally length 1 (the node
@@ -153,6 +566,9 @@ pub struct PaginationGeometry {
     /// fragment holds, parallel to `fragments`. Empty for everything else (the
     /// renderer then measures the lines itself, with a warning).
     pub line_slices: Vec<LineSlice>,
+    /// F30d: for a multicol container cut by [`fragment_multicol_container`], what each column holds on every
+    /// page (absolute page index), parallel to the container's `fragments`. Empty for everything else.
+    pub multicol_pages: Vec<(u32, McPage)>,
 }
 
 impl PaginationGeometry {
@@ -267,6 +683,9 @@ pub struct PaginationLayoutTree<'a> {
     /// for unit-test entry points) means "no running mappings"; the
     /// fragmenter treats every body child as in-flow.
     pub(crate) running_store: Option<&'a crate::gcpm::running::RunningElementStore>,
+    /// F30d: the geometry of the multicol pass, which says what flows in each multi-column container. `None`
+    /// (unit tests) leaves every multi-column container to the paths that treat it as one box.
+    pub(crate) multicol: Option<&'a crate::multicol_layout::MulticolGeometryTable>,
     /// fulgur-uebl: per-element used page-name (CSS Page 3 §5.3),
     /// resolved from the same author-facing `page` declarations the
     /// `column_styles` table carries. The fragmenter consults this when
@@ -301,7 +720,7 @@ pub struct PaginationLayoutTree<'a> {
 /// `ColumnStyleTable` are honoured.
 #[cfg(test)]
 pub fn run_pass(doc: &mut BaseDocument, page_height_px: f32) -> PaginationGeometryTable {
-    run_pass_inner(doc, page_height_px, None, None)
+    run_pass_inner(doc, page_height_px, None, None, None)
 }
 
 /// fulgur-k0g0 variant: thread the document's `break-before` /
@@ -315,7 +734,13 @@ pub fn run_pass_with_break_styles<'a>(
     page_height_px: crate::units::Px,
     column_styles: &'a crate::column_css::ColumnStyleTable,
 ) -> PaginationGeometryTable {
-    run_pass_inner(doc, page_height_px.to_f32(), Some(column_styles), None)
+    run_pass_inner(
+        doc,
+        page_height_px.to_f32(),
+        Some(column_styles),
+        None,
+        None,
+    )
 }
 
 /// fulgur-s67g Phase 2.2 variant: extends
@@ -335,6 +760,27 @@ pub fn run_pass_with_break_and_running<'a>(
         page_height_px,
         Some(column_styles),
         Some(running_store),
+        None,
+    )
+}
+
+/// F30d variant: the production entry point. Like [`run_pass_with_break_and_running`] (`running_store` is
+/// optional), and `multicol` (the geometry the multicol pass recorded, see
+/// [`crate::multicol_layout::run_pass`]) lets the fragmenter cut a multi-column container that is taller than
+/// the room it has over the pages instead of treating it as one box ([`fragment_multicol_container`]).
+pub fn run_pass_with_multicol<'a>(
+    doc: &'a mut BaseDocument,
+    page_height_px: f32,
+    column_styles: &'a crate::column_css::ColumnStyleTable,
+    running_store: Option<&'a crate::gcpm::running::RunningElementStore>,
+    multicol: &'a crate::multicol_layout::MulticolGeometryTable,
+) -> PaginationGeometryTable {
+    run_pass_inner(
+        doc,
+        page_height_px,
+        Some(column_styles),
+        running_store,
+        Some(multicol),
     )
 }
 
@@ -343,6 +789,7 @@ fn run_pass_inner<'a>(
     page_height_px: f32,
     column_styles: Option<&'a crate::column_css::ColumnStyleTable>,
     running_store: Option<&'a crate::gcpm::running::RunningElementStore>,
+    multicol: Option<&'a crate::multicol_layout::MulticolGeometryTable>,
 ) -> PaginationGeometryTable {
     // fulgur-uebl: pre-compute the used page-name table when column
     // styles are available. The walk takes one DOM pass and produces a
@@ -353,6 +800,7 @@ fn run_pass_inner<'a>(
     let mut tree = PaginationLayoutTree::new(doc, page_height_px);
     tree.column_styles = column_styles;
     tree.running_store = running_store;
+    tree.multicol = multicol;
     tree.used_page_names = used_page_names;
     if tree.body_id.is_some() && page_height_px > 0.0 {
         // Read body's children's existing `final_layout` (populated by
@@ -388,6 +836,7 @@ impl<'a> PaginationLayoutTree<'a> {
             body_id,
             column_styles: None,
             running_store: None,
+            multicol: None,
             used_page_names: None,
         }
     }
@@ -843,6 +1292,70 @@ impl<'a> PaginationLayoutTree<'a> {
                 Some(crate::draw_primitives::BreakInside::Avoid)
             );
 
+            // F30d: a multi-column container that does not fit the room below the cursor is
+            // distributed over the pages column by column, wherever it is itself an inline
+            // root (the line-split path below would cut the one-column layout Blitz measured, not
+            // the columns). One that fits keeps the paths below, byte for byte.
+            if let Some(mc) =
+                multicol_container(self.doc, self.multicol, self.column_styles, child_id)
+            {
+                let strips = self.strips;
+                let wants = |page: u32, cursor: f32| {
+                    multicol_wants_split(
+                        child_h,
+                        strips.bottom(page) - cursor,
+                        strips.fresh(),
+                        avoid_inside,
+                    )
+                };
+                if wants(page_index, cursor_y) {
+                    // F28: when its first unit does not fit below the cursor the container starts on the
+                    // next page, where it may fit whole after all.
+                    let leading = mc.top_inset() + mc.first_unit();
+                    if cursor_y > 0.0
+                        && leading > strips.bottom(page_index) - cursor_y
+                        && leading <= strips.fresh()
+                    {
+                        page_index += 1;
+                        cursor_y = 0.0;
+                    }
+                    if wants(page_index, cursor_y) {
+                        let (new_page_index, new_cursor_y) = fragment_multicol_container(
+                            &mut self.geometry,
+                            self.doc,
+                            &mc,
+                            child_id,
+                            body_x + layout.location.x,
+                            child_w,
+                            page_index,
+                            cursor_y,
+                            strips,
+                        );
+                        page_index = new_page_index;
+                        cursor_y = new_cursor_y;
+                        emitted += 1;
+                        prev_bottom_y_in_body = this_top_in_body + child_h;
+                        if let Some((row_page, row_end, row_bottom)) = parallel_row {
+                            if page_index == row_page {
+                                cursor_y = cursor_y.max(row_end);
+                            }
+                            prev_bottom_y_in_body = prev_bottom_y_in_body.max(row_bottom);
+                        }
+                        if !is_float {
+                            prev_used_page = Some(used_end.clone());
+                        }
+                        if matches!(
+                            break_props.break_after,
+                            Some(crate::draw_primitives::BreakAfter::Page)
+                        ) {
+                            page_index += 1;
+                            cursor_y = 0.0;
+                        }
+                        continue;
+                    }
+                }
+            }
+
             // fulgur-p55h: if the child carries a Parley inline layout,
             // probe its line metrics and split at line boundaries —
             // mirrors the v1 paragraph-pageable split path (removed in
@@ -1027,6 +1540,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     self.doc,
                     self.column_styles,
                     self.used_page_names.as_ref(),
+                    self.multicol,
                     child_id,
                     child_w,
                     child_x_in_body,
@@ -2036,6 +2550,7 @@ fn fragment_block_subtree(
     doc: &BaseDocument,
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
     used_page_names: Option<&crate::blitz_adapter::UsedPageNameTable>,
+    multicol: Option<&crate::multicol_layout::MulticolGeometryTable>,
     parent_id: usize,
     parent_w: f32,
     parent_x_in_body: f32,
@@ -2526,6 +3041,32 @@ fn fragment_block_subtree(
             strips,
             page_index,
         );
+        // F30d: a multi-column container that does not fit the room below it is distributed over the
+        // pages (plain block flow only: in a flex / grid box, a table or an atomic inline it stays one
+        // box, F30d-b).
+        let block_parent = !suppress_page_check && !parent_is_table;
+        let avoid_inside_child = matches!(
+            break_props.break_inside,
+            Some(crate::draw_primitives::BreakInside::Avoid)
+        );
+        let mc_for = |page: u32, y: f32| -> Option<McContainer<'_>> {
+            if !block_parent {
+                return None;
+            }
+            multicol_container(doc, multicol, column_styles, child_id).filter(|_| {
+                multicol_wants_split(
+                    child_h,
+                    strips.bottom(page) - y,
+                    strips.fresh(),
+                    avoid_inside_child,
+                )
+            })
+        };
+        let mut mc_split = if line_split.is_none() {
+            mc_for(page_index, child_page_y)
+        } else {
+            None
+        };
         let mut needs_recursion =
             line_split.is_none() && gate((strips.bottom(page_index) - cursor_y).max(0.0));
 
@@ -2557,6 +3098,15 @@ fn fragment_block_subtree(
             let leading = split.leading();
             // Of a flex / grid row only the first item decides, as for an
             // entered item below (F28).
+            if first_in_row && leading <= strips.fresh() {
+                leading
+            } else {
+                0.0
+            }
+        } else if let Some(mc) = &mc_split {
+            // The container's top padding and its first line (or box) must fit; otherwise it starts on
+            // the next page.
+            let leading = mc.top_inset() + mc.first_unit();
             if first_in_row && leading <= strips.fresh() {
                 leading
             } else {
@@ -2614,7 +3164,11 @@ fn fragment_block_subtree(
             // siblings then continue from this point.
             page_taffy_origin = this_top_in_parent - band;
             child_page_y = band;
-            let was_entered = line_split.is_some() || needs_recursion;
+            let was_entered = line_split.is_some() || needs_recursion || mc_split.is_some();
+            if mc_split.is_some() {
+                // On a fresh page the container may fit whole after all.
+                mc_split = mc_for(page_index, child_page_y);
+            }
             if line_split.is_some() {
                 // On a fresh page the paragraph may fit whole after all.
                 line_split = nested_line_split(
@@ -2644,7 +3198,7 @@ fn fragment_block_subtree(
                 }
             }
         }
-        if needs_recursion || line_split.is_some() {
+        if needs_recursion || line_split.is_some() || mc_split.is_some() {
             let pre_recursion_page = page_index;
             let pre_recursion_cursor_y = cursor_y;
             let row_start = RowCursor {
@@ -2690,7 +3244,23 @@ fn fragment_block_subtree(
                 Some(r) => r.height,
                 None => top_floor,
             };
+            let mc_used = mc_split.is_some();
             let (np, nc, split_below, stretch) = match &line_split {
+                None if mc_split.is_some() => {
+                    let mc = mc_split.as_ref().expect("checked above");
+                    let (np, nc) = fragment_multicol_container(
+                        geometry,
+                        doc,
+                        mc,
+                        child_id,
+                        child_x_in_body,
+                        child_w,
+                        page_index,
+                        child_page_y,
+                        strips,
+                    );
+                    (np, nc, np > pre_recursion_page, 0.0)
+                }
                 Some(split) => {
                     let (np, nc) = fragment_nested_inline_root(
                         geometry,
@@ -2713,6 +3283,7 @@ fn fragment_block_subtree(
                     doc,
                     column_styles,
                     used_page_names,
+                    multicol,
                     child_id,
                     child_w,
                     child_x_in_body,
@@ -2902,6 +3473,11 @@ fn fragment_block_subtree(
                         _ => this_row,
                     });
                 }
+            } else if mc_used {
+                // F30d: the container ended on the page it started on, shorter than the one-column height
+                // Taffy gave it: what follows it starts below the columns, not where Taffy put it.
+                origin_pending_target_y = Some(cursor_y);
+                origin_pending_prev_bottom = Some(this_top_in_parent + child_h);
             }
 
             // Honour `break-after: page` after recursion.
@@ -5502,6 +6078,7 @@ mod tests {
             &doc, // &BaseDocument via deref coercion
             None, // column_styles
             None, // used_page_names
+            None, // multicol
             parent_id,
             600.0, // parent_w
             0.0,   // parent_x_in_body
@@ -10187,5 +10764,449 @@ h2 { string-set: chapter-title content(text); }
             f[0].y.to_f32() + f[0].height.to_f32() <= 160.5,
             "page 0 ends at 160px: {f:?}"
         );
+    }
+
+    // ── F30d: plan_multicol_pages ───────────────────────────────────────────
+
+    use crate::column_css::ColumnFill;
+    use crate::multicol_layout::FlowItem;
+
+    fn lines(source: usize, count: usize, h: f32) -> FlowItem {
+        FlowItem::Lines {
+            source,
+            advances: vec![h.as_px(); count],
+        }
+    }
+
+    fn block(node: usize, h: f32) -> FlowItem {
+        FlowItem::Block {
+            node,
+            height: h.as_px(),
+        }
+    }
+
+    /// `(first, end)` of the single `Lines` piece of `source` in `page.columns[col]`.
+    fn line_range(page: &McPage, col: usize, source: usize) -> Option<(u32, u32)> {
+        page.columns[col].iter().find_map(|p| match p {
+            McPiece::Lines {
+                source: s,
+                first,
+                end,
+                ..
+            } if *s == source => Some((*first, *end)),
+            _ => None,
+        })
+    }
+
+    /// Every line of `source` once, in order: pages in order, columns in order.
+    fn assert_lines_tile(pages: &[McPage], source: usize, count: u32) {
+        let mut next = 0;
+        for (p, page) in pages.iter().enumerate() {
+            for (c, col) in page.columns.iter().enumerate() {
+                for piece in col {
+                    if let McPiece::Lines {
+                        source: s,
+                        first,
+                        end,
+                        ..
+                    } = piece
+                    {
+                        assert_eq!(*s, source);
+                        assert_eq!(*first, next, "page {p} column {c} starts at {first}");
+                        assert!(end > first, "empty piece on page {p} column {c}");
+                        next = *end;
+                    }
+                }
+            }
+        }
+        assert_eq!(next, count, "every line placed once");
+    }
+
+    #[test]
+    fn plan_lines_over_many_pages_tile_without_gaps_or_repeats() {
+        // 1000 lines of 20 px, two columns of 50 lines per page after a first page of 10 lines per column.
+        let pages = plan_multicol_pages(
+            &[lines(7, 1000, 20.0)],
+            2,
+            200.0,
+            1000.0,
+            ColumnFill::Balance,
+            0.0,
+        );
+        assert_lines_tile(&pages, 7, 1000);
+        assert_eq!(
+            pages.len(),
+            1 + 10,
+            "10 + 10 on the first page, 100 per page after: 980 = 9.8 pages"
+        );
+        assert_eq!(line_range(&pages[0], 0, 7), Some((0, 10)));
+        assert_eq!(line_range(&pages[0], 1, 7), Some((10, 20)));
+        assert_eq!(pages[0].height.to_f32(), 200.0);
+        assert_eq!(line_range(&pages[1], 0, 7), Some((20, 70)));
+        assert_eq!(line_range(&pages[1], 1, 7), Some((70, 120)));
+        // 980 lines after page 0 = 9 full pages (900) + 80 lines balanced 40 / 40.
+        let last = pages.last().unwrap();
+        let a = line_range(last, 0, 7).unwrap();
+        let b = line_range(last, 1, 7).unwrap();
+        assert_eq!((a.1 - a.0, b.1 - b.0), (40, 40));
+        assert_eq!(last.height.to_f32(), 800.0);
+        for page in &pages[..pages.len() - 1] {
+            assert_eq!(page.height.to_f32() as u32 % 200, 0);
+        }
+    }
+
+    #[test]
+    fn plan_places_one_unit_per_column_when_the_first_room_is_tiny() {
+        // A first room smaller than a line: each column still takes a line (nothing else would ever fit).
+        let pages = plan_multicol_pages(
+            &[lines(1, 10, 20.0)],
+            2,
+            5.0,
+            100.0,
+            ColumnFill::Balance,
+            0.0,
+        );
+        assert_lines_tile(&pages, 1, 10);
+        assert_eq!(line_range(&pages[0], 0, 1), Some((0, 1)));
+        assert_eq!(line_range(&pages[0], 1, 1), Some((1, 2)));
+        assert_eq!(pages[0].height.to_f32(), 20.0);
+        // The remaining 8 lines are balanced on page 2: 4 + 4.
+        assert_eq!(pages.len(), 2);
+        assert_eq!(line_range(&pages[1], 0, 1), Some((2, 6)));
+        assert_eq!(line_range(&pages[1], 1, 1), Some((6, 10)));
+    }
+
+    #[test]
+    fn plan_balance_and_auto_differ_only_on_the_last_page() {
+        let flow = [lines(1, 30, 20.0)];
+        let balanced = plan_multicol_pages(&flow, 2, 1000.0, 1000.0, ColumnFill::Balance, 0.0);
+        assert_eq!(balanced.len(), 1);
+        assert_eq!(line_range(&balanced[0], 0, 1), Some((0, 15)));
+        assert_eq!(line_range(&balanced[0], 1, 1), Some((15, 30)));
+        assert_eq!(balanced[0].height.to_f32(), 300.0);
+        // `auto` never balances: the first column takes all that fits.
+        let auto = plan_multicol_pages(&flow, 2, 1000.0, 1000.0, ColumnFill::Auto, 0.0);
+        assert_eq!(auto.len(), 1);
+        assert_eq!(line_range(&auto[0], 0, 1), Some((0, 30)));
+        assert_eq!(line_range(&auto[0], 1, 1), None);
+        assert_eq!(auto[0].height.to_f32(), 600.0);
+        // Earlier pages are filled in both modes: 45 lines over pages of 10 lines per column.
+        for fill in [ColumnFill::Balance, ColumnFill::Auto] {
+            let pages = plan_multicol_pages(&[lines(1, 45, 20.0)], 2, 200.0, 200.0, fill, 0.0);
+            assert_lines_tile(&pages, 1, 45);
+            assert_eq!(line_range(&pages[0], 1, 1), Some((10, 20)));
+            assert_eq!(line_range(&pages[1], 0, 1), Some((20, 30)));
+            assert_eq!(pages.len(), 3);
+        }
+    }
+
+    #[test]
+    fn plan_mixed_blocks_and_lines() {
+        // A heading, a paragraph of 12 lines, another box: room of 160 per column.
+        let flow = [block(10, 30.0), lines(11, 12, 20.0), block(12, 50.0)];
+        let pages = plan_multicol_pages(&flow, 2, 160.0, 160.0, ColumnFill::Balance, 0.0);
+        // Page 0: heading 30 + 6 lines (150 <= 160); column 2: 6 lines (120), then the 50 px box does not fit.
+        assert_eq!(pages.len(), 2);
+        assert_eq!(
+            pages[0].columns[0][0],
+            McPiece::Block {
+                node: 10,
+                y: 0.0.as_px()
+            }
+        );
+        assert_eq!(line_range(&pages[0], 0, 11), Some((0, 6)));
+        assert_eq!(
+            pages[0].columns[0][1],
+            McPiece::Lines {
+                source: 11,
+                first: 0,
+                end: 6,
+                y: 30.0.as_px()
+            }
+        );
+        assert_eq!(line_range(&pages[0], 1, 11), Some((6, 12)));
+        assert_eq!(
+            pages[1].columns[0],
+            vec![McPiece::Block {
+                node: 12,
+                y: 0.0.as_px()
+            }]
+        );
+        assert!(pages[1].columns[1].is_empty());
+        assert_eq!(pages[1].height.to_f32(), 50.0);
+    }
+
+    #[test]
+    fn plan_a_block_taller_than_a_page_is_placed_alone() {
+        let flow = [lines(1, 3, 20.0), block(2, 3000.0), lines(3, 3, 20.0)];
+        let pages = plan_multicol_pages(&flow, 2, 1000.0, 1000.0, ColumnFill::Balance, 0.0);
+        // The block does not fit under the three lines: it opens column 2 and overflows it.
+        assert_eq!(line_range(&pages[0], 0, 1), Some((0, 3)));
+        assert_eq!(
+            pages[0].columns[1],
+            vec![McPiece::Block {
+                node: 2,
+                y: 0.0.as_px()
+            }]
+        );
+        assert_eq!(pages[0].height.to_f32(), 3000.0);
+        // Everything after it goes on the next page.
+        assert_eq!(pages.len(), 2);
+        assert_eq!(line_range(&pages[1], 0, 3), Some((0, 2)));
+        assert_eq!(line_range(&pages[1], 1, 3), Some((2, 3)));
+        // A block taller than the page is also alone in the first column of a page.
+        let pages = plan_multicol_pages(
+            &[block(2, 3000.0)],
+            2,
+            100.0,
+            100.0,
+            ColumnFill::Balance,
+            0.0,
+        );
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].height.to_f32(), 3000.0);
+    }
+
+    #[test]
+    fn plan_three_columns() {
+        let pages = plan_multicol_pages(
+            &[lines(1, 100, 20.0)],
+            3,
+            400.0,
+            400.0,
+            ColumnFill::Balance,
+            0.0,
+        );
+        assert_lines_tile(&pages, 1, 100);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].columns.len(), 3);
+        // Page 0 holds 3 x 20 lines; the 40 lines left balance to a budget of 14 lines: 14 / 14 / 12.
+        assert_eq!(line_range(&pages[0], 2, 1), Some((40, 60)));
+        let sizes: Vec<u32> = (0..3)
+            .map(|c| {
+                let (a, b) = line_range(&pages[1], c, 1).unwrap();
+                b - a
+            })
+            .collect();
+        assert_eq!(sizes, vec![14, 14, 12]);
+    }
+
+    #[test]
+    fn plan_keeps_the_bottom_inset_free_on_the_last_page_only() {
+        // 50 lines of 20 px, columns of 10 lines, 30 px of bottom padding under the last page's columns.
+        let flow = [lines(1, 50, 20.0)];
+        let pages = plan_multicol_pages(&flow, 2, 200.0, 200.0, ColumnFill::Auto, 30.0);
+        assert_lines_tile(&pages, 1, 50);
+        assert_eq!(pages.len(), 3);
+        // Not the last page: filled to the room, ignoring the inset.
+        assert_eq!(line_range(&pages[0], 1, 1), Some((10, 20)));
+        assert_eq!(pages[0].height.to_f32(), 200.0);
+        // The last page keeps 30 px free: 8 lines of 160 px fit 170, a 9th would not.
+        assert_eq!(line_range(&pages[2], 0, 1), Some((40, 48)));
+        assert_eq!(line_range(&pages[2], 1, 1), Some((48, 50)));
+        // A rest that fits the room but not the room less the inset hangs the padding below the page and
+        // is balanced like any last page.
+        let pages = plan_multicol_pages(
+            &[lines(1, 18, 20.0)],
+            2,
+            200.0,
+            200.0,
+            ColumnFill::Balance,
+            30.0,
+        );
+        assert_eq!(pages.len(), 1);
+        assert_eq!(line_range(&pages[0], 0, 1), Some((0, 9)));
+        assert_eq!(line_range(&pages[0], 1, 1), Some((9, 18)));
+    }
+
+    #[test]
+    fn plan_empty_flow_and_empty_paragraph() {
+        assert!(plan_multicol_pages(&[], 2, 100.0, 100.0, ColumnFill::Balance, 0.0).is_empty());
+        assert!(
+            plan_multicol_pages(
+                &[lines(1, 0, 20.0)],
+                2,
+                100.0,
+                100.0,
+                ColumnFill::Balance,
+                0.0
+            )
+            .is_empty()
+        );
+    }
+
+    // ── F30d: fragment_multicol_container ───────────────────────────────────
+
+    /// Lay `html` out, run the multicol pass, then the fragmenter on a `page_h` px strip.
+    fn multicol_fragments(
+        html: &str,
+        page_h: f32,
+    ) -> (
+        blitz_html::HtmlDocument,
+        crate::multicol_layout::MulticolGeometryTable,
+        PaginationGeometryTable,
+    ) {
+        let mut doc = parse(html, 600.0);
+        let table = blitz_adapter::extract_column_style_table(&doc);
+        let mc = crate::multicol_layout::run_pass(doc.deref_mut(), &table);
+        let geom = run_pass_with_multicol(doc.deref_mut(), page_h, &table, None, &mc);
+        (doc, mc, geom)
+    }
+
+    fn nodes_by_class(doc: &BaseDocument, class: &str) -> Vec<usize> {
+        fn walk(doc: &BaseDocument, id: usize, class: &str, out: &mut Vec<usize>) {
+            let Some(n) = doc.get_node(id) else { return };
+            if n.element_data()
+                .and_then(|e| blitz_adapter::get_attr(e, "class"))
+                .is_some_and(|c| c.split_whitespace().any(|x| x == class))
+            {
+                out.push(id);
+            }
+            for &c in &n.children {
+                walk(doc, c, class, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(doc, doc.root_element().id, class, &mut out);
+        out
+    }
+
+    fn node_by_class(doc: &BaseDocument, class: &str) -> usize {
+        *nodes_by_class(doc, class)
+            .first()
+            .unwrap_or_else(|| panic!("no .{class}"))
+    }
+
+    /// Twelve 40 px boxes in two columns on 200 px pages: 5 + 5 on the first page, the last two balanced.
+    #[test]
+    fn multicol_blocks_are_cut_over_pages() {
+        let html = format!(
+            "<!doctype html><html><head><style>body{{margin:0}}\
+             .mc{{column-count:2;column-gap:20px}}.b{{height:40px}}</style></head><body>\
+             <div class=\"mc\">{}</div></body></html>",
+            "<div class=\"b\"></div>".repeat(12)
+        );
+        let (doc, mc, geom) = multicol_fragments(&html, 200.0);
+        let mc_id = node_by_class(&doc, "mc");
+        let g = &geom[&mc_id];
+        // Blitz laid the container out as 240 px tall (balanced against the one-column height), too tall for
+        // a 200 px page.
+        assert_eq!(g.fragments.len(), 2, "{:?}", g.fragments);
+        assert_eq!(g.multicol_pages.len(), 2);
+        assert_eq!(
+            g.fragments.iter().map(|f| f.page_index).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(g.fragments[0].y.to_f32(), 0.0);
+        assert_eq!(g.fragments[0].height.to_f32(), 200.0);
+        assert_eq!(g.fragments[1].height.to_f32(), 40.0);
+        let col_w = mc[&mc_id].groups[0].col_w.to_f32();
+        // Every box once, at the column and y the plan gave it.
+        let boxes = nodes_by_class(&doc, "b");
+        let mut placed: Vec<(u32, f32, f32)> = Vec::new();
+        for (id, gg) in &geom {
+            if boxes.contains(id) {
+                for f in &gg.fragments {
+                    placed.push((f.page_index, f.x.to_f32(), f.y.to_f32()));
+                }
+            }
+        }
+        placed.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(placed.len(), 12);
+        let col2 = col_w + 20.0;
+        let expect: Vec<(u32, f32, f32)> = (0..5)
+            .map(|i| (0, 0.0, i as f32 * 40.0))
+            .chain((0..5).map(|i| (0, col2, i as f32 * 40.0)))
+            .chain([(1, 0.0, 0.0), (1, col2, 0.0)])
+            .collect();
+        let mut expect = expect;
+        expect.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for (got, want) in placed.iter().zip(&expect) {
+            assert_eq!(got.0, want.0);
+            assert!((got.1 - want.1).abs() < 0.6, "{got:?} vs {want:?}");
+            assert!((got.2 - want.2).abs() < 0.6, "{got:?} vs {want:?}");
+        }
+    }
+
+    /// A paragraph in two columns over pages: every line is in exactly one piece, in order, one fragment of the
+    /// paragraph per page.
+    #[test]
+    fn multicol_paragraph_lines_are_placed_once() {
+        let words = (0..400)
+            .map(|i| format!("word{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let html = format!(
+            "<!doctype html><html><head><style>body{{margin:0;font-size:16px;line-height:20px}}\
+             .mc{{column-count:2;column-gap:20px}}p{{margin:0}}</style></head><body>\
+             <div class=\"mc\"><p class=\"t\">{words}</p></div></body></html>"
+        );
+        let (doc, mc, geom) = multicol_fragments(&html, 200.0);
+        let mc_id = node_by_class(&doc, "mc");
+        let p_id = node_by_class(&doc, "t");
+        let lines: usize = mc[&mc_id].groups[0]
+            .flow
+            .iter()
+            .map(|f| match f {
+                crate::multicol_layout::FlowItem::Lines { advances, .. } => advances.len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(lines > 40, "the paragraph has {lines} lines");
+        let g = &geom[&mc_id];
+        assert!(
+            g.multicol_pages.len() >= 3,
+            "{} pages",
+            g.multicol_pages.len()
+        );
+        let mut next = 0u32;
+        for (_, page) in &g.multicol_pages {
+            for col in &page.columns {
+                for piece in col {
+                    let McPiece::Lines {
+                        source, first, end, ..
+                    } = piece
+                    else {
+                        panic!("only lines expected, got {piece:?}");
+                    };
+                    assert_eq!(*source, p_id);
+                    assert_eq!(*first, next);
+                    next = *end;
+                }
+            }
+        }
+        assert_eq!(next as usize, lines, "every line placed once");
+        // One fragment of the paragraph and of the container on every page; all pages but the last are full.
+        let pages: Vec<u32> = g.multicol_pages.iter().map(|(p, _)| *p).collect();
+        assert_eq!(
+            geom[&p_id]
+                .fragments
+                .iter()
+                .map(|f| f.page_index)
+                .collect::<Vec<_>>(),
+            pages
+        );
+        assert_eq!(
+            g.fragments.iter().map(|f| f.page_index).collect::<Vec<_>>(),
+            pages
+        );
+        for (_, page) in &g.multicol_pages[..g.multicol_pages.len() - 1] {
+            assert_eq!(page.height.to_f32(), 200.0);
+        }
+    }
+
+    /// A container that fits the page keeps the path it had: one fragment, no pages recorded.
+    #[test]
+    fn multicol_that_fits_is_left_alone() {
+        let html = format!(
+            "<!doctype html><html><head><style>body{{margin:0}}\
+             .mc{{column-count:2;column-gap:20px}}.b{{height:40px}}</style></head><body>\
+             <div class=\"mc\">{}</div></body></html>",
+            "<div class=\"b\"></div>".repeat(4)
+        );
+        let (doc, _, geom) = multicol_fragments(&html, 200.0);
+        let g = &geom[&node_by_class(&doc, "mc")];
+        assert_eq!(g.fragments.len(), 1);
+        assert!(g.multicol_pages.is_empty());
     }
 }

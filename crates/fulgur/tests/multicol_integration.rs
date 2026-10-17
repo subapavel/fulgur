@@ -84,13 +84,8 @@ fn multicol_balance_renders() {
     assert_eq!(page_count(&pdf), 1);
 }
 
-/// A tall multicol container that would exceed one page renders without panicking.
-///
-/// NOTE: multicol container page-spanning (the multicol box itself fragmenting
-/// across pages) is not yet implemented in fulgur. Currently only
-/// `column-span: all` subtrees drive inter-page splits inside a multicol
-/// context (covered by multicol_span_all.rs). Once container fragmentation
-/// lands, this assertion should be tightened to `assert!(page_count(&pdf) >= 2)`.
+/// A tall multicol container that exceeds one page is cut over pages (F30d): 12 boxes of 40pt in two columns do not fit
+/// the 160pt of room, so the columns continue on the next page.
 #[test]
 fn multicol_page_spanning_renders_without_panic() {
     let html = r#"<!doctype html><html><head><style>
@@ -110,4 +105,5 @@ fn multicol_page_spanning_renders_without_panic() {
     </body></html>"#;
     let pdf = Engine::builder().build().render(html).expect("render");
     assert!(!pdf.is_empty());
+    assert!(page_count(&pdf) >= 2, "{} pages", page_count(&pdf));
 }

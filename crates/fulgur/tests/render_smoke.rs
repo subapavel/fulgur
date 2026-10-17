@@ -7429,3 +7429,30 @@ fn render_smoke_rtl_paragraph_over_64_kib_is_not_dropped_text() {
         .render(&html)
         .expect("a long RTL paragraph is not reported");
 }
+
+#[test]
+fn render_v2_smoke_multicol_text_taller_than_a_page_prints_every_word() {
+    // F30d: 4000 words in two columns run over many pages. The columns were one slice each, many pages tall, and
+    // the renderer skipped every slice that crossed a page break: no word was painted at all. Each page now
+    // paints the lines the fragmenter put in each of its columns, so every word is in the text layer exactly once.
+    let words: Vec<String> = (0..4000).map(|i| format!("w{i:04}")).collect();
+    let html = format!(
+        "<!doctype html><html><body style=\"margin:0\">\
+         <div style=\"column-count:2\"><p style=\"margin:0\">{}</p></div></body></html>",
+        words.join(" ")
+    );
+    let pdf = noto_engine()
+        .render(&html)
+        .expect("multicol text over pages renders");
+    if let Some(text) = extract_pdf_text(&pdf) {
+        let printed: Vec<&str> = text.split_whitespace().collect();
+        let mut missing = 0;
+        for w in &words {
+            match printed.iter().filter(|p| **p == w.as_str()).count() {
+                1 => {}
+                _ => missing += 1,
+            }
+        }
+        assert_eq!(missing, 0, "{missing} of 4000 words are missing or doubled");
+    }
+}
