@@ -52,6 +52,8 @@
 //!   `resolve()`).
 //! - `break-before` / `break-after` / `break-inside: avoid` from the
 //!   shared [`crate::column_css::ColumnStyleTable`] side-table.
+//!   `break-inside: avoid` holds while the box fits a page and is relaxed
+//!   past that ([`avoid_inside_holds`]).
 //!
 //! # Production extension points
 //!
@@ -399,6 +401,15 @@ fn multicol_wants_split(height: f32, room: f32, fresh: f32, avoid_inside: bool) 
     height.is_finite() && height > room && (!avoid_inside || height > fresh)
 }
 
+/// F83: whether `break-inside: avoid` on a box of block-size `height` still holds, `fresh` being the room of a
+/// fresh page. It holds while the box fits a page; past that it is relaxed and the box breaks like an `auto` one
+/// (css-break-3 §4.4: when the avoid rules leave no way to keep content from overflowing the fragmentainer they are
+/// dropped before orphans and widows; CSS 2.1 §13.3.3 has the same order). One px of slack, as the strip slicer
+/// has (`child_h > fresh + 1.0`), so a box it would not cut is not relaxed either.
+fn avoid_inside_holds(avoid_inside: bool, height: f32, fresh: f32) -> bool {
+    avoid_inside && height <= fresh + 1.0
+}
+
 /// F30d: cut the multi-column container `container_id` over pages from `(page_in, cursor_in)` and record
 /// what each page holds.
 ///
@@ -728,7 +739,8 @@ pub fn run_pass(doc: &mut BaseDocument, page_height_px: f32) -> PaginationGeomet
 /// [`crate::blitz_adapter::extract_column_style_table`]) into the
 /// fragmenter. `break-before: page` and `break-after: page` force
 /// page boundaries; `break-inside: avoid` defers a child that does not
-/// fit the remaining strip rather than splitting it.
+/// fit the remaining strip rather than splitting it, as long as the
+/// child fits a page ([`avoid_inside_holds`]).
 pub fn run_pass_with_break_styles<'a>(
     doc: &'a mut BaseDocument,
     page_height_px: crate::units::Px,
@@ -1365,7 +1377,15 @@ impl<'a> PaginationLayoutTree<'a> {
             // fulgur-k0g0: when `break-inside: avoid` is set, fall
             // through to the block path below so the paragraph emits
             // whole instead of splitting between lines.
-            let line_metrics = if avoid_inside {
+            //
+            // F83: only while it fits a page. A paragraph taller than a
+            // page cannot be kept together, so `avoid` is relaxed
+            // (css-break-3 §4.4) and it takes this line path like an
+            // `auto` one: the strip slicer below cuts at fixed heights,
+            // records no line ranges, and the renderer then measures the
+            // lines from those heights and drops the one that straddles
+            // each cut.
+            let line_metrics = if avoid_inside_holds(avoid_inside, child_h, self.strips.fresh()) {
                 Vec::new()
             } else {
                 collect_inline_line_metrics(child)
@@ -1460,9 +1480,12 @@ impl<'a> PaginationLayoutTree<'a> {
             // existing whole-emit path and avoids the children-sum
             // parent-height bug.
             //
-            // `break-inside: avoid` is overridden when the subtree is
-            // truly oversized (CSS Fragmentation §4.2 "unforced
-            // break"), so we still fall through to splitting.
+            // The gate does not read `break-inside` at all: a block with
+            // several children that does not fit the strip is entered and
+            // split in place whether or not it is `avoid` and whether or
+            // not it would fit a fresh page (F83b: Chrome moves such a
+            // box to the next page). An inline root with text children
+            // only never passes it (text nodes have no height).
             let child_node = self.doc.get_node(child_id);
             let has_splittable_children = child_node.is_some_and(|n| !n.children.is_empty());
             // fulgur-7hf5: multicol containers (`column-count > 1` /
@@ -1577,9 +1600,11 @@ impl<'a> PaginationLayoutTree<'a> {
             // No recursion needed — apply the existing strip-overflow
             // page advance for non-splittable / fits-fine children.
             // `break-inside: avoid` collapses to this path via
-            // `avoid_inside` above (it just suppresses the inline
+            // `avoid_inside_holds` above (it just suppresses the inline
             // split branch; remaining-strip overflow handling is
-            // identical).
+            // identical), and only for a box that fits a page. A taller
+            // inline root has gone through the line path above (F83); a
+            // taller box without lines is cut into strips below.
             if cursor_y > 0.0 && cursor_y + child_h > strips.bottom(page_index) {
                 page_index += 1;
                 cursor_y = 0.0;
@@ -8328,6 +8353,129 @@ h2 { string-set: chapter-title content(text); }
             );
         }
         assert_eq!(entry.line_slices[0].offset.to_f32(), 0.0);
+    }
+
+    // ── F83: `break-inside: avoid` on an inline root taller than a page ─────
+
+    /// `n` lines of 20 px, one per `<br>`.
+    fn lines_20px(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("<br>")
+    }
+
+    /// Fragment every node of `body` on 200 px pages (document margin 0, 20 px lines, `.av` is `break-inside:
+    /// avoid`) and return the document with the geometry.
+    fn avoid_fragments(body: &str) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        let html = format!(
+            "<!doctype html><html><head><style>body{{margin:0;font-size:16px;line-height:20px}}\
+             p{{margin:0}}.av{{break-inside:avoid}}</style></head><body>{body}</body></html>"
+        );
+        let mut doc = parse(&html, 600.0);
+        let table = blitz_adapter::extract_column_style_table(&doc);
+        let geom = run_pass_with_break_styles(doc.deref_mut(), 200.0_f32.as_px(), &table);
+        (doc, geom)
+    }
+
+    /// `(page, y, height)` of every fragment and `(first, end, offset)` of every slice.
+    type Shape = (Vec<(u32, f32, f32)>, Vec<(u32, u32, f32)>);
+
+    /// What one node's geometry holds, for comparing two runs: page, y, height of every fragment and the line range
+    /// and offset of every slice.
+    fn shape_of(g: &PaginationGeometry) -> Shape {
+        (
+            g.fragments
+                .iter()
+                .map(|f| (f.page_index, f.y.to_f32(), f.height.to_f32()))
+                .collect(),
+            g.line_slices
+                .iter()
+                .map(|s| (s.first, s.end, s.offset.to_f32()))
+                .collect(),
+        )
+    }
+
+    /// F83: a body-level `break-inside: avoid` paragraph of 800 px on 200 px pages is split between its line boxes
+    /// exactly like the same paragraph without the property (css-break-3 §4.4: `avoid` is relaxed when the box cannot
+    /// fit a fragmentainer). It used to be cut into strips by height, with no line ranges.
+    #[test]
+    fn avoid_paragraph_taller_than_a_page_splits_like_an_auto_one() {
+        let text = lines_20px(40);
+        let (avoid_doc, avoid) = avoid_fragments(&format!("<p class=\"av\">{text}</p>"));
+        let (auto_doc, auto) = avoid_fragments(&format!("<p class=\"x\">{text}</p>"));
+        let a = &avoid[&node_by_class(&avoid_doc, "av")];
+        let b = &auto[&node_by_class(&auto_doc, "x")];
+        assert!(a.fragments.len() >= 4, "{:?}", a.fragments);
+        assert_eq!(
+            a.line_slices.len(),
+            a.fragments.len(),
+            "one slice per fragment"
+        );
+        assert!(line_slices_tile(&a.line_slices, 40), "{:?}", a.line_slices);
+        assert_eq!(shape_of(a), shape_of(b), "the same fragments and slices");
+    }
+
+    /// An inline root that is not a `<p>` (direct text of a `div`) takes the same path.
+    #[test]
+    fn avoid_div_with_direct_text_taller_than_a_page_splits_like_an_auto_one() {
+        let text = lines_20px(40);
+        let (avoid_doc, avoid) = avoid_fragments(&format!("<div class=\"av\">{text}</div>"));
+        let (auto_doc, auto) = avoid_fragments(&format!("<div class=\"x\">{text}</div>"));
+        let a = &avoid[&node_by_class(&avoid_doc, "av")];
+        let b = &auto[&node_by_class(&auto_doc, "x")];
+        assert_eq!(a.line_slices.len(), a.fragments.len());
+        assert!(line_slices_tile(&a.line_slices, 40));
+        assert_eq!(shape_of(a), shape_of(b));
+    }
+
+    /// An avoid paragraph that fits a page is untouched: it does not fit the 50 px left under the spacer, so it
+    /// moves whole to the next page (page index 1) as one fragment, and records no slices.
+    #[test]
+    fn avoid_paragraph_that_fits_a_page_moves_whole() {
+        let (doc, geom) = avoid_fragments(&format!(
+            "<div style=\"height:150px\"></div><p class=\"av\">{}</p>",
+            lines_20px(5)
+        ));
+        let g = &geom[&node_by_class(&doc, "av")];
+        assert_eq!(g.fragments.len(), 1, "{:?}", g.fragments);
+        assert_eq!(g.fragments[0].page_index, 1);
+        assert_eq!(g.fragments[0].y.to_f32(), 0.0);
+        assert!(g.line_slices.is_empty(), "{:?}", g.line_slices);
+    }
+
+    /// The nested paths already recorded slices (`nested_line_split` never read `break-inside`): `div > p{avoid}`
+    /// and `div{avoid} > p`. Pinned so the body-level change does not touch them.
+    #[test]
+    fn avoid_paragraphs_in_a_div_keep_their_tiling_slices() {
+        let text = lines_20px(40);
+        for body in [
+            format!("<div><p class=\"av\">{text}</p></div>"),
+            format!("<div class=\"av\"><p class=\"t\">{text}</p></div>"),
+        ] {
+            let (doc, geom) = avoid_fragments(&body);
+            let p = &geom[&if body.contains("class=\"t\"") {
+                node_by_class(&doc, "t")
+            } else {
+                node_by_class(&doc, "av")
+            }];
+            assert!(p.fragments.len() >= 4, "{body}: {:?}", p.fragments);
+            assert_eq!(p.line_slices.len(), p.fragments.len(), "{body}");
+            assert!(line_slices_tile(&p.line_slices, 40), "{body}");
+        }
+    }
+
+    /// F83: `break-inside: avoid` holds while the box fits a page (1 px of slack, as the strip slicer has) and is
+    /// relaxed past that.
+    #[test]
+    fn avoid_inside_holds_only_while_the_box_fits_a_page() {
+        assert!(!avoid_inside_holds(false, 100.0, 1000.0), "auto");
+        assert!(!avoid_inside_holds(false, 5000.0, 1000.0), "auto, tall");
+        assert!(avoid_inside_holds(true, 100.0, 1000.0), "fits");
+        assert!(avoid_inside_holds(true, 1000.0, 1000.0), "exactly a page");
+        assert!(avoid_inside_holds(true, 1000.5, 1000.0), "within the slack");
+        assert!(!avoid_inside_holds(true, 1001.5, 1000.0), "past the slack");
+        assert!(!avoid_inside_holds(true, 7000.0, 1000.0), "taller");
     }
 
     #[test]

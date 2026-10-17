@@ -7390,6 +7390,29 @@ fn render_smoke_a_paragraph_over_many_a4_pages_loses_no_line_at_a_page_break() {
 }
 
 #[test]
+fn render_smoke_an_avoid_paragraph_over_many_a4_pages_loses_no_line() {
+    // F83: the twin of the test above with `break-inside: avoid`. The paragraph is taller than a page, so `avoid` is
+    // relaxed (css-break-3 §4.4) and it is split between its line boxes. It used to be cut into strips by height,
+    // without line ranges, and the line that straddled each cut was painted on no page.
+    let html = format!(
+        "<!doctype html><html><head><style>p{{margin:0}}</style></head><body>\
+         <p style=\"break-inside:avoid\">{}</p></body></html>",
+        numbered_words(7000)
+    );
+    let pdf = Engine::builder()
+        .system_fonts(false)
+        .strict_text(true)
+        .assets(noto_bundle())
+        .build()
+        .render(&html)
+        .expect("every word has a face");
+    assert!(page_count(&pdf) >= 10, "{} pages", page_count(&pdf));
+    if let Some(text) = extract_pdf_text(&pdf) {
+        assert_words_once_in_order(&text, 7000);
+    }
+}
+
+#[test]
 fn render_smoke_dropped_text_after_64_kib_is_found_once_and_only_it() {
     // `monospace` is unmapped here, so the `<code>` gets no glyph run (a named family inside a root that has a
     // face is drawn by Parley's fallback).
