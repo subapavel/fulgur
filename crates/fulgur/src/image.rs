@@ -94,27 +94,46 @@ fn check_size(w: u32, h: u32) -> Result<(), ImageError> {
     }
 }
 
-/// Decodes `data` completely and says whether it can be drawn.
+/// What [`validate_detailed`] found out about an image that can be drawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Validation {
+    pub kind: AssetKind,
+    /// `Some(reason)` for a JPEG that is embedded although it is damaged: truncated, without an end marker
+    /// or with stray bytes between header segments. Chrome and every viewer draw what is there and Krilla
+    /// passes the bytes through, so it is not refused; an invoice with a cut-off logo is better than one
+    /// with none. `None` for everything else.
+    pub damaged: Option<String>,
+}
+
+/// Decodes `data` completely and says whether it can be drawn; see [`validate_detailed`].
+pub fn validate(data: &[u8]) -> Result<AssetKind, ImageError> {
+    validate_detailed(data).map(|v| v.kind)
+}
+
+/// Decodes `data` and says whether it can be drawn, and whether it is damaged.
 ///
 /// Krilla reads only the header of a PNG or GIF when an image is created and decodes the pixels in
 /// `Document::finish()`, where a failure aborts the whole document; a JPEG is passed through after a
-/// header check without ever being decoded. This runs the decoders Krilla uses (`png`, `gif`) with the
-/// calls it makes, and `zune-jpeg` in strict mode (a truncated JPEG decodes without complaint
-/// otherwise), so that the verdict is known before the image reaches Krilla (HTML §4.8.4.1: an image
-/// "corrupted in some fatal way" is broken). SVG is parsed with `usvg` and no font database. The pixel
-/// count is checked against [`MAX_IMAGE_PIXELS`] from the header first.
+/// header check without ever being decoded. So a PNG or GIF is refused when it does not decode, with the
+/// decoders and calls Krilla uses (`png`, `gif`) and the pixel count checked against [`MAX_IMAGE_PIXELS`]
+/// from the header first. A JPEG is refused only when `zune-jpeg` cannot decode it at all, even leniently
+/// (a garbage header, an unsupported coding); one that decodes only leniently is accepted and reported in
+/// [`Validation::damaged`] (`zune-jpeg`'s strict mode is what notices truncation). A JPEG over the pixel
+/// limit is checked by its header only: nothing of ours decodes it. SVG is parsed with `usvg` and no font
+/// database.
 ///
 /// Costs one extra decode of the image.
-pub fn validate(data: &[u8]) -> Result<AssetKind, ImageError> {
+pub fn validate_detailed(data: &[u8]) -> Result<Validation, ImageError> {
     let kind = AssetKind::detect(data);
+    let ok = |damaged| Ok(Validation { kind, damaged });
     match kind {
         AssetKind::Unknown => Err(ImageError::Unsupported),
         AssetKind::Svg => usvg::Tree::from_data(data, &usvg::Options::default())
-            .map(|_| kind)
-            .map_err(|e| ImageError::Corrupt(e.to_string())),
-        AssetKind::Raster(ImageFormat::Png) => validate_png(data).map(|()| kind),
-        AssetKind::Raster(ImageFormat::Jpeg) => validate_jpeg(data).map(|()| kind),
-        AssetKind::Raster(ImageFormat::Gif) => validate_gif(data).map(|()| kind),
+            .map_err(|e| ImageError::Corrupt(e.to_string()))
+            .and_then(|_| ok(None)),
+        AssetKind::Raster(ImageFormat::Png) => validate_png(data).and_then(|()| ok(None)),
+        AssetKind::Raster(ImageFormat::Jpeg) => validate_jpeg(data).and_then(ok),
+        AssetKind::Raster(ImageFormat::Gif) => validate_gif(data).and_then(|()| ok(None)),
     }
 }
 
@@ -134,82 +153,32 @@ fn validate_png(data: &[u8]) -> Result<(), ImageError> {
     Ok(())
 }
 
-fn validate_jpeg(data: &[u8]) -> Result<(), ImageError> {
-    match decode_jpeg_strictly(data) {
-        Err((_, true)) => {
-            // Strict mode refuses padding between header segments, which libjpeg skips with a warning
-            // and viewers draw. Take the padding out and decode strictly again: the entropy-coded data
-            // is still held to the strict standard, so a truncated file stays refused.
-            match strip_jpeg_header_padding(data) {
-                Some(clean) => decode_jpeg_strictly(&clean).map_err(|(e, _)| e),
-                None => decode_jpeg_strictly(data).map_err(|(e, _)| e),
-            }
-        }
-        result => result.map_err(|(e, _)| e),
-    }
-}
-
-/// `zune-jpeg` in strict mode. The `bool` of an error says it is the header-padding refusal that
-/// [`strip_jpeg_header_padding`] repairs, as opposed to a refusal of the image data.
-fn decode_jpeg_strictly(data: &[u8]) -> Result<(), (ImageError, bool)> {
-    use zune_jpeg::errors::DecodeErrors;
+/// `Ok(Some(reason))` when the JPEG decodes leniently but not strictly.
+fn validate_jpeg(data: &[u8]) -> Result<Option<String>, ImageError> {
     use zune_jpeg::zune_core::options::DecoderOptions;
-    let corrupt = |e: DecodeErrors| {
-        // The one strict-mode error that concerns the headers only: "Extra bytes between headers"
-        // (zune-jpeg 0.5 `decoder.rs`, `parse_marker`). Everything else, "Exhausted data" and
-        // "Premature end of buffer" among them, is about the data and stays fatal. Matched on the
-        // text because the library has no variant for it.
-        let padding = matches!(&e, DecodeErrors::FormatStatic(m) if m.starts_with("[strict-mode]: Extra bytes"));
-        (ImageError::Corrupt(e.to_string()), padding)
-    };
-    let options = DecoderOptions::default().set_strict_mode(true);
-    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(data), options);
-    decoder.decode_headers().map_err(corrupt)?;
-    let (w, h) = decoder.dimensions().ok_or_else(|| {
-        (
-            ImageError::Corrupt("failed to read image dimensions".into()),
-            false,
-        )
-    })?;
-    check_size(w as u32, h as u32).map_err(|e| (e, false))?;
-    decoder.decode().map_err(corrupt)?;
-    Ok(())
-}
-
-/// `data` without the bytes between its header segments that are not part of a segment (ITU-T T.81
-/// §B.1.1.2 allows `0xFF` fill before a marker; other padding is what some writers leave), up to the
-/// start of the first scan, which and everything after it is copied unchanged. `None` when `data` is
-/// not a JPEG that reaches a scan through well-formed segments.
-fn strip_jpeg_header_padding(data: &[u8]) -> Option<Vec<u8>> {
-    if !data.starts_with(&[0xff, 0xd8]) {
-        return None;
+    let corrupt = |e: zune_jpeg::errors::DecodeErrors| ImageError::Corrupt(e.to_string());
+    let decoder =
+        |options| zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(data), options);
+    // The header, leniently, as Krilla reads it.
+    let mut headers = decoder(DecoderOptions::default());
+    headers.decode_headers().map_err(corrupt)?;
+    let (w, h) = headers
+        .dimensions()
+        .ok_or_else(|| ImageError::Corrupt("failed to read image dimensions".into()))?;
+    if check_size(w as u32, h as u32).is_err() {
+        // Krilla passes a JPEG through undecoded: only our own decode needs the limit.
+        return Ok(None);
     }
-    let mut out = vec![0xff, 0xd8];
-    let mut i = 2;
-    loop {
-        while *data.get(i)? != 0xff {
-            i += 1;
-        }
-        while *data.get(i + 1)? == 0xff {
-            i += 1;
-        }
-        match *data.get(i + 1)? {
-            0x00 => i += 2,
-            0xda => {
-                out.extend_from_slice(&data[i..]);
-                return Some(out);
-            }
-            0xd9 => return None,
-            0x01 | 0xd0..=0xd8 => {
-                out.extend_from_slice(&data[i..i + 2]);
-                i += 2;
-            }
-            _ => {
-                let len = usize::from(u16::from_be_bytes([*data.get(i + 2)?, *data.get(i + 3)?]));
-                let end = i + 2 + len;
-                out.extend_from_slice(data.get(i..end)?);
-                i = end;
-            }
+    let strict = decoder(DecoderOptions::default().set_strict_mode(true))
+        .decode()
+        .map(|_| ());
+    match strict {
+        Ok(()) => Ok(None),
+        Err(strict_error) => {
+            decoder(DecoderOptions::default())
+                .decode()
+                .map_err(corrupt)?;
+            Ok(Some(strict_error.to_string().trim_matches('"').to_string()))
         }
     }
 }
@@ -760,19 +729,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_truncated_jpeg_and_gif() {
-        let sos = JPEG.windows(2).position(|w| w == [0xff, 0xda]).unwrap();
-        assert!(is_corrupt(validate(&JPEG[..sos + (JPEG.len() - sos) / 2])));
-        assert!(is_corrupt(validate(&JPEG[..10])));
-        let sos = JPEG_PROGRESSIVE
-            .windows(2)
-            .position(|w| w == [0xff, 0xda])
-            .unwrap();
-        assert!(is_corrupt(validate(
-            &JPEG_PROGRESSIVE[..sos + (JPEG_PROGRESSIVE.len() - sos) / 2]
-        )));
+    fn validate_rejects_truncated_gif_and_empty_gif() {
+        // Krilla decodes a GIF at `finish()` and fails the document, so a truncated one is refused (a
+        // JPEG is not: see `damaged_jpegs_are_passed_through_like_krilla_does`).
         assert!(is_corrupt(validate(&GIF[..GIF.len() / 2])));
-        // A header and nothing else.
         assert!(is_corrupt(validate(MINIMAL_GIF)));
     }
 
@@ -790,14 +750,9 @@ mod tests {
             validate(&huge),
             Err(ImageError::TooLarge { w: 20000, h: 20000 })
         );
-        // A JPEG whose SOF says 12000 x 12000 (144 Mpx): within zune-jpeg's own 16384 limit, over ours.
+        // A JPEG is not subject to the limit: see `a_jpeg_above_the_pixel_cap_is_checked_by_header_only`.
         let mut jpeg = JPEG.to_vec();
         let sof = jpeg.windows(2).position(|w| w == [0xff, 0xc0]).unwrap();
-        jpeg[sof + 5..sof + 9].copy_from_slice(&[0x2e, 0xe0, 0x2e, 0xe0]);
-        assert_eq!(
-            validate(&jpeg),
-            Err(ImageError::TooLarge { w: 12000, h: 12000 })
-        );
         // Wider than zune-jpeg decodes at all: refused as well (Krilla's header check says the same).
         jpeg[sof + 5..sof + 9].copy_from_slice(&[0xea, 0x60, 0xea, 0x60]);
         assert!(validate(&jpeg).is_err());
@@ -848,41 +803,63 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_jpeg_with_stray_bytes_between_headers() {
-        // libjpeg skips them with a warning, viewers draw the image, and Krilla embeds it; zune-jpeg's
-        // strict mode refuses it ("Extra bytes between headers").
-        for original in [JPEG, JPEG_PROGRESSIVE, JPEG_CMYK, JPEG_GRAY] {
-            for n in [1, 3, 6, 40] {
-                let stray = with_stray_bytes(original, n);
-                assert_eq!(
-                    validate(&stray),
-                    Ok(AssetKind::Raster(ImageFormat::Jpeg)),
-                    "{n} stray bytes"
-                );
-                let stray = Arc::new(stray);
-                assert!(krilla_image(&ImageCache::default(), &stray, ImageFormat::Jpeg).is_some());
-            }
+    fn damaged_jpegs_are_passed_through_like_krilla_does() {
+        // Krilla never decodes a JPEG; Chrome and viewers draw what is there. Only a JPEG that no
+        // decoder can read at all is refused; one that decodes non-strictly is accepted.
+        let cut = |data: &[u8], keep: f32| {
+            let sos = data.windows(2).position(|w| w == [0xff, 0xda]).unwrap();
+            data[..sos + ((data.len() - sos) as f32 * keep) as usize].to_vec()
+        };
+        for (what, data) in [
+            ("stray header bytes", with_stray_bytes(JPEG, 3)),
+            ("stray bytes before APP", with_stray_bytes(JPEG, 6)),
+            ("cmyk with stray bytes", with_stray_bytes(JPEG_CMYK, 40)),
+            ("truncated at 99 %", cut(JPEG, 0.99)),
+            ("truncated at 50 %", cut(JPEG, 0.5)),
+            ("progressive truncated", cut(JPEG_PROGRESSIVE, 0.6)),
+            ("no EOI", JPEG[..JPEG.len() - 2].to_vec()),
+        ] {
+            assert_eq!(
+                validate(&data),
+                Ok(AssetKind::Raster(ImageFormat::Jpeg)),
+                "{what}"
+            );
+            let data = Arc::new(data);
+            assert!(
+                krilla_image(&ImageCache::default(), &data, ImageFormat::Jpeg).is_some(),
+                "{what}"
+            );
         }
     }
 
     #[test]
-    fn stray_header_bytes_do_not_excuse_a_truncated_scan() {
-        for original in [JPEG, JPEG_PROGRESSIVE] {
-            let stray = with_stray_bytes(original, 3);
-            let sos = stray.windows(2).position(|w| w == [0xff, 0xda]).unwrap();
-            let cut = &stray[..sos + (stray.len() - sos) / 2];
-            assert!(is_corrupt(validate(cut)));
-        }
+    fn jpegs_that_do_not_decode_at_all_are_refused() {
+        assert!(is_corrupt(validate(&JPEG[..10])));
+        let mut broken = JPEG.to_vec();
+        broken[2..30].fill(0x11);
+        assert!(validate(&broken).is_err());
     }
 
     #[test]
-    fn jpeg_header_padding_is_removed_up_to_the_scan_only() {
-        let stray = with_stray_bytes(JPEG, 5);
-        assert_eq!(strip_jpeg_header_padding(&stray).as_deref(), Some(JPEG));
-        // Nothing to strip: the same bytes come back.
-        assert_eq!(strip_jpeg_header_padding(JPEG).as_deref(), Some(JPEG));
-        // Not a JPEG, or no scan: nothing to repair.
-        assert_eq!(strip_jpeg_header_padding(b"\xff\xd8"), None);
-        assert_eq!(strip_jpeg_header_padding(b"GIF89a"), None);
+    fn a_jpeg_above_the_pixel_cap_is_checked_by_header_only() {
+        // Krilla passes a JPEG through undecoded, so the cap (which bounds our decode) does not apply:
+        // 12000 x 12000 is 144 Mpx and is embedded as it was before F32a. PNG and GIF, which Krilla
+        // does decode, stay refused (`validate_refuses_huge_headers_before_decoding`).
+        let mut jpeg = JPEG.to_vec();
+        let sof = jpeg.windows(2).position(|w| w == [0xff, 0xc0]).unwrap();
+        jpeg[sof + 5..sof + 9].copy_from_slice(&[0x2e, 0xe0, 0x2e, 0xe0]);
+        assert_eq!(validate(&jpeg), Ok(AssetKind::Raster(ImageFormat::Jpeg)));
+    }
+
+    #[test]
+    fn validate_detailed_says_when_a_jpeg_is_embedded_although_damaged() {
+        let intact = validate_detailed(JPEG).unwrap();
+        assert_eq!(intact.damaged, None);
+        let sos = JPEG.windows(2).position(|w| w == [0xff, 0xda]).unwrap();
+        let cut = validate_detailed(&JPEG[..sos + (JPEG.len() - sos) / 2]).unwrap();
+        assert_eq!(cut.kind, AssetKind::Raster(ImageFormat::Jpeg));
+        assert!(cut.damaged.is_some_and(|why| !why.is_empty()));
+        let stray = validate_detailed(&with_stray_bytes(JPEG, 3)).unwrap();
+        assert!(stray.damaged.is_some_and(|why| why.contains("Extra bytes")));
     }
 }

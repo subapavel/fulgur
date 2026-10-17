@@ -7535,6 +7535,23 @@ mod seed_image_natural_size_tests {
         }
     }
 
+    /// A line break right after the overflowing box does not add a line either: `revert()` in the Blitz
+    /// fork's `break_lines` also takes back the empty line that follows a line which overflowed and ends
+    /// with a `<br>`. CSS gives the same: a `<br>` ends its line and creates no line of its own, and
+    /// Chrome's `<img wide><br>x` has the box line and the text line, nothing in between. A text line
+    /// after the `<br>` is kept (`img_wider_than_the_line_keeps_its_neighbours_on_their_own_lines`).
+    #[test]
+    fn a_br_after_an_overflowing_img_adds_no_line() {
+        let b = bundle("a.png", png_header(700, 100));
+        for html in [
+            r#"<body style="margin:0"><img src="a.png"><br></body>"#,
+            r#"<body style="margin:0"><img src="a.png"><br><br></body>"#,
+        ] {
+            let (lines, _) = lines_around_img(html, 400.0, &b);
+            assert_eq!(lines, vec![(0.0, 100.0, 1)], "{html}");
+        }
+    }
+
     #[test]
     fn svg_root_size_is_the_natural_size() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="#f00"/></svg>"##;
