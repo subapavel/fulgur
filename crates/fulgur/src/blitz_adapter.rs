@@ -1136,23 +1136,24 @@ fn walk_for_column_styles(doc: &HtmlDocument, node_id: usize, out: &mut String, 
         return;
     };
     if let Some(el) = node.element_data()
+        && matches!(el.name.local.as_ref(), "template" | "noscript")
+    {
+        // F87 review: the contents of a `<template>` are inert and a browser with scripting on treats `<noscript>`
+        // as text, so a `<style>` in either never applies (an unlayered rule was read from them on main too).
+        return;
+    }
+    if let Some(el) = node.element_data()
         && el.name.local.as_ref() == "style"
     {
-        // Honour `<style media="...">`: skip sheets whose media query
-        // excludes the PDF render target. Phase A uses a simple token scan
-        // that accepts the attribute when absent, empty, or contains `all`
-        // / `print`. `screen` / `speech` / anything else means "don't fold
-        // these rules into the column side-table". Full media-query
-        // evaluation (size ranges, logical operators, etc.) is deferred —
-        // the common author intent of `media="screen"` vs `media="print"`
-        // is what we need to get right here.
+        // Honour `<style media="...">`: skip sheets whose media query list does not match the PDF render target,
+        // which is print. The attribute is evaluated as a media query list on a print device (F87 review: it was a
+        // substring test, so `not print` counted as print). `htmltopdf` swaps `print` and `screen` in CSS text, not in
+        // attributes, hence print here and `READER_MEDIA_TYPE` for the at-rules. A feature query on a matching type
+        // keeps the sheet (`print and (min-width: 1px)`), as the old test did.
         if let Some(media) = el.attr(blitz_dom::LocalName::from("media")) {
-            let lower = media.to_ascii_lowercase();
-            let applies = lower.split(',').any(|tok| {
-                let t = tok.trim();
-                t.is_empty() || t == "all" || t.contains("print")
-            });
-            if !applies {
+            let mut input = cssparser::ParserInput::new(media);
+            let mut parser = cssparser::Parser::new(&mut input);
+            if !crate::column_css::media_query_list_matches_on(&mut parser, "print", true) {
                 return;
             }
         }
@@ -6596,6 +6597,81 @@ mod tests {
         // No media attribute: rule applies (default = all).
         let n_rule = table.get(&n).and_then(|props| props.rule).expect("n rule");
         assert_eq!(n_rule.color, [0, 128, 0, 255]);
+    }
+
+    /// F87 review: the `media` attribute of a `<style>` is a media query list evaluated for print (the embedding
+    /// crate swaps `print` and `screen` in CSS text, not in attributes), not a substring test. `not print` is not
+    /// print; a query with features keeps the sheet when its type matches (it applied before, whole).
+    #[test]
+    fn extract_column_style_table_evaluates_the_media_attribute() {
+        let cases: &[(&str, bool)] = &[
+            ("", true),
+            ("all", true),
+            ("print", true),
+            ("PRINT", true),
+            ("only print", true),
+            ("print, screen", true),
+            ("screen, print", true),
+            ("print and (min-width: 1px)", true),
+            ("all and (orientation: portrait)", true),
+            ("not screen", true),
+            ("screen", false),
+            ("not print", false),
+            ("not all", false),
+            ("only screen", false),
+            ("screen and (hover: hover)", false),
+            ("speech", false),
+            ("not print and (color)", false),
+        ];
+        for (media, applies) in cases {
+            let html = format!(
+                r#"<html><head><style media="{media}">.k {{ break-before: page }}</style></head>
+                   <body><p class="k" id="k">x</p></body></html>"#
+            );
+            let mut doc = parse(&html, 400.0, &[]);
+            resolve(&mut doc);
+            use std::ops::Deref;
+            let k = find_element_by_attr_id(doc.deref(), "k");
+            let table = extract_column_style_table(&doc);
+            assert_eq!(
+                table.get(&k).is_some_and(|p| p.break_before.is_some()),
+                *applies,
+                "media={media:?}"
+            );
+        }
+    }
+
+    /// F87 review: a `<style>` inside `<template>` or `<noscript>` is never applied by a browser (the template is
+    /// inert, scripting is on), so its rules, layered or not, do not reach the side table.
+    #[test]
+    fn extract_column_style_table_skips_template_and_noscript_styles() {
+        for wrap in ["template", "noscript"] {
+            for css in [
+                ".k { break-before: page }",
+                "@layer u { .k { break-before: page } }",
+            ] {
+                let html = format!(
+                    r#"<html><head></head><body><{wrap}><style>{css}</style></{wrap}>
+                       <p class="k" id="k">x</p></body></html>"#
+                );
+                let mut doc = parse(&html, 400.0, &[]);
+                resolve(&mut doc);
+                use std::ops::Deref;
+                let k = find_element_by_attr_id(doc.deref(), "k");
+                assert!(
+                    !extract_column_style_table(&doc).contains_key(&k),
+                    "<{wrap}> {css}"
+                );
+            }
+        }
+        // A sibling `<style>` still applies.
+        let html = r#"<html><body><template><style>.z{x:y}</style></template>
+            <style>.k { break-before: page }</style><p class="k" id="k">x</p></body></html>"#;
+        let mut doc = parse(html, 400.0, &[]);
+        resolve(&mut doc);
+        use std::ops::Deref;
+        let k = find_element_by_attr_id(doc.deref(), "k");
+        assert!(extract_column_style_table(&doc).contains_key(&k));
     }
 
     #[test]

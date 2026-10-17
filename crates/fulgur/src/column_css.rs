@@ -504,26 +504,54 @@ fn parse_break_inside_value<'i>(
     }
 }
 
+/// Value of `break-before` / `break-after`, as the side table models it: `true` is a forced page break.
+///
+/// css-break-3 §3.1: `break-*` takes `auto | avoid | avoid-page | page | left | right | recto | verso | avoid-column |
+/// column` (and region values, which are dropped). `avoid*` and `column` force no page break (`column` only breaks
+/// columns, and the table has no column breaks); what matters is that a later one overrides an earlier `page`.
+/// §3.4: the legacy `page-break-*` takes `auto | always | avoid | left | right`; `always` is not a value of
+/// `break-*` (Chrome ignores it there), and `page`, `recto`, `verso`, `column`, `avoid-page` are not legacy values.
+fn parse_break_forced<'i>(
+    input: &mut Parser<'i, '_>,
+    legacy: bool,
+) -> Result<bool, ParseError<'i, ()>> {
+    let ident = input.expect_ident()?.clone();
+    let lower = ident.as_ref().to_ascii_lowercase();
+    let forced = match (lower.as_str(), legacy) {
+        ("auto" | "avoid", _) => false,
+        ("left" | "right", _) => true,
+        ("always", true) => true,
+        ("avoid-page" | "avoid-column" | "column", false) => false,
+        ("page" | "recto" | "verso", false) => true,
+        _ => return Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid)),
+    };
+    Ok(forced)
+}
+
 fn parse_break_after_value<'i>(
     input: &mut Parser<'i, '_>,
+    legacy: bool,
 ) -> Result<BreakAfter, ParseError<'i, ()>> {
-    let ident = input.expect_ident()?.clone();
-    match ident.as_ref().to_ascii_lowercase().as_str() {
-        "always" | "page" | "left" | "right" | "recto" | "verso" => Ok(BreakAfter::Page),
-        "auto" => Ok(BreakAfter::Auto),
-        _ => Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid)),
-    }
+    parse_break_forced(input, legacy).map(|f| {
+        if f {
+            BreakAfter::Page
+        } else {
+            BreakAfter::Auto
+        }
+    })
 }
 
 fn parse_break_before_value<'i>(
     input: &mut Parser<'i, '_>,
+    legacy: bool,
 ) -> Result<BreakBefore, ParseError<'i, ()>> {
-    let ident = input.expect_ident()?.clone();
-    match ident.as_ref().to_ascii_lowercase().as_str() {
-        "always" | "page" | "left" | "right" | "recto" | "verso" => Ok(BreakBefore::Page),
-        "auto" => Ok(BreakBefore::Auto),
-        _ => Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid)),
-    }
+    parse_break_forced(input, legacy).map(|f| {
+        if f {
+            BreakBefore::Page
+        } else {
+            BreakBefore::Auto
+        }
+    })
 }
 
 /// Parse a `page: auto | <custom-ident>` value. CSS Page 3 §5.3 defines
@@ -725,13 +753,15 @@ fn parse_value_into(props: &mut ColumnStyleProps, name: &str, input: &mut Parser
     } else if name.eq_ignore_ascii_case("break-after")
         || name.eq_ignore_ascii_case("page-break-after")
     {
-        if let Ok(v) = input.parse_entirely(parse_break_after_value) {
+        let legacy = name.eq_ignore_ascii_case("page-break-after");
+        if let Ok(v) = input.parse_entirely(|i| parse_break_after_value(i, legacy)) {
             props.break_after = Some(v);
         }
     } else if name.eq_ignore_ascii_case("break-before")
         || name.eq_ignore_ascii_case("page-break-before")
     {
-        if let Ok(v) = input.parse_entirely(parse_break_before_value) {
+        let legacy = name.eq_ignore_ascii_case("page-break-before");
+        if let Ok(v) = input.parse_entirely(|i| parse_break_before_value(i, legacy)) {
             props.break_before = Some(v);
         }
     } else if name.eq_ignore_ascii_case("page") {
@@ -1115,11 +1145,22 @@ impl LayerTree {
 /// deprecated type, or any syntax the reader does not know does not match: the block is skipped, which leaves today's
 /// value. A comma separates queries, any one of which may match. An empty list matches (§2.1).
 pub(crate) fn media_query_list_matches(input: &mut Parser<'_, '_>) -> bool {
+    media_query_list_matches_on(input, READER_MEDIA_TYPE, false)
+}
+
+/// [`media_query_list_matches`] for a device of type `device`. With `features_match`, `<type> and <features>` is
+/// taken to match when the type does (the features cannot be evaluated here): the `media` attribute of a `<style>`
+/// applied or not as a whole, so a sheet for `print and (min-width: 1px)` must stay on for a print device.
+pub(crate) fn media_query_list_matches_on(
+    input: &mut Parser<'_, '_>,
+    device: &str,
+    features_match: bool,
+) -> bool {
     use cssparser::Delimiter;
     let mut any = input.is_exhausted();
     while !input.is_exhausted() {
         let query = input.parse_until_before(Delimiter::Comma, |i| {
-            Ok::<bool, ParseError<'_, ()>>(media_query_matches(i))
+            Ok::<bool, ParseError<'_, ()>>(media_query_matches(i, device, features_match))
         });
         any |= query.unwrap_or(false);
         // Consume the comma; at the end of the input there is none.
@@ -1128,7 +1169,7 @@ pub(crate) fn media_query_list_matches(input: &mut Parser<'_, '_>) -> bool {
     any
 }
 
-fn media_query_matches(input: &mut Parser<'_, '_>) -> bool {
+fn media_query_matches(input: &mut Parser<'_, '_>, device: &str, features_match: bool) -> bool {
     let Ok(first) = input.expect_ident_cloned() else {
         return false;
     };
@@ -1145,18 +1186,24 @@ fn media_query_matches(input: &mut Parser<'_, '_>) -> bool {
     } else {
         (false, first)
     };
-    if !input.is_exhausted() {
-        return false;
-    }
     let is_all = media_type.eq_ignore_ascii_case("all");
-    let is_device = media_type.eq_ignore_ascii_case(READER_MEDIA_TYPE);
+    let is_device = media_type.eq_ignore_ascii_case(device);
     // `not` negates a known type only: `not speech` is not "matches everything".
     let is_other_known =
         media_type.eq_ignore_ascii_case("print") || media_type.eq_ignore_ascii_case("screen");
     if !(is_all || is_device || is_other_known) {
         return false;
     }
-    (is_all || is_device) != negated
+    let type_matches = is_all || is_device;
+    if !input.is_exhausted() {
+        // `<type> and <features>`: only with the optimistic reading, and never under `not` (a negated feature
+        // list is not the negated type).
+        let has_and = input.expect_ident_matching("and").is_ok();
+        // The segment must be consumed whole for `parse_until_before`.
+        while input.next().is_ok() {}
+        return features_match && has_and && !negated && type_matches;
+    }
+    type_matches != negated
 }
 
 /// Parse a top-level CSS source into [`StyleRule`]s, in ascending cascade order. Qualified rules whose prelude
@@ -2168,8 +2215,9 @@ mod tests {
 
     #[test]
     fn parse_break_after_always_inline() {
+        // `always` is a value of the legacy `page-break-after` only (css-break-3 §3.4; F87 review).
         let props = parse_inline_style("break-after: always");
-        assert_eq!(props.break_after, Some(BreakAfter::Page));
+        assert_eq!(props.break_after, None);
     }
 
     #[test]
@@ -2181,7 +2229,7 @@ mod tests {
     #[test]
     fn parse_break_before_always_inline() {
         let props = parse_inline_style("break-before: always");
-        assert_eq!(props.break_before, Some(BreakBefore::Page));
+        assert_eq!(props.break_before, None);
     }
 
     #[test]
@@ -2422,7 +2470,10 @@ mod tests {
 
     #[test]
     fn parses_break_before_always() {
+        // Not a value of `break-before` (F87 review); `page-break-before: always` is.
         let props = parse_declaration_block("break-before: always;");
+        assert_eq!(props.break_before, None);
+        let props = parse_declaration_block("page-break-before: always;");
         assert_eq!(
             props.break_before,
             Some(crate::draw_primitives::BreakBefore::Page)
@@ -3159,5 +3210,89 @@ mod tests {
             ),
             Some(Avoid)
         );
+    }
+    // -------- break-before / break-after values (F87 review) --------
+
+    fn before_after(css: &str) -> (Option<BreakBefore>, Option<BreakAfter>) {
+        let p = parse_declaration_block(css);
+        (p.break_before, p.break_after)
+    }
+
+    #[test]
+    fn avoid_and_column_values_map_to_no_forced_break() {
+        // css-break-3 §3.1. The table models "forced page break" or "none"; `avoid*` and `column` (outside a
+        // multicol) are none, and an unknown region value is dropped.
+        for v in [
+            "auto",
+            "avoid",
+            "avoid-page",
+            "avoid-column",
+            "column",
+            "AVOID-PAGE",
+        ] {
+            assert_eq!(
+                before_after(&format!("break-before:{v};break-after:{v}")),
+                (Some(BreakBefore::Auto), Some(BreakAfter::Auto)),
+                "{v}"
+            );
+        }
+        for v in ["page", "left", "right", "recto", "verso"] {
+            assert_eq!(
+                before_after(&format!("break-before:{v};break-after:{v}")),
+                (Some(BreakBefore::Page), Some(BreakAfter::Page)),
+                "{v}"
+            );
+        }
+        for v in ["region", "avoid-region", "banana", "page page"] {
+            assert_eq!(
+                before_after(&format!("break-before:{v};break-after:{v}")),
+                (None, None),
+                "{v}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_later_avoid_value_overrides_an_earlier_page() {
+        // `bf_page_then_always` of the validator: Chrome, page 1.
+        for v in ["avoid", "avoid-page", "avoid-column", "column"] {
+            assert_eq!(
+                before_after(&format!(
+                    "break-before:page;break-before:{v};break-after:page;break-after:{v}"
+                )),
+                (Some(BreakBefore::Auto), Some(BreakAfter::Auto)),
+                "{v}"
+            );
+        }
+    }
+
+    #[test]
+    fn always_is_a_value_of_the_legacy_properties_only() {
+        // css-break-3 §3.4: `page-break-*` takes `auto | always | avoid | left | right`; `break-*` has no `always`
+        // (Chrome ignores `break-before: always`, and keeps an earlier `page`).
+        assert_eq!(
+            before_after("break-before:always;break-after:always"),
+            (None, None)
+        );
+        assert_eq!(
+            before_after("page-break-before:always;page-break-after:always"),
+            (Some(BreakBefore::Page), Some(BreakAfter::Page))
+        );
+        assert_eq!(
+            before_after("break-before:page;break-before:always"),
+            (Some(BreakBefore::Page), None)
+        );
+        // `avoid` maps through the alias too, and the new-only values are not legacy ones.
+        assert_eq!(
+            before_after("page-break-before:page;page-break-before:avoid"),
+            (Some(BreakBefore::Auto), None)
+        );
+        for v in ["page", "recto", "verso", "column", "avoid-page"] {
+            assert_eq!(
+                before_after(&format!("page-break-before:{v};page-break-after:{v}")),
+                (None, None),
+                "{v}"
+            );
+        }
     }
 }
