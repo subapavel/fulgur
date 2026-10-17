@@ -3849,17 +3849,6 @@ fn paragraph_lines_for_page(
         return Some(rebase_lines(&all_lines[first..end], slice.offset.in_pt()));
     }
 
-    log::warn!(
-        "paragraph \"{}\" is split over {} pages but its fragmenter recorded no matching line ranges \
-         ({} slices for {} fragments, {} lines); measuring its lines from the fragment heights, \
-         which can skip or repeat a line",
-        paragraph_start(all_lines),
-        fragments.len(),
-        line_slices.len(),
-        fragments.len(),
-        all_lines.len()
-    );
-
     let target_h = fragments[target_pos].height.in_pt();
     let consumed: crate::units::Pt = fragments[..target_pos]
         .iter()
@@ -3894,7 +3883,29 @@ fn paragraph_lines_for_page(
         return None;
     }
 
+    // Measuring can only be wrong when the paragraph really is cut between lines: more than one line, and this page
+    // gets some of them. A whole paragraph inside a block the block fragmenter split (one line, or every line on one
+    // page) is drawn once either way.
+    if measured_cut_is_partial(all_lines.len(), start_idx, end_idx) {
+        log::warn!(
+            "paragraph \"{}\" is split over {} pages but its fragmenter recorded no matching line ranges \
+             ({} slices for {} fragments, {} lines); measuring its lines from the fragment heights, \
+             which can skip or repeat a line",
+            paragraph_start(all_lines),
+            fragments.len(),
+            line_slices.len(),
+            fragments.len(),
+            all_lines.len()
+        );
+    }
+
     Some(rebase_lines(&all_lines[start_idx..end_idx], consumed))
+}
+
+/// Whether a page whose lines `[start, end)` were measured from fragment heights holds only some of a paragraph of
+/// `n` lines, the one case where that measuring can skip or repeat a line.
+fn measured_cut_is_partial(n: usize, start: usize, end: usize) -> bool {
+    n > 1 && end > start && (start > 0 || end < n)
 }
 
 /// Copies of `lines` moved up by `by`: paragraph-absolute coords (baseline +
@@ -5604,6 +5615,16 @@ mod tests {
         // counted too little per page and painted a line on two pages.
         let (lines, boxes) = synthetic_paragraph(3000, 20.4, 20.0);
         assert_pages_hold_the_planned_lines(&lines, &boxes);
+    }
+
+    #[test]
+    fn measured_cut_is_partial_only_for_some_lines_of_several() {
+        assert!(!measured_cut_is_partial(1, 0, 1), "one line");
+        assert!(!measured_cut_is_partial(3, 0, 3), "whole paragraph");
+        assert!(!measured_cut_is_partial(3, 3, 3), "no lines on this page");
+        assert!(measured_cut_is_partial(3, 0, 2), "head");
+        assert!(measured_cut_is_partial(3, 2, 3), "tail");
+        assert!(measured_cut_is_partial(3, 1, 2), "middle");
     }
 
     #[test]
