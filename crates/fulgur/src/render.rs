@@ -5331,6 +5331,7 @@ mod tests {
                 .collect(),
             is_repeat: false,
             line_split_insets: insets.map(|(t, b)| (t.as_px(), b.as_px())),
+            ..Default::default()
         }
     }
 

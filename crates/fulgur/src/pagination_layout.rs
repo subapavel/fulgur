@@ -84,6 +84,39 @@ pub struct Fragment {
     pub height: crate::units::Px,
 }
 
+/// F78: the lines `[first, end)` of an inline root that one [`Fragment`] holds.
+///
+/// A fragmenter that splits a paragraph between line boxes decides the line
+/// ranges once, here, and the renderer paints exactly these lines: deriving the
+/// range a second time from float heights drifts (Parley advances `y` by the
+/// unrounded `line-height` while a quantised line box is taller or shorter, so
+/// consecutive boxes overlap or leave gaps) and loses or repeats a line.
+///
+/// `offset` is the distance from the top of the paragraph's first line box to
+/// the top of line `first`, in the fragmenter's own coordinate: the renderer
+/// moves the lines of the fragment up by it, which puts line `first` where line 0
+/// sits on the first page. It is the base
+/// [`record_split_inline_root_descendants`] uses for inline boxes, so text and
+/// images agree on every page.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineSlice {
+    pub first: u32,
+    pub end: u32,
+    pub offset: crate::units::Px,
+}
+
+/// Whether `slices` are contiguous, start at line 0 and cover exactly `0..n`.
+fn line_slices_tile(slices: &[LineSlice], n: usize) -> bool {
+    let mut next = 0u32;
+    for s in slices {
+        if s.first != next || s.end <= s.first {
+            return false;
+        }
+        next = s.end;
+    }
+    next as usize == n
+}
+
 /// Per-source-node geometry: every page on which the node has a placement.
 ///
 /// For the block-only fragmenter the vector is normally length 1 (the node
@@ -115,6 +148,11 @@ pub struct PaginationGeometry {
     /// `(top, bottom)` px bigger, the top on every fragment and the bottom on the
     /// last. `None` for everything else.
     pub line_split_insets: Option<(crate::units::Px, crate::units::Px)>,
+    /// F78: for an inline root split between line boxes by
+    /// [`fragment_inline_root`] or [`fragment_nested_inline_root`], the lines each
+    /// fragment holds, parallel to `fragments`. Empty for everything else (the
+    /// renderer then measures the lines itself, with a warning).
+    pub line_slices: Vec<LineSlice>,
 }
 
 impl PaginationGeometry {
@@ -3589,14 +3627,25 @@ fn fragment_nested_inline_root(
             width: width.as_px(),
             height: (bottom - top).as_px(),
         });
+        entry.line_slices.push(LineSlice {
+            first: range.start as u32,
+            end: range.end as u32,
+            offset: (top - split.lines[0].0).as_px(),
+        });
         // Where the lines of this strip start, so that a descendant can be
         // placed relative to the strip: `y + (local_y - top)`.
         placements.push((page, y - top, top));
         cursor_y = y + split.inset_top + (bottom - top);
     }
     cursor_y += split.inset_bottom;
-    geometry.entry(child_id).or_default().line_split_insets =
-        Some((split.inset_top.as_px(), split.inset_bottom.as_px()));
+    let entry = geometry.entry(child_id).or_default();
+    entry.line_split_insets = Some((split.inset_top.as_px(), split.inset_bottom.as_px()));
+    debug_assert!(
+        line_slices_tile(&entry.line_slices, split.lines.len()),
+        "fragment_nested_inline_root: line slices do not tile 0..{}: {:?}",
+        split.lines.len(),
+        entry.line_slices
+    );
     record_split_inline_root_descendants(
         geometry,
         doc,
@@ -3752,7 +3801,7 @@ fn warn_unprinted_inline_lines(child: &blitz_dom::Node, child_page_y: f32, page_
 /// The fourth element is one `(page, y - top, top)` per emitted fragment: where
 /// its first line starts, for placing the paragraph's descendants (F32a).
 #[allow(clippy::too_many_arguments)]
-fn fragment_inline_root(
+pub(crate) fn fragment_inline_root(
     geometry: &mut PaginationGeometryTable,
     child_id: usize,
     paragraph_x: f32,
@@ -3811,7 +3860,13 @@ fn fragment_inline_root(
                 width: width.as_px(),
                 height: frag_h.as_px(),
             };
-            geometry.entry(child_id).or_default().fragments.push(frag);
+            let entry = geometry.entry(child_id).or_default();
+            entry.fragments.push(frag);
+            entry.line_slices.push(LineSlice {
+                first: fragment_start_idx as u32,
+                end: i as u32,
+                offset: (frag_top_local - line_metrics[0].0).as_px(),
+            });
             placements.push((
                 page_index,
                 paragraph_top_in_body - frag_top_local,
@@ -3836,7 +3891,18 @@ fn fragment_inline_root(
         width: width.as_px(),
         height: frag_h.as_px(),
     };
-    geometry.entry(child_id).or_default().fragments.push(frag);
+    let entry = geometry.entry(child_id).or_default();
+    entry.fragments.push(frag);
+    entry.line_slices.push(LineSlice {
+        first: fragment_start_idx as u32,
+        end: total_lines as u32,
+        offset: (frag_top_local - line_metrics[0].0).as_px(),
+    });
+    debug_assert!(
+        line_slices_tile(&entry.line_slices, total_lines),
+        "fragment_inline_root: line slices do not tile 0..{total_lines}: {:?}",
+        entry.line_slices
+    );
     placements.push((
         page_index,
         paragraph_top_in_body - frag_top_local,
@@ -4146,6 +4212,7 @@ pub fn append_position_fixed_fragments(
         // single fragment). Per-page repetition is the canonical
         // representation for fixed content.
         entry.fragments.clear();
+        entry.line_slices.clear();
         entry.is_repeat = true;
         for page_index in 0..pages {
             if emitted >= crate::MAX_SUBTREE_PAGE_FRAGMENTS {
@@ -4234,6 +4301,7 @@ fn record_fixed_subtree_descendants(
 
         let entry = geometry.entry(node_id).or_default();
         entry.fragments.clear();
+        entry.line_slices.clear();
         entry.is_repeat = true;
         // Per-page repeat fragments, bounded by the aggregate `emitted` budget
         // (the hard cap on O(descendants × pages)). Use `break`, not `return`,
@@ -4691,6 +4759,7 @@ fn record_subtree_fragments_at_offset(
                 };
                 let entry = geometry.entry(node_id).or_default();
                 entry.fragments.clear();
+                entry.line_slices.clear();
                 entry.is_repeat = false;
                 for page_index in first_page..=last_page {
                     // Aggregate budget: each node emits one fragment per
@@ -7637,6 +7706,69 @@ h2 { string-set: chapter-title content(text); }
         assert!((frags[0].height.to_f32() - 225.0).abs() < 0.01);
     }
 
+    /// Line boxes of 20px that advance by 19.2px (a 16px font at `line-height: normal` = 1.2, quantised by
+    /// Blitz): `(top, bottom)` of line `i`, as `collect_inline_line_metrics` reports them.
+    fn overlapping_boxes(n: usize) -> Vec<(f32, f32)> {
+        (0..n)
+            .map(|i| {
+                let top = (i as f32 * 19.2).round() - 1.0;
+                (top, top + 20.0)
+            })
+            .collect()
+    }
+
+    /// F78: a body-level paragraph records the line range and offset of every fragment.
+    #[test]
+    fn fragment_inline_root_records_one_tiling_slice_per_fragment() {
+        let lines = overlapping_boxes(3000);
+        let mut geom = PaginationGeometryTable::new();
+        let (last_page, _, emitted, _) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            0.0,
+            0,
+            PageStrips::new(1000.0, 0.0),
+            &lines,
+        );
+        assert!(emitted > 50, "about 60 pages, got {emitted}");
+        assert_eq!(last_page as usize, emitted - 1);
+        let entry = geom.get(&1).unwrap();
+        assert_eq!(entry.line_slices.len(), entry.fragments.len());
+        assert!(super::line_slices_tile(&entry.line_slices, lines.len()));
+        for (s, f) in entry.line_slices.iter().zip(&entry.fragments) {
+            let (first, end) = (s.first as usize, s.end as usize);
+            assert_eq!(
+                s.offset.to_f32(),
+                lines[first].0 - lines[0].0,
+                "offset is the fragmenter's own distance from the first line's top: {s:?}"
+            );
+            assert_eq!(
+                f.height.to_f32(),
+                lines[end - 1].1 - lines[first].0,
+                "the fragment holds exactly the lines of its slice: {f:?} {s:?}"
+            );
+        }
+        assert_eq!(entry.line_slices[0].offset.to_f32(), 0.0);
+    }
+
+    #[test]
+    fn line_slices_tile_rejects_gaps_overlaps_and_short_cover() {
+        let s = |first, end| super::LineSlice {
+            first,
+            end,
+            offset: 0.0_f32.as_px(),
+        };
+        assert!(super::line_slices_tile(&[s(0, 3), s(3, 5)], 5));
+        assert!(!super::line_slices_tile(&[s(0, 3), s(4, 5)], 5), "gap");
+        assert!(!super::line_slices_tile(&[s(0, 3), s(2, 5)], 5), "overlap");
+        assert!(!super::line_slices_tile(&[s(0, 3), s(3, 4)], 5), "short");
+        assert!(!super::line_slices_tile(&[s(1, 5)], 5), "starts at 1");
+        assert!(!super::line_slices_tile(&[s(0, 0), s(0, 5)], 5), "empty");
+        assert!(!super::line_slices_tile(&[], 5), "nothing");
+    }
+
     /// Node id of the element with `id="..."`.
     fn node_with_id(doc: &blitz_html::HtmlDocument, id: &str) -> usize {
         doc.tree()
@@ -9196,6 +9328,27 @@ h2 { string-set: chapter-title content(text); }
             table[&find_by_id(doc.deref(), "p").unwrap()].is_split(),
             "the renderer slices lines by fragment"
         );
+    }
+
+    /// F78: the nested fragmenter records the same slices.
+    #[test]
+    fn a_tall_paragraph_in_a_div_records_its_line_slices() {
+        let (doc, table) = nested_geometry(
+            &format!("<div><p id=\"p\">{}</p></div>", br_lines(30)),
+            200.0,
+        );
+        let geom = &table[&find_by_id(doc.deref(), "p").unwrap()];
+        let got: Vec<(u32, u32, f32)> = geom
+            .line_slices
+            .iter()
+            .map(|s| (s.first, s.end, s.offset.to_f32()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(0, 10, 0.0), (10, 20, 200.0), (20, 30, 400.0)],
+            "{geom:?}"
+        );
+        assert_eq!(geom.line_slices.len(), geom.fragments.len());
     }
 
     #[test]
