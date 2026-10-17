@@ -401,8 +401,9 @@ fn multicol_wants_split(height: f32, room: f32, fresh: f32, avoid_inside: bool) 
     height.is_finite() && height > room && (!avoid_inside || height > fresh)
 }
 
-/// F83: whether `break-inside: avoid` on a box of block-size `height` still holds, `fresh` being the room of a
-/// fresh page. It holds while the box fits a page; past that it is relaxed and the box breaks like an `auto` one
+/// F83: whether `break-inside: avoid` on an inline root whose lines span `height` (bottom of the last line box minus
+/// top of the first) still holds, `fresh` being the room of a fresh page. It holds while the lines fit a page; past
+/// that it is relaxed and the box breaks like an `auto` one
 /// (css-break-3 §4.4: when the avoid rules leave no way to keep content from overflowing the fragmentainer they are
 /// dropped before orphans and widows; CSS 2.1 §13.3.3 has the same order). One px of slack, as the strip slicer
 /// has (`child_h > fresh + 1.0`), so a box it would not cut is not relaxed either.
@@ -1385,11 +1386,22 @@ impl<'a> PaginationLayoutTree<'a> {
             // records no line ranges, and the renderer then measures the
             // lines from those heights and drops the one that straddles
             // each cut.
-            let line_metrics = if avoid_inside_holds(avoid_inside, child_h, self.strips.fresh()) {
-                Vec::new()
-            } else {
-                collect_inline_line_metrics(child)
-            };
+            //
+            // "Fits a page" is about the lines, not the box: a box taller
+            // than a page only through `height`, padding or `min-height`
+            // keeps its lines on one page, so `avoid` holds and it takes
+            // the path it always had (F83c: the strip slicer continues the
+            // box frame over the pages like Chrome).
+            let all_line_metrics = collect_inline_line_metrics(child);
+            let lines_extent = all_line_metrics
+                .last()
+                .map_or(0.0, |l| l.1 - all_line_metrics[0].0);
+            let line_metrics =
+                if avoid_inside_holds(avoid_inside, lines_extent, self.strips.fresh()) {
+                    Vec::new()
+                } else {
+                    all_line_metrics
+                };
             if line_metrics.len() > 1 {
                 // fulgur-s67g Phase 2.2: if the paragraph cannot fit
                 // the remaining space on the current page strip but
@@ -8427,6 +8439,30 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(a.line_slices.len(), a.fragments.len());
         assert!(line_slices_tile(&a.line_slices, 40));
         assert_eq!(shape_of(a), shape_of(b));
+    }
+
+    /// F83c: an avoid box taller than a page only through `height` (its three lines fit a page) keeps the path it
+    /// had: `avoid` holds, the strip slicer cuts the box frame over the pages and records no line slices.
+    #[test]
+    fn avoid_box_taller_than_a_page_only_by_height_keeps_the_strip_path() {
+        let (doc, geom) = avoid_fragments(&format!(
+            "<div class=\"av\" style=\"height:500px\">{}</div>",
+            lines_20px(3)
+        ));
+        let g = &geom[&node_by_class(&doc, "av")];
+        assert_eq!(g.fragments.len(), 3, "{:?}", g.fragments);
+        assert!(g.line_slices.is_empty(), "{:?}", g.line_slices);
+        let (doc, geom) = avoid_fragments(&format!(
+            "<p>before</p><div class=\"av\" style=\"height:500px\">{}</div>",
+            lines_20px(3)
+        ));
+        let g = &geom[&node_by_class(&doc, "av")];
+        assert_eq!(
+            g.fragments[0].page_index, 1,
+            "moved to the next page: {:?}",
+            g.fragments
+        );
+        assert!(g.line_slices.is_empty());
     }
 
     /// An avoid paragraph that fits a page is untouched: it does not fit the 50 px left under the spacer, so it
