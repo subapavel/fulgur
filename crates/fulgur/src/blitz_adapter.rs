@@ -1136,13 +1136,6 @@ fn walk_for_column_styles(doc: &HtmlDocument, node_id: usize, out: &mut String, 
         return;
     };
     if let Some(el) = node.element_data()
-        && matches!(el.name.local.as_ref(), "template" | "noscript")
-    {
-        // F87 review: the contents of a `<template>` are inert and a browser with scripting on treats `<noscript>`
-        // as text, so a `<style>` in either never applies (an unlayered rule was read from them on main too).
-        return;
-    }
-    if let Some(el) = node.element_data()
         && el.name.local.as_ref() == "style"
     {
         // Honour `<style media="...">`: skip sheets whose media query list does not match the PDF render target,
@@ -6641,37 +6634,42 @@ mod tests {
         }
     }
 
-    /// F87 review: a `<style>` inside `<template>` or `<noscript>` is never applied by a browser (the template is
-    /// inert, scripting is on), so its rules, layered or not, do not reach the side table.
+    /// F87 review: the break reader and Stylo agree on which `<style>` elements apply, layered or not. There is no
+    /// scripting, so `<noscript>` content applies (HTML, scripting disabled) and Stylo colours `#a` in it; the table
+    /// holds `#a` too. Blitz also applies a `<style>` inside an (inert) `<template>`, which a browser never does;
+    /// the reader follows the engine rather than skipping it, so one stylesheet never applies half its
+    /// declarations. When Blitz makes `<template>` inert, this test fails: skip `template` in the harvester then
+    /// (F87e).
     #[test]
-    fn extract_column_style_table_skips_template_and_noscript_styles() {
-        for wrap in ["template", "noscript"] {
-            for css in [
-                ".k { break-before: page }",
-                "@layer u { .k { break-before: page } }",
-            ] {
-                let html = format!(
-                    r#"<html><head></head><body><{wrap}><style>{css}</style></{wrap}>
-                       <p class="k" id="k">x</p></body></html>"#
-                );
-                let mut doc = parse(&html, 400.0, &[]);
-                resolve(&mut doc);
-                use std::ops::Deref;
-                let k = find_element_by_attr_id(doc.deref(), "k");
-                assert!(
-                    !extract_column_style_table(&doc).contains_key(&k),
-                    "<{wrap}> {css}"
-                );
-            }
+    fn column_reader_agrees_with_stylo_on_template_and_noscript_styles() {
+        for wrap in ["noscript", "template"] {
+            let html = format!(
+                r#"<!doctype html><html><head></head><body>
+                   <{wrap}><style>#a {{ color: rgb(1,2,3); break-before: page }}</style></{wrap}>
+                   <p id="a">a</p></body></html>"#
+            );
+            let mut doc = parse(&html, 400.0, &[]);
+            resolve(&mut doc);
+            use std::ops::Deref;
+            let a = find_element_by_attr_id(doc.deref(), "a");
+            let coloured = doc
+                .get_node(a)
+                .and_then(|n| n.primary_styles())
+                .is_some_and(|s| {
+                    let c = s.clone_color().into_srgb_legacy();
+                    let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    [q(c.components.0), q(c.components.1), q(c.components.2)] == [1, 2, 3]
+                });
+            let in_table = extract_column_style_table(&doc)
+                .get(&a)
+                .is_some_and(|p| p.break_before.is_some());
+            assert_eq!(
+                in_table, coloured,
+                "<{wrap}>: Stylo applies the sheet: {coloured}, the break reader: {in_table}"
+            );
+            // What Stylo does today with both (F87e: Blitz applies a `<style>` in a `<template>`).
+            assert!(coloured, "<{wrap}>");
         }
-        // A sibling `<style>` still applies.
-        let html = r#"<html><body><template><style>.z{x:y}</style></template>
-            <style>.k { break-before: page }</style><p class="k" id="k">x</p></body></html>"#;
-        let mut doc = parse(html, 400.0, &[]);
-        resolve(&mut doc);
-        use std::ops::Deref;
-        let k = find_element_by_attr_id(doc.deref(), "k");
-        assert!(extract_column_style_table(&doc).contains_key(&k));
     }
 
     #[test]
