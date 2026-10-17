@@ -727,6 +727,38 @@ fn link_span_ptr(link: Option<&Arc<LinkSpan>>) -> Option<usize> {
     link.map(|l| Arc::as_ptr(l) as usize)
 }
 
+/// The rightmost edge, in the coordinates of `x` (the paragraph's left edge), of what `lines` paint: the glyphs of text
+/// runs (trailing whitespace is not ink), inline images and inline boxes. Used to warn about content that runs past the
+/// page edge.
+fn lines_right_edge(lines: &[ShapedLine], x: crate::units::Pt) -> crate::units::Pt {
+    let mut right = x;
+    for item in lines.iter().flat_map(|l| &l.items) {
+        let edge = match item {
+            LineItem::Text(run) => {
+                let advance = |g: &ShapedGlyph| g.x_advance * run.font_size;
+                let trailing_space = run
+                    .glyphs
+                    .iter()
+                    .rev()
+                    .take_while(|g| {
+                        run.text
+                            .get(g.text_range.clone())
+                            .is_some_and(|t| !t.is_empty() && t.chars().all(char::is_whitespace))
+                    })
+                    .map(advance)
+                    .sum::<crate::units::Pt>();
+                let width: crate::units::Pt = run.glyphs.iter().map(advance).sum();
+                x + run.x_offset + width - trailing_space
+            }
+            LineItem::Image(img) if img.visible => x + img.x_offset + img.width,
+            LineItem::InlineBox(ib) => x + ib.x_offset + ib.width,
+            LineItem::Image(_) => continue,
+        };
+        right = right.max(edge);
+    }
+    right
+}
+
 /// Draw pre-shaped text lines at the given position.
 pub fn draw_shaped_lines(
     canvas: &mut Canvas<'_, '_>,
@@ -742,6 +774,9 @@ pub fn draw_shaped_lines(
     // to derive it from `line.baseline` (which is an absolute baseline offset
     // and does not carry per-line ascent).
     let mut line_top = crate::units::Pt::ZERO;
+    canvas
+        .paint_extent
+        .note_right(lines_right_edge(lines, x).to_f32());
     // Per-run tagging mode is active when canvas.link_run_node_id is set and
     // tagging is enabled. In this mode each glyph-run or inline-image cluster
     // bounded by `Arc<LinkSpan>` identity gets its own start_tagged/end_tagged
@@ -939,6 +974,7 @@ pub fn draw_shaped_lines(
                                 lc.push_transform(link_affine);
                             }
                             canvas.surface.push_transform(&transform);
+                            canvas.paint_extent.enter_local();
                             crate::render::dispatch_inline_box_content(
                                 canvas,
                                 content_id,
@@ -953,6 +989,7 @@ pub fn draw_shaped_lines(
                                 ctx.page_index,
                                 &ctx.drawables.inline_box_subtree_descendants,
                             );
+                            canvas.paint_extent.leave_local();
                             canvas.surface.pop();
                             if let Some(lc) = canvas.link_collector.as_deref_mut() {
                                 lc.pop_transform();
@@ -1179,6 +1216,7 @@ mod tests {
                 link_run_node_id: None,
                 in_marked_content: false,
                 images: Default::default(),
+                paint_extent: Default::default(),
             };
             // Draw origin (5, 7) pt; rect must land at (5+2, 7+3, 20, 10).
             draw_shaped_lines(&mut canvas, &[line], 5.0_f32.as_pt(), 7.0_f32.as_pt(), None);

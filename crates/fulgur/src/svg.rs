@@ -104,6 +104,7 @@ mod tests {
                     link_run_node_id: None,
                     in_marked_content: false,
                     images: Default::default(),
+                    paint_extent: Default::default(),
                 };
                 svg.draw(
                     &mut canvas,

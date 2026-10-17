@@ -672,6 +672,43 @@ pub struct Canvas<'a, 'b> {
     /// Validated Krilla images of this render (see [`crate::image::krilla_image`]). Shared by every
     /// canvas of a render, so an image is checked once however many pages draw it.
     pub images: crate::image::ImageCache,
+    /// How far to the right of the page's left edge this canvas has painted (see [`PaintExtent`]).
+    pub paint_extent: PaintExtent,
+}
+
+/// The rightmost x, in pt from the page's left edge, that text, inline images and boxes with a visible background or
+/// border were drawn at on a canvas. Used to warn when content runs past the page edge, where it is clipped
+/// (`render_v2`). Only coordinates that are page coordinates count: while a clip path or a transform is active
+/// (`enter_local` .. `leave_local`) the x values are not, or the content is clipped away anyway, so nothing is
+/// recorded.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PaintExtent {
+    right: f32,
+    local: u32,
+}
+
+impl PaintExtent {
+    /// Records that something was painted up to `right` pt.
+    pub fn note_right(&mut self, right: f32) {
+        if self.local == 0 && right.is_finite() {
+            self.right = self.right.max(right);
+        }
+    }
+
+    /// A clip path or a transform is pushed: x values are no longer page coordinates until the matching
+    /// [`leave_local`](Self::leave_local).
+    pub fn enter_local(&mut self) {
+        self.local += 1;
+    }
+
+    pub fn leave_local(&mut self) {
+        self.local = self.local.saturating_sub(1);
+    }
+
+    /// The rightmost painted x in pt, 0 when nothing was recorded.
+    pub fn right(&self) -> f32 {
+        self.right
+    }
 }
 
 /// Run a draw closure wrapped in opacity guards.
@@ -2864,6 +2901,7 @@ mod dp_unit_tests {
             link_run_node_id: None,
             in_marked_content: false,
             images: Default::default(),
+            paint_extent: Default::default(),
         };
         f(&mut canvas);
     }
@@ -3078,5 +3116,39 @@ pub(crate) mod matrix_test_util {
 
     pub(crate) fn approx(a: f32, b: f32) -> bool {
         (a - b).abs() < EPS
+    }
+}
+
+#[cfg(test)]
+mod paint_extent_tests {
+    use super::PaintExtent;
+
+    #[test]
+    fn keeps_the_rightmost_edge() {
+        let mut e = PaintExtent::default();
+        assert_eq!(e.right(), 0.0);
+        e.note_right(120.0);
+        e.note_right(80.0);
+        e.note_right(f32::NAN);
+        e.note_right(f32::INFINITY);
+        assert_eq!(e.right(), 120.0);
+    }
+
+    #[test]
+    fn clip_and_transform_scopes_record_nothing() {
+        let mut e = PaintExtent::default();
+        e.enter_local();
+        e.enter_local();
+        e.note_right(900.0);
+        e.leave_local();
+        e.note_right(900.0);
+        assert_eq!(e.right(), 0.0, "still inside a scope");
+        e.leave_local();
+        e.note_right(10.0);
+        assert_eq!(e.right(), 10.0);
+        // An unbalanced leave cannot wrap around.
+        e.leave_local();
+        e.note_right(20.0);
+        assert_eq!(e.right(), 20.0);
     }
 }

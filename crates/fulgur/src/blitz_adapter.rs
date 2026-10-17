@@ -7696,6 +7696,56 @@ mod seed_image_natural_size_tests {
         assert_eq!(lines("nowrap"), 1);
     }
 
+    /// The border-box widths of the `td`s of the first row, in order.
+    fn cell_widths(html: &str) -> Vec<f32> {
+        let (mut doc, _gcpm) =
+            parse_html_with_local_resources(html, 800.0, 10000, &noto(), false, None);
+        resolve(&mut doc);
+        doc.tree()
+            .iter()
+            .filter(|(_, n)| {
+                n.element_data()
+                    .is_some_and(|e| e.name.local.as_ref() == "td")
+            })
+            .map(|(id, _)| doc.get_node(id).unwrap().final_layout.size.width)
+            .collect()
+    }
+
+    /// F66 review (H1): in automatic layout a column is at least as wide as its cells' min-content width (CSS 2.1
+    /// §17.5.2.2), whatever explicit `width` a cell has; the fixed algorithm keeps the width and the text overflows.
+    #[test]
+    fn explicit_cell_width_never_goes_below_the_min_content() {
+        let table = |style: &str, td: &str| {
+            format!(
+                r#"<body style="margin:0;font-family:Noto Sans"><table style="width:200px;border-spacing:0;{style}"><tr>
+                   <td {td}>{LONG_TEXT}</td><td>b</td></tr></table></body>"#
+            )
+        };
+        let natural = cell_widths(&table("", r#"style="white-space:nowrap""#))[0];
+        assert!(natural > 300.0, "the text is {natural} px wide");
+        for td in [
+            r#"nowrap width=80"#,
+            r#"style="white-space:nowrap;width:80px""#,
+            r#"style="white-space:nowrap;width:80px;box-sizing:content-box;padding:0 10px""#,
+        ] {
+            let w = cell_widths(&table("", td));
+            assert!(
+                w[0] >= natural - 0.5,
+                "{td}: the cell is {} px, its text {natural}",
+                w[0]
+            );
+        }
+        // A width above the min-content stays (the text wraps inside the cell): 150 px content box + 1 px UA padding.
+        let w = cell_widths(&table("", r#"style="width:150px""#));
+        assert_eq!(w[0], 152.0);
+        // In fixed layout the width wins (80 px content box + 2 px UA padding), the text overflows.
+        let w = cell_widths(&table(
+            "table-layout:fixed",
+            r#"style="white-space:nowrap;width:80px""#,
+        ));
+        assert_eq!(w[0], 82.0);
+    }
+
     #[test]
     fn svg_root_size_is_the_natural_size() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="#f00"/></svg>"##;

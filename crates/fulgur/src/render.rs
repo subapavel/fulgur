@@ -224,6 +224,7 @@ pub fn render_v2(
                     link_run_node_id: None,
                     in_marked_content: false,
                     images: images.clone(),
+                    paint_extent: Default::default(),
                 };
                 // Root `<html>` + `<body>` background pre-pass. Root
                 // `<html>` / `<body>` backgrounds repeat per page
@@ -313,6 +314,14 @@ pub fn render_v2(
                     &opacity_wrapped_descendants,
                     tagging,
                 );
+                // Content past the right edge of the page is clipped by the page box (CSS Page 3 §3.2 lets it
+                // overflow the margins; the page box is the medium). Say so: Chrome shrinks the page instead.
+                let overflow = canvas.paint_extent.right() - page_size.width;
+                if overflow > PAGE_OVERFLOW_TOLERANCE_PT {
+                    log::warn!(
+                        "content extends {overflow:.1} pt past the right page edge on page {page_num} and is clipped"
+                    );
+                }
             }
             // Paint margin boxes after body content so page headers /
             // footers are not hidden by page-filling body backgrounds.
@@ -328,6 +337,7 @@ pub fn render_v2(
                 link_run_node_id: None,
                 in_marked_content: false,
                 images: images.clone(),
+                paint_extent: Default::default(),
             };
             let page_content_width = content_area.width.to_f32();
             let any_margin_box_painted = margin_box_renderer.render_page(
@@ -643,6 +653,7 @@ fn paint_repeated_table_headers(
                 link_run_node_id: None,
                 in_marked_content: false,
                 images: canvas.images.clone(),
+                paint_extent: Default::default(),
             };
             if tagging {
                 copy_canvas
@@ -1687,6 +1698,7 @@ fn draw_under_transform(
         lc.push_transform(full);
     }
     canvas.surface.push_transform(&full.to_krilla());
+    canvas.paint_extent.enter_local();
 
     // Dispatch the wrapper's own payload first (the same NodeId
     // carries both the transform and its inner content), before
@@ -1946,6 +1958,7 @@ fn draw_under_transform(
         );
     }
 
+    canvas.paint_extent.leave_local();
     canvas.surface.pop();
     if let Some(lc) = canvas.link_collector.as_deref_mut() {
         lc.pop_transform();
@@ -2053,6 +2066,7 @@ fn draw_under_clip(
         // `draw_block_inner_paint` but inlined so the opacity wrap
         // covers the entire clipped region too.
         if block.visible {
+            note_painted_box(canvas, &block.style, x_pt, total_width);
             crate::background::draw_box_shadows(
                 canvas,
                 &block.style,
@@ -2093,6 +2107,7 @@ fn draw_under_clip(
             canvas
                 .surface
                 .push_clip_path(&clip_path, &krilla::paint::FillRule::default());
+            canvas.paint_extent.enter_local();
             true
         } else {
             false
@@ -2330,6 +2345,7 @@ fn draw_under_clip(
         }
 
         if clip_pushed {
+            canvas.paint_extent.leave_local();
             canvas.surface.pop();
         }
     });
@@ -2996,6 +3012,30 @@ fn paint_root_block_v2(
     });
 }
 
+/// Overflow smaller than this (pt) is rounding, not content: nothing is reported.
+const PAGE_OVERFLOW_TOLERANCE_PT: f32 = 0.5;
+
+/// Records the right edge of a box that paints a background or a border, for the page-overflow warning.
+fn note_painted_box(
+    canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
+    style: &crate::draw_primitives::BlockStyle,
+    x: f32,
+    width: f32,
+) {
+    let background =
+        style.background_color.is_some_and(|c| c[3] > 0) || !style.background_layers.is_empty();
+    let border = style
+        .border_widths
+        .iter()
+        .zip(&style.border_styles)
+        .any(|(w, s)| {
+            *w > crate::units::Pt::ZERO && *s != crate::draw_primitives::BorderStyleValue::None
+        });
+    if background || border {
+        canvas.paint_extent.note_right(x + width);
+    }
+}
+
 /// Block bg / border / shadow paint without the outer `draw_with_opacity`
 /// wrap. Used by `draw_list_item_with_block` so the list-item's
 /// marker and body block share a single opacity transparency group
@@ -3038,6 +3078,7 @@ fn draw_block_inner_paint(
         .unwrap_or_else(|| frag.height.in_pt().to_f32());
 
     if entry.visible {
+        note_painted_box(canvas, &entry.style, x, total_width);
         crate::background::draw_box_shadows(canvas, &entry.style, x, y, total_width, total_height);
         crate::background::draw_background(canvas, &entry.style, x, y, total_width, total_height);
         crate::draw_primitives::draw_block_border(
@@ -3261,6 +3302,7 @@ fn draw_under_clip_table(
             canvas
                 .surface
                 .push_clip_path(&clip_path, &krilla::paint::FillRule::default());
+            canvas.paint_extent.enter_local();
             true
         } else {
             false
@@ -3427,6 +3469,7 @@ fn draw_under_clip_table(
         }
 
         if clip_pushed {
+            canvas.paint_extent.leave_local();
             canvas.surface.pop();
         }
     });
