@@ -35,8 +35,10 @@ pub(super) enum Anchor {
     /// `top` (or the initial containing block): `offset` px below the top of the border box of `cb` as if it were
     /// stitched from its fragments, or below the top of the page area when `cb` is `None`.
     Top { cb: Option<usize>, offset: f32 },
-    /// `bottom` with `top: auto`: the box's top is `from_end` px above the bottom of the border box of `cb`.
-    Bottom { cb: usize, from_end: f32 },
+    /// `bottom` with `top: auto`: the box's top is `from_end` px above the bottom of the border box of `cb`, which is
+    /// `cb_h` px tall (Taffy's height; the fragments of a box the block fragmenter split close at its last child, so
+    /// their heights can add up to less: the bottom padding and border are missing).
+    Bottom { cb: usize, from_end: f32, cb_h: f32 },
     /// No inset on the vertical axis: after the previous in-flow sibling `after` (its last fragment plus the gap Taffy
     /// left, `offset`), or `offset` px below the first fragment of `parent` when there is none.
     Static {
@@ -209,10 +211,17 @@ fn locate_forward(frags: &[Fragment], offset: f32, strips: PageStrips) -> (u32, 
     )
 }
 
-/// The page and y of the point `from_end` above the end of a box made of `frags`.
-fn locate_backward(frags: &[Fragment], from_end: f32, strips: PageStrips) -> (u32, f32) {
-    let total: f32 = frags.iter().map(|f| f.height.to_f32().max(0.0)).sum();
-    locate_forward(frags, total - from_end, strips)
+/// The page and y of the point `from_end` above the end of a box made of `frags`. The box is `min_total` tall at least:
+/// fragments that stop short of it (the block fragmenter closes the last one at the last child) leave the rest below
+/// the last fragment.
+fn locate_backward(
+    frags: &[Fragment],
+    from_end: f32,
+    min_total: f32,
+    strips: PageStrips,
+) -> (u32, f32) {
+    let stacked: f32 = frags.iter().map(|f| f.height.to_f32().max(0.0)).sum();
+    locate_forward(frags, stacked.max(min_total) - from_end, strips)
 }
 
 /// `(page, y)` with a `y` at or below the bottom of the page carried to the pages after it.
@@ -698,6 +707,7 @@ fn anchor_of(
             Some(c) => Anchor::Bottom {
                 cb: c,
                 from_end: cb_total_h - (cb_border_top + rel_y),
+                cb_h: cb_total_h,
             },
             None => Anchor::Top {
                 cb: None,
@@ -730,7 +740,9 @@ fn locate_anchor(
             cb: Some(c),
             offset,
         } => locate_forward(frags(c)?, offset, strips),
-        Anchor::Bottom { cb, from_end } => locate_backward(frags(cb)?, from_end, strips),
+        Anchor::Bottom { cb, from_end, cb_h } => {
+            locate_backward(frags(cb)?, from_end, cb_h, strips)
+        }
         Anchor::Static {
             after: Some(sib),
             offset,
@@ -1258,6 +1270,22 @@ mod tests {
         assert_eq!(shape(&geom, stamp), vec![(1, 80, 20)]);
     }
 
+    /// The block fragmenter closes the last fragment of a split box at its last child, so the bottom padding is not in
+    /// the fragments: `bottom: 0` still lands at the bottom of the padding box (40 px below the last row).
+    #[test]
+    fn abspos_bottom_anchored_counts_the_bottom_padding_of_a_split_cb() {
+        let rows: String = (0..15).map(|i| format!("<p>row{i}</p>")).collect();
+        let (doc, geom) = fragments(
+            &format!(
+                "<div class=\"rel\" style=\"position:relative;padding-bottom:40px\">{rows}\
+                 <div class=\"stamp\" style=\"position:absolute;bottom:0;right:0\">ZAPLACENO</div></div>"
+            ),
+            true,
+            "",
+        );
+        assert_eq!(shape(&geom, by_class(&doc, "stamp")), vec![(1, 120, 20)]);
+    }
+
     /// `top: auto`: after the previous sibling. That sibling does not fit the 50 px left and moves whole to page 1,
     /// so the box follows it there (Taffy's offset, 250 px, would put it 50 px down page 1, inside the sibling). A box
     /// whose text fits the window of its page keeps the window's position (`abspos_that_fits_keeps_its_geometry`).
@@ -1448,12 +1476,12 @@ mod tests {
     fn locate_backward_counts_from_the_end() {
         let strips = PageStrips::new(200.0, 0.0);
         let frags = [frag(0, 120.0, 80.0), frag(1, 0.0, 100.0)];
-        assert_eq!(locate_backward(&frags, 20.0, strips), (1, 80.0));
-        assert_eq!(locate_backward(&frags, 100.0, strips), (1, 0.0));
-        assert_eq!(locate_backward(&frags, 120.0, strips), (0, 180.0));
-        assert_eq!(locate_backward(&frags, 0.0, strips), (1, 100.0));
+        assert_eq!(locate_backward(&frags, 20.0, 0.0, strips), (1, 80.0));
+        assert_eq!(locate_backward(&frags, 100.0, 0.0, strips), (1, 0.0));
+        assert_eq!(locate_backward(&frags, 120.0, 0.0, strips), (0, 180.0));
+        assert_eq!(locate_backward(&frags, 0.0, 0.0, strips), (1, 100.0));
         // Further back than the box: above its first fragment.
-        assert_eq!(locate_backward(&frags, 200.0, strips), (0, 100.0));
+        assert_eq!(locate_backward(&frags, 200.0, 0.0, strips), (0, 100.0));
     }
 
     #[test]
