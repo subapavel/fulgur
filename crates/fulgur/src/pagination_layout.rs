@@ -1848,10 +1848,20 @@ impl<'a> PaginationLayoutTree<'a> {
                         0.0,
                     )
             };
+            // F83b review (fuzz `Z2_34`): a relaxed avoid box with an `auto` height whose children fit the strip but
+            // whose frame does not (bottom padding and border) is entered, as nested ones are, so that its last child
+            // moves on and the frame closes with it; the strip slicer used to leave the frame's end on a page of
+            // its own, which the next relaxed box then left blank.
+            let relaxed_frame = avoid_inside
+                && body_block_flow
+                && !is_multicol
+                && !avoid_inside_holds(true, avoid_extent_h, page_height_px)
+                && child_node.is_some_and(|n| frame_is_content_sized(self.doc, n));
             let gate = |doc: &BaseDocument, available_strip: f32, keeps_whole: bool| {
                 has_splittable_children
                     && (!is_multicol || multicol_has_span_all)
-                    && (has_forced_break_below(doc, child_id, self.column_styles, 0)
+                    && (relaxed_frame
+                        || has_forced_break_below(doc, child_id, self.column_styles, 0)
                         || has_page_name_change_below(
                             doc,
                             child_id,
@@ -9377,6 +9387,22 @@ h2 { string-set: chapter-title content(text); }
         ));
         let lines = nodes_by_class(doc.deref(), "l");
         assert_eq!(geom[&lines[0]].fragments[0].page_index, 0);
+    }
+
+    /// Fuzz `Z2_34`: a padded relaxed avoid box at the top of the document whose children fit the page but whose frame
+    /// does not: the last line moves on and the frame closes with it (the strip slicer left the end of the frame on a
+    /// page of its own, which stayed blank when the next relaxed box moved on).
+    #[test]
+    fn relaxed_padded_avoid_box_at_the_top_closes_its_frame_with_its_last_line() {
+        let (doc, geom) = avoid_fragments(&format!(
+            "<div class=\"av\" style=\"padding:12px\"><div>{}</div></div>",
+            (0..9)
+                .map(|i| format!("<div class=\"l\">l{i}</div>"))
+                .collect::<String>()
+        ));
+        let lines = nodes_by_class(doc.deref(), "l");
+        assert_eq!(geom[&lines[7]].fragments[0].page_index, 0);
+        assert_eq!(geom[&lines[8]].fragments[0].page_index, 1);
     }
 
     /// F83b: kept whole when `avoid` holds and the box fits the room or can move; the six combinations.
