@@ -471,6 +471,27 @@ fn is_block_flow_container(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
             .is_some_and(|s| s.clone_display().inside() == DisplayInside::Table)
 }
 
+/// F83b: whether `node_id` or one of its ancestors has `break-inside: avoid`.
+fn in_avoid_box(
+    doc: &BaseDocument,
+    node_id: usize,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+) -> bool {
+    let mut id = Some(node_id);
+    let mut hops = 0;
+    while let Some(n) = id {
+        if has_avoid(column_styles, n) {
+            return true;
+        }
+        hops += 1;
+        if hops > crate::MAX_DOM_DEPTH {
+            return false;
+        }
+        id = doc.get_node(n).and_then(|node| node.parent);
+    }
+    false
+}
+
 /// F83b: whether `node_id` has `break-inside: avoid` in `column_styles`.
 fn has_avoid(column_styles: Option<&crate::column_css::ColumnStyleTable>, node_id: usize) -> bool {
     column_styles
@@ -3467,7 +3488,7 @@ fn fragment_block_subtree(
         } else {
             0.0
         };
-        let parent_avoids = has_avoid(column_styles, parent_id);
+        let parent_avoids = in_avoid_box(doc, parent_id, column_styles);
         let tail_raw = if block_parent && Some(child_id) == last_flow_child && closes_like_block {
             let parent_h = parent.final_layout.size.height;
             let below = if parent_h.is_finite() {
@@ -3615,10 +3636,11 @@ fn fragment_block_subtree(
         // A first row taller than a page is not cut: a fresh page would not
         // hold it either.
         //
-        // F83b review: in an avoid box in block flow the guard is `content_above_child` as well: a first child
-        // that only the box's padding, border or margin precede is not cut to a page of its own (that left a page
-        // holding nothing but the frame, the validator's H3); like an atomic leaf it overflows where it is. Other
-        // parents keep the cut (main's behaviour, which the harness showed Chrome's words agree with).
+        // F83b review: inside an avoid box in block flow the guard is `content_above_child` as well: a first child
+        // that only the padding, border or margin of the box (or of a parent inside it) precede is not cut to a page
+        // of its own (that left a page holding nothing but the frame, the validator's H3 and fuzz `Z1_549`); like an
+        // atomic leaf it overflows where it is. Other parents keep the cut (main's behaviour, which the harness
+        // showed Chrome's words agree with).
         // And a child kept whole that is the last in its box needs room for what the boxes around it need below it
         // (bottom padding and border), as a split paragraph does (F30): without it the frame crossed the content
         // bottom by the padding.
@@ -9319,6 +9341,17 @@ h2 { string-set: chapter-title content(text); }
         ));
         let lines = nodes_by_class(doc.deref(), "l");
         assert_eq!(geom[&lines[0]].fragments[0].page_index, 1);
+    }
+
+    /// Fuzz `Z1_549`: a relaxed avoid box that starts the next page, whose parent (inside it) is padded and holds an
+    /// atomic leaf that does not fit below the padding: the leaf stays where it is, it is not cut to another page that
+    /// would hold only the frames (a blank page).
+    #[test]
+    fn leaf_in_a_padded_parent_inside_a_relaxed_avoid_box_is_not_cut_to_a_blank_page() {
+        let (doc, geom) = avoid_fragments(
+            "<p>x</p><div class=\"av\"><div style=\"padding:12px\"><div class=\"sp\" style=\"height:195px\"></div></div></div>",
+        );
+        assert_eq!(first_fragment(&doc, &geom, "sp").0, 1);
     }
 
     /// F83b: kept whole when `avoid` holds and the box fits the room or can move; the six combinations.
