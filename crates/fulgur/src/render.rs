@@ -304,6 +304,7 @@ pub fn render_v2(
                     &opacity_wrapped_descendants,
                     page_node_ids,
                 );
+                check_continuations_painted(page_idx as u32, geometry, drawables);
                 paint_repeated_table_headers(
                     &mut canvas,
                     page_idx as u32,
@@ -1091,6 +1092,79 @@ pub(crate) fn dispatch_inline_box_content(
     }
 }
 
+// F30f: which `(inline box, page)` continuations `paint_inline_box_continuation` painted on the page being drawn. A box
+// can be reached from more than one walk (the main loop, a scope walk, the continuation of the box that carries it);
+// the first one paints it, inside the groups it is called in, and the others find it in this set. Every box that
+// `inline_box_continues_on` that page must be in it when the page is done (`check_continuations_painted`, debug
+// builds): a split box whose later fragments no walk reaches prints nothing there.
+thread_local! {
+    static CONTINUATIONS_PAINTED: std::cell::RefCell<std::collections::BTreeSet<(usize, u32)>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+/// Records the continuation of `ib_id` on `page_index`; `false` when it was recorded (painted) already.
+fn note_continuation_painted(ib_id: usize, page_index: u32) -> bool {
+    CONTINUATIONS_PAINTED.with(|m| m.borrow_mut().insert((ib_id, page_index)))
+}
+
+/// Forgets what was painted on `page_index` once the page is done. In debug builds first checks that every inline
+/// box that continues on it was painted: the fragmenter may only split a box whose later fragments the renderer
+/// reaches, through the main loop or through the scope walks (`draw_under_clip`, `draw_under_opacity`,
+/// `draw_under_transform`) and the continuation of the box that carries it.
+fn check_continuations_painted(
+    page_index: u32,
+    geometry: &crate::pagination_layout::PaginationGeometryTable,
+    drawables: &Drawables,
+) {
+    let painted: std::collections::BTreeSet<usize> = CONTINUATIONS_PAINTED.with(|m| {
+        let mut m = m.borrow_mut();
+        let mine = m
+            .iter()
+            .filter(|(_, p)| *p == page_index)
+            .map(|(id, _)| *id)
+            .collect();
+        m.clear();
+        mine
+    });
+    if cfg!(debug_assertions) {
+        for &ib_id in drawables.inline_box_subtree_descendants.keys() {
+            if geometry
+                .get(&ib_id)
+                .is_some_and(|g| inline_box_continues_on(g, page_index))
+            {
+                debug_assert!(
+                    painted.contains(&ib_id),
+                    "inline box {ib_id} continues on page {page_index} and no walk painted it"
+                );
+            }
+        }
+    }
+}
+
+/// The inline boxes carried by the paragraphs of the inline box `ib_id` and of its descendants: the boxes nested in
+/// it. They are not in its descendant list (their own subtrees are recorded under their own keys), and the carrier
+/// that would paint their first fragment has no line on a continuation page.
+fn nested_inline_boxes(ib_id: usize, drawables: &Drawables) -> Vec<usize> {
+    let mut found = Vec::new();
+    let descendants = drawables
+        .inline_box_subtree_descendants
+        .get(&ib_id)
+        .map_or(&[][..], Vec::as_slice);
+    for id in std::iter::once(&ib_id).chain(descendants) {
+        let Some(para) = drawables.paragraphs.get(id) else {
+            continue;
+        };
+        for item in para.lines.iter().flat_map(|line| line.items.iter()) {
+            if let crate::paragraph::LineItem::InlineBox(nested) = item
+                && let Some(nested_id) = nested.node_id
+            {
+                found.push(nested_id);
+            }
+        }
+    }
+    found
+}
+
 /// F30f: whether the inline box with geometry `geom` has a fragment on `page_index` that no paragraph paints: the box
 /// was fragmented over several pages and this one is after the first.
 ///
@@ -1110,6 +1184,20 @@ fn inline_box_continues_on(
             .first()
             .is_some_and(|f| f.page_index < page_index)
         && geom.fragments.iter().any(|f| f.page_index == page_index)
+}
+
+/// F30f: the opacity of the paragraph that carries the inline box `ib_id`, 1 when it has none.
+///
+/// The carrier paints the box inside its paragraph's opacity group, which holds the opacity of the box that is the
+/// carrier when that box has no block entry of its own (a box with an opacity scope and a block entry paints its
+/// descendants itself, `draw_under_opacity`, and reaches the continuation from there). The continuation pages have
+/// no carrier line, so the group has to be made for the box here, or it is painted at full opacity from page 2 on.
+fn carrier_opacity(ib_id: usize, drawables: &Drawables) -> f32 {
+    drawables
+        .inline_box_carrier
+        .get(&ib_id)
+        .and_then(|carrier| drawables.paragraphs.get(carrier))
+        .map_or(1.0, |para| para.opacity)
 }
 
 /// F30f: paint the fragment of the inline box `ib_id` that is on `page_index`, when
@@ -1146,6 +1234,9 @@ fn paint_inline_box_continuation(
     let Some(frag) = geom.fragments.iter().find(|f| f.page_index == page_index) else {
         return false;
     };
+    if !note_continuation_painted(ib_id, page_index) {
+        return false;
+    }
     // The carrier skips a box that is not visible, with everything in it.
     let hidden = drawables
         .block_styles
@@ -1164,32 +1255,48 @@ fn paint_inline_box_continuation(
     let transform = krilla::geom::Transform::from_translate(-body_x, -body_y);
     let link_affine =
         crate::draw_primitives::Affine2D::translation((-body_x).as_pt(), (-body_y).as_pt());
-    crate::draw_primitives::draw_with_opacity(canvas, 1.0, |canvas| {
-        if let Some(lc) = canvas.link_collector.as_deref_mut() {
-            lc.push_transform(link_affine);
-        }
-        canvas.surface.push_transform(&transform);
-        canvas.paint_extent.enter_local();
-        dispatch_inline_box_content(
+    crate::draw_primitives::draw_with_opacity(
+        canvas,
+        carrier_opacity(ib_id, drawables),
+        |canvas| {
+            if let Some(lc) = canvas.link_collector.as_deref_mut() {
+                lc.push_transform(link_affine);
+            }
+            canvas.surface.push_transform(&transform);
+            canvas.paint_extent.enter_local();
+            dispatch_inline_box_content(
+                canvas,
+                ib_id,
+                geom,
+                frag,
+                geo_x_pt,
+                geo_y_pt,
+                drawables,
+                geometry,
+                margin_left_pt,
+                margin_top_pt,
+                page_index,
+                &drawables.inline_box_subtree_descendants,
+            );
+            canvas.paint_extent.leave_local();
+            canvas.surface.pop();
+            if let Some(lc) = canvas.link_collector.as_deref_mut() {
+                lc.pop_transform();
+            }
+        },
+    );
+    // The boxes nested in this one: their carrier is a descendant that has no line on this page.
+    for nested in nested_inline_boxes(ib_id, drawables) {
+        paint_inline_box_continuation(
             canvas,
-            ib_id,
-            geom,
-            frag,
-            geo_x_pt,
-            geo_y_pt,
-            drawables,
+            nested,
+            page_index,
             geometry,
+            drawables,
             margin_left_pt,
             margin_top_pt,
-            page_index,
-            &drawables.inline_box_subtree_descendants,
         );
-        canvas.paint_extent.leave_local();
-        canvas.surface.pop();
-        if let Some(lc) = canvas.link_collector.as_deref_mut() {
-            lc.pop_transform();
-        }
-    });
+    }
     true
 }
 
@@ -1960,17 +2067,21 @@ fn draw_under_transform(
         if nested_skip.contains(&desc_id)
             || clip_skip.contains(&desc_id)
             || opacity_skip.contains(&desc_id)
-            || paragraph_ib_skip.contains(&desc_id)
         {
-            // F30f: a transformed box is never fragmented over pages (`inline_root_lines` leaves transformed boxes
-            // alone and the strip slicer treats a transformed parent as atomic), so no inline box inside it has a
-            // continuation to paint here.
-            debug_assert!(
-                !paragraph_ib_skip.contains(&desc_id)
-                    || geometry
-                        .get(&desc_id)
-                        .is_none_or(|g| !inline_box_continues_on(g, page_index)),
-                "an inline box inside a transform spans pages: {desc_id}"
+            continue;
+        }
+        if paragraph_ib_skip.contains(&desc_id) {
+            // F30f: a box fragmented over several pages is painted by its carrier on the first of them only; the
+            // later pages are painted here, under the transform like the first (a transformed ancestor does not stop
+            // the fragmenter: its `div` has a fragment on every page the box touches).
+            paint_inline_box_continuation(
+                canvas,
+                desc_id,
+                page_index,
+                geometry,
+                drawables,
+                margin_left_pt,
+                margin_top_pt,
             );
             continue;
         }
@@ -5926,11 +6037,22 @@ mod tests {
                 paint_inline_box_continuation(canvas, id, page, &geometry, d, 10.0, 10.0)
             })
         };
-        let painted: Vec<bool> = (0..5).map(|page| paint(7, page, &d)).collect();
+        let painted: Vec<bool> = (0..5)
+            .map(|page| {
+                let painted = paint(7, page, &d);
+                // Every box that continues on the page was painted (debug builds assert it).
+                check_continuations_painted(page, &geometry, &d);
+                painted
+            })
+            .collect();
         assert_eq!(painted, [false, true, true, true, false]);
         // A descendant is walked by its box, and a node that is no inline box is not this function's.
         assert!(!paint(8, 2, &d));
         assert!(!paint(9, 2, &d));
+        // A second walk that reaches a box that was painted already paints nothing.
+        assert!(paint(7, 1, &d));
+        assert!(!paint(7, 1, &d));
+        check_continuations_painted(1, &geometry, &d);
         // A box that is not visible is skipped with everything in it, as its carrier does.
         let mut hidden = Drawables::new();
         hidden.inline_box_subtree_descendants.insert(7, vec![8]);
@@ -5947,6 +6069,63 @@ mod tests {
             },
         );
         assert!(!paint(7, 2, &hidden));
+        check_continuations_painted(2, &geometry, &hidden);
+    }
+
+    #[test]
+    fn a_continuation_has_the_opacity_of_its_carrier_paragraph() {
+        let mut d = Drawables::new();
+        let mut para = make_para(vec![make_shaped_line(vec![])]);
+        para.opacity = 0.5;
+        d.paragraphs.insert(1, para);
+        d.inline_box_carrier.insert(2, 1);
+        assert_eq!(carrier_opacity(2, &d), 0.5);
+        assert_eq!(carrier_opacity(3, &d), 1.0, "no carrier recorded");
+        // The carrier of an opacity scope with a block entry holds no opacity itself.
+        d.paragraphs
+            .insert(4, make_para(vec![make_shaped_line(vec![])]));
+        d.inline_box_carrier.insert(5, 4);
+        assert_eq!(carrier_opacity(5, &d), 1.0);
+    }
+
+    #[test]
+    fn a_box_nested_in_a_continuation_is_painted_with_it_and_only_once() {
+        // Box 7 holds a descendant 8 whose paragraph carries box 10: on a page after its first, 8 has no line, so
+        // nothing else paints 10 (a clip box inside an inline-block, F30f validator H2).
+        let mut d = Drawables::new();
+        d.inline_box_subtree_skip.extend([7, 8, 10]);
+        d.inline_box_subtree_descendants.insert(7, vec![8]);
+        d.inline_box_subtree_descendants.insert(10, vec![]);
+        d.paragraphs.insert(
+            8,
+            make_para(vec![make_shaped_line(vec![
+                crate::paragraph::LineItem::InlineBox(crate::paragraph::InlineBoxItem {
+                    node_id: Some(10),
+                    width: 10.0_f32.as_pt(),
+                    height: 10.0_f32.as_pt(),
+                    x_offset: crate::units::Pt::ZERO,
+                    computed_y: crate::units::Pt::ZERO,
+                    link: None,
+                    opacity: 1.0,
+                    visible: true,
+                }),
+            ])]),
+        );
+        assert_eq!(nested_inline_boxes(7, &d), vec![10]);
+        let mut geometry = crate::pagination_layout::PaginationGeometryTable::new();
+        for id in [7, 8, 10] {
+            geometry.insert(id, geometry_over_pages(&[0, 1, 2]));
+        }
+        with_scratch_canvas(|canvas| {
+            assert!(paint_inline_box_continuation(
+                canvas, 7, 1, &geometry, &d, 10.0, 10.0
+            ));
+            // 10 was painted with 7: a walk that reaches it too paints nothing.
+            assert!(!paint_inline_box_continuation(
+                canvas, 10, 1, &geometry, &d, 10.0, 10.0
+            ));
+        });
+        check_continuations_painted(1, &geometry, &d);
     }
 
     #[test]

@@ -7531,6 +7531,27 @@ fn render_smoke_overflow_hidden_paragraph_spans_pages() {
 }
 
 #[test]
+fn render_smoke_inline_block_under_a_transform_spans_pages() {
+    // F30f validator H1: the transform's own walk skipped the box after its first page (a debug build panicked at an
+    // assertion that a transformed box is never split; a release build printed page 1 and blank pages).
+    assert_lines_on_three_pages(&wrapper_pages(
+        "<div style=\"transform:translateX(10px)\"><div style=\"display:inline-block;width:100%\">",
+        "</div></div>",
+    ));
+}
+
+#[test]
+fn render_smoke_nested_inline_blocks_in_clip_boxes_span_pages() {
+    // F30f validator H2: `clip > inline-block > clip > inline-block`; the inner box's carrier is a descendant of the
+    // outer box and has no line on the later pages, so nothing painted them.
+    assert_lines_on_three_pages(&wrapper_pages(
+        "<div style=\"overflow:hidden;border:1px solid\"><div style=\"display:inline-block;width:100%\">\
+         <div style=\"overflow:hidden\"><div style=\"display:inline-block;width:100%\">",
+        "</div></div></div></div>",
+    ));
+}
+
+#[test]
 fn render_smoke_dropped_text_after_64_kib_is_found_once_and_only_it() {
     // `monospace` is unmapped here, so the `<code>` gets no glyph run (a named family inside a root that has a
     // face is drawn by Parley's fallback).

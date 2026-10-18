@@ -759,6 +759,27 @@ fn lines_right_edge(lines: &[ShapedLine], x: crate::units::Pt) -> crate::units::
     right
 }
 
+/// The translate that moves the content of an inline box from the position the dispatcher paints it at,
+/// `geo = (margin + body offset + fragment)`, to where the carrier's line puts it, `inline_flow = (ox, oy)`.
+///
+/// F30f: a box fragmented over pages (`split`) is painted where the fragmenter put it on every page, which is
+/// `geo` less the body offset the dispatcher adds (`render::paint_inline_box_continuation` does the same on the later
+/// pages): the break between its line boxes was planned for that position, and the baseline shift of the inline flow
+/// (CSS 2.1 §10.8.1, folded into `computed_y`) would put the last line of its first page a few px below the content
+/// box, and past a frame's bottom padding.
+fn inline_box_offset(
+    split: bool,
+    body_offset: (f32, f32),
+    inline_flow: (f32, f32),
+    geo: (f32, f32),
+) -> (f32, f32) {
+    if split {
+        (-body_offset.0, -body_offset.1)
+    } else {
+        (inline_flow.0 - geo.0, inline_flow.1 - geo.1)
+    }
+}
+
 /// Draw pre-shaped text lines at the given position.
 pub fn draw_shaped_lines(
     canvas: &mut Canvas<'_, '_>,
@@ -962,8 +983,15 @@ pub fn draw_shaped_lines(
                         let geo_y_pt = ctx.margin_top_pt
                             + ctx.drawables.body_offset_pt.1.to_f32()
                             + content_frag.y.in_pt().to_f32();
-                        let off_x = ox.to_f32() - geo_x_pt;
-                        let off_y = oy.to_f32() - geo_y_pt;
+                        let (off_x, off_y) = inline_box_offset(
+                            content_geom.is_split(),
+                            (
+                                ctx.drawables.body_offset_pt.0.to_f32(),
+                                ctx.drawables.body_offset_pt.1.to_f32(),
+                            ),
+                            (ox.to_f32(), oy.to_f32()),
+                            (geo_x_pt, geo_y_pt),
+                        );
                         let transform = krilla::geom::Transform::from_translate(off_x, off_y);
                         let link_affine = crate::draw_primitives::Affine2D::translation(
                             off_x.as_pt(),
@@ -1230,6 +1258,28 @@ mod tests {
         // (x + x_offset, y + computed_y, width, height) = (7, 10, 20, 10).
         let pts = occ[0].quads[0].points;
         assert_eq!(pts, [[7.0, 20.0], [27.0, 20.0], [27.0, 10.0], [7.0, 10.0]]);
+    }
+
+    #[test]
+    fn a_split_inline_box_is_painted_at_its_geometry_position_on_every_page() {
+        // geo = margin 10 + body offset 8 + fragment 100; the inline flow puts the box 5 lower (baseline shift).
+        let geo = (118.0, 118.0);
+        let inline_flow = (118.0, 123.0);
+        // One fragment: the carrier's position, as before.
+        assert_eq!(
+            inline_box_offset(false, (8.0, 8.0), inline_flow, geo),
+            (0.0, 5.0)
+        );
+        // Split over pages: the geometry position without the body offset the dispatcher added, like the pages after
+        // the first.
+        assert_eq!(
+            inline_box_offset(true, (8.0, 8.0), inline_flow, geo),
+            (-8.0, -8.0)
+        );
+        assert_eq!(
+            inline_box_offset(true, (0.0, 0.0), inline_flow, geo),
+            (0.0, 0.0)
+        );
     }
 
     /// Compare a migrated `Pt` coordinate against a raw `f32` expectation.

@@ -604,6 +604,9 @@ pub(super) fn extract_paragraph(
                         .extend(descendants.iter().copied());
                     out.inline_box_subtree_descendants
                         .insert(node_id, descendants);
+                    if let Some(content_id) = content {
+                        out.inline_box_carrier.insert(content_id, node.id);
+                    }
 
                     let link = ctx.link_cache.lookup(doc, node_id);
                     let height = positioned.height.as_px().in_pt();

@@ -527,6 +527,11 @@ pub struct Drawables {
     /// `inline_box_subtree_skip`. `BTreeMap`/`Vec` keep iteration
     /// deterministic for PDF byte-equality.
     pub inline_box_subtree_descendants: BTreeMap<NodeId, Vec<NodeId>>,
+    /// F30f: inline-box content root NodeId -> the NodeId of the paragraph that carries it (the inline root whose
+    /// line holds the box). A box fragmented over pages is painted on the pages after the first by
+    /// `render::paint_inline_box_continuation`, which paints it inside the opacity group the carrier's paragraph
+    /// has when it holds the opacity itself.
+    pub inline_box_carrier: BTreeMap<NodeId, NodeId>,
     /// 合成 NodeId カウンタ。usize::MAX / 2 から降順に割り当て。
     /// DOM NodeId（通常 < 100_000）との衝突を避けるため大きな値から開始する。
     pub synthetic_id_counter: usize,
@@ -560,6 +565,7 @@ impl Default for Drawables {
             semantics: BTreeMap::new(),
             inline_box_subtree_skip: std::collections::BTreeSet::new(),
             inline_box_subtree_descendants: BTreeMap::new(),
+            inline_box_carrier: BTreeMap::new(),
             synthetic_id_counter: usize::MAX / 2,
             li_lbl_ids: BTreeMap::new(),
             li_lbody_ids: BTreeMap::new(),
