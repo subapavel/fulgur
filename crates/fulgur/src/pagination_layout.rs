@@ -592,6 +592,20 @@ fn starts_with_relaxed_avoid(
     if crate::blitz_adapter::is_multicol_container(node) {
         return false;
     }
+    // A forced break before the box (or before an ancestor on the way) is the break before it already: moving first
+    // would make the forced break fire a second time on the fresh page, which has the box's parents' padding above
+    // it, and leave a blank page (fuzz `Z1_198`).
+    if column_styles
+        .and_then(|t| t.get(&node_id))
+        .is_some_and(|p| {
+            matches!(
+                p.break_before,
+                Some(crate::draw_primitives::BreakBefore::Page)
+            )
+        })
+    {
+        return false;
+    }
     if has_avoid(column_styles, node_id)
         && !avoid_inside_holds(
             true,
@@ -9290,6 +9304,21 @@ h2 { string-set: chapter-title content(text); }
                 );
             }
         }
+    }
+
+    /// Fuzz `Z1_198`: a relaxed avoid box with its own `break-before: page` inside a padded parent after content: the
+    /// forced break is the one break before it. Moving the parent first made the break fire again on the fresh page
+    /// (the padding above the box counts as content there) and left a blank page.
+    #[test]
+    fn relaxed_avoid_box_with_a_forced_break_before_it_starts_one_page_only() {
+        let (doc, geom) = avoid_fragments(&format!(
+            "<p>x</p><div style=\"padding:12px\"><div class=\"av\" style=\"break-before:page\">{}</div></div>",
+            (0..12)
+                .map(|i| format!("<div class=\"l\">l{i}</div>"))
+                .collect::<String>()
+        ));
+        let lines = nodes_by_class(doc.deref(), "l");
+        assert_eq!(geom[&lines[0]].fragments[0].page_index, 1);
     }
 
     /// F83b: kept whole when `avoid` holds and the box fits the room or can move; the six combinations.
