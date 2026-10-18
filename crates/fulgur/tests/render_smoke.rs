@@ -7478,6 +7478,58 @@ fn render_smoke_abspos_paragraph_spans_pages() {
     }
 }
 
+/// 120 lines `LN000`.. of 20 px, one per `<br>`, in `wrapper` (`{lines}` marks where), on pages of 1122 px: 56 + 56 + 8.
+fn wrapper_pages(wrapper_open: &str, wrapper_close: &str) -> Vec<u8> {
+    let lines: String = (0..120)
+        .map(|i| format!("LN{i:03}"))
+        .collect::<Vec<_>>()
+        .join("<br>");
+    let html = format!(
+        "<!doctype html><html><head><style>@page{{size:A4;margin:0}}\
+         body{{margin:0;line-height:20px}}p{{margin:0}}</style></head><body>\
+         {wrapper_open}<p>{lines}</p>{wrapper_close}</body></html>"
+    );
+    Engine::builder()
+        .system_fonts(false)
+        .strict_text(true)
+        .assets(noto_bundle())
+        .build()
+        .render(&html)
+        .expect("every word has a face")
+}
+
+/// Every `LNnnn` is printed on exactly one page of `pdf`, from page 1 to page 3.
+fn assert_lines_on_three_pages(pdf: &[u8]) {
+    assert_eq!(page_count(pdf), 3);
+    if let Some(text) = extract_pdf_text(pdf) {
+        let pages: Vec<&str> = text.split('\x0c').collect();
+        for i in 0..120 {
+            let word = format!("LN{i:03}");
+            let on: Vec<usize> = (0..3).filter(|&p| pages[p].contains(&word)).collect();
+            assert_eq!(on.len(), 1, "{word} printed on pages {on:?}");
+        }
+        assert!(pages[0].contains("LN000") && pages[2].contains("LN119"));
+    }
+}
+
+#[test]
+fn render_smoke_inline_block_paragraph_spans_pages() {
+    // F30f: a paragraph taller than a page in an `inline-block` alone on its line was placed whole: the lines below
+    // the page were drawn below it and lost. The box is split between its line boxes, its carrier's line is drawn on
+    // the page where it starts and the later pages are painted as continuations of the box.
+    assert_lines_on_three_pages(&wrapper_pages(
+        "<div style=\"display:inline-block;width:100%\">",
+        "</div>",
+    ));
+}
+
+#[test]
+fn render_smoke_overflow_hidden_paragraph_spans_pages() {
+    // F30f: the same for a clipping box whose content ends inside it: it is fragmented, and the clip is applied to
+    // each fragment.
+    assert_lines_on_three_pages(&wrapper_pages("<div style=\"overflow:hidden\">", "</div>"));
+}
+
 #[test]
 fn render_smoke_dropped_text_after_64_kib_is_found_once_and_only_it() {
     // `monospace` is unmapped here, so the `<code>` gets no glyph run (a named family inside a root that has a

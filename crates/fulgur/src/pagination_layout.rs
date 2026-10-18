@@ -4265,6 +4265,10 @@ fn fragment_block_subtree(
             .as_px(),
         });
 
+    // F30f: an `inline-block` alone on this box's line now spans several pages: the box's one line is painted where
+    // the inline-block starts.
+    record_carrier_slices_after(geometry, doc, parent, &walk_children);
+
     // What `closing` holds beyond the box's own bottom padding and border: the
     // room a stretched box (a table cell as tall as its row) has below its last
     // child. It is part of the frame but not of the content.
@@ -4276,6 +4280,104 @@ fn fragment_block_subtree(
         - trailing)
         .max(0.0);
     (page_index, cursor_y + closing, lines_split_below, stretch)
+}
+
+/// F30f: whether `geom` is the geometry of the carrier of a split `inline-block` that [`record_carrier_slices`] gave
+/// its slices: one per fragment, exactly one of them the carrier's one line (`0..1`), the fragments before it empty
+/// (`0..0`) and the ones after it empty too (`1..1`). Stricter than [`line_slices_tile`], which an inline root's own
+/// slices must satisfy.
+fn carrier_slices_ok(geom: &PaginationGeometry) -> bool {
+    let slices = &geom.line_slices;
+    if slices.is_empty() || slices.len() != geom.fragments.len() {
+        return false;
+    }
+    let Some(line) = slices.iter().position(|s| (s.first, s.end) == (0, 1)) else {
+        return false;
+    };
+    slices.iter().enumerate().all(|(k, s)| match k.cmp(&line) {
+        std::cmp::Ordering::Less => (s.first, s.end) == (0, 0),
+        std::cmp::Ordering::Equal => true,
+        std::cmp::Ordering::Greater => (s.first, s.end) == (1, 1),
+    })
+}
+
+/// F30f: give the carrier `carrier_id` of an `inline-block` that spans several pages line slices that put its one
+/// line (the line that holds the box) on the first fragment on `line_page`, the page where the box starts, and none on
+/// the other fragments.
+///
+/// A carrier that is split over several fragments and has no slices is painted by measuring its line from the fragment
+/// heights ([`crate::render`]'s `paragraph_lines_for_page`): its one line is taller than every fragment, so it is
+/// painted on no page, and the box with it. With these slices the line (and so the box's first fragment, which the
+/// carrier paints under the baseline shift of CSS 2.1 §10.8.1) is drawn once, on the page where it always was.
+fn record_carrier_slices(
+    geometry: &mut PaginationGeometryTable,
+    carrier_id: usize,
+    line_page: u32,
+) {
+    let Some(entry) = geometry.get_mut(&carrier_id) else {
+        return;
+    };
+    let Some(line) = entry
+        .fragments
+        .iter()
+        .position(|f| f.page_index == line_page)
+    else {
+        return;
+    };
+    entry.line_slices = (0..entry.fragments.len())
+        .map(|k| {
+            let (first, end) = match k.cmp(&line) {
+                std::cmp::Ordering::Less => (0, 0),
+                std::cmp::Ordering::Equal => (0, 1),
+                std::cmp::Ordering::Greater => (1, 1),
+            };
+            LineSlice {
+                first,
+                end,
+                offset: 0.0_f32.as_px(),
+            }
+        })
+        .collect();
+    debug_assert!(
+        carrier_slices_ok(entry),
+        "record_carrier_slices: {:?}",
+        entry.line_slices
+    );
+}
+
+/// F30f: after a box `parent` has been fragmented: when it is the carrier of an `inline-block` alone on its line, and
+/// the box now has fragments on several pages, record the carrier's slices ([`record_carrier_slices`]).
+fn record_carrier_slices_after(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    parent: &blitz_dom::Node,
+    walk_children: &[usize],
+) {
+    if geometry
+        .get(&parent.id)
+        .is_none_or(|g| g.fragments.len() < 2)
+        || collect_inline_line_metrics(parent).len() != 1
+    {
+        return;
+    }
+    for &id in walk_children {
+        let Some(ib) = doc.get_node(id) else {
+            continue;
+        };
+        if !alone_on_its_line(doc, ib) {
+            continue;
+        }
+        let pages = geometry.get(&id).and_then(|g| {
+            let (first, last) = (g.fragments.first()?, g.fragments.last()?);
+            Some((first.page_index, last.page_index))
+        });
+        if let Some((first, last)) = pages
+            && last > first
+        {
+            record_carrier_slices(geometry, parent.id, first);
+            return;
+        }
+    }
 }
 
 /// F12: a table's first `table-header-group`, repeated at the top of every
@@ -4665,11 +4767,132 @@ impl LineBarrier {
     }
 }
 
-/// F30f: the barrier a box puts up on its own, whether it is the parent or the child of the paragraph: an atomic
-/// inline, or a clipping box.
-fn box_barrier(node: &blitz_dom::Node) -> Option<LineBarrier> {
+/// F30f: how far the last line box of a paragraph may reach past the box that holds it without the clip hiding
+/// anything: Blitz quantises line boxes, so with a font whose ascent and descent exceed the line height they are taller
+/// than their advance, start a pixel above the content top and the last one ends a pixel or two below the box (Noto at
+/// 20 px: lines `(-1, 21)`, `(19, 41)`, ..). A line that is really hidden is hidden by a line, 10 px or more.
+const LINE_BOX_SLACK: f32 = 2.0;
+
+/// F30f: whether the box `node` is a clipping box whose content ends inside its padding box in the block axis, so
+/// that the clip hides nothing there and the box may be fragmented like any other (css-break-3 §4.1: only an
+/// `overflow: hidden` box with a definite block size is one a UA may treat as monolithic; Chrome fragments `hidden`,
+/// `clip`, `auto` and `scroll` boxes in print).
+///
+/// An inline root: its inset, lines and bottom inset fit the border box. A block: the lowest in-flow child, and the
+/// margin below it (inside a clipping box, a BFC root, the last child's margin does not collapse out), end within the
+/// padding box. Floats count. 0.5 px of slack, as in [`frame_is_content_sized`]; content that overflows (a negative
+/// margin, a float that sticks out) makes this false and the box stays whole, as before.
+fn clip_hides_nothing(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
+    let layout = &node.final_layout;
+    let height = layout.size.height;
+    if !height.is_finite() {
+        return false;
+    }
+    let lines = collect_inline_line_metrics(node);
+    if let Some(last) = lines.last() {
+        let inset_top = layout.border.top + layout.padding.top;
+        let inset_bottom = layout.border.bottom + layout.padding.bottom;
+        // The lines' coordinates are measured from the content top; the first line box of a quantised paragraph
+        // (`line-height: normal`) starts a pixel above it, so the end of the last one is what counts.
+        return inset_top + last.1 + inset_bottom <= height + LINE_BOX_SLACK;
+    }
+    let layout_children = node.layout_children.borrow();
+    let children: &[usize] = layout_children
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .unwrap_or(&node.children);
+    let mut bottom: f32 = 0.0;
+    let mut last = None;
+    for &id in children {
+        if let Some(c) = doc.get_node(id)
+            && is_flow_child_with_height(c)
+        {
+            let l = &c.final_layout;
+            bottom = bottom.max(l.location.y + l.size.height);
+            // A child whose lines overflow its own box (a `height` on the paragraph, a stretched flex item) reaches
+            // further than its box does. The slack of the line boxes is taken off here, so that the comparison below
+            // keeps its own half pixel for the boxes.
+            let lines = collect_inline_line_metrics(c);
+            if let Some(last_line) = lines.last() {
+                bottom = bottom.max(
+                    l.location.y
+                        + l.border.top
+                        + l.padding.top
+                        + last_line.1
+                        + l.border.bottom
+                        + l.padding.bottom
+                        - LINE_BOX_SLACK,
+                );
+            }
+            last = Some(id);
+        }
+    }
+    let Some(last) = last else {
+        return true;
+    };
+    bottom + trailing_margin(doc, last, 0)
+        <= height - layout.border.bottom - layout.padding.bottom + 0.5
+}
+
+/// F30f: whether the `inline-block` `node` is the only thing on its carrier's single line: the box that holds it in
+/// the inline formatting context (its `layout_parent`) has exactly one Parley line, and that line holds this box and
+/// glyph runs of whitespace only.
+///
+/// Then the carrier's line *is* the box: the carrier is never a line-split candidate itself (one line), and
+/// nothing else on the line needs the room a page break takes from it. css-break-3 §4.1 lets a UA treat such a box as
+/// monolithic; Chrome slices it, we split it between its line boxes (ADR-0004).
+fn alone_on_its_line(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
     use ::style::values::specified::box_::{DisplayInside, DisplayOutside};
-    if crate::blitz_adapter::is_atomic_inline_container_node(node) {
+    let is_inline_block = node.primary_styles().is_some_and(|s| {
+        let display = s.clone_display();
+        display.outside() == DisplayOutside::Inline && display.inside() == DisplayInside::FlowRoot
+    });
+    if !is_inline_block {
+        return false;
+    }
+    let Some(carrier) = node.layout_parent.get().and_then(|id| doc.get_node(id)) else {
+        return false;
+    };
+    let Some(text_layout) = carrier
+        .element_data()
+        .and_then(|e| e.inline_layout_data.as_deref())
+    else {
+        return false;
+    };
+    let mut lines = text_layout.layout.lines();
+    let (Some(line), None) = (lines.next(), lines.next()) else {
+        return false;
+    };
+    let mut found = false;
+    for item in line.items() {
+        match item {
+            parley::PositionedLayoutItem::InlineBox(b) => {
+                if b.id as usize != node.id || found {
+                    return false;
+                }
+                found = true;
+            }
+            parley::PositionedLayoutItem::GlyphRun(run) => {
+                let blank = text_layout
+                    .text
+                    .get(run.run().text_range())
+                    .is_some_and(|t| t.chars().all(char::is_whitespace));
+                if !blank {
+                    return false;
+                }
+            }
+        }
+    }
+    found
+}
+
+/// F30f: the barrier a box puts up on its own, whether it is the parent or the child of the paragraph: an atomic
+/// inline that is not an `inline-block` alone on its line ([`alone_on_its_line`]), or a clipping box that hides
+/// content ([`clip_hides_nothing`]).
+fn box_barrier(doc: &BaseDocument, node: &blitz_dom::Node) -> Option<LineBarrier> {
+    use ::style::values::specified::box_::{DisplayInside, DisplayOutside};
+    if crate::blitz_adapter::is_atomic_inline_container_node(node) && !alone_on_its_line(doc, node)
+    {
         let inline_block = node.primary_styles().is_some_and(|s| {
             let display = s.clone_display();
             display.outside() == DisplayOutside::Inline
@@ -4681,7 +4904,7 @@ fn box_barrier(node: &blitz_dom::Node) -> Option<LineBarrier> {
             LineBarrier::AtomicNotFlowRoot
         });
     }
-    clips_overflow(node).then_some(LineBarrier::ClipsItsContent)
+    (clips_overflow(node) && !clip_hides_nothing(doc, node)).then_some(LineBarrier::ClipsItsContent)
 }
 
 /// F30f: why the line splitter does not look through `parent` and `child` to split the paragraph `child`, or `None`
@@ -4706,7 +4929,7 @@ fn split_barrier(
     // other child of a table box, or a cell outside one, is not handled (F30e).
     let cell_of_table = inside_of(parent) == Some(DisplayInside::Table)
         && inside_of(child) == Some(DisplayInside::TableCell);
-    if let Some(barrier) = box_barrier(parent) {
+    if let Some(barrier) = box_barrier(doc, parent) {
         return Some(barrier);
     }
     if crate::blitz_adapter::is_multicol_container(parent) {
@@ -4720,7 +4943,7 @@ fn split_barrier(
     {
         return Some(LineBarrier::TablePart);
     }
-    if let Some(barrier) = box_barrier(child) {
+    if let Some(barrier) = box_barrier(doc, child) {
         return Some(barrier);
     }
     if crate::blitz_adapter::is_multicol_container(child) {
@@ -11678,16 +11901,191 @@ h2 { string-set: chapter-title content(text); }
         }
     }
 
+    /// `n` 20px lines of the paragraph `frags` are the fragments of, each once.
+    fn assert_lines_once(frags: &[Fragment], n: usize, what: &str) {
+        assert!(frags.len() >= 3, "{what}: {frags:?}");
+        let total: f32 = frags.iter().map(|f| f.height.to_f32()).sum();
+        assert!(
+            (total - 20.0 * n as f32).abs() < 0.5,
+            "{what}: every line once: {frags:?}"
+        );
+    }
+
+    /// The geometry of the node with `id`, or none (never entered).
+    fn geometry_of<'t>(
+        doc: &blitz_html::HtmlDocument,
+        table: &'t PaginationGeometryTable,
+        id: &str,
+    ) -> Option<&'t PaginationGeometry> {
+        table.get(&find_by_id(doc.deref(), id).unwrap())
+    }
+
+    /// A document laid out at 600px wide, as `nested_geometry` does, without the fragmenter.
+    fn laid_out(body: &str) -> blitz_html::HtmlDocument {
+        parse(
+            &format!("<html><head>{LINE_CSS}</head><body>{body}</body></html>"),
+            600.0,
+        )
+    }
+
+    fn node_of<'d>(doc: &'d blitz_html::HtmlDocument, id: &str) -> &'d blitz_dom::Node {
+        doc.deref()
+            .get_node(find_by_id(doc.deref(), id).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn a_paragraph_in_a_content_sized_clip_box_is_split() {
+        // css-break-3 §4.1: a box with `overflow: hidden` and no definite block size is fragmentable, and Chrome
+        // fragments `clip`, `auto` and `scroll` boxes in print too: every line once, a frame on every page.
+        for style in [
+            "overflow:hidden",
+            "overflow:clip",
+            "overflow:auto",
+            "overflow:scroll",
+            "overflow-x:hidden",
+            "overflow-x:auto",
+        ] {
+            let (doc, table) = nested_geometry(
+                &format!(
+                    "<div id=\"w\" style=\"{style}\"><p id=\"x\">{}</p></div>",
+                    br_lines(30)
+                ),
+                200.0,
+            );
+            assert_lines_once(fragments_of(&doc, &table, "x"), 30, style);
+            assert_eq!(fragments_of(&doc, &table, "w").len(), 3, "{style}");
+        }
+    }
+
+    #[test]
+    fn direct_text_in_a_clip_box_is_split() {
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div><div id=\"x\" style=\"overflow:hidden\">{}</div></div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        assert_lines_once(fragments_of(&doc, &table, "x"), 30, "overflow:hidden text");
+    }
+
+    #[test]
+    fn a_clip_box_shorter_than_its_paragraph_keeps_it_whole() {
+        // The clip hides 300px of the paragraph: fragmenting the box would show them on the next pages. One unit,
+        // as before (Chrome: a box clipped at its height, F30f-b).
+        for style in ["height:300px", "max-height:300px"] {
+            let (doc, table) = nested_geometry(
+                &format!(
+                    "<div style=\"overflow:hidden;{style}\"><p id=\"x\">{}</p></div>",
+                    br_lines(30)
+                ),
+                200.0,
+            );
+            let n = geometry_of(&doc, &table, "x").map_or(0, |g| g.fragments.len());
+            assert!(n <= 1, "{style}: {n} fragments");
+        }
+    }
+
+    #[test]
+    fn a_paragraph_in_an_inline_block_alone_on_its_line_is_split() {
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div id=\"ib\" style=\"display:inline-block;width:100%\"><p id=\"x\">{}</p></div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        assert_lines_once(fragments_of(&doc, &table, "x"), 30, "ib > p");
+        assert_eq!(fragments_of(&doc, &table, "ib").len(), 3);
+    }
+
+    #[test]
+    fn an_inline_block_with_direct_text_is_split() {
+        // A carrier `div` holds the box; the box holds its text itself.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div id=\"c\"><div id=\"ib\" style=\"display:inline-block\">{}</div></div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        assert_lines_once(fragments_of(&doc, &table, "ib"), 30, "ib text");
+    }
+
+    #[test]
+    fn the_carrier_line_is_on_the_page_where_its_inline_box_starts() {
+        // The carrier's one line holds the box. Once the box has a fragment per page, the carrier has one per
+        // page too, and its line has to be painted exactly once, where the box starts (F30f).
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div id=\"c\"><div id=\"ib\" style=\"display:inline-block;width:100%\"><p>{}</p></div></div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let carrier = geometry_of(&doc, &table, "c").unwrap();
+        let got: Vec<(u32, u32)> = carrier
+            .line_slices
+            .iter()
+            .map(|s| (s.first, s.end))
+            .collect();
+        assert_eq!(got, vec![(0, 1), (1, 1), (1, 1)], "{carrier:?}");
+        assert_eq!(carrier.fragments.len(), 3);
+        assert!(carrier_slices_ok(carrier));
+        assert_eq!(fragments_of(&doc, &table, "ib")[0].page_index, 0);
+    }
+
+    #[test]
+    fn an_inline_block_moved_to_the_next_page_takes_its_carrier_line_along() {
+        // 170px of padding leave one line on page 0: ORPHANS moves the box to page 1. The carrier has a fragment
+        // on page 0 (its padding) with no line, and its line is on page 1 with the box.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div id=\"c\" style=\"padding-top:170px\"><div id=\"ib\" style=\"display:inline-block;width:100%\">\
+                 <p>{}</p></div></div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let ib = fragments_of(&doc, &table, "ib");
+        assert_eq!(ib[0].page_index, 1, "{ib:?}");
+        let carrier = geometry_of(&doc, &table, "c").unwrap();
+        let got: Vec<(u32, u32)> = carrier
+            .line_slices
+            .iter()
+            .map(|s| (s.first, s.end))
+            .collect();
+        assert_eq!(got, vec![(0, 0), (0, 1), (1, 1), (1, 1)], "{carrier:?}");
+        assert_eq!(carrier.fragments.len(), 4);
+        assert!(carrier_slices_ok(carrier));
+    }
+
+    #[test]
+    fn an_inline_block_sharing_its_line_keeps_its_paragraph_whole() {
+        // Text on the line: the box is one unit (Chrome slices it, F30f-b).
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div>Hi <span id=\"x\" style=\"display:inline-block\">{}</span> end</div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let n = geometry_of(&doc, &table, "x").map_or(0, |g| g.fragments.len());
+        assert!(n <= 1, "{n} fragments");
+    }
+
     #[test]
     fn paragraphs_that_are_not_in_plain_flow_stay_whole() {
-        // The exclusions of `line_split_candidate` still hold: a clipping parent and an atomic-inline
-        // parent place a paragraph as one unit. (A non-cell child of a `display: table` box used to be
-        // one too; since F50 it sits in an anonymous cell and splits like any block, see below.)
+        // The exclusions of `line_split_candidate` that hold: an atomic inline that is not an `inline-block` alone on
+        // its line, and a clipping parent that hides content, place a paragraph as one unit. (A non-cell child of a
+        // `display: table` box used to be one too; since F50 it sits in an anonymous cell and splits like any block,
+        // see below. A content-sized clipping parent splits since F30f, see above.)
         for (what, markup) in [
             (
-                "overflow:hidden flex",
+                "overflow:hidden flex, height",
                 format!(
-                    "<div style=\"display:flex;overflow:hidden\"><p id=\"x\">{}</p></div>",
+                    "<div style=\"display:flex;overflow:hidden;height:300px\"><p id=\"x\">{}</p></div>",
                     br_lines(30)
                 ),
             ),
@@ -11701,10 +12099,371 @@ h2 { string-set: chapter-title content(text); }
         ] {
             let (doc, table) = nested_geometry(&markup, 200.0);
             // Not entered at all (no entry), or one whole fragment: never split between lines.
-            let node = find_by_id(doc.deref(), "x").unwrap();
-            let n = table.get(&node).map_or(0, |g| g.fragments.len());
+            let n = geometry_of(&doc, &table, "x").map_or(0, |g| g.fragments.len());
             assert!(n <= 1, "{what}: {n} fragments");
         }
+    }
+
+    #[test]
+    fn a_paragraph_in_a_content_sized_flex_clip_box_is_split() {
+        // Chrome (P17): `display:flex; overflow:hidden` around a paragraph fragments it: every line once.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"display:flex;overflow:hidden\"><p id=\"x\">{}</p></div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        assert_lines_once(fragments_of(&doc, &table, "x"), 30, "flex overflow:hidden");
+    }
+
+    #[test]
+    fn clip_hides_nothing_reads_the_block_axis() {
+        let two = br_lines(2);
+        let cases: [(&str, String, bool); 13] = [
+            (
+                "auto",
+                format!("<div id=\"x\" style=\"overflow:hidden\"><p>{two}</p></div>"),
+                true,
+            ),
+            (
+                "height below",
+                format!("<div id=\"x\" style=\"overflow:hidden;height:30px\"><p>{two}</p></div>"),
+                false,
+            ),
+            (
+                "height above",
+                format!("<div id=\"x\" style=\"overflow:hidden;height:100px\"><p>{two}</p></div>"),
+                true,
+            ),
+            (
+                "max-height",
+                format!(
+                    "<div id=\"x\" style=\"overflow:hidden;max-height:30px\"><p>{two}</p></div>"
+                ),
+                false,
+            ),
+            (
+                "padding",
+                format!("<div id=\"x\" style=\"overflow:hidden;padding:10px\"><p>{two}</p></div>"),
+                true,
+            ),
+            (
+                "content over the bottom padding",
+                format!(
+                    "<div id=\"x\" style=\"overflow:hidden;box-sizing:border-box;height:50px;padding:10px\"><p>{two}</p></div>"
+                ),
+                false,
+            ),
+            (
+                "float",
+                format!(
+                    "<div id=\"x\" style=\"overflow:hidden\"><div style=\"float:left;height:100px\"></div><p>{two}</p></div>"
+                ),
+                true,
+            ),
+            (
+                "float over a height",
+                format!(
+                    "<div id=\"x\" style=\"overflow:hidden;height:50px\"><div style=\"float:left;height:100px\"></div><p>{two}</p></div>"
+                ),
+                false,
+            ),
+            (
+                "overflow-x only",
+                format!("<div id=\"x\" style=\"overflow-x:hidden\"><p>{two}</p></div>"),
+                true,
+            ),
+            (
+                "inline root",
+                format!("<div id=\"x\" style=\"overflow:hidden\">{two}</div>"),
+                true,
+            ),
+            (
+                "inline root with a height",
+                format!("<div id=\"x\" style=\"overflow:hidden;height:30px\">{two}</div>"),
+                false,
+            ),
+            (
+                "paragraph taller than its own box",
+                format!(
+                    "<div id=\"x\" style=\"overflow:hidden\"><p style=\"height:30px\">{two}</p></div>"
+                ),
+                false,
+            ),
+            (
+                "stretched flex item taller than the box",
+                format!(
+                    "<div id=\"x\" style=\"display:flex;overflow:hidden;height:30px\"><p>{two}</p></div>"
+                ),
+                false,
+            ),
+        ];
+        for (what, markup, expected) in cases {
+            let doc = laid_out(&markup);
+            assert_eq!(
+                clip_hides_nothing(doc.deref(), node_of(&doc, "x")),
+                expected,
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn alone_on_its_line_wants_one_line_with_only_the_box_on_it() {
+        let cases: [(&str, &str, bool); 8] = [
+            (
+                "alone",
+                "<div><div id=\"x\" style=\"display:inline-block\">a</div></div>",
+                true,
+            ),
+            (
+                "blanks around it",
+                "<div> <span id=\"x\" style=\"display:inline-block\">a</span> </div>",
+                true,
+            ),
+            (
+                "two boxes",
+                "<div><span id=\"x\" style=\"display:inline-block\">a</span><span style=\"display:inline-block\">b</span></div>",
+                false,
+            ),
+            (
+                "text before",
+                "<div>Hi <span id=\"x\" style=\"display:inline-block\">a</span></div>",
+                false,
+            ),
+            (
+                "text after",
+                "<div><span id=\"x\" style=\"display:inline-block\">a</span> end</div>",
+                false,
+            ),
+            (
+                "second line",
+                "<div>Hi<br><span id=\"x\" style=\"display:inline-block\">a</span></div>",
+                false,
+            ),
+            (
+                "inline-flex",
+                "<div><span id=\"x\" style=\"display:inline-flex\">a</span></div>",
+                false,
+            ),
+            ("a block", "<div><div id=\"x\">a</div></div>", false),
+        ];
+        for (what, markup, expected) in cases {
+            let doc = laid_out(markup);
+            assert_eq!(
+                alone_on_its_line(doc.deref(), node_of(&doc, "x")),
+                expected,
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_barrier_names_each_arm() {
+        use LineBarrier::*;
+        let two = br_lines(2);
+        // (what, markup, parent id, child id, expected)
+        let cases: Vec<(&str, String, &str, &str, Option<LineBarrier>)> = vec![
+            (
+                "plain",
+                format!("<div id=\"p\"><p id=\"c\">{two}</p></div>"),
+                "p",
+                "c",
+                None,
+            ),
+            (
+                "inline-block alone",
+                format!(
+                    "<div><div id=\"p\" style=\"display:inline-block\"><p id=\"c\">{two}</p></div></div>"
+                ),
+                "p",
+                "c",
+                None,
+            ),
+            (
+                "inline-block sharing",
+                format!(
+                    "<div>Hi <span id=\"p\" style=\"display:inline-block\"><p id=\"c\">{two}</p></span></div>"
+                ),
+                "p",
+                "c",
+                Some(SharesItsLine),
+            ),
+            (
+                "inline-flex",
+                format!(
+                    "<div><div id=\"p\" style=\"display:inline-flex\"><p id=\"c\">{two}</p></div></div>"
+                ),
+                "p",
+                "c",
+                Some(AtomicNotFlowRoot),
+            ),
+            (
+                "clip, content hidden",
+                format!(
+                    "<div id=\"p\" style=\"overflow:hidden;height:30px\"><p id=\"c\">{two}</p></div>"
+                ),
+                "p",
+                "c",
+                Some(ClipsItsContent),
+            ),
+            (
+                "clip, content inside",
+                format!("<div id=\"p\" style=\"overflow:hidden\"><p id=\"c\">{two}</p></div>"),
+                "p",
+                "c",
+                None,
+            ),
+            (
+                "clip child",
+                format!(
+                    "<div id=\"p\"><div id=\"c\" style=\"overflow:hidden;height:30px\">{two}</div></div>"
+                ),
+                "p",
+                "c",
+                Some(ClipsItsContent),
+            ),
+            (
+                "multicol parent",
+                format!("<div id=\"p\" style=\"columns:2\"><p id=\"c\">{two}</p></div>"),
+                "p",
+                "c",
+                Some(Multicol),
+            ),
+            (
+                "multicol child",
+                format!("<div id=\"p\"><div id=\"c\" style=\"columns:2\">{two}</div></div>"),
+                "p",
+                "c",
+                Some(Multicol),
+            ),
+            (
+                "table part",
+                format!("<div id=\"p\" style=\"display:table\"><div id=\"c\">{two}</div></div>"),
+                "p",
+                "c",
+                Some(TablePart),
+            ),
+            (
+                "floating child",
+                format!("<div id=\"p\"><p id=\"c\" style=\"float:left\">{two}</p></div>"),
+                "p",
+                "c",
+                Some(Floating),
+            ),
+            (
+                "transformed child",
+                format!(
+                    "<div id=\"p\"><p id=\"c\" style=\"transform:rotate(1deg)\">{two}</p></div>"
+                ),
+                "p",
+                "c",
+                Some(Transformed),
+            ),
+        ];
+        for (what, markup, parent, child, expected) in cases {
+            let doc = laid_out(&markup);
+            assert_eq!(
+                split_barrier(doc.deref(), node_of(&doc, parent), node_of(&doc, child)),
+                expected,
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn carrier_slices_ok_wants_one_line_slice_between_empty_ones() {
+        let geom = |slices: &[(u32, u32)]| PaginationGeometry {
+            fragments: slices
+                .iter()
+                .enumerate()
+                .map(|(k, _)| Fragment {
+                    page_index: k as u32,
+                    x: 0.0_f32.as_px(),
+                    y: 0.0_f32.as_px(),
+                    width: 10.0_f32.as_px(),
+                    height: 10.0_f32.as_px(),
+                })
+                .collect(),
+            line_slices: slices
+                .iter()
+                .map(|&(first, end)| LineSlice {
+                    first,
+                    end,
+                    offset: 0.0_f32.as_px(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(carrier_slices_ok(&geom(&[(0, 1), (1, 1), (1, 1)])));
+        assert!(carrier_slices_ok(&geom(&[(0, 0), (0, 1), (1, 1)])));
+        assert!(carrier_slices_ok(&geom(&[(0, 1)])));
+        assert!(!carrier_slices_ok(&geom(&[(0, 0), (1, 1)])), "no line page");
+        assert!(
+            !carrier_slices_ok(&geom(&[(0, 1), (0, 1)])),
+            "two line pages"
+        );
+        assert!(
+            !carrier_slices_ok(&geom(&[(1, 1), (0, 1)])),
+            "line before an after"
+        );
+        assert!(
+            !carrier_slices_ok(&geom(&[(0, 1), (0, 0)])),
+            "empty before the line page after it"
+        );
+        assert!(
+            !carrier_slices_ok(&PaginationGeometry::default()),
+            "no fragments"
+        );
+    }
+
+    #[test]
+    fn unprinted_lines_in_a_clip_box_count_only_what_the_clip_shows() {
+        // 30 lines of 20px on a 200px page.
+        let lines = br_lines(30);
+        // The clip box ends at 100px, above the page bottom: nothing the clip shows is below the page.
+        let doc = laid_out(&format!(
+            "<div id=\"p\" style=\"overflow:hidden;height:100px\"><p id=\"c\">{lines}</p></div>"
+        ));
+        assert!(
+            unprinted_inline_lines(
+                doc.deref(),
+                node_of(&doc, "p"),
+                node_of(&doc, "c"),
+                0.0,
+                200.0
+            )
+            .is_none()
+        );
+        // It ends at 300px: 100px of it are below the page.
+        let doc = laid_out(&format!(
+            "<div id=\"p\" style=\"overflow:hidden;height:300px\"><p id=\"c\">{lines}</p></div>"
+        ));
+        let (n, below, barrier) = unprinted_inline_lines(
+            doc.deref(),
+            node_of(&doc, "p"),
+            node_of(&doc, "c"),
+            0.0,
+            200.0,
+        )
+        .expect("lines below the page");
+        assert_eq!(n, 30);
+        assert!((below - 100.0).abs() < 0.5, "{below}");
+        assert_eq!(barrier, Some(LineBarrier::ClipsItsContent));
+        // A paragraph kept whole by an inline-block that shares its line says so.
+        let doc = laid_out(&format!(
+            "<div>Hi <span id=\"p\" style=\"display:inline-block\"><p id=\"c\">{lines}</p></span></div>"
+        ));
+        let (_, _, barrier) = unprinted_inline_lines(
+            doc.deref(),
+            node_of(&doc, "p"),
+            node_of(&doc, "c"),
+            0.0,
+            200.0,
+        )
+        .expect("lines below the page");
+        assert_eq!(barrier, Some(LineBarrier::SharesItsLine));
     }
 
     #[test]

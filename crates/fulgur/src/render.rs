@@ -774,6 +774,17 @@ fn dispatch_page_node(
         // (which doesn't include the CSS 2.1 §10.8.1 baseline_shift
         // that fulgur applies at convert time, see
         // `convert/inline_root.rs:493`).
+        //
+        // F30f: except the pages of a box fragmented over several pages after the one its carrier painted it on.
+        paint_inline_box_continuation(
+            canvas,
+            node_id,
+            page_index,
+            geometry,
+            drawables,
+            margin_left_pt,
+            margin_top_pt,
+        );
         return;
     }
     // Skip the html root: its bg / border / shadow are painted
@@ -1078,6 +1089,108 @@ pub(crate) fn dispatch_inline_box_content(
             );
         }
     }
+}
+
+/// F30f: whether the inline box with geometry `geom` has a fragment on `page_index` that no paragraph paints: the box
+/// was fragmented over several pages and this one is after the first.
+///
+/// An inline box (`inline-block`) is painted by the paragraph whose line holds it (`paragraph::draw_shaped_lines`),
+/// once, with the fragment on the page that line is drawn on; its subtree is in `Drawables::inline_box_subtree_skip`,
+/// which every walk leaves alone. That is all the box ever needed while it was one fragment. A box the fragmenter
+/// splits between its line boxes has a fragment on every page, and the carrier's one line is on the first of them
+/// (`record_carrier_slices`), so the later fragments have no one to paint them. Geometry that repeats a box on every
+/// page (`position: fixed`) is painted whole by its carrier each time, and a box with one fragment never continues.
+fn inline_box_continues_on(
+    geom: &crate::pagination_layout::PaginationGeometry,
+    page_index: u32,
+) -> bool {
+    geom.is_split()
+        && geom
+            .fragments
+            .first()
+            .is_some_and(|f| f.page_index < page_index)
+        && geom.fragments.iter().any(|f| f.page_index == page_index)
+}
+
+/// F30f: paint the fragment of the inline box `ib_id` that is on `page_index`, when
+/// [`inline_box_continues_on`]: the pages after the one its carrier painted it on. Returns whether it painted.
+///
+/// The carrier moves the box to its place in the line with a translate (`paragraph.rs`, the `InlineBox` arm). Here
+/// the box is where the fragmenter put it, so only the body offset that [`dispatch_inline_box_content`] adds to
+/// the root and to every descendant is cancelled again: `margin_top_pt` is the page's own on a continuation page
+/// (the body offset is page 0 only, `render_v2`), and `frag.x` is html-relative.
+///
+/// The descendants are painted by the helper (`inline_box_subtree_descendants`), so callers leave them alone, as they
+/// do for the first page.
+fn paint_inline_box_continuation(
+    canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
+    ib_id: usize,
+    page_index: u32,
+    geometry: &crate::pagination_layout::PaginationGeometryTable,
+    drawables: &Drawables,
+    margin_left_pt: f32,
+    margin_top_pt: f32,
+) -> bool {
+    if !drawables
+        .inline_box_subtree_descendants
+        .contains_key(&ib_id)
+    {
+        return false;
+    }
+    let Some(geom) = geometry.get(&ib_id) else {
+        return false;
+    };
+    if !inline_box_continues_on(geom, page_index) {
+        return false;
+    }
+    let Some(frag) = geom.fragments.iter().find(|f| f.page_index == page_index) else {
+        return false;
+    };
+    // The carrier skips a box that is not visible, with everything in it.
+    let hidden = drawables
+        .block_styles
+        .get(&ib_id)
+        .is_some_and(|b| !b.visible)
+        || drawables.paragraphs.get(&ib_id).is_some_and(|p| !p.visible);
+    if hidden {
+        return false;
+    }
+    let (body_x, body_y) = (
+        drawables.body_offset_pt.0.to_f32(),
+        drawables.body_offset_pt.1.to_f32(),
+    );
+    let geo_x_pt = margin_left_pt + body_x + frag.x.in_pt().to_f32();
+    let geo_y_pt = margin_top_pt + body_y + frag.y.in_pt().to_f32();
+    let transform = krilla::geom::Transform::from_translate(-body_x, -body_y);
+    let link_affine =
+        crate::draw_primitives::Affine2D::translation((-body_x).as_pt(), (-body_y).as_pt());
+    crate::draw_primitives::draw_with_opacity(canvas, 1.0, |canvas| {
+        if let Some(lc) = canvas.link_collector.as_deref_mut() {
+            lc.push_transform(link_affine);
+        }
+        canvas.surface.push_transform(&transform);
+        canvas.paint_extent.enter_local();
+        dispatch_inline_box_content(
+            canvas,
+            ib_id,
+            geom,
+            frag,
+            geo_x_pt,
+            geo_y_pt,
+            drawables,
+            geometry,
+            margin_left_pt,
+            margin_top_pt,
+            page_index,
+            &drawables.inline_box_subtree_descendants,
+        );
+        canvas.paint_extent.leave_local();
+        canvas.surface.pop();
+        if let Some(lc) = canvas.link_collector.as_deref_mut() {
+            lc.pop_transform();
+        }
+    });
+    true
 }
 
 /// Returns `true` if any line item in `entry` is a text run or inline image
@@ -1849,6 +1962,16 @@ fn draw_under_transform(
             || opacity_skip.contains(&desc_id)
             || paragraph_ib_skip.contains(&desc_id)
         {
+            // F30f: a transformed box is never fragmented over pages (`inline_root_lines` leaves transformed boxes
+            // alone and the strip slicer treats a transformed parent as atomic), so no inline box inside it has a
+            // continuation to paint here.
+            debug_assert!(
+                !paragraph_ib_skip.contains(&desc_id)
+                    || geometry
+                        .get(&desc_id)
+                        .is_none_or(|g| !inline_box_continues_on(g, page_index)),
+                "an inline box inside a transform spans pages: {desc_id}"
+            );
             continue;
         }
         let Some(desc_geom) = geometry.get(&desc_id) else {
@@ -2279,8 +2402,20 @@ fn draw_under_clip(
             if transform_skip.contains(&desc_id)
                 || nested_clip_skip.contains(&desc_id)
                 || nested_opacity_skip.contains(&desc_id)
-                || paragraph_ib_skip.contains(&desc_id)
             {
+                continue;
+            }
+            if paragraph_ib_skip.contains(&desc_id) {
+                // F30f: a box fragmented over several pages is painted by its carrier on the first of them only.
+                paint_inline_box_continuation(
+                    canvas,
+                    desc_id,
+                    page_index,
+                    geometry,
+                    drawables,
+                    margin_left_pt,
+                    margin_top_pt,
+                );
                 continue;
             }
             let Some(desc_geom) = geometry.get(&desc_id) else {
@@ -2636,8 +2771,20 @@ fn draw_under_opacity(
             if transform_skip.contains(&desc_id)
                 || nested_clip_skip.contains(&desc_id)
                 || nested_opacity_skip.contains(&desc_id)
-                || paragraph_ib_skip.contains(&desc_id)
             {
+                continue;
+            }
+            if paragraph_ib_skip.contains(&desc_id) {
+                // F30f: as in `draw_under_clip`.
+                paint_inline_box_continuation(
+                    canvas,
+                    desc_id,
+                    page_index,
+                    geometry,
+                    drawables,
+                    margin_left_pt,
+                    margin_top_pt,
+                );
                 continue;
             }
             let Some(desc_geom) = geometry.get(&desc_id) else {
@@ -5673,6 +5820,133 @@ mod tests {
         assert!(measured_cut_is_partial(3, 0, 2), "head");
         assert!(measured_cut_is_partial(3, 2, 3), "tail");
         assert!(measured_cut_is_partial(3, 1, 2), "middle");
+    }
+
+    // --- F30f: a carrier's line, and the continuation pages of an inline box ---
+
+    fn geometry_over_pages(pages: &[u32]) -> crate::pagination_layout::PaginationGeometry {
+        crate::pagination_layout::PaginationGeometry {
+            fragments: pages.iter().map(|&p| make_fragment(p, 16.0)).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn slice(first: u32, end: u32) -> crate::pagination_layout::LineSlice {
+        crate::pagination_layout::LineSlice {
+            first,
+            end,
+            offset: 0.0_f32.as_px(),
+        }
+    }
+
+    #[test]
+    fn paragraph_lines_for_page_paints_a_carrier_line_on_its_page_only() {
+        // The carrier of a split `inline-block` has one line and a fragment per page; the fragmenter put the line on
+        // the page where the box starts (page 1) and gave the others none (`record_carrier_slices`). The line is
+        // taller than every fragment, so measuring would paint it nowhere.
+        let lines = vec![make_line(120.0, 90.0)];
+        let fragments = vec![
+            make_fragment(0, 16.0),
+            make_fragment(1, 16.0),
+            make_fragment(2, 16.0),
+        ];
+        let slices = [slice(0, 0), slice(0, 1), slice(1, 1)];
+        for (page, painted) in [(0, false), (1, true), (2, false)] {
+            let got = paragraph_lines_for_page(&lines, &fragments, &slices, page, true);
+            assert_eq!(got.is_some(), painted, "page {page}");
+        }
+        let line = paragraph_lines_for_page(&lines, &fragments, &slices, 1, true).unwrap();
+        assert_eq!(line.len(), 1);
+        assert!(
+            (line[0].baseline.to_f32() - 90.0).abs() < 0.01,
+            "painted where the box starts, not moved"
+        );
+        // Without the slices the line is measured from the fragment heights and is painted on no page.
+        for page in 0..3 {
+            assert!(
+                paragraph_lines_for_page(&lines, &fragments, &[], page, true).is_none(),
+                "page {page}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_box_continues_on_only_after_its_first_page() {
+        let g = geometry_over_pages(&[0, 1, 2]);
+        assert!(!inline_box_continues_on(&g, 0), "its carrier paints page 0");
+        assert!(inline_box_continues_on(&g, 1));
+        assert!(inline_box_continues_on(&g, 2));
+        assert!(!inline_box_continues_on(&g, 3), "no fragment on page 3");
+        // Starting on page 1: the carrier paints it there.
+        let g = geometry_over_pages(&[1, 2]);
+        assert!(!inline_box_continues_on(&g, 1));
+        assert!(inline_box_continues_on(&g, 2));
+        // One fragment never continues.
+        assert!(!inline_box_continues_on(&geometry_over_pages(&[0]), 0));
+        assert!(!inline_box_continues_on(&geometry_over_pages(&[2]), 2));
+        // Repeated whole on every page (`position: fixed`): its carrier paints it each time.
+        let mut g = geometry_over_pages(&[0, 1, 2]);
+        g.is_repeat = true;
+        assert!(!inline_box_continues_on(&g, 1));
+    }
+
+    /// Runs `f` with a canvas on a scratch page.
+    fn with_scratch_canvas<R>(
+        f: impl FnOnce(&mut crate::draw_primitives::Canvas<'_, '_>) -> R,
+    ) -> R {
+        let mut doc = krilla::Document::new();
+        let settings = krilla::page::PageSettings::from_wh(200.0, 200.0).expect("valid page size");
+        let mut page = doc.start_page_with(settings);
+        let mut surface = page.surface();
+        let mut canvas = crate::draw_primitives::Canvas {
+            surface: &mut surface,
+            bookmark_collector: None,
+            link_collector: None,
+            tag_collector: None,
+            link_run_node_id: None,
+            in_marked_content: false,
+            images: Default::default(),
+            paint_extent: Default::default(),
+        };
+        f(&mut canvas)
+    }
+
+    #[test]
+    fn an_inline_box_continuation_is_painted_once_per_page() {
+        // Box 7 (subtree {8}) has a fragment on pages 0 to 3; box 9 is not an inline box.
+        let mut d = Drawables::new();
+        d.inline_box_subtree_skip.extend([7, 8]);
+        d.inline_box_subtree_descendants.insert(7, vec![8]);
+        let mut geometry = crate::pagination_layout::PaginationGeometryTable::new();
+        for id in [7, 8, 9] {
+            geometry.insert(id, geometry_over_pages(&[0, 1, 2, 3]));
+        }
+        let paint = |id: usize, page: u32, d: &Drawables| {
+            with_scratch_canvas(|canvas| {
+                paint_inline_box_continuation(canvas, id, page, &geometry, d, 10.0, 10.0)
+            })
+        };
+        let painted: Vec<bool> = (0..5).map(|page| paint(7, page, &d)).collect();
+        assert_eq!(painted, [false, true, true, true, false]);
+        // A descendant is walked by its box, and a node that is no inline box is not this function's.
+        assert!(!paint(8, 2, &d));
+        assert!(!paint(9, 2, &d));
+        // A box that is not visible is skipped with everything in it, as its carrier does.
+        let mut hidden = Drawables::new();
+        hidden.inline_box_subtree_descendants.insert(7, vec![8]);
+        hidden.block_styles.insert(
+            7,
+            crate::drawables::BlockEntry {
+                style: crate::draw_primitives::BlockStyle::default(),
+                opacity: 1.0,
+                visible: false,
+                id: None,
+                layout_size: None,
+                clip_descendants: vec![],
+                opacity_descendants: vec![],
+            },
+        );
+        assert!(!paint(7, 2, &hidden));
     }
 
     #[test]
