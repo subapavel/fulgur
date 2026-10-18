@@ -3714,6 +3714,11 @@ fn fragment_block_subtree(
             // (F30): another cell of the row splits, so the row starts here
             // instead of moving whole to the next page, which would not hold it.
             0.0
+        } else if keeps_whole {
+            // Kept whole because it fits within the 1 px of slack `avoid_keeps_whole` has: the cut must not move
+            // what the fit test let stay (gen6 `M_k50_*_bordered`: a box 1 px over the room was moved away from the
+            // top of its page, leaving it blank).
+            (child_h + leaf_tail - 1.0).max(0.0)
         } else {
             child_h + leaf_tail
         };
@@ -9422,6 +9427,21 @@ h2 { string-set: chapter-title content(text); }
              <div style=\"break-before:page\"><p class=\"a\">text</p></div></div>",
         );
         assert_eq!(first_fragment(&doc, &geom, "a").0, 1);
+    }
+
+    /// Harness gen6 `M_k50_*`: an avoid box that fits the room within the 1 px of slack, inside a padded plain parent
+    /// at the top of the page, stays where it is (the strip cut used to move it by the sub-pixel it was over, leaving the
+    /// page blank).
+    #[test]
+    fn avoid_box_within_the_slack_of_the_room_is_not_cut_away_from_the_page_top() {
+        let (doc, geom) = avoid_fragments(&format!(
+            "<div style=\"padding:0.8px\"><div class=\"av\">{}</div></div>",
+            (0..10)
+                .map(|i| format!("<div class=\"l\">l{i}</div>"))
+                .collect::<String>()
+        ));
+        let lines = nodes_by_class(doc.deref(), "l");
+        assert_eq!(geom[&lines[0]].fragments[0].page_index, 0);
     }
 
     /// F83b: kept whole when `avoid` holds and the box fits the room or can move; the six combinations.
