@@ -3453,6 +3453,7 @@ fn fragment_block_subtree(
         } else {
             0.0
         };
+        let parent_avoids = has_avoid(column_styles, parent_id);
         let tail_raw = if block_parent && Some(child_id) == last_flow_child && closes_like_block {
             let parent_h = parent.final_layout.size.height;
             let below = if parent_h.is_finite() {
@@ -3595,9 +3596,10 @@ fn fragment_block_subtree(
         // A first row taller than a page is not cut: a fresh page would not
         // hold it either.
         //
-        // F83b review: in block flow the guard is `content_above_child` as well: a first child that only the
-        // parent's padding, border or margin precede is not cut to a page of its own (that left a page holding
-        // nothing but the frame, the validator's H1 / H3); like an atomic leaf it overflows where it is.
+        // F83b review: in an avoid box in block flow the guard is `content_above_child` as well: a first child
+        // that only the box's padding, border or margin precede is not cut to a page of its own (that left a page
+        // holding nothing but the frame, the validator's H3); like an atomic leaf it overflows where it is. Other
+        // parents keep the cut (main's behaviour, which the harness showed Chrome's words agree with).
         // And a child kept whole that is the last in its box needs room for what the boxes around it need below it
         // (bottom padding and border), as a split paragraph does (F30): without it the frame crossed the content
         // bottom by the padding.
@@ -3648,7 +3650,7 @@ fn fragment_block_subtree(
             child_h + leaf_tail
         };
         if child_page_y > page_start_y + band
-            && (content_above_child || !block_parent)
+            && (content_above_child || !block_parent || !parent_avoids)
             && child_page_y + first_break_h > strips.bottom(page_index)
         {
             // The child itself fits: it moves on for the room its box's bottom padding and border need, so that
