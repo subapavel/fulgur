@@ -163,6 +163,32 @@ fn containing_block(doc: &BaseDocument, id: usize, body_id: usize) -> (Option<us
     (None, guarded)
 }
 
+/// Whether a clipping, transformed or multicol box lies anywhere above `id`, up to but not including `<body>` (a clip
+/// on `<html>` / `<body>` propagates to the viewport and clips nothing on the page). The window geometry of such a box is
+/// clipped, transformed or columned by the renderer, so a flow built from the start would only add blank pages.
+fn has_guarded_ancestor(doc: &BaseDocument, id: usize, body_id: usize) -> bool {
+    let mut cur = doc.get_node(id).and_then(|n| n.parent);
+    let mut depth = 0;
+    while let Some(pid) = cur {
+        if pid == body_id || depth >= crate::MAX_DOM_DEPTH {
+            return false;
+        }
+        let Some(p) = doc.get_node(pid) else {
+            return false;
+        };
+        if p.element_data().is_some()
+            && (clips_overflow(p)
+                || has_transform(p)
+                || crate::blitz_adapter::is_multicol_container(p))
+        {
+            return true;
+        }
+        cur = p.parent;
+        depth += 1;
+    }
+    false
+}
+
 /// Whether some ancestor of `id` is in `set`.
 fn has_ancestor_in(doc: &BaseDocument, id: usize, set: &BTreeSet<usize>) -> bool {
     if set.is_empty() {
@@ -959,6 +985,7 @@ pub fn fragment_abspos_flows(
         let body_direct = node.parent == Some(body_id);
         let (cb, ancestors_guard) = containing_block(doc, id, body_id);
         let guarded = ancestors_guard
+            || has_guarded_ancestor(doc, id, body_id)
             || clips_overflow(node)
             || has_transform(node)
             || has_ancestor_in(doc, id, &kept_roots);
@@ -968,7 +995,8 @@ pub fn fragment_abspos_flows(
             }
         };
         if guarded {
-            keep(&mut kept_roots);
+            // Whatever is nested in a box left as it was is left too.
+            kept_roots.insert(id);
             continue;
         }
         if let Some(c) = cb {
@@ -1158,6 +1186,86 @@ mod tests {
         geom.get(&id)
             .map(|g| g.fragments.iter().map(|f| f.page_index).collect())
             .unwrap_or_default()
+    }
+
+    /// The geometry of every node and the page count, with and without the F30g pass: for a box the pass must leave
+    /// alone the two are equal.
+    fn assert_pass_changes_nothing(body: &str) {
+        type Shapes = Vec<(usize, Vec<(u32, i32, i32)>)>;
+        let all = |geom: &PaginationGeometryTable| -> Shapes {
+            geom.keys().map(|&id| (id, shape(geom, id))).collect()
+        };
+        let (_, off) = fragments(body, false, "");
+        let (_, on) = fragments(body, true, "");
+        assert_eq!(all(&off), all(&on));
+        assert_eq!(implied_page_count(&off), implied_page_count(&on));
+        // And none of the pages the geometry reaches is empty of fragments.
+        let reached = implied_page_count(&on);
+        for page in 0..reached {
+            assert!(
+                on.values()
+                    .any(|g| g.fragments.iter().any(|f| f.page_index == page)),
+                "page {page} of {reached} has no fragment"
+            );
+        }
+    }
+
+    /// F30g validator, `clip_above_cb`: a clipping ancestor above the containing block. The renderer clips the content,
+    /// so the pages a flow added came out blank.
+    #[test]
+    fn abspos_under_a_clip_above_its_cb_is_kept() {
+        assert_pass_changes_nothing(&format!(
+            "<div style=\"overflow:hidden;height:80px\"><div style=\"position:relative\">\
+             <div style=\"position:absolute;top:10px;left:0\">{}</div></div></div>",
+            lines_20px(40)
+        ));
+    }
+
+    /// `clip_above_cb_short`: the same with an auto-height clipping ancestor and a box that only just crosses a page.
+    #[test]
+    fn abspos_under_an_auto_height_clip_above_its_cb_is_kept() {
+        assert_pass_changes_nothing(&format!(
+            "<div style=\"overflow:hidden\"><div style=\"position:relative\"><p>head</p>\
+             <p style=\"position:absolute;top:150px;left:0\">{}</p></div></div>",
+            lines_20px(6)
+        ));
+    }
+
+    /// An abspos wrapper holding a nested abspos box, both under a clipping ancestor.
+    #[test]
+    fn nested_abspos_wrapper_under_a_clip_is_kept() {
+        assert_pass_changes_nothing(&format!(
+            "<div style=\"overflow:hidden;height:80px\"><div style=\"position:relative\">\
+             <div style=\"position:absolute;top:0;left:0\"><p>{}</p>\
+             <div style=\"position:absolute;top:30px;left:50px;width:200px\">{}</div></div></div></div>",
+            lines_20px(10),
+            lines_20px(30)
+        ));
+    }
+
+    /// `xform_above_cb`: a transformed ancestor above the containing block (a transform makes the renderer draw the
+    /// geometry it has under the matrix: the added pages were empty).
+    #[test]
+    fn abspos_under_a_transform_above_its_cb_is_kept() {
+        assert_pass_changes_nothing(&format!(
+            "<div style=\"transform:translateX(3px)\"><div style=\"position:relative\">\
+             <div style=\"position:absolute;top:0;left:0\">{}</div></div></div>",
+            lines_20px(40)
+        ));
+    }
+
+    /// A clip on `<body>` propagates to the viewport and clips nothing on the page: the box is still flowed.
+    #[test]
+    fn a_clip_on_body_does_not_guard_an_abspos_box() {
+        let (doc, geom) = fragments(
+            &format!(
+                "<div style=\"position:relative\"><p class=\"a\" style=\"position:absolute;top:0;left:0\">{}</p></div>",
+                lines_20px(25)
+            ),
+            true,
+            "overflow:hidden",
+        );
+        assert_eq!(pages(&geom, by_class(&doc, "a")), vec![0, 1, 2]);
     }
 
     // ── red before F30g ─────────────────────────────────────────────────────────────────────────────────────────
