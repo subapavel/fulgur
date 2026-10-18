@@ -112,6 +112,12 @@ pub struct Fragment {
 /// sits on the first page. It is the base
 /// [`record_split_inline_root_descendants`] uses for inline boxes, so text and
 /// images agree on every page.
+///
+/// F30f: the *carrier* of an `inline-block` that spans pages (the box that holds the
+/// block in its one line) has slices of its own kind: `0..1` on the fragment where
+/// the block starts, `0..0` before it and `1..1` after it ([`carrier_slices_ok`],
+/// [`record_carrier_slices`]). The line is painted once, on that page, and the later
+/// pages of the block are painted as continuations.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LineSlice {
     pub first: u32,
