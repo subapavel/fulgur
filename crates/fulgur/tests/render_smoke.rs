@@ -7530,6 +7530,64 @@ fn render_smoke_overflow_hidden_paragraph_spans_pages() {
     assert_lines_on_three_pages(&wrapper_pages("<div style=\"overflow:hidden\">", "</div>"));
 }
 
+/// Like [`wrapper_pages`] with the 120 lines as direct text of `wrapper_open`'s box instead of a `<p>`.
+fn direct_text_pages(wrapper_open: &str, wrapper_close: &str) -> Vec<u8> {
+    let lines: String = (0..120)
+        .map(|i| format!("LN{i:03}"))
+        .collect::<Vec<_>>()
+        .join("<br>");
+    let html = format!(
+        "<!doctype html><html><head><style>@page{{size:A4;margin:0}}\
+         body{{margin:0;line-height:20px}}p{{margin:0}}</style></head><body>\
+         {wrapper_open}{lines}{wrapper_close}</body></html>"
+    );
+    Engine::builder()
+        .system_fonts(false)
+        .strict_text(true)
+        .assets(noto_bundle())
+        .build()
+        .render(&html)
+        .expect("every word has a face")
+}
+
+#[test]
+fn render_smoke_display_table_direct_text_spans_pages() {
+    // F30e: text directly in a `display: table` box sits in an anonymous cell (F50), which is the paragraph. It was
+    // placed whole under the `TablePart` barrier, and the lines below the page were drawn below it and lost.
+    assert_lines_on_three_pages(&direct_text_pages(
+        "<div style=\"display:table\">",
+        "</div>",
+    ));
+}
+
+#[test]
+fn render_smoke_orphan_table_cell_spans_pages() {
+    // F30e: a `table-cell` box outside a table is a block container (CSS 2.1 §9.4.1), split between its lines.
+    assert_lines_on_three_pages(&direct_text_pages(
+        "<div><div style=\"display:table-cell\">",
+        "</div></div>",
+    ));
+}
+
+#[test]
+fn render_smoke_inline_table_paragraph_spans_pages() {
+    // F30e: an `inline-table` alone on its line is split between its line boxes like an `inline-block` (ADR-0004),
+    // and its carrier's line is drawn on the page where it starts.
+    assert_lines_on_three_pages(&wrapper_pages(
+        "<div style=\"display:inline-table;width:100%\">",
+        "</div>",
+    ));
+    assert_lines_on_three_pages(&direct_text_pages(
+        "<div style=\"display:inline-table;width:100%\">",
+        "</div>",
+    ));
+    // Inside a frame, the carrier is not the page's first box: its line has to be on the page where the table starts.
+    assert_lines_on_three_pages(&wrapper_pages(
+        "<div style=\"border:1px solid\"><div style=\"display:inline-table;width:100%\">",
+        "</div></div>",
+    ));
+}
+
 #[test]
 fn render_smoke_inline_block_under_a_transform_spans_pages() {
     // F30f validator H1: the transform's own walk skipped the box after its first page (a debug build panicked at an

@@ -4742,10 +4742,10 @@ impl LineSplit {
 /// F30f: why the line splitter does not look through a box (`None` from [`split_barrier`]: it does).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LineBarrier {
-    /// An `inline-block` that is not alone on its line: the carrier's line holds more than the box, and one fragment
-    /// of it would have to hold the rest (F30f-b).
+    /// An `inline-block` or `inline-table` that is not alone on its line: the carrier's line holds more than the box,
+    /// and one fragment of it would have to hold the rest (F30f-b).
     SharesItsLine,
-    /// An `inline-flex`, `inline-grid` or `inline-table` box, or an `inline-block` with no carrier line to find.
+    /// An `inline-flex` or `inline-grid` box, or an `inline-block` or `inline-table` with no carrier line to find.
     AtomicNotFlowRoot,
     /// A clipping box that hides some of its content in the block axis: fragmenting it would give it one frame per
     /// page, and the per-fragment clip would show what the clip hides today (and in Chrome).
@@ -4754,6 +4754,7 @@ enum LineBarrier {
     Transformed,
     Floating,
     Orthogonal,
+    /// A child of a table box that is neither a cell nor an anonymous cell of it: its `::before` / `::after` box.
     TablePart,
 }
 
@@ -4761,8 +4762,8 @@ impl LineBarrier {
     /// What the warning calls the box that keeps the paragraph whole.
     fn describe(self) -> &'static str {
         match self {
-            Self::SharesItsLine => "an inline-block that shares its line",
-            Self::AtomicNotFlowRoot => "an inline-flex, inline-grid or inline-table box",
+            Self::SharesItsLine => "an inline-block or inline-table that shares its line",
+            Self::AtomicNotFlowRoot => "an inline-flex or inline-grid box",
             Self::ClipsItsContent => "a clipping box shorter than its content",
             Self::Multicol => "a multi-column container",
             Self::Transformed => "a transformed box",
@@ -4840,20 +4841,29 @@ fn clip_hides_nothing(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
         <= height - layout.border.bottom - layout.padding.bottom + 0.5
 }
 
-/// F30f: whether the `inline-block` `node` is the only thing on its carrier's single line: the box that holds it in
-/// the inline formatting context (its `layout_parent`) has exactly one Parley line, and that line holds this box and
-/// glyph runs of whitespace only.
+/// F30e: whether `node` is an `inline-block` or an `inline-table`: an atomic inline whose inside is a block formatting
+/// context (a flow-root, or a table box whose cells are block containers) that [`alone_on_its_line`] may split.
+fn is_inline_block_or_table(node: &blitz_dom::Node) -> bool {
+    use ::style::values::specified::box_::{DisplayInside, DisplayOutside};
+    node.primary_styles().is_some_and(|s| {
+        let display = s.clone_display();
+        display.outside() == DisplayOutside::Inline
+            && matches!(
+                display.inside(),
+                DisplayInside::FlowRoot | DisplayInside::Table
+            )
+    })
+}
+
+/// F30f: whether the `inline-block` (F30e: or `inline-table`) `node` is the only thing on its carrier's single line:
+/// the box that holds it in the inline formatting context (its `layout_parent`) has exactly one Parley line, and that
+/// line holds this box and glyph runs of whitespace only.
 ///
 /// Then the carrier's line *is* the box: the carrier is never a line-split candidate itself (one line), and
 /// nothing else on the line needs the room a page break takes from it. css-break-3 §4.1 lets a UA treat such a box as
 /// monolithic; Chrome slices it, we split it between its line boxes (ADR-0004).
 fn alone_on_its_line(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
-    use ::style::values::specified::box_::{DisplayInside, DisplayOutside};
-    let is_inline_block = node.primary_styles().is_some_and(|s| {
-        let display = s.clone_display();
-        display.outside() == DisplayOutside::Inline && display.inside() == DisplayInside::FlowRoot
-    });
-    if !is_inline_block {
+    if !is_inline_block_or_table(node) {
         return false;
     }
     let Some(carrier) = node.layout_parent.get().and_then(|id| doc.get_node(id)) else {
@@ -4896,15 +4906,9 @@ fn alone_on_its_line(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
 /// inline that is not an `inline-block` alone on its line ([`alone_on_its_line`]), or a clipping box that hides
 /// content ([`clip_hides_nothing`]).
 fn box_barrier(doc: &BaseDocument, node: &blitz_dom::Node) -> Option<LineBarrier> {
-    use ::style::values::specified::box_::{DisplayInside, DisplayOutside};
     if crate::blitz_adapter::is_atomic_inline_container_node(node) && !alone_on_its_line(doc, node)
     {
-        let inline_block = node.primary_styles().is_some_and(|s| {
-            let display = s.clone_display();
-            display.outside() == DisplayOutside::Inline
-                && display.inside() == DisplayInside::FlowRoot
-        });
-        return Some(if inline_block {
+        return Some(if is_inline_block_or_table(node) {
             LineBarrier::SharesItsLine
         } else {
             LineBarrier::AtomicNotFlowRoot
@@ -4931,10 +4935,13 @@ fn split_barrier(
         .and_then(|gp| doc.get_node(gp))
         .is_some_and(|gp| crate::blitz_adapter::is_orthogonal_to_parent(gp, parent));
     let inside_of = |n: &blitz_dom::Node| n.primary_styles().map(|s| s.clone_display().inside());
-    // A cell of a `display: table` box is a block container (CSS 2.1 §17.5); any
-    // other child of a table box, or a cell outside one, is not handled (F30e).
-    let cell_of_table = inside_of(parent) == Some(DisplayInside::Table)
-        && inside_of(child) == Some(DisplayInside::TableCell);
+    // A cell of a table box is a block container (CSS 2.1 §17.5), and so is the anonymous cell Blitz makes for text
+    // and boxes that are not table parts (CSS 2.1 §17.2.1, F50): its lines are break points. A `table-cell` box that
+    // is not in a table box is laid out as a block container too (CSS 2.1 §9.4.1), so it is no barrier (F30e).
+    let table_parent = inside_of(parent) == Some(DisplayInside::Table);
+    let cell_of_table = table_parent
+        && (inside_of(child) == Some(DisplayInside::TableCell)
+            || crate::blitz_adapter::is_anonymous_table_cell(parent, child));
     if let Some(barrier) = box_barrier(doc, parent) {
         return Some(barrier);
     }
@@ -4944,9 +4951,7 @@ fn split_barrier(
     if parent_orthogonal || crate::blitz_adapter::is_orthogonal_to_parent(parent, child) {
         return Some(LineBarrier::Orthogonal);
     }
-    if (inside_of(parent) == Some(DisplayInside::Table)) != cell_of_table
-        || (inside_of(child) == Some(DisplayInside::TableCell)) != cell_of_table
-    {
+    if table_parent && !cell_of_table {
         return Some(LineBarrier::TablePart);
     }
     if let Some(barrier) = box_barrier(doc, child) {
@@ -4972,11 +4977,12 @@ fn split_barrier(
 ///
 /// Paragraphs in block flow qualify, and so do inline roots that are flex items,
 /// grid items (css-flexbox-1 §4, css-grid-2 §6: each is a block container whose
-/// lines are class B break points) or cells of a `display: table` box (F30b).
-/// Anything the fragmenter treats as one unit stays one ([`split_barrier`]): atomic
-/// inlines that share their line and their contents, orthogonal flows, multicol
-/// containers, transformed boxes, clipping boxes that hide content, floats, other
-/// children of a `display: table` box (F30e).
+/// lines are class B break points), cells of a table box and the anonymous cells
+/// Blitz makes for text directly in one (F30b, F30e), and table cells outside a
+/// table (F30e). Anything the fragmenter treats as one unit stays one
+/// ([`split_barrier`]): atomic inlines that share their line and their contents,
+/// orthogonal flows, multicol containers, transformed boxes, clipping boxes that
+/// hide content, floats, the pseudo-element boxes of a table box.
 fn line_split_candidate(
     doc: &BaseDocument,
     parent: &blitz_dom::Node,
@@ -12217,11 +12223,21 @@ h2 { string-set: chapter-title content(text); }
 
     #[test]
     fn alone_on_its_line_wants_one_line_with_only_the_box_on_it() {
-        let cases: [(&str, &str, bool); 8] = [
+        let cases: [(&str, &str, bool); 10] = [
             (
                 "alone",
                 "<div><div id=\"x\" style=\"display:inline-block\">a</div></div>",
                 true,
+            ),
+            (
+                "inline-table alone",
+                "<div><div id=\"x\" style=\"display:inline-table\">a</div></div>",
+                true,
+            ),
+            (
+                "inline-table with text",
+                "<div>Hi <span id=\"x\" style=\"display:inline-table\">a</span></div>",
+                false,
             ),
             (
                 "blanks around it",
@@ -12486,6 +12502,211 @@ h2 { string-set: chapter-title content(text); }
         let node = find_by_id(doc.deref(), "x").unwrap();
         let n = table.get(&node).map_or(0, |g| g.fragments.len());
         assert!(n > 1, "{n} fragments");
+    }
+
+    /// F30e: the first layout child of the table box `id`, the anonymous cell Blitz makes for text that stands directly in
+    /// the table or in one of its rows (F50).
+    fn first_layout_child(doc: &blitz_html::HtmlDocument, id: &str) -> usize {
+        let node = node_of(doc, id);
+        let children = node.layout_children.borrow();
+        *children
+            .as_deref()
+            .and_then(|v| v.first())
+            .expect("a layout child")
+    }
+
+    /// F30e: `n` 20px lines whose fragments are `frags` are each printed once, as one tiling of line slices.
+    fn assert_slices_tile(table: &PaginationGeometryTable, node: usize, n: usize, what: &str) {
+        let geom = &table[&node];
+        assert_lines_once(&geom.fragments, n, what);
+        assert!(
+            line_slices_tile(&geom.line_slices, n),
+            "{what}: {:?}",
+            geom.line_slices
+        );
+    }
+
+    #[test]
+    fn direct_text_in_a_table_box_splits_in_its_anonymous_cell() {
+        // CSS 2.1 §17.2.1: the text is wrapped in an anonymous row and cell; the cell is a block container whose
+        // lines are break points, like the direct-text `<td>` of F30b.
+        for (what, content) in [
+            ("text", br_lines(30)),
+            ("span", format!("<span>{}</span>", br_lines(30))),
+        ] {
+            let (doc, table) = nested_geometry(
+                &format!("<div id=\"t\" style=\"display:table\">{content}</div>"),
+                200.0,
+            );
+            let cell = first_layout_child(&doc, "t");
+            assert_slices_tile(&table, cell, 30, what);
+        }
+    }
+
+    #[test]
+    fn direct_text_in_a_table_row_splits_in_its_anonymous_cell() {
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div id=\"t\" style=\"display:table\"><div style=\"display:table-row\">{}</div></div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let cell = first_layout_child(&doc, "t");
+        assert_slices_tile(&table, cell, 30, "row text");
+    }
+
+    #[test]
+    fn a_table_cell_outside_a_table_is_split() {
+        // Blitz lays such a cell out as a block container (CSS 2.1 §9.4.1).
+        for (what, markup) in [
+            (
+                "cell",
+                format!(
+                    "<div><div id=\"x\" style=\"display:table-cell\">{}</div></div>",
+                    br_lines(30)
+                ),
+            ),
+            (
+                "row and cell",
+                format!(
+                    "<div style=\"display:table-row\"><div id=\"x\" style=\"display:table-cell\">{}</div></div>",
+                    br_lines(30)
+                ),
+            ),
+        ] {
+            let (doc, table) = nested_geometry(&markup, 200.0);
+            let node = find_by_id(doc.deref(), "x").unwrap();
+            assert_slices_tile(&table, node, 30, what);
+        }
+    }
+
+    #[test]
+    fn an_inline_table_alone_on_its_line_is_split() {
+        // css-break-3 §4.1 lets a UA treat an `inline-table` as monolithic; like an `inline-block` alone on its line
+        // (ADR-0004) it is split between its line boxes instead.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div><div id=\"it\" style=\"display:inline-table;width:100%\"><p id=\"x\">{}</p></div></div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        assert_slices_tile(&table, find_by_id(doc.deref(), "x").unwrap(), 30, "it > p");
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div><div id=\"it\" style=\"display:inline-table;width:100%\">{}</div></div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let cell = first_layout_child(&doc, "it");
+        assert_slices_tile(&table, cell, 30, "it text");
+    }
+
+    #[test]
+    fn the_carrier_line_of_an_inline_table_is_on_the_page_where_it_starts() {
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div id=\"c\"><div id=\"it\" style=\"display:inline-table;width:100%\"><p>{}</p></div></div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let carrier = geometry_of(&doc, &table, "c").unwrap();
+        let got: Vec<(u32, u32)> = carrier
+            .line_slices
+            .iter()
+            .map(|s| (s.first, s.end))
+            .collect();
+        assert_eq!(got, vec![(0, 1), (1, 1), (1, 1)], "{carrier:?}");
+        assert!(carrier_slices_ok(carrier));
+        assert_eq!(fragments_of(&doc, &table, "it")[0].page_index, 0);
+    }
+
+    #[test]
+    fn an_inline_table_sharing_its_line_keeps_its_paragraph_whole() {
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div>Hi <span id=\"it\" style=\"display:inline-table\">{}</span> end</div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let cell = first_layout_child(&doc, "it");
+        let n = table.get(&cell).map_or(0, |g| g.fragments.len());
+        assert!(n <= 1, "{n} fragments");
+    }
+
+    #[test]
+    fn split_barrier_looks_through_anonymous_and_orphan_cells() {
+        use LineBarrier::*;
+        let two = br_lines(2);
+        // (what, markup, parent id, child id or the first layout child of the parent, expected)
+        type Case = (
+            &'static str,
+            String,
+            &'static str,
+            Option<&'static str>,
+            Option<LineBarrier>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "anonymous cell of a table box",
+                format!("<div id=\"p\" style=\"display:table\">{two}</div>"),
+                "p",
+                None,
+                None,
+            ),
+            (
+                "anonymous cell of a row",
+                format!(
+                    "<div id=\"p\" style=\"display:table\"><div style=\"display:table-row\">{two}</div></div>"
+                ),
+                "p",
+                None,
+                None,
+            ),
+            (
+                "cell outside a table",
+                format!(
+                    "<div id=\"p\"><div id=\"c\" style=\"display:table-cell\">{two}</div></div>"
+                ),
+                "p",
+                Some("c"),
+                None,
+            ),
+            (
+                "inline-table alone",
+                format!("<div><div id=\"p\" style=\"display:inline-table\">{two}</div></div>"),
+                "p",
+                None,
+                None,
+            ),
+            (
+                "inline-table sharing",
+                format!("<div>Hi <span id=\"p\" style=\"display:inline-table\">{two}</span></div>"),
+                "p",
+                None,
+                Some(SharesItsLine),
+            ),
+        ];
+        for (what, markup, parent, child, expected) in cases {
+            let doc = laid_out(&markup);
+            let child = child.map_or_else(
+                || first_layout_child(&doc, parent),
+                |c| find_by_id(doc.deref(), c).unwrap(),
+            );
+            assert_eq!(
+                split_barrier(
+                    doc.deref(),
+                    node_of(&doc, parent),
+                    doc.deref().get_node(child).unwrap()
+                ),
+                expected,
+                "{what}"
+            );
+        }
     }
 
     #[test]
