@@ -3622,7 +3622,7 @@ fn fragment_block_subtree(
             && gate(
                 (strips.bottom(page_index) - cursor_y).max(0.0),
                 keeps_whole,
-                tail_over_at(page_index, child_page_y, movable),
+                tail_over_at(page_index, child_page_y, content_above_child),
             );
         // F83b: an avoid box taller than a page breaks like `auto`, but when
         // content precedes it (or something that starts with it) the break
@@ -9458,6 +9458,22 @@ h2 { string-set: chapter-title content(text); }
         let lines = nodes_by_class(doc.deref(), "l");
         assert_eq!(geom[&lines[8]].fragments[0].page_index, 0);
         assert_eq!(geom[&lines[9]].fragments[0].page_index, 1);
+    }
+
+    /// Validator `r6` (plain document, no `avoid`): three nested parents with a bottom padding after a spacer, a one-line
+    /// last child that fits but not with the padding below it. The chain is not entered for the padding (its last child
+    /// cannot move: it is flush with the chain's top), so the cursor handed back is below the frames and the next
+    /// sibling goes to the next page, as on main. Entering it left the cursor at the line and the sibling landed in
+    /// the padding.
+    #[test]
+    fn plain_nested_bottom_padding_does_not_pull_the_next_sibling_up() {
+        let (doc, geom) = avoid_fragments(
+            "<div style=\"height:150px\"></div>\
+             <div style=\"padding-bottom:20px\"><div style=\"padding-bottom:20px\"><div style=\"padding-bottom:20px\">\
+             <p class=\"a\">x</p></div></div></div><p class=\"q\">y</p>",
+        );
+        assert_eq!(first_fragment(&doc, &geom, "a").0, 0);
+        assert_eq!(first_fragment(&doc, &geom, "q").0, 1);
     }
 
     /// F83b: kept whole when `avoid` holds and the box fits the room or can move; the six combinations.
