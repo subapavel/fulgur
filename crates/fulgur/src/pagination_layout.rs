@@ -1894,10 +1894,12 @@ impl<'a> PaginationLayoutTree<'a> {
                 let leading = if keeps_whole {
                     avoid_piece_size(self.doc, child_id, self.column_styles, 0).min(child_h)
                 } else {
+                    // Counting an avoid box below as a whole only helps when something precedes this child and it can
+                    // move; first on its page it would only be moved away from its own top (a blank page).
                     leading_block_size(
                         self.doc,
                         child_id,
-                        self.column_styles,
+                        self.column_styles.filter(|_| content_above),
                         0.0,
                         0,
                         page_height_px,
@@ -3673,7 +3675,15 @@ fn fragment_block_subtree(
                 // A kept-whole avoid box a forced break inside makes the gate enter: the piece before the break.
                 avoid_piece_size(doc, child_id, column_styles, 0).min(child_h)
             } else {
-                leading_block_size(doc, child_id, column_styles, 0.0, 0, strips.fresh())
+                // As at body level: an avoid box below counts whole only for a child that can move.
+                leading_block_size(
+                    doc,
+                    child_id,
+                    column_styles.filter(|_| movable),
+                    0.0,
+                    0,
+                    strips.fresh(),
+                )
             };
             if leading <= strips.fresh() {
                 leading
@@ -9352,6 +9362,21 @@ h2 { string-set: chapter-title content(text); }
             "<p>x</p><div class=\"av\"><div style=\"padding:12px\"><div class=\"sp\" style=\"height:195px\"></div></div></div>",
         );
         assert_eq!(first_fragment(&doc, &geom, "sp").0, 1);
+    }
+
+    /// Fuzz `Z2_320`: padded parent > plain wrapper > avoid box that fits a page without the padding above it: nothing
+    /// precedes the chain, so it starts on page 0 and the box breaks there like Chrome's (it used to be moved whole to
+    /// page 1, leaving page 0 empty).
+    #[test]
+    fn avoid_box_in_a_plain_wrapper_in_a_padded_parent_stays_on_the_first_page() {
+        let (doc, geom) = avoid_fragments(&format!(
+            "<div style=\"padding:6px\"><div><div class=\"av\">{}</div></div></div>",
+            (0..10)
+                .map(|i| format!("<div class=\"l\">l{i}</div>"))
+                .collect::<String>()
+        ));
+        let lines = nodes_by_class(doc.deref(), "l");
+        assert_eq!(geom[&lines[0]].fragments[0].page_index, 0);
     }
 
     /// F83b: kept whole when `avoid` holds and the box fits the room or can move; the six combinations.
