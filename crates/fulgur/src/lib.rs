@@ -149,7 +149,12 @@ pub(crate) const MAX_PAGE_NAME_BYTES: usize = 256;
 ///   node of a body-direct `position: absolute` subtree is recorded once per
 ///   page it intersects (`first_page..=last_page`).
 ///
-/// In both, the page axis is already bounded by [`MAX_PAGES`], but the node
+/// A third pass, `pagination_layout::fragment_abspos_flows` (F30g), records one
+/// fragment per node per **page span** of a box it fragments from its start
+/// (not per page it intersects); it counts what it adds against the same budget
+/// and keeps the geometry it found when a box would go over it.
+///
+/// In the first two, the page axis is already bounded by [`MAX_PAGES`], but the node
 /// axis is not: a subtree with many descendants — or many page-spanning
 /// absolute / fixed elements — amplifies to O(nodes × pages) retained
 /// `Fragment`s plus a matching per-page render loop on untrusted input.

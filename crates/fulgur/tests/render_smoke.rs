@@ -7444,6 +7444,41 @@ fn render_smoke_avoid_wrapper_moves_whole_to_the_next_page() {
 }
 
 #[test]
+fn render_smoke_abspos_paragraph_spans_pages() {
+    // F30g: an absolutely positioned paragraph taller than a page used to print the lines of its first page only (the
+    // window the body-direct pass gave each page could only be cut at the page edge), and one in a relative parent
+    // without height was not drawn at all. Both are fragmented between their lines now.
+    let lines: String = (0..120)
+        .map(|i| format!("LN{i:03}"))
+        .collect::<Vec<_>>()
+        .join("<br>");
+    let html = format!(
+        "<!doctype html><html><head><style>@page{{size:A4;margin:0}}\
+         body{{margin:0;line-height:20px}}p{{margin:0}}</style></head><body>\
+         <div style=\"position:relative\"><p style=\"position:absolute;top:0;left:0\">{lines}</p></div>\
+         </body></html>"
+    );
+    let pdf = Engine::builder()
+        .system_fonts(false)
+        .strict_text(true)
+        .assets(noto_bundle())
+        .build()
+        .render(&html)
+        .expect("every word has a face");
+    // 120 lines of 20 px on 1122 px pages: 56 + 56 + 8.
+    assert_eq!(page_count(&pdf), 3);
+    if let Some(text) = extract_pdf_text(&pdf) {
+        let pages: Vec<&str> = text.split('\x0c').collect();
+        for i in 0..120 {
+            let word = format!("LN{i:03}");
+            let on: Vec<usize> = (0..3).filter(|&p| pages[p].contains(&word)).collect();
+            assert_eq!(on.len(), 1, "{word} printed on pages {on:?}");
+        }
+        assert!(pages[0].contains("LN000") && pages[2].contains("LN119"));
+    }
+}
+
+#[test]
 fn render_smoke_dropped_text_after_64_kib_is_found_once_and_only_it() {
     // `monospace` is unmapped here, so the `<code>` gets no glyph run (a named family inside a root that has a
     // face is drawn by Parley's fallback).

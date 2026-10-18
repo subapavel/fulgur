@@ -585,6 +585,18 @@ impl Engine {
             resolved_content_height_px,
             Some(&running_store),
         );
+        // F30g: an absolutely positioned box whose text the passes above lose (no geometry, or full-height windows
+        // the renderer can only cut at the page edge) is fragmented from its own start like content in the normal
+        // flow. Before the second fixed pass below, so fixed boxes repeat on the pages this adds.
+        crate::pagination_layout::fragment_abspos_flows(
+            &mut pagination_geometry,
+            doc.deref_mut(),
+            resolved_content_height_px,
+            resolved_content_width_px,
+            Some(&column_styles),
+            Some(&multicol_geometry),
+            Some(&running_store),
+        );
         let expanded_total_pages =
             crate::pagination_layout::implied_page_count(&pagination_geometry).max(1);
         if expanded_total_pages > total_pages {
@@ -1015,6 +1027,15 @@ impl Engine {
             total_pages,
             content_w_px,
             content_h_px,
+            None,
+        );
+        crate::pagination_layout::fragment_abspos_flows(
+            &mut pagination_geometry,
+            doc.deref_mut(),
+            content_h_px,
+            content_w_px,
+            Some(&column_styles),
+            Some(&multicol_geometry),
             None,
         );
         let expanded_total_pages =

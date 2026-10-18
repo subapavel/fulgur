@@ -59,6 +59,10 @@
 //!   page starts the next page when content precedes it and then breaks
 //!   like an `auto` one ([`avoid_keeps_whole`], [`starts_with_relaxed_avoid`],
 //!   F83b).
+//! - Absolutely positioned boxes whose text crosses a page ([`fragment_abspos_flows`],
+//!   `abspos_flow.rs`, F30g): after the body-direct pass, a box that has no geometry or
+//!   whose lines the full-height windows of that pass would cut is fragmented from its
+//!   own start with the fragmenters above.
 //!
 //! # Production extension points
 //!
@@ -67,6 +71,9 @@
 //! is wired into `engine.rs` so v2's geometry-driven dispatch can
 //! repeat `position: fixed` elements on every page (`is_repeat=true`
 //! on the resulting `PaginationGeometry`).
+
+mod abspos_flow;
+pub use abspos_flow::fragment_abspos_flows;
 
 use crate::units::F32Units;
 use blitz_dom::BaseDocument;
@@ -4639,10 +4646,8 @@ fn line_split_candidate(
     child: &blitz_dom::Node,
 ) -> Option<LineSplit> {
     use ::style::values::specified::box_::DisplayInside;
-    let lines = collect_inline_line_metrics(child);
-    if lines.len() < 2 {
-        return None;
-    }
+    // Cheap exit first: a paragraph of one line has nothing to split.
+    let split = abspos_line_split(child)?;
     let parent_orthogonal = parent
         .parent
         .and_then(|gp| doc.get_node(gp))
@@ -4658,8 +4663,23 @@ fn line_split_candidate(
         || clips_overflow(parent)
         || (inside_of(parent) == Some(DisplayInside::Table)) != cell_of_table
         || (inside_of(child) == Some(DisplayInside::TableCell)) != cell_of_table
-        || crate::blitz_adapter::is_atomic_inline_container_node(child)
         || crate::blitz_adapter::is_orthogonal_to_parent(parent, child)
+    {
+        return None;
+    }
+    Some(split)
+}
+
+/// F30g: the child-side part of [`line_split_candidate`]: whether `child` is an inline root of at least two lines that
+/// the fragmenter may split between its line boxes, and if so its lines. Atomic inlines, multicol containers, floats,
+/// clipping and transformed boxes stay one unit.
+///
+/// The parent-side checks of [`line_split_candidate`] are about the formatting context the child takes part in (flex /
+/// grid / table parents, orthogonal flows); an absolutely positioned box takes part in none, so it asks only this.
+fn abspos_line_split(child: &blitz_dom::Node) -> Option<LineSplit> {
+    let lines = collect_inline_line_metrics(child);
+    if lines.len() < 2
+        || crate::blitz_adapter::is_atomic_inline_container_node(child)
         || crate::blitz_adapter::is_multicol_container(child)
         || crate::blitz_adapter::node_is_floating(child)
         || clips_overflow(child)
