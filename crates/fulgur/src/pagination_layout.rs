@@ -3558,12 +3558,17 @@ fn fragment_block_subtree(
         };
         // The parent's own padding / border and the child's margin are not content above it (H1): only a previous
         // sibling, or content above the parent on the page it was entered on, is.
-        let mut keeps_whole = keeps_whole_at(page_index, child_page_y, content_above_child);
+        // A child that sits at the top edge of its parent cannot be moved by the cut below (the parent's caller moves a
+        // parent whose first row does not fit): it is "movable" only when it is below the strip top as well. Counting
+        // outer content above a flush first child kept it whole in place, and a box a hair taller than the page lost
+        // its last lines (fuzz `Z1_59`).
+        let movable = content_above_child && child_page_y > page_start_y + band;
+        let mut keeps_whole = keeps_whole_at(page_index, child_page_y, movable);
         let mut needs_recursion = line_split.is_none()
             && gate(
                 (strips.bottom(page_index) - cursor_y).max(0.0),
                 keeps_whole,
-                tail_over_at(page_index, child_page_y, content_above_child),
+                tail_over_at(page_index, child_page_y, movable),
             );
         // F83b: an avoid box taller than a page breaks like `auto`, but when
         // content precedes it (or something that starts with it) the break
@@ -9259,6 +9264,32 @@ h2 { string-set: chapter-title content(text); }
             "{:?}",
             geom[&lines[8]].fragments
         );
+    }
+
+    /// Fuzz `Z1_59`: an avoid box a hair taller than a page (it holds, 1 px of slack) inside two plain wrappers after a
+    /// spacer: every line keeps a fragment (words were lost) and none starts below the page bottom.
+    #[test]
+    fn avoid_box_a_hair_taller_than_a_page_in_wrappers_loses_no_line() {
+        for spacer in [60, 140] {
+            let (doc, geom) = avoid_fragments(&format!(
+                "<div style=\"height:{spacer}px\"></div><div><div><div class=\"av\" style=\"padding:10.4px\">{}</div></div></div>",
+                (0..9)
+                    .map(|i| format!("<div class=\"l\">l{i}</div>"))
+                    .collect::<String>()
+            ));
+            let lines = nodes_by_class(doc.deref(), "l");
+            for (i, id) in lines.iter().enumerate() {
+                let f = geom
+                    .get(id)
+                    .map(|g| g.fragments.clone())
+                    .unwrap_or_default();
+                assert!(!f.is_empty(), "spacer {spacer}: line {i} has no fragment");
+                assert!(
+                    f[0].y.to_f32() + f[0].height.to_f32() <= 200.5,
+                    "spacer {spacer}: line {i} {f:?}"
+                );
+            }
+        }
     }
 
     /// F83b: kept whole when `avoid` holds and the box fits the room or can move; the six combinations.
