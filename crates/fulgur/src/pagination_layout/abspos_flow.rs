@@ -342,7 +342,10 @@ fn window_cuts_lines(doc: &BaseDocument, root_id: usize, root_y_icb: f32, page_h
             return false;
         };
         if clips_overflow(node) {
-            // Clipped overflow is invisible and not fragmented; a clipping box keeps the window model.
+            // Stops at a clipping box, and so keeps the window model for an abspos box that holds, say, an
+            // `overflow-hidden` card around a long paragraph: that paragraph is lossy there (F95 e). The in-flow
+            // fragmenter splits such a card since F30f, but flowing the abspos root would give its nested
+            // out-of-flow boxes window geometry against a placement that no longer exists.
             return false;
         }
         let layout = node.final_layout;
@@ -416,6 +419,9 @@ fn window_cuts_lines(doc: &BaseDocument, root_id: usize, root_y_icb: f32, page_h
 
 /// Whether some inline root in the in-flow subtree of `root_id` that has geometry, and is not split between lines,
 /// ends below the bottom of the page its fragment is on: text the renderer cannot print.
+///
+/// Like [`window_cuts_lines`] it stops at clipping boxes (F95 e): text inside a clipping card of an abspos root that
+/// stays on the window model is not looked at, although the in-flow fragmenter splits such a card since F30f.
 fn lines_end_below_page(
     doc: &BaseDocument,
     geometry: &PaginationGeometryTable,
