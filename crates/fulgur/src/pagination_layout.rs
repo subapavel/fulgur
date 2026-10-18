@@ -4131,7 +4131,7 @@ fn fragment_block_subtree(
         // in-flow child there is no valid interior split point, so
         // the leaf emits whole). Emit its fragment and recurse into
         // descendants on the same page.
-        warn_unprinted_inline_lines(child, child_page_y, strips.bottom(page_index));
+        warn_unprinted_inline_lines(doc, parent, child, child_page_y, strips.bottom(page_index));
         geometry
             .entry(child_id)
             .or_default()
@@ -4631,23 +4631,72 @@ impl LineSplit {
     }
 }
 
-/// F30: whether a child of `parent` is an inline root that the fragmenter may
-/// split between its line boxes, and if so its lines — whatever its height.
+/// F30f: why the line splitter does not look through a box (`None` from [`split_barrier`]: it does).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineBarrier {
+    /// An `inline-block` that is not alone on its line: the carrier's line holds more than the box, and one fragment
+    /// of it would have to hold the rest (F30f-b).
+    SharesItsLine,
+    /// An `inline-flex`, `inline-grid` or `inline-table` box, or an `inline-block` with no carrier line to find.
+    AtomicNotFlowRoot,
+    /// A clipping box that hides some of its content in the block axis: fragmenting it would give it one frame per
+    /// page, and the per-fragment clip would show what the clip hides today (and in Chrome).
+    ClipsItsContent,
+    Multicol,
+    Transformed,
+    Floating,
+    Orthogonal,
+    TablePart,
+}
+
+impl LineBarrier {
+    /// What the warning calls the box that keeps the paragraph whole.
+    fn describe(self) -> &'static str {
+        match self {
+            Self::SharesItsLine => "an inline-block that shares its line",
+            Self::AtomicNotFlowRoot => "an inline-flex, inline-grid or inline-table box",
+            Self::ClipsItsContent => "a clipping box shorter than its content",
+            Self::Multicol => "a multi-column container",
+            Self::Transformed => "a transformed box",
+            Self::Floating => "a float",
+            Self::Orthogonal => "an orthogonal writing mode",
+            Self::TablePart => "a `display: table` box",
+        }
+    }
+}
+
+/// F30f: the barrier a box puts up on its own, whether it is the parent or the child of the paragraph: an atomic
+/// inline, or a clipping box.
+fn box_barrier(node: &blitz_dom::Node) -> Option<LineBarrier> {
+    use ::style::values::specified::box_::{DisplayInside, DisplayOutside};
+    if crate::blitz_adapter::is_atomic_inline_container_node(node) {
+        let inline_block = node.primary_styles().is_some_and(|s| {
+            let display = s.clone_display();
+            display.outside() == DisplayOutside::Inline
+                && display.inside() == DisplayInside::FlowRoot
+        });
+        return Some(if inline_block {
+            LineBarrier::SharesItsLine
+        } else {
+            LineBarrier::AtomicNotFlowRoot
+        });
+    }
+    clips_overflow(node).then_some(LineBarrier::ClipsItsContent)
+}
+
+/// F30f: why the line splitter does not look through `parent` and `child` to split the paragraph `child`, or `None`
+/// when it does. The first barrier in the order the checks are made.
 ///
-/// Paragraphs in block flow qualify, and so do inline roots that are flex items,
-/// grid items (css-flexbox-1 §4, css-grid-2 §6: each is a block container whose
-/// lines are class B break points) or cells of a `display: table` box (F30b).
-/// Anything the fragmenter treats as one unit stays one: atomic inlines and
-/// their contents, orthogonal flows, multicol containers, transformed or
-/// clipping boxes, floats, other children of a `display: table` box (F30e).
-fn line_split_candidate(
+/// The parent side is about the formatting context the child takes part in (atomic and clipping parents, multicol,
+/// orthogonal flows, table parts); the child side about the child itself (atomic, clipping, multicol, floating,
+/// transformed). An absolutely positioned box takes part in no such context and asks only the child side
+/// ([`abspos_line_split`]).
+fn split_barrier(
     doc: &BaseDocument,
     parent: &blitz_dom::Node,
     child: &blitz_dom::Node,
-) -> Option<LineSplit> {
+) -> Option<LineBarrier> {
     use ::style::values::specified::box_::DisplayInside;
-    // Cheap exit first: a paragraph of one line has nothing to split.
-    let split = abspos_line_split(child)?;
     let parent_orthogonal = parent
         .parent
         .and_then(|gp| doc.get_node(gp))
@@ -4657,32 +4706,78 @@ fn line_split_candidate(
     // other child of a table box, or a cell outside one, is not handled (F30e).
     let cell_of_table = inside_of(parent) == Some(DisplayInside::Table)
         && inside_of(child) == Some(DisplayInside::TableCell);
-    if crate::blitz_adapter::is_atomic_inline_container_node(parent)
-        || crate::blitz_adapter::is_multicol_container(parent)
-        || parent_orthogonal
-        || clips_overflow(parent)
-        || (inside_of(parent) == Some(DisplayInside::Table)) != cell_of_table
-        || (inside_of(child) == Some(DisplayInside::TableCell)) != cell_of_table
-        || crate::blitz_adapter::is_orthogonal_to_parent(parent, child)
-    {
-        return None;
+    if let Some(barrier) = box_barrier(parent) {
+        return Some(barrier);
     }
-    Some(split)
+    if crate::blitz_adapter::is_multicol_container(parent) {
+        return Some(LineBarrier::Multicol);
+    }
+    if parent_orthogonal || crate::blitz_adapter::is_orthogonal_to_parent(parent, child) {
+        return Some(LineBarrier::Orthogonal);
+    }
+    if (inside_of(parent) == Some(DisplayInside::Table)) != cell_of_table
+        || (inside_of(child) == Some(DisplayInside::TableCell)) != cell_of_table
+    {
+        return Some(LineBarrier::TablePart);
+    }
+    if let Some(barrier) = box_barrier(child) {
+        return Some(barrier);
+    }
+    if crate::blitz_adapter::is_multicol_container(child) {
+        return Some(LineBarrier::Multicol);
+    }
+    if crate::blitz_adapter::node_is_floating(child) {
+        return Some(LineBarrier::Floating);
+    }
+    if child
+        .primary_styles()
+        .is_some_and(|s| !s.get_box().transform.0.is_empty())
+    {
+        return Some(LineBarrier::Transformed);
+    }
+    None
 }
 
-/// F30g: the child-side part of [`line_split_candidate`]: whether `child` is an inline root of at least two lines that
-/// the fragmenter may split between its line boxes, and if so its lines. Atomic inlines, multicol containers, floats,
-/// clipping and transformed boxes stay one unit.
+/// F30: whether a child of `parent` is an inline root that the fragmenter may
+/// split between its line boxes, and if so its lines — whatever its height.
+///
+/// Paragraphs in block flow qualify, and so do inline roots that are flex items,
+/// grid items (css-flexbox-1 §4, css-grid-2 §6: each is a block container whose
+/// lines are class B break points) or cells of a `display: table` box (F30b).
+/// Anything the fragmenter treats as one unit stays one ([`split_barrier`]): atomic
+/// inlines that share their line and their contents, orthogonal flows, multicol
+/// containers, transformed boxes, clipping boxes that hide content, floats, other
+/// children of a `display: table` box (F30e).
+fn line_split_candidate(
+    doc: &BaseDocument,
+    parent: &blitz_dom::Node,
+    child: &blitz_dom::Node,
+) -> Option<LineSplit> {
+    // Cheap exit first: a paragraph of one line has nothing to split.
+    let split = inline_root_lines(child)?;
+    split_barrier(doc, parent, child).is_none().then_some(split)
+}
+
+/// F30g: the child-side part of [`line_split_candidate`] for an absolutely positioned box: whether `child` is an inline
+/// root of at least two lines that the fragmenter may split between its line boxes, and if so its lines. Atomic
+/// inlines, multicol containers, floats, clipping and transformed boxes stay one unit, whatever they hold: F30g keeps
+/// every clipping or transformed abspos box `Keep`, and an abspos box is blockified (CSS 2.1 §9.7).
 ///
 /// The parent-side checks of [`line_split_candidate`] are about the formatting context the child takes part in (flex /
 /// grid / table parents, orthogonal flows); an absolutely positioned box takes part in none, so it asks only this.
 fn abspos_line_split(child: &blitz_dom::Node) -> Option<LineSplit> {
+    let split = inline_root_lines(child)?;
+    (!crate::blitz_adapter::is_atomic_inline_container_node(child) && !clips_overflow(child))
+        .then_some(split)
+}
+
+/// F30f: `child` as an inline root of at least two lines that is not multicol, floating or transformed, with its
+/// lines. What [`abspos_line_split`] and [`line_split_candidate`] share; the atomic and clipping checks differ.
+fn inline_root_lines(child: &blitz_dom::Node) -> Option<LineSplit> {
     let lines = collect_inline_line_metrics(child);
     if lines.len() < 2
-        || crate::blitz_adapter::is_atomic_inline_container_node(child)
         || crate::blitz_adapter::is_multicol_container(child)
         || crate::blitz_adapter::node_is_floating(child)
-        || clips_overflow(child)
         || child
             .primary_styles()
             .is_some_and(|s| !s.get_box().transform.0.is_empty())
@@ -4941,18 +5036,58 @@ fn inline_lines_below_page(
     (bottom > page_height_px + 1.0).then_some((lines.len(), bottom - page_height_px))
 }
 
-/// Say so when [`inline_lines_below_page`] finds lines that end below the content
-/// box, rather than leave them unremarked (paragraphs are split between line
-/// boxes except in clipping, multicol, transformed, atomic-inline and
-/// `display: table` wrappers). Whether they are lost depends on the page margin:
-/// what falls outside the page box is not printed.
-fn warn_unprinted_inline_lines(child: &blitz_dom::Node, child_page_y: f32, page_height_px: f32) {
-    if let Some((lines, below)) = inline_lines_below_page(child, child_page_y, page_height_px) {
+/// F30f: the lines of the paragraph `child` that the fragmenter places whole at `child_page_y` and that end below the
+/// content box, as `(lines in the paragraph, how far below the page the last of them ends, the barrier that kept it
+/// whole)`; `None` when none do.
+///
+/// A clipping box that hides content hides the lines below it in Chrome too: only the lines that are inside the clip
+/// box and below the page count, and there may be none. Blaming pagination for a clip would be wrong.
+fn unprinted_inline_lines(
+    doc: &BaseDocument,
+    parent: &blitz_dom::Node,
+    child: &blitz_dom::Node,
+    child_page_y: f32,
+    page_height_px: f32,
+) -> Option<(usize, f32, Option<LineBarrier>)> {
+    let (lines, mut below) = inline_lines_below_page(child, child_page_y, page_height_px)?;
+    let barrier = split_barrier(doc, parent, child);
+    if barrier == Some(LineBarrier::ClipsItsContent) {
+        // The bottom of the clip box (its padding box) in page coordinates.
+        let clip_bottom = if clips_overflow(parent) {
+            child_page_y - child.final_layout.location.y + parent.final_layout.size.height
+                - parent.final_layout.border.bottom
+        } else {
+            child_page_y + child.final_layout.size.height - child.final_layout.border.bottom
+        };
+        let metrics = collect_inline_line_metrics(child);
+        let first = metrics.first()?;
+        let top = child_page_y + child.final_layout.border.top + child.final_layout.padding.top;
+        let last = metrics.iter().rfind(|line| {
+            top + (line.0 - first.0) < clip_bottom
+                && top + (line.1 - first.0) > page_height_px + 1.0
+        })?;
+        below = (top + (last.1 - first.0)).min(clip_bottom) - page_height_px;
+    }
+    Some((lines, below, barrier))
+}
+
+/// Say so when [`unprinted_inline_lines`] finds lines that end below the content box, rather than leave them
+/// unremarked, and name the box that kept the paragraph whole ([`split_barrier`]; F30f). Whether the lines are lost
+/// depends on the page margin: what falls outside the page box is not printed.
+fn warn_unprinted_inline_lines(
+    doc: &BaseDocument,
+    parent: &blitz_dom::Node,
+    child: &blitz_dom::Node,
+    child_page_y: f32,
+    page_height_px: f32,
+) {
+    if let Some((lines, below, barrier)) =
+        unprinted_inline_lines(doc, parent, child, child_page_y, page_height_px)
+    {
+        let what = barrier.map_or_else(String::new, |b| format!(" in {}", b.describe()));
         log::warn!(
-            "pagination: a paragraph of {lines} lines is placed whole and ends {below:.0}px below the \
-             content box; lines that fall outside the page box are not printed (paragraphs in \
-             clipping, multicol, transformed, inline-block / inline-flex and `display: table` \
-             wrappers are not split between lines)",
+            "pagination: a paragraph of {lines} lines{what} is placed whole and ends {below:.0}px below the \
+             content box; lines outside the page box are not printed",
         );
     }
 }
