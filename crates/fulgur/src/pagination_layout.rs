@@ -3433,7 +3433,14 @@ fn fragment_block_subtree(
         // when some content has already been placed on this page —
         // gated by `cursor_y > page_start_y` (mirrors body-level's
         // `cursor_y > 0.0` since body's implicit page_start is 0).
-        if break_before_page && cursor_y > page_start_y + band {
+        // F83b review (fuzz `Z1_234`): in block flow a forced break before the first child of a box only counts when
+        // something precedes it (`content_above_child`). The box's own padding above it is not content: when the box
+        // was moved to a fresh page by F28 or by an avoid rule, the break is the page boundary already, and firing it
+        // again left a blank page.
+        if break_before_page
+            && cursor_y > page_start_y + band
+            && (content_above_child || suppress_page_check || parent_is_table)
+        {
             geometry
                 .entry(parent_id)
                 .or_default()
@@ -9403,6 +9410,18 @@ h2 { string-set: chapter-title content(text); }
         let lines = nodes_by_class(doc.deref(), "l");
         assert_eq!(geom[&lines[7]].fragments[0].page_index, 0);
         assert_eq!(geom[&lines[8]].fragments[0].page_index, 1);
+    }
+
+    /// Fuzz `Z1_234`: F28 moves a padded box to a fresh page because its first row does not fit; the forced break
+    /// before its first child is the page boundary already and must not fire again (the padding above the child is not
+    /// content), or a blank page is left.
+    #[test]
+    fn forced_break_before_the_first_child_of_a_moved_padded_box_does_not_fire_twice() {
+        let (doc, geom) = avoid_fragments(
+            "<div style=\"height:190px\"></div><div style=\"padding:12px\">\
+             <div style=\"break-before:page\"><p class=\"a\">text</p></div></div>",
+        );
+        assert_eq!(first_fragment(&doc, &geom, "a").0, 1);
     }
 
     /// F83b: kept whole when `avoid` holds and the box fits the room or can move; the six combinations.
