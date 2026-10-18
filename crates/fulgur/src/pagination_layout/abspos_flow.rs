@@ -35,10 +35,8 @@ pub(super) enum Anchor {
     /// `top` (or the initial containing block): `offset` px below the top of the border box of `cb` as if it were
     /// stitched from its fragments, or below the top of the page area when `cb` is `None`.
     Top { cb: Option<usize>, offset: f32 },
-    /// `bottom` with `top: auto`: the box's top is `from_end` px above the bottom of the border box of `cb`, which is
-    /// `cb_h` px tall (Taffy's height; the fragments of a box the block fragmenter split close at its last child, so
-    /// their heights can add up to less: the bottom padding and border are missing).
-    Bottom { cb: usize, from_end: f32, cb_h: f32 },
+    /// `bottom` with `top: auto`: the box's top is `from_end` px above the bottom of the border box of `cb`.
+    Bottom { cb: usize, from_end: f32 },
     /// No inset on the vertical axis: after the previous in-flow sibling `after` (its last fragment plus the gap Taffy
     /// left, `offset`), or `offset` px below the first fragment of `parent` when there is none.
     Static {
@@ -707,7 +705,6 @@ fn anchor_of(
             Some(c) => Anchor::Bottom {
                 cb: c,
                 from_end: cb_total_h - (cb_border_top + rel_y),
-                cb_h: cb_total_h,
             },
             None => Anchor::Top {
                 cb: None,
@@ -722,8 +719,40 @@ fn anchor_of(
     }
 }
 
+/// How far the bottom border box of `cb` reaches below its last fragment `last`: the block fragmenter closes the last
+/// fragment of a box it split at the bottom of its last in-flow child, so the bottom padding and border are not in it.
+/// Measured from that child's last fragment when it is on the page of `last`; 0 when the fragment already holds them.
+fn closing_deficit(
+    doc: &BaseDocument,
+    geometry: &PaginationGeometryTable,
+    cb: usize,
+    last: &Fragment,
+) -> f32 {
+    let Some(node) = doc.get_node(cb) else {
+        return 0.0;
+    };
+    let inset = node.final_layout.border.bottom + node.final_layout.padding.bottom;
+    if inset <= 0.0 {
+        return 0.0;
+    }
+    let child_bottom = laid_out_children(node).into_iter().rev().find_map(|k| {
+        let c = doc.get_node(k)?;
+        if is_out_of_flow_positioned(c) {
+            return None;
+        }
+        bottom_of_last_fragment(geometry.get(&k)?)
+    });
+    match child_bottom {
+        Some((page, y)) if page == last.page_index => {
+            (y + inset - (last.y.to_f32() + last.height.to_f32())).max(0.0)
+        }
+        _ => 0.0,
+    }
+}
+
 /// The page and y of the top of a box anchored by `anchor`, or `None` when what it hangs on has no geometry.
 fn locate_anchor(
+    doc: &BaseDocument,
     geometry: &PaginationGeometryTable,
     anchor: &Anchor,
     strips: PageStrips,
@@ -740,8 +769,11 @@ fn locate_anchor(
             cb: Some(c),
             offset,
         } => locate_forward(frags(c)?, offset, strips),
-        Anchor::Bottom { cb, from_end, cb_h } => {
-            locate_backward(frags(cb)?, from_end, cb_h, strips)
+        Anchor::Bottom { cb, from_end } => {
+            let f = frags(cb)?;
+            let stacked: f32 = f.iter().map(|x| x.height.to_f32().max(0.0)).sum();
+            let extra = closing_deficit(doc, geometry, cb, f.last()?);
+            locate_backward(f, from_end, stacked + extra, strips)
         }
         Anchor::Static {
             after: Some(sib),
@@ -958,7 +990,7 @@ pub fn fragment_abspos_flows(
             continue;
         };
         let (Some(start), Some(x)) = (
-            locate_anchor(geometry, &anchor, strips),
+            locate_anchor(doc, geometry, &anchor, strips),
             abspos_x(doc, geometry, id, cb, viewport_w_px, page_height_px),
         ) else {
             keep(&mut kept_roots);
