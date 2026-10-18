@@ -3536,7 +3536,7 @@ fn fragment_block_subtree(
                     strips.bottom(page) - y,
                     strips.fresh(),
                     above,
-                    leaf_tail,
+                    tail_raw,
                 )
         };
         // A box that fits a page and the room, but not together with what its parents need below it (their bottom
@@ -9442,6 +9442,22 @@ h2 { string-set: chapter-title content(text); }
         ));
         let lines = nodes_by_class(doc.deref(), "l");
         assert_eq!(geom[&lines[0]].fragments[0].page_index, 0);
+    }
+
+    /// Harness gen6 `M_k50_*pp10`: an avoid box that fits the room exactly but not together with its parent's bottom
+    /// padding, at the top of the page: it is entered and its last line moves on (Chrome), instead of the box staying
+    /// whole with the parent's padding crossing the page bottom.
+    #[test]
+    fn avoid_box_that_fills_the_room_but_not_its_parents_bottom_padding_is_split() {
+        let (doc, geom) = avoid_fragments(&format!(
+            "<div style=\"padding:10px\"><div class=\"av\">{}</div></div>",
+            (0..10)
+                .map(|i| format!("<div class=\"l\" style=\"height:19.1px\">l{i}</div>"))
+                .collect::<String>()
+        ));
+        let lines = nodes_by_class(doc.deref(), "l");
+        assert_eq!(geom[&lines[8]].fragments[0].page_index, 0);
+        assert_eq!(geom[&lines[9]].fragments[0].page_index, 1);
     }
 
     /// F83b: kept whole when `avoid` holds and the box fits the room or can move; the six combinations.
