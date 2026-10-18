@@ -1027,6 +1027,22 @@ pub fn is_table_box(node: &Node) -> bool {
         .is_some_and(|s| s.clone_display().inside() == DisplayInside::Table)
 }
 
+/// F30e: `child` is an anonymous table cell of the table box `table` (CSS 2.1 §17.2.1): an anonymous block laid out
+/// as one of `table`'s cells, not its `::before` / `::after` box.
+///
+/// Blitz wraps text, inline content and boxes that are not table parts in an anonymous row and cell (F50). The cell
+/// is an anonymous block whose computed `display` is `inline`, so `table_part` does not see it as one. It is told
+/// by its `layout_parent`, which is the table for every cell of the grid, also when the row it stands in is a
+/// `display: table-row` element (its `parent` is that row). The pseudo-element boxes are anonymous blocks too and are
+/// pushed into a table's layout children (`construct.rs`), but they are not cells.
+pub fn is_anonymous_table_cell(table: &Node, child: &Node) -> bool {
+    is_table_box(table)
+        && child.is_anonymous()
+        && child.layout_parent.get() == Some(table.id)
+        && table.before != Some(child.id)
+        && table.after != Some(child.id)
+}
+
 /// fulgur-uebl: true if `node` establishes a flex / grid formatting
 /// context (its inside display is `Flex` or `Grid`). Children of such
 /// containers are flex / grid items, which the spec excludes from
@@ -6805,6 +6821,63 @@ mod tests {
             heights.len(),
         );
         assert!(heights.iter().all(|h| *h > 0.0));
+    }
+
+    /// F30e: which layout children of the element `id` are anonymous cells of it.
+    fn anonymous_cells_of(doc: &HtmlDocument, id: &str) -> Vec<bool> {
+        fn walk(doc: &HtmlDocument, node_id: usize, target: &str) -> Option<usize> {
+            let n = doc.get_node(node_id)?;
+            if let Some(elem) = n.element_data()
+                && elem.attr(blitz_dom::LocalName::from("id")) == Some(target)
+            {
+                return Some(node_id);
+            }
+            n.children.iter().find_map(|&c| walk(doc, c, target))
+        }
+        let table = doc
+            .get_node(walk(doc, doc.root_element().id, id).expect("id"))
+            .unwrap();
+        let children = table.layout_children.borrow();
+        children
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|&c| is_anonymous_table_cell(table, doc.get_node(c).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn anonymous_table_cells_are_told_from_real_cells_and_pseudo_boxes() {
+        let html = r#"<!doctype html><html><head><style>
+            #d::before{content:"x"}</style></head><body style="margin:0">
+          <div id="a" style="display:table">text <span>more</span></div>
+          <div id="b" style="display:table"><div style="display:table-row">row text</div></div>
+          <div id="c" style="display:table"><div style="display:table-row"><div style="display:table-cell">cell</div></div></div>
+          <div id="d" style="display:table"><div style="display:table-row"><div style="display:table-cell">cell</div></div></div>
+          <div id="e">text <p>block</p> tail</div>
+          <div id="f" style="display:table">a<div style="display:table-cell">cell</div>b</div>
+        </body></html>"#;
+        let mut doc = parse(html, 600.0, &[]);
+        resolve(&mut doc);
+        // Text directly in a table box: one anonymous cell.
+        assert_eq!(anonymous_cells_of(&doc, "a"), [true], "table-level run");
+        // Text in a row: an anonymous cell whose `parent` is the row but whose `layout_parent` is the table.
+        assert_eq!(anonymous_cells_of(&doc, "b"), [true], "row-level run");
+        // A real cell is not anonymous.
+        assert_eq!(anonymous_cells_of(&doc, "c"), [false], "real cell");
+        // The pseudo-element box is an anonymous block in the table's layout children, and not a cell.
+        assert_eq!(
+            anonymous_cells_of(&doc, "d"),
+            [false, false],
+            "::before, cell"
+        );
+        // The anonymous block wrapper of a plain `div` is not a table cell.
+        assert!(
+            anonymous_cells_of(&doc, "e").iter().all(|&a| !a),
+            "plain div"
+        );
+        // Runs of text around a real cell: anonymous cells, the real cell between them is not.
+        assert_eq!(anonymous_cells_of(&doc, "f"), [true, false, true]);
     }
 }
 
