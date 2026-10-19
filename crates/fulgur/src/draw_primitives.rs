@@ -677,13 +677,14 @@ pub struct Canvas<'a, 'b> {
 }
 
 /// The rightmost x, in pt from the page's left edge, that text, inline images and boxes with a visible background or
-/// border were drawn at on a canvas. Used to warn when content runs past the page edge, where it is clipped
-/// (`render_v2`). Only coordinates that are page coordinates count: while a clip path or a transform is active
-/// (`enter_local` .. `leave_local`) the x values are not, or the content is clipped away anyway, so nothing is
-/// recorded.
+/// border were drawn at on a canvas, and the lowest y that text was drawn down to. Used to warn when content runs
+/// past the page edge, where it is clipped (`render_v2`). Only coordinates that are page coordinates count: while a
+/// clip path or a transform is active (`enter_local` .. `leave_local`) the values are not, or the content is clipped
+/// away anyway, so nothing is recorded.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PaintExtent {
     right: f32,
+    bottom: f32,
     local: u32,
 }
 
@@ -692,6 +693,15 @@ impl PaintExtent {
     pub fn note_right(&mut self, right: f32) {
         if self.local == 0 && right.is_finite() {
             self.right = self.right.max(right);
+        }
+    }
+
+    /// Records that text was painted down to `bottom` pt from the page's top edge (F111). Text only: the html root
+    /// and body backgrounds are painted at the full document height on every page, and a box taller than the page
+    /// is not lost the way a line is (every line is painted on exactly one page, F78).
+    pub fn note_bottom(&mut self, bottom: f32) {
+        if self.local == 0 && bottom.is_finite() {
+            self.bottom = self.bottom.max(bottom);
         }
     }
 
@@ -708,6 +718,11 @@ impl PaintExtent {
     /// The rightmost painted x in pt, 0 when nothing was recorded.
     pub fn right(&self) -> f32 {
         self.right
+    }
+
+    /// The lowest painted text y in pt, 0 when nothing was recorded.
+    pub fn bottom(&self) -> f32 {
+        self.bottom
     }
 }
 
@@ -3132,6 +3147,29 @@ mod paint_extent_tests {
         e.note_right(f32::NAN);
         e.note_right(f32::INFINITY);
         assert_eq!(e.right(), 120.0);
+    }
+
+    /// F111: the lowest text y, with the same scopes and the same refusal of non-finite values as the right edge.
+    #[test]
+    fn keeps_the_lowest_text_bottom() {
+        let mut e = PaintExtent::default();
+        assert_eq!(e.bottom(), 0.0);
+        e.note_bottom(700.0);
+        e.note_bottom(300.0);
+        e.note_bottom(f32::NAN);
+        e.note_bottom(f32::INFINITY);
+        assert_eq!(e.bottom(), 700.0);
+        assert_eq!(e.right(), 0.0, "the two extents are independent");
+        e.enter_local();
+        e.note_bottom(9000.0);
+        e.leave_local();
+        assert_eq!(
+            e.bottom(),
+            700.0,
+            "a clip or transform scope records nothing"
+        );
+        e.note_bottom(800.0);
+        assert_eq!(e.bottom(), 800.0);
     }
 
     #[test]

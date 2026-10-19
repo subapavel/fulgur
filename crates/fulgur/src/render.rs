@@ -376,6 +376,15 @@ pub fn render_v2(
                         "content extends {overflow:.1} pt past the right page edge on page {page_num} and is clipped"
                     );
                 }
+                // Text below the bottom edge is not printed: every line is painted on exactly one page (F78), so a
+                // line that sits below its page's edge is on no page. The fragmenter keeps some boxes whole (an
+                // `inline-flex`, an oversized leaf); this says so where it cannot have been split.
+                let below = canvas.paint_extent.bottom() - page_size.height;
+                if below > PAGE_OVERFLOW_TOLERANCE_PT {
+                    log::warn!(
+                        "content extends {below:.1} pt past the bottom page edge on page {page_num} and is not printed"
+                    );
+                }
             }
             // Paint margin boxes after body content so page headers /
             // footers are not hidden by page-filling body backgrounds.

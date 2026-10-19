@@ -780,6 +780,16 @@ fn inline_box_offset(
     }
 }
 
+/// Whether a line item paints text or an image of its own: not an inline box, whose content is dispatched under its
+/// own geometry, and not a run of white space.
+fn item_is_ink(item: &LineItem) -> bool {
+    match item {
+        LineItem::Text(run) => !run.text.trim().is_empty(),
+        LineItem::Image(_) => true,
+        LineItem::InlineBox(_) => false,
+    }
+}
+
 /// Draw pre-shaped text lines at the given position.
 pub fn draw_shaped_lines(
     canvas: &mut Canvas<'_, '_>,
@@ -798,6 +808,18 @@ pub fn draw_shaped_lines(
     canvas
         .paint_extent
         .note_right(lines_right_edge(lines, x).to_f32());
+    // The lowest baseline of a line that has text or an image on it (F111). A line that holds only inline boxes is
+    // as tall as the box, which is painted by the box's own fragments; its baseline says nothing about the text.
+    // Baselines are advance-based, so the quantised boxes of F78 do not matter, and a line whose baseline is inside
+    // the page still shows most of its glyphs.
+    if let Some(baseline) = lines
+        .iter()
+        .filter(|line| line.items.iter().any(item_is_ink))
+        .map(|line| line.baseline)
+        .max_by(|a, b| a.to_f32().total_cmp(&b.to_f32()))
+    {
+        canvas.paint_extent.note_bottom((y + baseline).to_f32());
+    }
     // Per-run tagging mode is active when canvas.link_run_node_id is set and
     // tagging is enabled. In this mode each glyph-run or inline-image cluster
     // bounded by `Arc<LinkSpan>` identity gets its own start_tagged/end_tagged
