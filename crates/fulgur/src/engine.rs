@@ -1337,6 +1337,13 @@ impl EngineBuilder {
         self
     }
 
+    /// The margin for sides the document's `@page` rules leave unset. A CSS `@page` margin wins over it;
+    /// [`EngineBuilder::margin`] is the one that overrides the document.
+    pub fn default_margin(mut self, margin: Margin) -> Self {
+        self.config_builder = self.config_builder.default_margin(margin);
+        self
+    }
+
     pub fn landscape(mut self, landscape: bool) -> Self {
         self.config_builder = self.config_builder.landscape(landscape);
         self

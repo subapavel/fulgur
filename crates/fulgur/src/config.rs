@@ -65,6 +65,17 @@ impl Margin {
     pub fn uniform_mm(mm: f32) -> Self {
         Self::uniform(mm * 72.0 / 25.4)
     }
+
+    /// A margin with a different width per side, in millimetres (CSS order: top, right, bottom, left).
+    /// Each side is converted exactly like [`Margin::uniform_mm`], so equal sides give the same bits.
+    pub fn sides_mm(top: f32, right: f32, bottom: f32, left: f32) -> Self {
+        Self {
+            top: top * 72.0 / 25.4,
+            right: right * 72.0 / 25.4,
+            bottom: bottom * 72.0 / 25.4,
+            left: left * 72.0 / 25.4,
+        }
+    }
 }
 
 impl Default for Margin {
@@ -197,6 +208,13 @@ impl ConfigBuilder {
         self
     }
 
+    /// Sets the margin pages get when the document's `@page` rules do not set that side. Unlike
+    /// [`ConfigBuilder::margin`] it is not an override: a CSS `@page` margin wins, side by side.
+    pub fn default_margin(mut self, margin: Margin) -> Self {
+        self.config.margin = margin;
+        self
+    }
+
     pub fn landscape(mut self, landscape: bool) -> Self {
         self.config.landscape = landscape;
         self.config.overrides.landscape = true;
@@ -309,6 +327,30 @@ mod tests {
             .build();
         assert!((config.content_width() - (841.89 - 144.0)).abs() < 0.01);
         assert!((config.content_height() - (595.28 - 144.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_default_margin_is_not_an_override() {
+        let config = Config::builder()
+            .default_margin(Margin::uniform(30.0))
+            .build();
+        assert_eq!(config.margin, Margin::uniform(30.0));
+        assert!(!config.overrides.margin);
+        let config = Config::builder().margin(Margin::uniform(30.0)).build();
+        assert!(config.overrides.margin);
+    }
+
+    #[test]
+    fn test_sides_mm_converts_each_side() {
+        let m = Margin::sides_mm(10.0, 20.0, 30.0, 40.0);
+        assert!((m.top - 28.346).abs() < 0.01);
+        assert!((m.right - 56.693).abs() < 0.01);
+        assert!((m.bottom - 85.039).abs() < 0.01);
+        assert!((m.left - 113.386).abs() < 0.01);
+        assert_eq!(
+            Margin::sides_mm(15.0, 15.0, 15.0, 15.0),
+            Margin::uniform_mm(15.0)
+        );
     }
 
     #[test]

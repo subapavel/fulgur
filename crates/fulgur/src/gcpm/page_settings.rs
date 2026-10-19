@@ -1,15 +1,32 @@
 use crate::config::{Config, Margin, PageSize};
 use crate::gcpm::{PageSettingsRule, PageSizeDecl, PartialMargin};
 
-/// Map a CSS page-size keyword (case-insensitive) to a [`PageSize`].
-/// Falls back to A4 for unrecognised keywords.
-fn keyword_to_page_size(name: &str) -> PageSize {
-    match name.to_uppercase().as_str() {
-        "A4" => PageSize::A4,
-        "A3" => PageSize::A3,
-        "LETTER" => PageSize::LETTER,
-        _ => PageSize::A4,
-    }
+/// Map a CSS page-size keyword (case-insensitive) to a [`PageSize`], or `None` when it is not one of
+/// css-page-3's `<page-size>` keywords ("Page size: the size property").
+///
+/// `A4`, `A3` and `letter` keep the [`PageSize`] constants so everything rendered with them stays
+/// byte-identical; the others are built from their millimetre or inch sizes.
+pub(crate) fn keyword_to_page_size(name: &str) -> Option<PageSize> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "a5" => PageSize::custom(148.0, 210.0),
+        "a4" => PageSize::A4,
+        "a3" => PageSize::A3,
+        "b5" => PageSize::custom(176.0, 250.0),
+        "b4" => PageSize::custom(250.0, 353.0),
+        "jis-b5" => PageSize::custom(182.0, 257.0),
+        "jis-b4" => PageSize::custom(257.0, 364.0),
+        "letter" => PageSize::LETTER,
+        // 8.5 x 14 in and 11 x 17 in; a point is 1/72 in.
+        "legal" => PageSize {
+            width: 8.5 * 72.0,
+            height: 14.0 * 72.0,
+        },
+        "ledger" => PageSize {
+            width: 11.0 * 72.0,
+            height: 17.0 * 72.0,
+        },
+        _ => return None,
+    })
 }
 
 /// Returns `true` when `selector` matches the given page number.
@@ -47,6 +64,9 @@ fn selector_matches(selector: &str, page_num: usize, first_page_is_left: bool) -
 /// ```text
 /// CLI override (config.overrides) > CSS @page selector match > CSS @page default > Config defaults
 /// ```
+///
+/// "Config defaults" are `Config::page_size` / `Config::margin` while the matching `overrides` flag is
+/// false: `ConfigBuilder::default_margin` sets the margin that way.
 ///
 /// When `config.overrides.page_size` is set (i.e. `--size` / `builder.page_size`),
 /// the CLI fully owns page geometry **including orientation**: CSS `@page`
@@ -100,7 +120,12 @@ pub fn resolve_page_settings(
             Some(PageSizeDecl::Keyword(name)) => {
                 // Keyword without orientation carries no landscape signal;
                 // use config.landscape regardless of override flag.
-                (keyword_to_page_size(name), config.landscape)
+                // The parser only stores known keywords; a rule built by hand with another one keeps the
+                // configured size.
+                (
+                    keyword_to_page_size(name).unwrap_or(config.page_size),
+                    config.landscape,
+                )
             }
             Some(PageSizeDecl::KeywordWithOrientation(name, is_landscape)) => {
                 let ls = if config.overrides.landscape {
@@ -111,7 +136,7 @@ pub fn resolve_page_settings(
                 let size = if name == "auto" {
                     config.page_size
                 } else {
-                    keyword_to_page_size(name)
+                    keyword_to_page_size(name).unwrap_or(config.page_size)
                 };
                 (size, ls)
             }
@@ -378,5 +403,139 @@ mod tests {
             (m4.top - 22.0).abs() < 0.01,
             "page 4 should be :right in RTL"
         );
+    }
+
+    // --- F6 (htmltopdf): complete css-page-3 keyword table, config default margin ---
+
+    fn keyword(name: &str) -> (f32, f32) {
+        let s =
+            keyword_to_page_size(name).unwrap_or_else(|| panic!("{name} is a page-size keyword"));
+        (s.width, s.height)
+    }
+
+    fn assert_pt(got: (f32, f32), want: (f32, f32), what: &str) {
+        assert!(
+            (got.0 - want.0).abs() < 0.01 && (got.1 - want.1).abs() < 0.01,
+            "{what}: {got:?}, want {want:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_table_covers_css_page_3() {
+        // Sizes in mm from css-page-3 "Page size: the size property", converted at 72/25.4.
+        let mm = |w: f32, h: f32| (w * 72.0 / 25.4, h * 72.0 / 25.4);
+        assert_pt(keyword("a5"), mm(148.0, 210.0), "A5");
+        assert_pt(keyword("a4"), mm(210.0, 297.0), "A4");
+        assert_pt(keyword("a3"), mm(297.0, 420.0), "A3");
+        assert_pt(keyword("b5"), mm(176.0, 250.0), "B5");
+        assert_pt(keyword("b4"), mm(250.0, 353.0), "B4");
+        assert_pt(keyword("jis-b5"), mm(182.0, 257.0), "JIS-B5");
+        assert_pt(keyword("jis-b4"), mm(257.0, 364.0), "JIS-B4");
+        assert_pt(keyword("letter"), (612.0, 792.0), "letter");
+        assert_pt(keyword("legal"), (612.0, 1008.0), "legal");
+        assert_pt(keyword("ledger"), (792.0, 1224.0), "ledger");
+    }
+
+    #[test]
+    fn keyword_table_is_case_insensitive_and_keeps_the_existing_constants() {
+        assert_pt(keyword("A5"), keyword("a5"), "case");
+        assert_pt(keyword("JIS-B5"), keyword("jis-b5"), "case");
+        // A4, A3 and letter stay the constants every golden was rendered with.
+        let a4 = keyword("A4");
+        assert_eq!((a4.0, a4.1), (PageSize::A4.width, PageSize::A4.height));
+        let a3 = keyword("A3");
+        assert_eq!((a3.0, a3.1), (PageSize::A3.width, PageSize::A3.height));
+        let l = keyword("Letter");
+        assert_eq!(
+            (l.0, l.1),
+            (PageSize::LETTER.width, PageSize::LETTER.height)
+        );
+    }
+
+    #[test]
+    fn unknown_keyword_is_not_a_page_size() {
+        assert!(keyword_to_page_size("Foo").is_none());
+        assert!(keyword_to_page_size("auto").is_none());
+        assert!(keyword_to_page_size("").is_none());
+    }
+
+    #[test]
+    fn css_a5_resolves_to_a5() {
+        let config = Config::default();
+        let rules = vec![PageSettingsRule {
+            page_selector: None,
+            size: Some(PageSizeDecl::Keyword("A5".into())),
+            margin: PartialMargin::default(),
+        }];
+        let (size, _, landscape) = resolve_page_settings(&rules, 1, 1, &config, false);
+        assert_pt((size.width, size.height), keyword("A5"), "size: A5");
+        assert!(!landscape);
+    }
+
+    #[test]
+    fn css_landscape_a5_is_landscape() {
+        let config = Config::default();
+        let rules = vec![PageSettingsRule {
+            page_selector: None,
+            size: Some(PageSizeDecl::KeywordWithOrientation("A5".into(), true)),
+            margin: PartialMargin::default(),
+        }];
+        let (size, _, landscape) = resolve_page_settings(&rules, 1, 1, &config, false);
+        assert_pt(
+            (size.width, size.height),
+            keyword("A5"),
+            "size: A5 landscape",
+        );
+        assert!(landscape);
+    }
+
+    #[test]
+    fn default_margin_is_beaten_by_css_margin() {
+        use crate::config::Margin;
+        let config = Config::builder()
+            .default_margin(Margin::uniform(40.0))
+            .build();
+        assert!(!config.overrides.margin, "a default is not an override");
+        // No CSS margin: the default stands, per side.
+        let (_, m, _) = resolve_page_settings(&[], 1, 1, &config, false);
+        assert_eq!(m, Margin::uniform(40.0));
+        // CSS margin: wins, side by side.
+        let rules = vec![PageSettingsRule {
+            page_selector: None,
+            size: None,
+            margin: PartialMargin::from_sides(10.0, 11.0, 12.0, 13.0),
+        }];
+        let (_, m, _) = resolve_page_settings(&rules, 1, 1, &config, false);
+        assert_eq!(
+            m,
+            Margin {
+                top: 10.0,
+                right: 11.0,
+                bottom: 12.0,
+                left: 13.0
+            }
+        );
+        // CSS size alone leaves the default margin alone.
+        let rules = vec![PageSettingsRule {
+            page_selector: None,
+            size: Some(PageSizeDecl::Keyword("A5".into())),
+            margin: PartialMargin::default(),
+        }];
+        let (_, m, _) = resolve_page_settings(&rules, 1, 1, &config, false);
+        assert_eq!(m, Margin::uniform(40.0));
+    }
+
+    #[test]
+    fn explicit_margin_still_beats_css() {
+        use crate::config::Margin;
+        let config = Config::builder().margin(Margin::uniform(40.0)).build();
+        assert!(config.overrides.margin);
+        let rules = vec![PageSettingsRule {
+            page_selector: None,
+            size: None,
+            margin: PartialMargin::from_uniform(10.0),
+        }];
+        let (_, m, _) = resolve_page_settings(&rules, 1, 1, &config, false);
+        assert_eq!(m, Margin::uniform(40.0));
     }
 }

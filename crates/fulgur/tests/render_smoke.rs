@@ -7941,3 +7941,44 @@ fn linked_stylesheet_running_header_has_exactly_one_link() {
         .expect("render");
     assert_eq!(count_bytes(&pdf, "/Subtype /Link"), 1);
 }
+
+/// F6 (htmltopdf): `@page { size: A5 }` was read as an unknown keyword and printed on A4. The css-page-3 keyword
+/// table is complete now and an orientation may come first.
+fn media_box(pdf: &[u8]) -> String {
+    let needle: &[u8] = b"/MediaBox [";
+    let at = pdf
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("a MediaBox");
+    let rest = &pdf[at + needle.len()..];
+    let end = rest
+        .iter()
+        .position(|&b| b == b']')
+        .expect("end of MediaBox");
+    String::from_utf8_lossy(&rest[..end]).into_owned()
+}
+
+#[test]
+fn test_render_page_size_a5_from_css_gives_an_a5_media_box() {
+    let html = r#"<!doctype html><html><head><style>@page { size: A5 }</style></head><body>x</body></html>"#;
+    let pdf = Engine::builder().build().render(html).expect("render");
+    let mb = media_box(&pdf);
+    assert!(mb.starts_with("0 0 419.5"), "A5 portrait, got {mb}");
+    assert!(mb.contains(" 595.2"), "A5 portrait, got {mb}");
+}
+
+#[test]
+fn test_render_page_size_landscape_a5_from_css_gives_a_landscape_a5_media_box() {
+    let html = r#"<!doctype html><html><head><style>@page { size: landscape A5 }</style></head><body>x</body></html>"#;
+    let pdf = Engine::builder().build().render(html).expect("render");
+    let mb = media_box(&pdf);
+    assert!(mb.starts_with("0 0 595.2"), "A5 landscape, got {mb}");
+    assert!(mb.contains(" 419.5"), "A5 landscape, got {mb}");
+}
+
+#[test]
+fn test_render_unknown_page_size_keyword_keeps_the_default_page() {
+    let html = r#"<!doctype html><html><head><style>@page { size: A5; size: Foo }</style></head><body>x</body></html>"#;
+    let pdf = Engine::builder().build().render(html).expect("render");
+    assert!(media_box(&pdf).starts_with("0 0 419.5"));
+}

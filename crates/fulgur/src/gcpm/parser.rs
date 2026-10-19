@@ -5,6 +5,7 @@ use cssparser::{
 
 use super::bookmark::{BookmarkLevel, BookmarkMapping};
 use super::margin_box::MarginBoxPosition;
+use super::page_settings::keyword_to_page_size;
 use super::{
     ContentCounterMapping, ContentItem, CounterMapping, CounterOp, CounterStyle, ElementPolicy,
     GcpmContext, LeaderStyle, MarginBoxRule, PageSettingsRule, PageSizeDecl, ParsedSelector,
@@ -307,16 +308,28 @@ fn parse_page_size_value(input: &mut Parser<'_, '_>) -> Option<PageSizeDecl> {
         Token::Ident(ref name) => {
             if name.eq_ignore_ascii_case("auto") {
                 Some(PageSizeDecl::Auto)
-            } else if name.eq_ignore_ascii_case("landscape") {
+            } else if name.eq_ignore_ascii_case("landscape")
+                || name.eq_ignore_ascii_case("portrait")
+            {
+                let landscape = name.eq_ignore_ascii_case("landscape");
+                // css-page-3: `[ <page-size> || [ portrait | landscape ] ]`, in either order.
+                let keyword = input.try_parse(|input| {
+                    let tok = input.next()?.clone();
+                    match tok {
+                        Token::Ident(ref k) if keyword_to_page_size(k).is_some() => {
+                            Ok(k.to_string())
+                        }
+                        _ => Err(input.new_error::<()>(BasicParseErrorKind::QualifiedRuleInvalid)),
+                    }
+                });
                 Some(PageSizeDecl::KeywordWithOrientation(
-                    "auto".to_string(),
-                    true,
+                    keyword.unwrap_or_else(|_| "auto".to_string()),
+                    landscape,
                 ))
-            } else if name.eq_ignore_ascii_case("portrait") {
-                Some(PageSizeDecl::KeywordWithOrientation(
-                    "auto".to_string(),
-                    false,
-                ))
+            } else if keyword_to_page_size(name).is_none() {
+                // Not a `<page-size>` keyword: the declaration is invalid and ignored, so an earlier
+                // valid `size` still applies (CSS Syntax 3, "Consume a declaration").
+                None
             } else {
                 let keyword = name.to_string();
                 // Try to read a second ident for orientation
@@ -3323,6 +3336,64 @@ mod tests {
                 .iter()
                 .any(|m| m.running_name == "footer")
         );
+    }
+
+    // --- F6 (htmltopdf): orientation before the keyword, unknown keywords are invalid ---
+
+    #[test]
+    fn test_page_size_orientation_before_keyword() {
+        assert_size(
+            "@page { size: landscape A5; }",
+            PageSizeDecl::KeywordWithOrientation("A5".to_string(), true),
+        );
+        assert_size(
+            "@page { size: portrait letter; }",
+            PageSizeDecl::KeywordWithOrientation("letter".to_string(), false),
+        );
+        assert_size(
+            "@page { size: LANDSCAPE jis-b4; }",
+            PageSizeDecl::KeywordWithOrientation("jis-b4".to_string(), true),
+        );
+    }
+
+    #[test]
+    fn test_page_size_orientation_alone_still_works() {
+        assert_size(
+            "@page { size: landscape; }",
+            PageSizeDecl::KeywordWithOrientation("auto".to_string(), true),
+        );
+    }
+
+    #[test]
+    fn test_page_size_orientation_with_junk_is_invalid() {
+        assert_no_page_settings("@page { size: landscape Foo; }");
+        assert_no_page_settings("@page { size: landscape A5 portrait; }");
+        assert_no_page_settings("@page { size: landscape 100pt; }");
+    }
+
+    #[test]
+    fn test_page_size_unknown_keyword_is_invalid() {
+        assert_no_page_settings("@page { size: Foo; }");
+        assert_no_page_settings("@page { size: Foo landscape; }");
+        assert_no_page_settings("@page { size: A6; }");
+    }
+
+    #[test]
+    fn test_page_size_invalid_declaration_keeps_the_earlier_valid_one() {
+        assert_size(
+            "@page { size: A5; size: Foo; }",
+            PageSizeDecl::Keyword("A5".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_page_size_new_keywords_are_stored() {
+        for k in ["A5", "B5", "B4", "JIS-B5", "JIS-B4", "legal", "ledger"] {
+            assert_size(
+                &format!("@page {{ size: {k}; }}"),
+                PageSizeDecl::Keyword(k.to_string()),
+            );
+        }
     }
 
     // --- page-size error paths (lines 336, 355-357, 363) ---
