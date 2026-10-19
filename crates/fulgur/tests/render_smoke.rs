@@ -7866,3 +7866,78 @@ fn render_smoke_page_counter_footer_over_three_pages() {
     assert!(pdf.starts_with(b"%PDF"));
     assert_eq!(page_count(&pdf), 3, "three pages");
 }
+
+// ---------------------------------------------------------------------------
+// F102: an element with `position: running()` is painted only where `element()`
+// places it, whichever way the rule reached the document.
+
+fn count_bytes(pdf: &[u8], needle: &str) -> usize {
+    let needle = needle.as_bytes();
+    pdf.windows(needle.len()).filter(|w| *w == needle).count()
+}
+
+const RUNNING_HEADER_BODY: &str = r#"<div class="run">Header <a href="https://example.cz/hdr">link</a></div>
+<p>Body text.</p>"#;
+
+fn running_header_document(rules_in_style: bool) -> String {
+    let style = if rules_in_style {
+        ".run { position: running(hdr); } @page { @top-center { content: element(hdr); } }"
+    } else {
+        ""
+    };
+    format!(
+        "<!doctype html><html><head><style>{style}</style></head><body>{RUNNING_HEADER_BODY}</body></html>"
+    )
+}
+
+/// A one-page document whose rules sit in an inline `<style>`: the running header is a link in the margin
+/// box and nothing else. Before the fix the body printed it too, with a second link annotation.
+#[test]
+fn inline_style_running_header_has_exactly_one_link() {
+    let pdf = Engine::builder()
+        .build()
+        .render(&running_header_document(true))
+        .expect("render");
+    assert_eq!(
+        count_bytes(&pdf, "/Subtype /Link"),
+        1,
+        "the margin box's link only, not the body copy's"
+    );
+}
+
+#[test]
+fn tagged_inline_style_running_header_has_no_link_structure() {
+    let pdf = Engine::builder()
+        .tagged(true)
+        .lang("en")
+        .build()
+        .render(&running_header_document(true))
+        .expect("render");
+    assert_eq!(count_bytes(&pdf, "/Subtype /Link"), 1);
+    assert_eq!(
+        count_bytes(&pdf, "/S /Link"),
+        0,
+        "the body has no link, and margin-box links are not tagged"
+    );
+}
+
+/// The same rules in a `<link>`ed sheet reach Stylo cleaned (`display: none`), so the element was already
+/// hidden on this path; it must stay one link.
+#[test]
+fn linked_stylesheet_running_header_has_exactly_one_link() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("style.css"),
+        ".run { position: running(hdr); } @page { @top-center { content: element(hdr); } }",
+    )
+    .unwrap();
+    let html = format!(
+        "<!doctype html><html><head><link rel=\"stylesheet\" href=\"style.css\"></head><body>{RUNNING_HEADER_BODY}</body></html>"
+    );
+    let pdf = Engine::builder()
+        .base_path(dir.path())
+        .build()
+        .render(&html)
+        .expect("render");
+    assert_eq!(count_bytes(&pdf, "/Subtype /Link"), 1);
+}

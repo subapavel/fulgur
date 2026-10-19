@@ -144,9 +144,11 @@ fn margin_box_running_element_link_keeps_pdf_annotation() {
     );
     assert!(text.contains("/URI"), "missing /URI action type");
     let uri_count = text.matches("https://margin-box-link.test").count();
-    assert!(
-        uri_count >= 2,
-        "expected both source running element and margin-box render to keep link annotations, got {uri_count} URI entries"
+    // F102: the source element is not displayed where it stands (CSS GCPM 3 §2.2), so only the margin box's
+    // render carries the link. This used to expect two, which was the duplicate painted in the body.
+    assert_eq!(
+        uri_count, 1,
+        "expected only the margin-box render to keep a link annotation, got {uri_count} URI entries"
     );
 }
 

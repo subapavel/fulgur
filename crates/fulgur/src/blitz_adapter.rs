@@ -2261,6 +2261,30 @@ impl DomPass for RunningElementPass {
         let root = doc.root_element();
         let root_id = root.id;
         self.walk_tree(doc, root_id, 0);
+        // After `serialize_node` has copied the HTML the margin boxes show.
+        hide_registered_running_elements(doc, &self.store.borrow());
+    }
+}
+
+/// F102: takes every registered running element out of the document's own layout.
+///
+/// CSS GCPM 3 §2.2: a running element is not displayed where it stands, only where `element()` places it. The
+/// `display: none` rewrite in `cleaned_css` does that for rules that reach Stylo through the `AssetBundle` or a
+/// `<link>`, but an inline `<style>` is only *read* by `extract_gcpm_from_inline_styles`; Stylo drops
+/// `position: running()` as an invalid value, so the element kept its box and was painted a second time in the
+/// body, with its own link annotation. So the pass sets `display: none` on each node itself, as a declaration of
+/// the element: above every author rule of the same importance whatever its specificity or order (Cascade 5
+/// §6.1, CSS Display 3 §2.5: no box for the element or its descendants). It changes the style attribute the
+/// cascade reads, not the `attrs` that `serialize_node` copied, so the margin boxes get the same HTML as
+/// before. An author `!important` `display` still wins; `convert_node` keeps such a node out of the paint.
+fn hide_registered_running_elements(doc: &mut HtmlDocument, store: &RunningElementStore) {
+    let node_ids: Vec<usize> = store.node_ids().collect();
+    if node_ids.is_empty() {
+        return;
+    }
+    let mut mutator = doc.mutate();
+    for node_id in node_ids {
+        mutator.set_style_property(node_id, "display", "none");
     }
 }
 
@@ -4412,6 +4436,79 @@ mod tests {
             0,
             "Elements inside <head> (like <style>) should not be matched as running elements"
         );
+    }
+
+    /// The pass over `html` for `.run { position: running(x) }` mappings, then `resolve`.
+    fn run_running_pass(html: &str) -> (HtmlDocument, RunningElementStore) {
+        let mut doc = parse(html, 400.0, &[]);
+        let pass = RunningElementPass::new(vec![crate::gcpm::RunningMapping {
+            parsed: crate::gcpm::ParsedSelector::Class("run".to_string()),
+            running_name: "x".to_string(),
+        }]);
+        pass.apply(&mut doc, &PassContext { font_data: &[] });
+        let store = pass.into_running_store();
+        resolve(&mut doc);
+        (doc, store)
+    }
+
+    /// F102: an inline `<style>` is only read by the GCPM extraction, so Stylo sees `position: running(x)` as an
+    /// invalid value and the element keeps `display: block` and its box. The pass hides what it registered
+    /// (CSS GCPM 3 §2.2: a running element is not displayed where it stands), without touching the HTML it
+    /// handed to the margin boxes.
+    #[test]
+    fn running_pass_hides_registered_elements() {
+        let html = r#"<html><head><style>.run { position: running(x); }</style></head><body>
+            <div class="run">Header <a href="https://example.cz">link</a></div><p>Body text</p></body></html>"#;
+        let mut before = parse(html, 400.0, &[]);
+        let id = before.query_selector(".run").unwrap().expect(".run node");
+        let serialized = crate::gcpm::running::serialize_node(&before, id);
+        resolve(&mut before);
+        assert!(
+            before.get_node(id).unwrap().final_layout.size.height > 0.0,
+            "without the pass the element has a box (the bug)"
+        );
+
+        let (doc, store) = run_running_pass(html);
+        let id = doc.query_selector(".run").unwrap().expect(".run node");
+        assert!(store.instance_for_node(id).is_some());
+        assert!(
+            display_is_none(&doc, id),
+            "the registered element is display: none"
+        );
+        let size = doc.get_node(id).unwrap().final_layout.size;
+        assert_eq!((size.width, size.height), (0.0, 0.0), "and takes no room");
+        assert_eq!(
+            store.get_html(store.instance_for_node(id).unwrap()),
+            Some(serialized.as_str()),
+            "the HTML the margin boxes get is the one serialised before the change"
+        );
+        let p = doc.query_selector("p").unwrap().expect("p");
+        assert!(
+            !display_is_none(&doc, p),
+            "elements that are not running keep their display"
+        );
+    }
+
+    /// The hiding is a declaration of the element itself, so it wins over every author rule of the same
+    /// importance, however specific or late (Cascade 5 §6.1: the style attribute is above all rules), including
+    /// the `display: flex` Tailwind puts on a footer.
+    #[test]
+    fn running_pass_beats_a_later_display_rule() {
+        let html = r#"<html><head><style>
+            .run { position: running(x); }
+            body div.run#h { display: flex; }
+        </style></head><body>
+            <div class="run flex" id="h" style="display: grid"><span>A</span><span>B</span></div>
+            <p>Body text</p></body></html>"#;
+        let (doc, store) = run_running_pass(html);
+        let id = doc.query_selector(".run").unwrap().expect(".run node");
+        assert!(store.instance_for_node(id).is_some());
+        assert!(
+            display_is_none(&doc, id),
+            "a later, more specific display rule and the element's own style lose"
+        );
+        let size = doc.get_node(id).unwrap().final_layout.size;
+        assert_eq!((size.width, size.height), (0.0, 0.0));
     }
 
     // NOTE: The previous LinkStylesheetPass tests have been removed.

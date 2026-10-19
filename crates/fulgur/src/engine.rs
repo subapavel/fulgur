@@ -608,6 +608,13 @@ impl Engine {
                 resolved_content_height_px,
             );
         }
+        // F102: a hidden running element below a wrapper has no box and so no geometry; give it its source
+        // position, which decides the pages `element()` shows it on. After every geometry pass.
+        crate::pagination_layout::append_running_placeholders(
+            &mut pagination_geometry,
+            &doc,
+            &running_store,
+        );
 
         // Build the AnchorMap for `target-*` cross-references only when
         // pass 2 will actually consume it (parsed GCPM context contains

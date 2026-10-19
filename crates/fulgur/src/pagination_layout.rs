@@ -5575,6 +5575,86 @@ pub fn collect_string_set_states(
     result
 }
 
+/// F102: gives every registered running element that has no geometry a zero-height fragment at its source
+/// position.
+///
+/// The engine hides a running element (`display: none`, CSS GCPM 3 §2.2) so it is not painted where it stands.
+/// One directly under `<body>` still gets its zero-height fragment from the body loop, but a node below a
+/// wrapper is zero-sized and `record_descendant` never records it, so
+/// [`collect_running_element_states`] would not see it and its margin box would stay empty. Which page an
+/// instance counts for follows its source position (GCPM §2.2.1, `first` / `last` / `first-except`), so such a
+/// node gets the position the body loop's cursor would have had there: the bottom of the nearest previous
+/// sibling that has geometry, or else the top of the nearest ancestor that has. The height is zero, so the
+/// page count cannot grow. A registered node that already has geometry is left alone.
+///
+/// Nodes are taken in id (source) order and each placeholder is visible to the ones after it, so two running
+/// elements in a row land together.
+pub fn append_running_placeholders(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    running_store: &crate::gcpm::running::RunningElementStore,
+) {
+    for node_id in running_store.node_ids() {
+        if geometry
+            .get(&node_id)
+            .is_some_and(|g| !g.fragments.is_empty())
+        {
+            continue;
+        }
+        if let Some(fragment) = running_placeholder_fragment(geometry, doc, node_id) {
+            geometry
+                .entry(node_id)
+                .or_default()
+                .fragments
+                .push(fragment);
+        }
+    }
+}
+
+/// The zero-height fragment [`append_running_placeholders`] gives `node_id`, or `None` when neither a previous
+/// sibling nor an ancestor has geometry (a detached or fully hidden subtree).
+fn running_placeholder_fragment(
+    geometry: &PaginationGeometryTable,
+    doc: &BaseDocument,
+    node_id: usize,
+) -> Option<Fragment> {
+    use ::style::properties::longhands::position::computed_value::T as Pos;
+
+    let zero = |page_index: u32, x: crate::units::Px, y: crate::units::Px| Fragment {
+        page_index,
+        x,
+        y,
+        width: 0.0_f32.as_px(),
+        height: 0.0_f32.as_px(),
+    };
+    let mut current = node_id;
+    for _ in 0..crate::MAX_DOM_DEPTH {
+        let parent_id = doc.get_node(current)?.parent?;
+        let parent = doc.get_node(parent_id)?;
+        let at = parent.children.iter().position(|&c| c == current)?;
+        for &sibling_id in parent.children[..at].iter().rev() {
+            let Some(last) = geometry.get(&sibling_id).and_then(|g| g.fragments.last()) else {
+                continue;
+            };
+            // An absolutely positioned or fixed sibling is out of flow: the cursor never moved for it.
+            let out_of_flow = doc.get_node(sibling_id).is_some_and(|n| {
+                n.primary_styles().is_some_and(|s| {
+                    matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed)
+                })
+            });
+            if out_of_flow {
+                continue;
+            }
+            return Some(zero(last.page_index, last.x, last.y + last.height));
+        }
+        if let Some(first) = geometry.get(&parent_id).and_then(|g| g.fragments.first()) {
+            return Some(zero(first.page_index, first.x, first.y));
+        }
+        current = parent_id;
+    }
+    None
+}
+
 /// Walk the geometry table page-by-page and emit the running element
 /// instances whose first fragment lands on each page.
 ///
@@ -7664,6 +7744,111 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(
             entry.instance_ids,
             vec![store.instance_for_node(node_id).unwrap()]
+        );
+    }
+
+    /// Parses `html`, runs the running-element pass for `.run { position: running(x) }` (the rule is read from
+    /// the `<style>` of the document, which is the inline path: Stylo drops `position: running()`), resolves
+    /// the styles and returns the geometry the fragmenter made together with the document and the store.
+    fn running_geometry(
+        html: &str,
+    ) -> (
+        blitz_html::HtmlDocument,
+        crate::gcpm::running::RunningElementStore,
+        PaginationGeometryTable,
+    ) {
+        use crate::blitz_adapter;
+        use std::ops::DerefMut;
+        use std::sync::Arc;
+
+        let gcpm = crate::gcpm::parser::parse_gcpm(".run { position: running(x); }");
+        let fonts: Vec<Arc<Vec<u8>>> = Vec::new();
+        let mut doc = blitz_adapter::parse(html, 600.0, &fonts);
+        let pass = blitz_adapter::RunningElementPass::new(gcpm.running_mappings.clone());
+        let pass_ctx = blitz_adapter::PassContext { font_data: &fonts };
+        blitz_adapter::apply_single_pass(&pass, &mut doc, &pass_ctx);
+        let store = pass.into_running_store();
+        blitz_adapter::resolve(&mut doc);
+        let column_styles = blitz_adapter::extract_column_style_table(&doc);
+        let geometry = run_pass_with_break_and_running(
+            doc.deref_mut(),
+            800.0_f32.as_pt().in_px().to_f32(),
+            &column_styles,
+            &store,
+        );
+        (doc, store, geometry)
+    }
+
+    /// F102: a running element nested in a wrapper is hidden (`display: none`, zero size), so the fragmenter
+    /// never records it. [`append_running_placeholders`] gives it a zero-height fragment on the page its source
+    /// position is on, which is what `collect_running_element_states` needs to place it in the margin boxes.
+    #[test]
+    fn running_placeholder_for_nested_element() {
+        use std::ops::Deref;
+
+        let html = r#"<!DOCTYPE html><html><head><style>.run { position: running(x); }</style></head>
+<body><p>First page.</p>
+<div style="break-before: page"><div class="run">Nested header</div><p>Second page.</p></div>
+</body></html>"#;
+        let (doc, store, mut geometry) = running_geometry(html);
+        let run_id = doc.query_selector(".run").unwrap().expect(".run node");
+        assert!(store.instance_for_node(run_id).is_some());
+        assert!(
+            !geometry.contains_key(&run_id),
+            "a hidden nested node has no geometry before the placeholder pass"
+        );
+
+        append_running_placeholders(&mut geometry, doc.deref(), &store);
+
+        let fragments = &geometry
+            .get(&run_id)
+            .expect("the placeholder pass records the nested running node")
+            .fragments;
+        assert_eq!(fragments.len(), 1, "one zero-height fragment");
+        assert_eq!(fragments[0].page_index, 1, "the page the wrapper starts on");
+        assert_eq!(fragments[0].height.to_f32(), 0.0);
+        let states = collect_running_element_states(&geometry, &store);
+        assert_eq!(
+            states[1].get("x").map(|s| s.instance_ids.clone()),
+            Some(vec![store.instance_for_node(run_id).unwrap()])
+        );
+    }
+
+    /// A running element directly under `<body>` keeps the fragment the body loop gave it.
+    #[test]
+    fn running_placeholder_leaves_body_level_fragment_alone() {
+        use std::ops::Deref;
+
+        let html = r#"<!DOCTYPE html><html><head><style>.run { position: running(x); }</style></head>
+<body><p>First page.</p><div class="run">Header</div><p>More.</p></body></html>"#;
+        let (doc, store, mut geometry) = running_geometry(html);
+        let run_id = doc.query_selector(".run").unwrap().expect(".run node");
+        let before = geometry
+            .get(&run_id)
+            .expect("body-level node has geometry")
+            .fragments
+            .clone();
+        assert_eq!(before.len(), 1);
+
+        append_running_placeholders(&mut geometry, doc.deref(), &store);
+
+        let after = &geometry[&run_id].fragments;
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            (
+                after[0].page_index,
+                after[0].x,
+                after[0].y,
+                after[0].width,
+                after[0].height
+            ),
+            (
+                before[0].page_index,
+                before[0].x,
+                before[0].y,
+                before[0].width,
+                before[0].height
+            )
         );
     }
 

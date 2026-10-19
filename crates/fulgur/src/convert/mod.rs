@@ -233,7 +233,7 @@ pub fn dom_to_drawables(
     drawables.root_dir_rtl = extract_root_dir_rtl(doc);
     drawables.root_id = Some(root.id);
     drawables.body_id = find_body_id_in_dom(doc);
-    record_semantics_pass(doc, &mut drawables);
+    record_semantics_pass(doc, ctx.running_store, &mut drawables);
     drawables
 }
 
@@ -393,6 +393,12 @@ pub(super) fn convert_node(
     if depth >= MAX_DOM_DEPTH {
         return;
     }
+    // F102: a running element is shown by `element()` in a margin box and nowhere else (CSS GCPM 3 §2.2). The
+    // engine sets `display: none` on it, but an author `!important` `display` beats that, and the node would
+    // be painted, linked and tagged a second time in the body. Margin-box documents carry an empty store.
+    if ctx.running_store.instance_for_node(node_id).is_some() {
+        return;
+    }
     // Only `record_transform` consumes `before`, and `record_transform`
     // is a no-op for any node without a CSS transform. Snapshotting
     // every drawables map for every walked node was the dominant
@@ -442,13 +448,17 @@ fn node_has_transform(doc: &BaseDocument, node_id: usize) -> bool {
 /// fulgur-izp.3: pure data layer. The render path does not consume
 /// these entries yet, so PDF byte equality is preserved across this
 /// change.
-fn record_semantics_pass(doc: &HtmlDocument, out: &mut crate::drawables::Drawables) {
+fn record_semantics_pass(
+    doc: &HtmlDocument,
+    running_store: &RunningElementStore,
+    out: &mut crate::drawables::Drawables,
+) {
     use std::ops::Deref;
     let base = doc.deref();
     let Some(body_id) = out.body_id else {
         return;
     };
-    walk_semantics(base, body_id, 0, None, out);
+    walk_semantics(base, body_id, 0, None, running_store, out);
 }
 
 fn walk_semantics(
@@ -456,9 +466,14 @@ fn walk_semantics(
     node_id: usize,
     depth: usize,
     parent_override: Option<usize>,
+    running_store: &RunningElementStore,
     out: &mut crate::drawables::Drawables,
 ) {
     if depth >= MAX_DOM_DEPTH {
+        return;
+    }
+    // F102: a running element and its subtree are not in the body (`convert_node` skips them too).
+    if running_store.instance_for_node(node_id).is_some() {
         return;
     }
     let Some(node) = doc.get_node(node_id) else {
@@ -572,7 +587,7 @@ fn walk_semantics(
                 out.li_lbody_ids.insert(node_id, lbody_id);
                 // li の子は lbody_id を parent として再帰
                 for &child_id in &node.children {
-                    walk_semantics(doc, child_id, depth + 1, Some(lbody_id), out);
+                    walk_semantics(doc, child_id, depth + 1, Some(lbody_id), running_store, out);
                 }
                 return; // 通常の再帰をスキップ
             }
@@ -586,7 +601,7 @@ fn walk_semantics(
     };
 
     for &child_id in &node.children {
-        walk_semantics(doc, child_id, depth + 1, child_override, out);
+        walk_semantics(doc, child_id, depth + 1, child_override, running_store, out);
     }
 }
 
@@ -1430,6 +1445,63 @@ mod semantics_tests {
             viewport_size_px: Some((595.0, 842.0)),
         };
         super::dom_to_drawables(&doc, &mut ctx)
+    }
+
+    /// F102: a node the running-element pass registered is not converted, whatever its computed `display`. The
+    /// engine sets `display: none` on it, but an author `!important` declaration beats that, and the element
+    /// would be painted (and linked and tagged) a second time in the body.
+    #[test]
+    fn convert_skips_running_node_with_important_display() {
+        let html = "<!DOCTYPE html><html><head><style>\
+            .run { position: running(pageHeader); display: block !important; }\
+            </style></head><body><div class=\"run\">RUNNING <a href=\"https://example.cz/r\">link</a></div>\
+            <p>Body text</p></body></html>";
+        let mut doc = crate::blitz_adapter::parse(html, 595.0, &[]);
+        let gcpm = crate::gcpm::parser::parse_gcpm(".run { position: running(pageHeader); }");
+        let pass = crate::blitz_adapter::RunningElementPass::new(gcpm.running_mappings);
+        let pass_ctx = crate::blitz_adapter::PassContext { font_data: &[] };
+        crate::blitz_adapter::apply_single_pass(&pass, &mut doc, &pass_ctx);
+        let running_store = pass.into_running_store();
+        crate::blitz_adapter::resolve(&mut doc);
+
+        let run_id = doc.query_selector(".run").unwrap().expect(".run node");
+        assert!(running_store.instance_for_node(run_id).is_some());
+        let column_styles = crate::blitz_adapter::extract_column_style_table(&doc);
+        let multicol_geometry = crate::multicol_layout::run_pass(doc.deref_mut(), &column_styles);
+        let pagination_geometry = crate::pagination_layout::run_pass_with_break_and_running(
+            doc.deref_mut(),
+            842.0,
+            &column_styles,
+            &running_store,
+        );
+        let mut ctx = super::ConvertContext {
+            running_store: &running_store,
+            assets: None,
+            font_cache: Default::default(),
+            string_set_by_node: Default::default(),
+            counter_ops_by_node: Default::default(),
+            bookmark_by_node: Default::default(),
+            column_styles,
+            multicol_geometry,
+            pagination_geometry,
+            link_cache: Default::default(),
+            dropped_text: Default::default(),
+            viewport_size_px: Some((595.0, 842.0)),
+        };
+        let d = super::dom_to_drawables(&doc, &mut ctx);
+
+        assert!(
+            !d.paragraphs.contains_key(&run_id) && !d.block_styles.contains_key(&run_id),
+            "the registered running node must not be converted"
+        );
+        assert!(
+            !d.semantics.contains_key(&run_id),
+            "the registered running node must not be tagged"
+        );
+        assert!(
+            d.paragraphs.iter().count() >= 1,
+            "the body paragraph is still converted"
+        );
     }
 
     fn entries_by_tag(
