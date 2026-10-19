@@ -1232,6 +1232,73 @@ impl<'a> PaginationLayoutTree<'a> {
 
     /// Walk the body's direct block children and record fragments.
     ///
+    /// F111: split `<body>` between its line boxes when it is the inline root and taller than a page
+    /// ([`body_line_split`]). Returns the number of fragments emitted.
+    ///
+    /// The fragments are the ones [`fragment_nested_inline_root`] makes for a paragraph nested in a block: one per
+    /// page, the first on page 0 (so body's own `counter-reset` / `string-set` fire there, see
+    /// [`PaginationLayoutTree::fragment_pagination_root`]), each with the lines of its page; body's padding and
+    /// border are reserved on every page (`line_split_insets`). Inline boxes and images in the lines get their
+    /// fragments on the page of their line.
+    ///
+    /// The walk over body's children does not run: they are text nodes and inline elements, and an inline box
+    /// would be placed a second time at its unsplit position. A running element among them (GCPM 3 §2.2) still
+    /// gets the zero-height fragment on page 0 that the margin boxes read its source page from.
+    fn fragment_body_inline_root(
+        &mut self,
+        body_id: usize,
+        body_x: f32,
+        body_w: f32,
+        split: &LineSplit,
+    ) -> usize {
+        fragment_nested_inline_root(
+            &mut self.geometry,
+            self.doc,
+            body_id,
+            body_x,
+            body_w,
+            0.0,
+            0,
+            self.strips,
+            0.0,
+            0.0,
+            split,
+            0,
+        );
+        let mut emitted = self.geometry.get(&body_id).map_or(0, |g| g.fragments.len());
+        if let Some(store) = self.running_store {
+            let children = self
+                .doc
+                .get_node(body_id)
+                .map(|body| body.children.clone())
+                .unwrap_or_default();
+            for child_id in children {
+                if store.instance_for_node(child_id).is_none() {
+                    continue;
+                }
+                let Some(child) = self.doc.get_node(child_id) else {
+                    continue;
+                };
+                if child.element_data().is_none() {
+                    continue;
+                }
+                self.geometry
+                    .entry(child_id)
+                    .or_default()
+                    .fragments
+                    .push(Fragment {
+                        page_index: 0,
+                        x: (body_x + child.final_layout.location.x).as_px(),
+                        y: 0.0_f32.as_px(),
+                        width: 0.0_f32.as_px(),
+                        height: 0.0_f32.as_px(),
+                    });
+                emitted += 1;
+            }
+        }
+        emitted
+    }
+
     /// Called from `compute_pagination_layout` after Taffy dispatches
     /// body's layout through the wrapper. Returns the number of
     /// fragments emitted. `0` means either the document has no body or
@@ -1266,6 +1333,32 @@ impl<'a> PaginationLayoutTree<'a> {
             .unwrap_or_default();
         let body_w = body_layout.size.width;
         let body_x = body_layout.location.x;
+
+        // F111: body is itself the inline root when all its in-flow children are inline-level (CSS 2.1 §9.4.2): its
+        // lines are its own and no child carries them, so the walk below would see text nodes and `<br>`s of zero
+        // height and place every line on page 0. Split it between its line boxes like a paragraph nested in a block.
+        if let Some(body) = self.doc.get_node(body_id)
+            && body.flags.is_inline_root()
+        {
+            match body_line_split(self.doc, body, self.strips) {
+                Some(split) => {
+                    return self.fragment_body_inline_root(body_id, body_x, body_w, &split);
+                }
+                None => {
+                    // A barrier (clip, multicol, transform, ...) keeps body whole: say so, as for any paragraph
+                    // that is placed whole and ends below the page.
+                    if let Some(html) = body.parent.and_then(|id| self.doc.get_node(id)) {
+                        warn_unprinted_inline_lines(
+                            self.doc,
+                            html,
+                            body,
+                            0.0,
+                            self.strips.bottom(0),
+                        );
+                    }
+                }
+            }
+        }
 
         // fulgur-s67g Phase 2.3 (counter parity follow-up): record
         // body itself as a fragment on page 0. body's own
@@ -5051,6 +5144,23 @@ fn nested_line_split(
     (taller_than_a_page || first_and_overflowing).then_some(split)
 }
 
+/// F111: the split to apply to `<body>` when it is the inline root of the document: its text and inline elements are
+/// its own lines, and it is taller than the first page (or than any page). The same rule and the same barriers as
+/// for a paragraph nested in a block ([`nested_line_split`], [`split_barrier`]), with `<html>` as the parent and
+/// body placed at the top of page 0 (the body offset is already in `strips`). `None` when body is not an inline root,
+/// fits, or a barrier keeps it whole.
+fn body_line_split(
+    doc: &BaseDocument,
+    body: &blitz_dom::Node,
+    strips: PageStrips,
+) -> Option<LineSplit> {
+    if !body.flags.is_inline_root() {
+        return None;
+    }
+    let html = doc.get_node(body.parent?)?;
+    nested_line_split(doc, html, body, 0.0, 0.0, strips, 0)
+}
+
 /// F30: whether `cell_id`, a cell of table `parent`, shares its row with a cell
 /// taller than a page that the fragmenter can enter and split (it holds a
 /// paragraph that splits between lines, or is one itself: direct text, F30b).
@@ -7850,6 +7960,129 @@ h2 { string-set: chapter-title content(text); }
                 before[0].height
             )
         );
+    }
+
+    /// `Line001<br>Line002<br>…` with 20px lines, directly in `<body>` (no block around them).
+    fn body_lines_html(n: usize, body_style: &str, wrap: Option<&str>) -> String {
+        let text = (1..=n)
+            .map(|i| format!("Line{i:03}"))
+            .collect::<Vec<_>>()
+            .join("<br>");
+        let content = match wrap {
+            Some(tag) => format!("<{tag}>{text}</{tag}>"),
+            None => text,
+        };
+        format!(
+            "<!DOCTYPE html><html><head><style>.run {{ position: running(x); }}</style></head>\
+             <body style=\"margin:0;line-height:20px;{body_style}\">{content}</body></html>"
+        )
+    }
+
+    fn body_node(doc: &blitz_html::HtmlDocument) -> usize {
+        doc.query_selector("body").unwrap().expect("body")
+    }
+
+    /// F111: `<body>` is the inline root when all its in-flow children are inline-level (CSS 2.1 §9.4.2), so
+    /// the lines are body's own and the fragmenter splits body between them like it splits a nested paragraph.
+    /// Before, body had one fragment of its full height on page 0 and the lines below the page were lost.
+    #[test]
+    fn body_inline_root_taller_than_a_page_gets_one_fragment_per_page() {
+        let mut doc = parse(&body_lines_html(200, "", None), 600.0);
+        let body_id = body_node(&doc);
+        assert!(doc.get_node(body_id).unwrap().flags.is_inline_root());
+        let table = run_pass(&mut doc, 800.0);
+        let body = &table[&body_id];
+        // 200 lines of 20px on pages of 800px: 40 per page.
+        let pages: Vec<u32> = body.fragments.iter().map(|f| f.page_index).collect();
+        assert_eq!(pages, [0, 1, 2, 3, 4], "{:?}", body.fragments);
+        assert_eq!(implied_page_count(&table), 5);
+        assert!(
+            line_slices_tile(&body.line_slices, 200),
+            "{:?}",
+            body.line_slices
+        );
+        for (k, f) in body.fragments.iter().enumerate() {
+            assert_eq!(
+                f.y.to_f32(),
+                0.0,
+                "fragment {k} starts at the top of its page"
+            );
+            assert!(
+                (f.height.to_f32() - 800.0).abs() < 0.5,
+                "fragment {k}: {:?}",
+                f.height
+            );
+        }
+        // The same lines in a <div> make as many pages: the body path is the nested one.
+        let mut wrapped = parse(&body_lines_html(200, "", Some("div")), 600.0);
+        assert_eq!(implied_page_count(&run_pass(&mut wrapped, 800.0)), 5);
+    }
+
+    /// F111: a body with padding reserves it on every page, like a padded box split by F30.
+    #[test]
+    fn body_inline_root_split_reserves_its_padding_on_every_page() {
+        let mut doc = parse(&body_lines_html(200, "padding:20px", None), 600.0);
+        let body_id = body_node(&doc);
+        let table = run_pass(&mut doc, 800.0);
+        let body = &table[&body_id];
+        // 760px of lines per page: 38 lines; 200 lines need 6 pages.
+        assert_eq!(body.fragments.len(), 6, "{:?}", body.fragments);
+        assert_eq!(
+            body.line_split_insets
+                .map(|(t, b)| (t.to_f32(), b.to_f32())),
+            Some((20.0, 20.0))
+        );
+        assert!(line_slices_tile(&body.line_slices, 200));
+    }
+
+    /// F111: a body that fits a page keeps the one fragment of its full height, as before.
+    #[test]
+    fn short_body_inline_root_keeps_its_single_fragment() {
+        let mut doc = parse(&body_lines_html(10, "", None), 600.0);
+        let body_id = body_node(&doc);
+        let height = doc.get_node(body_id).unwrap().final_layout.size.height;
+        let table = run_pass(&mut doc, 800.0);
+        let body = &table[&body_id];
+        assert_eq!(body.fragments.len(), 1);
+        assert_eq!(body.fragments[0].page_index, 0);
+        assert_eq!(body.fragments[0].height.to_f32(), height);
+        assert!(body.line_slices.is_empty());
+        assert_eq!(implied_page_count(&table), 1);
+    }
+
+    /// F111: a barrier keeps body whole (the pagination warning names it, see `warn_unprinted_inline_lines`).
+    #[test]
+    fn transformed_body_inline_root_is_not_split() {
+        let mut doc = parse(
+            &body_lines_html(200, "transform:translateX(0)", None),
+            600.0,
+        );
+        let body_id = body_node(&doc);
+        let table = run_pass(&mut doc, 800.0);
+        assert_eq!(table[&body_id].fragments.len(), 1);
+        assert_eq!(implied_page_count(&table), 1);
+    }
+
+    /// F111: the body walk no longer runs for a split body, and a running element in it still gets its
+    /// placeholder on page 0 (it is the margin box's source).
+    #[test]
+    fn split_body_still_records_a_running_placeholder() {
+        let text = (1..=200)
+            .map(|i| format!("Line{i:03}"))
+            .collect::<Vec<_>>()
+            .join("<br>");
+        let html = format!(
+            "<!DOCTYPE html><html><body style=\"margin:0;line-height:20px\">\
+             <div class=\"run\">Footer</div>{text}</body></html>"
+        );
+        let (doc, _store, geometry) = running_geometry(&html);
+        let run_id = doc.query_selector(".run").unwrap().expect(".run node");
+        let body_id = body_node(&doc);
+        // `running_geometry` paginates 800pt pages (1066px): 4000px of lines make 4.
+        assert_eq!(geometry[&body_id].fragments.len(), 4, "body is split");
+        let run = &geometry[&run_id].fragments;
+        assert_eq!(run.len(), 1, "{run:?}");
+        assert_eq!(run[0].page_index, 0);
     }
 
     /// fulgur-6tco: synthesize a geometry table + string_set_by_node
