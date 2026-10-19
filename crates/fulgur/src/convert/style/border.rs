@@ -64,7 +64,9 @@ fn resolve_radius(
     radius_css_px.as_px().in_pt()
 }
 
-fn map_border_style(bs: style::values::specified::BorderStyle) -> BorderStyleValue {
+pub(in crate::convert) fn map_border_style(
+    bs: style::values::specified::BorderStyle,
+) -> BorderStyleValue {
     use style::values::specified::BorderStyle as BS;
     match bs {
         BS::None | BS::Hidden => BorderStyleValue::None,

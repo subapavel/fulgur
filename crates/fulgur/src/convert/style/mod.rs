@@ -3,7 +3,7 @@ use crate::blitz_adapter::Node;
 use crate::draw_primitives::BlockStyle;
 
 mod background;
-mod border;
+pub(super) mod border;
 mod box_metrics;
 mod opacity;
 mod overflow;

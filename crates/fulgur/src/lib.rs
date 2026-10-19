@@ -562,6 +562,7 @@ pub mod paragraph;
 pub mod render;
 pub mod schema;
 pub mod svg;
+pub(crate) mod table_borders;
 pub mod tagging;
 pub mod template;
 pub mod units;

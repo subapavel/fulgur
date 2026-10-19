@@ -232,6 +232,62 @@ pub struct TableEntry {
     pub clip_descendants: Vec<NodeId>,
 }
 
+/// F22: one segment of a grid line of a collapsed table: the border that won (CSS 2.1 §17.6.2.1). Widths are CSS px:
+/// the lines are snapped to the px grid at paint time, which is where Chrome puts them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EdgeSegment {
+    pub width: crate::units::Px,
+    pub style: crate::draw_primitives::BorderStyleValue,
+    pub color: [u8; 4],
+    /// The kind of element it came from (`0` table, `1` row group, `2` row, `3` cell), for the tie-break of rule 5 when
+    /// a segment competes with another one (the line under a repeated header, F12).
+    pub origin: u8,
+}
+
+impl EdgeSegment {
+    /// Whether two segments look the same (an uninterrupted run of them is one path).
+    pub fn same_paint(&self, other: &EdgeSegment) -> bool {
+        self.width == other.width && self.style == other.style && self.color == other.color
+    }
+
+    /// Whether a border of this kind is painted at all.
+    pub fn is_painted(&self) -> bool {
+        self.width > crate::units::Px::ZERO
+            && self.style != crate::draw_primitives::BorderStyleValue::None
+            && self.color[3] > 0
+    }
+}
+
+/// A cell of a collapsed table: its node and its place in the grid (tracks, not raw columns).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeCell {
+    pub node: NodeId,
+    pub row: u32,
+    pub track: u32,
+    pub span: u32,
+}
+
+/// F22: the resolved borders of a table in the collapsing border model, from Blitz's `CollapsedBorders`.
+///
+/// `horizontal` is `(rows + 1) x tracks`: line `i` is the line under row `i - 1` (line 0 is the table's top edge).
+/// `vertical` is `rows x (tracks + 1)`: line `j` is left of track `j`, one segment per row.
+#[derive(Debug, Clone)]
+pub struct CollapsedEdges {
+    pub rows: u32,
+    pub tracks: u32,
+    pub horizontal: Vec<EdgeSegment>,
+    pub vertical: Vec<EdgeSegment>,
+    /// The cells in row order.
+    pub cells: Vec<EdgeCell>,
+    /// The x of each vertical line relative to the table's box (CSS px, `tracks + 1` values): where the lines are
+    /// drawn on any page, because the table never moves sideways between pages.
+    pub track_x: Vec<crate::units::Px>,
+    /// The first `<thead>` group (F12) and how many of the leading `cells` and rows it holds; 0 without one.
+    pub header_group: Option<NodeId>,
+    pub header_cells: usize,
+    pub header_rows: u32,
+}
+
 /// F19: the background of a `<tr>` or a row group (`thead` / `tbody` /
 /// `tfoot`, by computed `display`). Blitz gives neither a box of its own: the
 /// table is a grid of cells, so the background is painted from the table, once
@@ -501,6 +557,14 @@ pub struct Drawables {
     /// of F12 uses it to paint those backgrounds, including for a header whose
     /// cells draw nothing and so has no entry in `table_header_groups`.
     pub table_header_background_owners: BTreeMap<NodeId, NodeId>,
+    /// F22: table → the resolved borders of a table in the collapsing border model (`border-collapse: collapse`),
+    /// painted by `table_borders` above the table's cells. The cells' and the table's own border styles are `none`
+    /// in their [`BlockStyle`](crate::draw_primitives::BlockStyle) (their widths, which are half of the collapsed
+    /// ones, stay). A separated table has no entry.
+    pub table_collapsed_borders: BTreeMap<NodeId, CollapsedEdges>,
+    /// F22: cell node → (its table, its index in [`CollapsedEdges::cells`]), for the cells of the tables in
+    /// `table_collapsed_borders`. Finds the cells of a page from the page's node list.
+    pub collapsed_cell_of: BTreeMap<NodeId, (NodeId, u32)>,
     pub transforms: BTreeMap<NodeId, TransformEntry>,
     pub bookmark_anchors: BTreeMap<NodeId, BookmarkAnchorEntry>,
     pub link_spans: Vec<(NodeId, LinkSpanEntry)>,
@@ -559,6 +623,8 @@ impl Default for Drawables {
             table_header_groups: BTreeMap::new(),
             table_row_backgrounds: BTreeMap::new(),
             table_header_background_owners: BTreeMap::new(),
+            table_collapsed_borders: BTreeMap::new(),
+            collapsed_cell_of: BTreeMap::new(),
             transforms: BTreeMap::new(),
             bookmark_anchors: BTreeMap::new(),
             link_spans: Vec::new(),

@@ -31,7 +31,7 @@ use blitz_html::HtmlDocument;
 // 同じ alias を adapter 自身の public API（例: `extract_content_image_url(node: &blitz_dom::Node)`）
 // が引数で受けるかは無関係——alias なので呼び出し元には透過。
 pub use blitz_dom::node::{ListItemLayoutPosition, Marker};
-pub use blitz_dom::{BaseDocument, Node, NodeData};
+pub use blitz_dom::{BaseDocument, BorderSpec, CollapsedBorders, EdgeOrigin, Node, NodeData};
 
 /// `Marker` を空白追加なしの `String` に変換する。
 ///
@@ -1093,6 +1093,16 @@ pub fn first_table_header_group(doc: &BaseDocument, table_id: usize) -> Option<u
                 d.outside() != DisplayOutside::None && d.inside() == DisplayInside::TableHeaderGroup
             })
     })
+}
+
+/// F22: the collapsed borders Blitz resolved for the table `table_id` (CSS 2.1 §17.6.2), or `None` for a separated
+/// table, a table without cells, or a node that is not a table box.
+pub fn collapsed_borders(doc: &BaseDocument, table_id: usize) -> Option<&CollapsedBorders> {
+    use blitz_dom::node::SpecialElementData;
+    match &doc.get_node(table_id)?.element_data()?.special_data {
+        SpecialElementData::TableRoot(context) => context.collapsed_borders(),
+        _ => None,
+    }
 }
 
 /// F19: the role a node plays inside a table, decided on its computed

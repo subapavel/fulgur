@@ -649,6 +649,25 @@ fn draw_v2_page(
             page_index,
         );
     }
+    // F22: the collapsed borders of the tables on this page, above their cells. A table inside a transform, an overflow
+    // clip or an opacity group is painted by that wrapper (`paint_wrapper_tables`), inside its scope.
+    crate::table_borders::paint_page(
+        canvas,
+        page_index,
+        margin_left_pt,
+        margin_top_pt,
+        geometry,
+        drawables,
+        page_node_ids,
+        &crate::table_borders::Scope {
+            skip: &|table| {
+                transformed_descendants.contains(&table)
+                    || clipped_descendants.contains(&table)
+                    || opacity_wrapped_descendants.contains(&table)
+                    || is_wrapper_key(drawables, table)
+            },
+        },
+    );
 }
 
 /// F12: paint the table headers the fragmenter repeated on `page_index`.
@@ -687,6 +706,7 @@ fn paint_repeated_table_headers(
 ) {
     if drawables.table_header_groups.is_empty()
         && drawables.table_header_background_owners.is_empty()
+        && drawables.table_collapsed_borders.is_empty()
     {
         return;
     }
@@ -698,6 +718,13 @@ fn paint_repeated_table_headers(
         .keys()
         .chain(drawables.table_header_background_owners.keys())
         .copied()
+        // F22: a header whose rows have collapsed borders is repeated for them as well.
+        .chain(
+            drawables
+                .table_collapsed_borders
+                .values()
+                .filter_map(|edges| edges.header_group),
+        )
         .collect();
     for group_id in &groups {
         let node_ids: &[usize] = drawables
@@ -765,6 +792,25 @@ fn paint_repeated_table_headers(
                     transformed_descendants,
                     clipped_descendants,
                     opacity_wrapped_descendants,
+                );
+            }
+            // F22: the header rows' collapsed borders, above the cells of the copy, in the same artifact.
+            if let Some((&table_id, _)) = drawables
+                .table_collapsed_borders
+                .iter()
+                .find(|(_, edges)| edges.header_group == Some(*group_id))
+            {
+                crate::table_borders::paint_header_copy(
+                    &mut copy_canvas,
+                    table_id,
+                    source.page_index,
+                    page_index,
+                    margin_left_pt,
+                    margin_top_pt,
+                    (repeat.x - source.x).to_f32(),
+                    (repeat.y - source.y).to_f32(),
+                    geometry,
+                    drawables,
                 );
             }
             if tagging {
@@ -2337,6 +2383,18 @@ fn draw_under_transform(
         }
     }
 
+    // F22: the collapsed borders of the tables in this scope, above their cells.
+    paint_wrapper_tables(
+        canvas,
+        node_id,
+        &tx.descendants,
+        page_index,
+        margin_left_pt,
+        margin_top_pt,
+        geometry,
+        drawables,
+    );
+
     // Paint multicol column rules for any multicol container in this
     // transform's direct scope. When the multicol container carries
     // a transform, the column rules must paint under the composed
@@ -2775,6 +2833,18 @@ fn draw_under_clip(
             }
         }
 
+        // F22: the collapsed borders of the tables in this scope, above their cells.
+        paint_wrapper_tables(
+            canvas,
+            node_id,
+            &block.clip_descendants,
+            page_index,
+            margin_left_pt,
+            margin_top_pt,
+            geometry,
+            drawables,
+        );
+
         if clip_pushed {
             canvas.paint_extent.leave_local();
             canvas.surface.pop();
@@ -3130,7 +3200,87 @@ fn draw_under_opacity(
                 }
             }
         }
+        // F22: the collapsed borders of the tables in this scope, above their cells.
+        paint_wrapper_tables(
+            canvas,
+            node_id,
+            &block.opacity_descendants,
+            page_index,
+            margin_left_pt,
+            margin_top_pt,
+            geometry,
+            drawables,
+        );
     });
+}
+
+/// F22: whether the table `table` is painted by a wrapper function of its own (a transform, or an overflow clip) and so
+/// not by the page or by the wrapper around it.
+fn is_wrapper_key(drawables: &Drawables, table: usize) -> bool {
+    drawables.transforms.contains_key(&table)
+        || drawables
+            .tables
+            .get(&table)
+            .is_some_and(|t| t.style.has_overflow_clip())
+}
+
+/// F22: paints the collapsed borders of the tables in the scope of a wrapper (the wrapper node itself, when it is a
+/// table, and its `descendants`), after the wrapper's descendants were dispatched, inside the wrapper's transform, clip
+/// or opacity group. A table in a wrapper nested in this one is left to that one.
+#[allow(clippy::too_many_arguments)]
+fn paint_wrapper_tables(
+    canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
+    node_id: usize,
+    descendants: &[usize],
+    page_index: u32,
+    margin_left_pt: f32,
+    margin_top_pt: f32,
+    geometry: &crate::pagination_layout::PaginationGeometryTable,
+    drawables: &Drawables,
+) {
+    if drawables.table_collapsed_borders.is_empty() {
+        return;
+    }
+    let nested: std::collections::BTreeSet<usize> = descendants
+        .iter()
+        .flat_map(|id| {
+            let mut inner: Vec<usize> = Vec::new();
+            if let Some(tx) = drawables.transforms.get(id) {
+                inner.extend(&tx.descendants);
+            }
+            if let Some(block) = drawables.block_styles.get(id) {
+                if block.style.has_overflow_clip() {
+                    inner.extend(&block.clip_descendants);
+                }
+                inner.extend(&block.opacity_descendants);
+            }
+            if let Some(table) = drawables.tables.get(id)
+                && table.style.has_overflow_clip()
+            {
+                inner.extend(&table.clip_descendants);
+            }
+            inner
+        })
+        .collect();
+    let tables = std::iter::once(node_id)
+        .chain(
+            descendants
+                .iter()
+                .copied()
+                .filter(|id| !is_wrapper_key(drawables, *id)),
+        )
+        .filter(|id| drawables.table_collapsed_borders.contains_key(id))
+        .filter(|id| *id == node_id || !nested.contains(id))
+        .collect::<Vec<usize>>();
+    crate::table_borders::paint_tables(
+        canvas,
+        tables.into_iter(),
+        page_index,
+        margin_left_pt,
+        margin_top_pt,
+        geometry,
+        drawables,
+    );
 }
 
 /// Paint multicol column-rule lines on `page_index` for one
@@ -3351,7 +3501,7 @@ fn draw_svg_inner_paint(
 /// covers the border and padding above them (reserved on every page, because the
 /// lines are painted at `y + inset_top`) and, on the last page, below them.
 /// Everything else gets `frag` back unchanged.
-fn frame_fragment(
+pub(crate) fn frame_fragment(
     geom: &crate::pagination_layout::PaginationGeometry,
     frag: &crate::pagination_layout::Fragment,
 ) -> crate::pagination_layout::Fragment {
@@ -3911,6 +4061,18 @@ fn draw_under_clip_table(
                 }
             }
         }
+
+        // F22: the collapsed borders of the tables in this scope, above their cells.
+        paint_wrapper_tables(
+            canvas,
+            table_id,
+            &table.clip_descendants,
+            page_index,
+            margin_left_pt,
+            margin_top_pt,
+            geometry,
+            drawables,
+        );
 
         if clip_pushed {
             canvas.paint_extent.leave_local();
@@ -7663,6 +7825,91 @@ mod tests {
               <tr><td>1</td><td>2</td></tr>
             </table>
             </body></html>"#,
+        );
+        assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    /// F22: a table in the collapsing border model paints its lines from the table: on the page, inside the wrappers
+    /// (transform, overflow clip, opacity group) and under the repeated header of a table that breaks over pages.
+    fn collapsed_rows(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("<tr><td>Row {i}</td><td>x</td></tr>"))
+            .collect()
+    }
+
+    const COLLAPSED_CSS: &str = "<style>table{border-collapse:collapse;width:100%}\
+                                 td,th{padding:4px;border:1px solid #888}\
+                                 thead{border-bottom:3px solid blue}tr{border-bottom:2px solid red}</style>";
+
+    #[test]
+    fn render_smoke_collapsed_table_every_wrapper() {
+        for wrapper in [
+            "<div>",
+            "<div style=\"transform:rotate(2deg)\">",
+            "<div style=\"overflow:hidden\">",
+            "<div style=\"opacity:0.5\">",
+            "<div style=\"overflow:hidden;opacity:0.5\">",
+            "<div style=\"transform:scale(0.9)\"><div style=\"overflow:hidden\">",
+        ] {
+            let close = "</div>".repeat(wrapper.matches("<div").count());
+            let pdf = render_html(&format!(
+                "<!doctype html><html><head>{COLLAPSED_CSS}</head><body>{wrapper}\
+                 <table><thead><tr><th>A</th><th>B</th></tr></thead><tbody>{}</tbody></table>{close}\
+                 </body></html>",
+                collapsed_rows(4)
+            ));
+            assert!(pdf.starts_with(b"%PDF"), "{wrapper}");
+        }
+    }
+
+    #[test]
+    fn render_smoke_collapsed_table_overflow_clip_and_opacity_on_the_table() {
+        for style in [
+            "overflow:hidden",
+            "opacity:0.5",
+            "transform:rotate(1deg)",
+            "visibility:hidden",
+        ] {
+            let pdf = render_html(&format!(
+                "<!doctype html><html><head>{COLLAPSED_CSS}</head><body>\
+                 <table style=\"{style}\"><thead><tr><th>A</th><th>B</th></tr></thead>\
+                 <tbody>{}</tbody></table></body></html>",
+                collapsed_rows(4)
+            ));
+            assert!(pdf.starts_with(b"%PDF"), "{style}");
+        }
+    }
+
+    #[test]
+    fn render_smoke_collapsed_table_over_pages_with_a_repeated_header_tagged() {
+        for tagged in [false, true] {
+            let pdf = crate::engine::Engine::builder()
+                .tagged(tagged)
+                .build()
+                .render(&format!(
+                    "<!doctype html><html><head>{COLLAPSED_CSS}</head><body>\
+                     <table><thead><tr><th>A</th><th>B</th></tr></thead>\
+                     <tbody>{}</tbody><tfoot><tr><td>Sum</td><td>1</td></tr></tfoot></table>\
+                     </body></html>",
+                    collapsed_rows(120)
+                ))
+                .expect("render failed");
+            assert!(pdf.starts_with(b"%PDF"));
+        }
+    }
+
+    #[test]
+    fn render_smoke_collapsed_table_with_spans_hidden_and_mixed_styles() {
+        let pdf = render_html(
+            r#"<!doctype html><html><head><style>table{border-collapse:collapse}
+              td{padding:4px}</style></head><body>
+            <table style="border:4px double navy">
+              <tbody style="border-top:3px dashed green">
+                <tr style="border-bottom:2px dotted red"><td style="border:2px groove gray">A</td>
+                  <td style="border-left:hidden">B</td><td style="border:3px inset #444">C</td></tr>
+                <tr><td colspan="2" style="border-bottom:5px ridge teal">AB</td><td>C</td></tr>
+                <tr><td>x</td></tr>
+              </tbody></table></body></html>"#,
         );
         assert!(pdf.starts_with(b"%PDF"));
     }

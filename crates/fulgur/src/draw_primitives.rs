@@ -1513,7 +1513,7 @@ pub(crate) fn colored_stroke(
 /// `is_top_or_left` determines the light/dark color assignment for 3D styles.
 /// `outward_sign` is +1.0 if the computed normal (-dy,dx) points outward, -1.0 if inward.
 #[allow(clippy::too_many_arguments)]
-fn draw_border_line(
+pub(crate) fn draw_border_line(
     canvas: &mut Canvas<'_, '_>,
     x1: f32,
     y1: f32,

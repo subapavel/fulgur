@@ -1,4 +1,5 @@
 use super::*;
+use crate::draw_primitives::BorderStyleValue;
 
 /// Dispatcher entry for `<table>` elements. Returns `true` when an entry
 /// was inserted into `out.tables` (and any cell descendants registered).
@@ -95,6 +96,26 @@ fn convert_table(
         out.table_row_backgrounds.insert(node.id, backgrounds);
     }
 
+    // F22: a table in the collapsing border model has its borders painted from the table (`table_borders`), above the
+    // cells; the cells' and the table's own border styles go, their widths (half of the collapsed ones) stay.
+    if let Some(collapsed) = crate::blitz_adapter::collapsed_borders(doc, node.id) {
+        let edges = collapsed_edges(doc, collapsed, header_group);
+        if let Some(entry) = out.tables.get_mut(&node.id) {
+            entry.style.border_styles = [BorderStyleValue::None; 4];
+        }
+        for (index, cell) in edges.cells.iter().enumerate() {
+            if let Some(block) = out.block_styles.get_mut(&cell.node) {
+                block.style.border_styles = [BorderStyleValue::None; 4];
+                // css-backgrounds-3 §5.4: `border-radius` does not apply to internal table elements in the collapsing
+                // border model.
+                block.style.border_radii = [[Pt::ZERO; 2]; 4];
+            }
+            out.collapsed_cell_of
+                .insert(cell.node, (node.id, index as u32));
+        }
+        out.table_collapsed_borders.insert(node.id, edges);
+    }
+
     if let Some(mark) = mark {
         let descendants: Vec<usize> = out
             .drawn_since(mark)
@@ -104,6 +125,111 @@ fn convert_table(
         if let Some(entry) = out.tables.get_mut(&node.id) {
             entry.clip_descendants = descendants;
         }
+    }
+}
+
+/// F22: Blitz's resolved borders of a collapsing table as a draw payload: the segments with their paint, the cells,
+/// where the vertical lines stand relative to the table, and how much of the table the header group (F12) is.
+fn collapsed_edges(
+    doc: &BaseDocument,
+    collapsed: &crate::blitz_adapter::CollapsedBorders,
+    header_group: Option<usize>,
+) -> crate::drawables::CollapsedEdges {
+    use crate::drawables::{CollapsedEdges, EdgeCell, EdgeSegment};
+
+    let segment = |spec: &crate::blitz_adapter::BorderSpec,
+                   origin: crate::blitz_adapter::EdgeOrigin| {
+        let style = self::style::border::map_border_style(spec.style);
+        let painted = style != BorderStyleValue::None && spec.width > 0.0;
+        EdgeSegment {
+            width: if painted {
+                spec.width.as_px()
+            } else {
+                Px::ZERO
+            },
+            style,
+            color: absolute_to_rgba(spec.color),
+            origin: origin as u8,
+        }
+    };
+    let tracks = collapsed.tracks as usize;
+    let horizontal = collapsed
+        .horizontal
+        .iter()
+        .zip(&collapsed.horizontal_origin)
+        .map(|(spec, &origin)| segment(spec, origin))
+        .collect();
+    let vertical = collapsed
+        .vertical
+        .iter()
+        .zip(&collapsed.vertical_origin)
+        .map(|(spec, &origin)| segment(spec, origin))
+        .collect();
+    let cells: Vec<EdgeCell> = collapsed
+        .cells
+        .iter()
+        .map(|c| EdgeCell {
+            node: c.node,
+            row: c.row,
+            track: c.track,
+            span: c.span,
+        })
+        .collect();
+
+    // The vertical lines: a cell that starts at a track gives the line left of it, a cell that ends at the last track
+    // gives the table's right line.
+    let mut track_x = vec![None; tracks + 1];
+    for c in &collapsed.cells {
+        let Some(node) = doc.get_node(c.node) else {
+            continue;
+        };
+        let layout = &node.final_layout;
+        let (left, right) = (layout.location.x, layout.location.x + layout.size.width);
+        let first = &mut track_x[c.track as usize];
+        if first.is_none() {
+            *first = Some(left);
+        }
+        let end = ((c.track + c.span) as usize).min(tracks);
+        let last = &mut track_x[end];
+        if end == tracks {
+            *last = Some(last.map_or(right, |x| x.max(right)));
+        } else if last.is_none() {
+            *last = Some(right);
+        }
+    }
+    let track_x = track_x
+        .into_iter()
+        .map(|x| x.unwrap_or(0.0).as_px())
+        .collect();
+
+    // The header group's cells come first (it is laid out first, F36), so they are a prefix of `cells`.
+    let in_header = |cell: &EdgeCell| {
+        let Some(group) = header_group else {
+            return false;
+        };
+        let mut id = cell.node;
+        for _ in 0..4 {
+            match doc.get_node(id).and_then(|n| n.parent) {
+                Some(parent) if parent == group => return true,
+                Some(parent) => id = parent,
+                None => return false,
+            }
+        }
+        false
+    };
+    let header_cells = cells.iter().take_while(|c| in_header(c)).count();
+    let header_rows = cells[..header_cells].last().map_or(0, |c| c.row + 1);
+
+    CollapsedEdges {
+        rows: collapsed.rows,
+        tracks: collapsed.tracks,
+        horizontal,
+        vertical,
+        cells,
+        track_x,
+        header_group: header_group.filter(|_| header_cells > 0),
+        header_cells,
+        header_rows,
     }
 }
 
@@ -533,6 +659,104 @@ mod tests {
             </table></body></html>"#
         ));
         assert!(rows.is_empty());
+    }
+
+    fn convert(html: &str) -> (HtmlDocument, crate::drawables::Drawables) {
+        let mut doc = parse_doc(html);
+        let column_styles = crate::blitz_adapter::extract_column_style_table(&doc);
+        let multicol_geometry = crate::multicol_layout::run_pass(&mut doc, &column_styles);
+        let pagination_geometry = crate::pagination_layout::run_pass(&mut doc, 842.0);
+        let store = RunningElementStore::new();
+        let mut ctx = ConvertContext {
+            running_store: &store,
+            assets: None,
+            font_cache: Default::default(),
+            string_set_by_node: Default::default(),
+            counter_ops_by_node: Default::default(),
+            bookmark_by_node: Default::default(),
+            column_styles,
+            multicol_geometry,
+            pagination_geometry,
+            link_cache: Default::default(),
+            dropped_text: Default::default(),
+            viewport_size_px: Some((595.0, 842.0)),
+        };
+        let drawables = dom_to_drawables(&doc, &mut ctx);
+        (doc, drawables)
+    }
+
+    const COLLAPSED: &str = "<style>table{border-collapse:collapse}td{width:100px;height:40px;padding:0;\
+                             border:2px solid red;background:#eee}</style>";
+
+    #[test]
+    fn a_collapsed_table_records_its_edges_and_its_cells_paint_no_border() {
+        let (doc, drawables) = convert(&format!(
+            r#"<!doctype html><html><head>{COLLAPSED}</head><body><table>
+              <thead><tr><td></td><td></td></tr></thead>
+              <tbody><tr><td></td><td></td></tr><tr><td colspan="2"></td></tr></tbody>
+            </table></body></html>"#
+        ));
+        let table_id = find_tag(doc.deref(), doc.root_element().id, "table").unwrap();
+        let thead_id = find_tag(doc.deref(), doc.root_element().id, "thead").unwrap();
+        let edges = &drawables.table_collapsed_borders[&table_id];
+        assert_eq!((edges.rows, edges.tracks), (3, 2));
+        assert_eq!(edges.cells.len(), 5);
+        assert_eq!(edges.horizontal.len(), 4 * 2);
+        assert_eq!(edges.vertical.len(), 3 * 3);
+        // 2 px red borders everywhere: every segment of every line is 2 px.
+        assert!(edges.horizontal.iter().all(|s| s.width.to_f32() == 2.0));
+        assert!(
+            edges
+                .vertical
+                .iter()
+                .all(|s| s.width.to_f32() == 2.0 || s.width.to_f32() == 0.0)
+        );
+        assert_eq!(edges.header_group, Some(thead_id));
+        assert_eq!((edges.header_cells, edges.header_rows), (2, 1));
+        // The vertical lines are at the left of each track and the right edge of the table.
+        let x: Vec<f32> = edges.track_x.iter().map(|x| x.to_f32()).collect();
+        assert_eq!(x.len(), 3);
+        assert!(x[0] < x[1] && x[1] < x[2], "{x:?}");
+        // The cells keep their half widths but not their style: the table paints the lines.
+        for cell in &edges.cells {
+            let block = &drawables.block_styles[&cell.node];
+            assert_eq!(block.style.border_styles, [BorderStyleValue::None; 4]);
+            assert!(block.style.border_widths.iter().any(|w| w.to_f32() > 0.0));
+            assert_eq!(drawables.collapsed_cell_of[&cell.node].0, table_id);
+        }
+        assert_eq!(
+            drawables.tables[&table_id].style.border_styles,
+            [BorderStyleValue::None; 4]
+        );
+    }
+
+    #[test]
+    fn a_separated_table_keeps_its_own_borders() {
+        let (doc, drawables) = convert(&format!(
+            r#"<!doctype html><html><head>{COLLAPSED}<style>table{{border-collapse:separate}}</style></head>
+            <body><table><tr><td></td><td></td></tr></table></body></html>"#
+        ));
+        let table_id = find_tag(doc.deref(), doc.root_element().id, "table").unwrap();
+        assert!(drawables.table_collapsed_borders.is_empty());
+        assert!(drawables.collapsed_cell_of.is_empty());
+        let td_id = find_tag(doc.deref(), table_id, "td").unwrap();
+        assert_eq!(
+            drawables.block_styles[&td_id].style.border_styles,
+            [BorderStyleValue::Solid; 4]
+        );
+    }
+
+    #[test]
+    fn a_nested_table_inherits_border_collapse() {
+        // `border-collapse` is inherited: a table in a collapsing table's cell collapses as well, and one that says
+        // `separate` does not.
+        let (_, drawables) = convert(&format!(
+            r#"<!doctype html><html><head>{COLLAPSED}</head><body><table><tr><td>
+              <table><tr><td></td></tr></table>
+              <table style="border-collapse:separate"><tr><td></td></tr></table>
+            </td></tr></table></body></html>"#
+        ));
+        assert_eq!(drawables.table_collapsed_borders.len(), 2);
     }
 
     #[test]
