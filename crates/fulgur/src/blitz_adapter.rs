@@ -183,6 +183,130 @@ pub fn parse_and_layout_with_generics(
     doc
 }
 
+/// The base URL every document gets (see [`parse_inner`]).
+const DOC_BASE_URL: &str = "file:///";
+
+/// What the `@page` margin-box documents of one render have in common: one Stylo lock, Blitz's user agent sheet,
+/// the author sheet made of the render's CSS, and one font template. Building these once per render instead of
+/// once per margin-box document is most of the cost of a page-number footer (F99b).
+///
+/// Everything in here is immutable after construction and derived only from the render's own inputs
+/// (`margin_css`, the bundled fonts, `system_fonts`, the generic-family map and Blitz's compiled-in UA sheet).
+/// The value is owned by one `MarginBoxRenderer` and dropped with it; nothing is `static`. It is `!Sync` on
+/// purpose: sharing it between threads (a parallel margin-box stage) has to be designed, not stumbled into.
+pub(crate) struct MarginDocEnv {
+    styles: blitz_dom::SharedStyles,
+    /// The font context every document starts from; each document gets a clone. `None` mirrors the branch of
+    /// [`parse_inner`] that lets Blitz build its default font context (no bundled fonts, system fonts, no
+    /// generic families).
+    fonts: Option<FontContext>,
+    /// `true` when the render's CSS is part of `styles`, so a wrapper must not carry it in a `<style>` again.
+    author_sheet_attached: bool,
+    _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
+}
+
+impl MarginDocEnv {
+    pub(crate) fn new(
+        margin_css: &str,
+        font_data: &[Arc<Vec<u8>>],
+        system_fonts: bool,
+        generics: &BTreeMap<String, String>,
+    ) -> Self {
+        let fonts = if font_data.is_empty() && system_fonts && generics.is_empty() {
+            None
+        } else {
+            let collection =
+                parley::fontique::Collection::new(parley::fontique::CollectionOptions {
+                    system_fonts,
+                    // A shared collection would make the clones below see each other's changes.
+                    shared: false,
+                });
+            let mut ctx = FontContext {
+                collection,
+                source_cache: parley::fontique::SourceCache::new(Default::default()),
+            };
+            for data in font_data {
+                // Same bytes as `parse_inner` registers, without copying them per document.
+                let blob = parley::fontique::Blob::new(Arc::clone(data) as _);
+                ctx.collection.register_fonts(blob, None);
+            }
+            apply_generic_families(&mut ctx.collection, generics);
+            Some(ctx)
+        };
+        let mut env = Self {
+            styles: blitz_dom::SharedStyles::new(DOC_BASE_URL),
+            fonts,
+            author_sheet_attached: false,
+            _not_sync: std::marker::PhantomData,
+        };
+        env.attach_author_sheet(margin_css);
+        env
+    }
+
+    /// Take the sheet Blitz makes of `<style>{css}</style>` and hand it to every document. The text goes
+    /// through html5ever (RAWTEXT, CR/CRLF) and entity decoding in a probe document built with the same shared
+    /// lock, so the sheet is the one a `<style>` in the document's `<head>` would have produced. A text that
+    /// would end the element early (`</style`) is left to the wrapper's own `<style>`.
+    fn attach_author_sheet(&mut self, css: &str) {
+        if css.to_ascii_lowercase().contains("</style") {
+            return;
+        }
+        let probe_html = format!("<!doctype html><html><head><style>{css}</style></head></html>");
+        let probe = self.parse(&probe_html, 1, 1);
+        let sheet = probe
+            .tree()
+            .iter()
+            .find(|(_, node)| {
+                node.element_data()
+                    .is_some_and(|el| el.name.local.as_ref() == "style")
+            })
+            .and_then(|(id, _)| probe.stylesheet_of_node(id));
+        if let Some(sheet) = sheet {
+            self.styles = self.styles.clone().with_author_sheet(sheet);
+            self.author_sheet_attached = true;
+        }
+    }
+
+    /// Whether every document already has the render's CSS, so the wrapper must not carry it again.
+    pub(crate) fn author_sheet_attached(&self) -> bool {
+        self.author_sheet_attached
+    }
+
+    fn parse(&self, html: &str, viewport_width: u32, viewport_height: u32) -> HtmlDocument {
+        let config = DocumentConfig {
+            viewport: Some(Viewport::new(
+                viewport_width,
+                viewport_height,
+                1.0,
+                ColorScheme::Light,
+            )),
+            font_ctx: self.fonts.clone(),
+            base_url: Some(DOC_BASE_URL.to_string()),
+            shared_styles: Some(self.styles.clone()),
+            ..DocumentConfig::default()
+        };
+        HtmlDocument::from_html(html, config)
+    }
+}
+
+/// [`parse_and_layout_with_generics`] for a margin-box document, built from the render's [`MarginDocEnv`]
+/// instead of from its own font context and style sheets.
+pub(crate) fn parse_and_layout_margin_doc(
+    env: &MarginDocEnv,
+    html: &str,
+    viewport_width: crate::units::Px,
+    viewport_height: crate::units::Px,
+) -> HtmlDocument {
+    let mut doc = env.parse(
+        html,
+        viewport_width.to_f32() as u32,
+        viewport_height.to_f32() as u32,
+    );
+    resolve(&mut doc);
+    relayout_position_fixed(&mut doc, viewport_width.to_f32(), viewport_height.to_f32());
+    doc
+}
+
 /// Context available to each DOM pass.
 pub struct PassContext<'a> {
     pub font_data: &'a [Arc<Vec<u8>>],
@@ -7820,6 +7944,77 @@ mod seed_image_natural_size_tests {
             let (lines, _) = lines_around_img(html, 400.0, &b);
             assert_eq!(lines, vec![(0.0, 100.0, 1)], "{html}");
         }
+    }
+
+    /// F99b: two documents of one environment share the style lock, the UA sheet and the author sheet, and each
+    /// gets its own copy of the font template.
+    #[test]
+    fn margin_documents_of_one_env_share_sheets_and_lock() {
+        let env = MarginDocEnv::new(".c{color:red}", &noto(), false, &BTreeMap::new());
+        assert!(env.author_sheet_attached());
+        let html = "<html><head></head><body><div class=\"c\">x</div></body></html>";
+        let a = env.parse(html, 100, 100);
+        let b = env.parse(html, 100, 100);
+
+        // The lock: a value wrapped under the environment's lock is readable under both documents' guards.
+        let locked = env.styles.lock().wrap(7_u32);
+        assert_eq!(*locked.read_with(&a.guard().read()), 7);
+        assert_eq!(*locked.read_with(&b.guard().read()), 7);
+        // ... and under a plain document's guard it is not (Stylo asserts the lock).
+        use crate::units::F32Units;
+        let plain = parse_and_layout(
+            "<html><body></body></html>",
+            100.0_f32.as_px(),
+            100.0_f32.as_px(),
+            &noto(),
+            false,
+        );
+        let foreign = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            *locked.read_with(&plain.guard().read())
+        }));
+        assert!(foreign.is_err(), "a plain document has a lock of its own");
+
+        // The sheets are the environment's: one UA sheet and one author sheet, as shared Arcs.
+        assert_eq!(env.styles.ua_sheets().len(), 1);
+        assert_eq!(env.styles.author_sheets().len(), 1);
+        let guard = a.guard().read();
+        let rules = env.styles.author_sheets()[0].0.contents.rules(&guard);
+        assert!(!rules.is_empty());
+
+        // The fonts: a clone per document. Registering a face in one clone changes neither the template nor
+        // another clone.
+        let faces = |ctx: &mut FontContext| {
+            ctx.collection
+                .family_by_name("Noto Sans")
+                .expect("the bundled family")
+                .fonts()
+                .len()
+        };
+        let mut fa = env.fonts.clone().expect("bundled fonts give a template");
+        let mut fb = env.fonts.clone().expect("bundled fonts give a template");
+        let one = faces(&mut fb);
+        fa.collection.register_fonts(
+            parley::fontique::Blob::new(Arc::new(
+                include_bytes!("../../../examples/.fonts/NotoSans-Bold.ttf").to_vec(),
+            ) as _),
+            None,
+        );
+        assert_eq!(faces(&mut fa), one + 1);
+        assert_eq!(faces(&mut fb), one);
+        assert_eq!(faces(&mut env.fonts.clone().unwrap()), one);
+    }
+
+    /// A render without bundled fonts, with host fonts allowed and no generic map, lets Blitz build its default
+    /// font context, as `parse_inner` does.
+    #[test]
+    fn margin_env_without_fonts_uses_the_blitz_default_context() {
+        let env = MarginDocEnv::new("", &[], true, &BTreeMap::new());
+        assert!(env.fonts.is_none());
+        let env = MarginDocEnv::new("", &[], false, &BTreeMap::new());
+        assert!(
+            env.fonts.is_some(),
+            "system fonts off: an empty collection, as parse_inner builds"
+        );
     }
 
     /// Noto Sans, bundled, so line breaking in these tests does not depend on the host's fonts.

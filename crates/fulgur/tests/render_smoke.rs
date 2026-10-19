@@ -7834,3 +7834,35 @@ fn render_v2_smoke_tagged_multicol_paragraphs_are_marked_content() {
         assert_eq!(empty, 0, "{what}: /P elements without content");
     }
 }
+
+/// F99b: the margin-box documents of one render share a style and font environment. A multi-page document whose
+/// footer text differs per page (`counter(page)`, `counter(pages)`) and a constant box builds one environment and
+/// many documents from it; every page gets its box.
+#[test]
+fn render_smoke_page_counter_footer_over_three_pages() {
+    let font_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/.fonts/NotoSans-Regular.ttf");
+    let mut assets = AssetBundle::default();
+    assets
+        .add_font_file(&font_path)
+        .unwrap_or_else(|e| panic!("failed to load Noto Sans from {}: {e}", font_path.display()));
+    assets.add_css("body, div { font-family: 'Noto Sans', sans-serif; }");
+    let pdf = Engine::builder()
+        .assets(assets)
+        .build()
+        .render(
+            r#"<!doctype html><html><head><style>
+            @page {
+              size: A5; margin: 15mm 15mm 20mm 15mm;
+              @bottom-right { content: "Strana " counter(page) " / " counter(pages); font-size: 9pt; }
+              @bottom-left { content: "Faktura 2026-001"; font-size: 9pt; }
+            }
+            .p { break-after: page; }
+            </style></head><body>
+            <p class="p">Prvni strana</p><p class="p">Druha strana</p><p>Treti strana</p>
+            </body></html>"#,
+        )
+        .expect("render");
+    assert!(pdf.starts_with(b"%PDF"));
+    assert_eq!(page_count(&pdf), 3, "three pages");
+}

@@ -4364,6 +4364,32 @@ pub(crate) struct MarginBoxRenderer<'a> {
     /// `target-*(attr(href), ...)` evaluated inside `@page` margin
     /// boxes. Built once per render pass by `engine::Engine::layout_to_drawables`.
     pub implicit_href_by_page: &'a BTreeMap<usize, String>,
+    /// The style and font environment all margin-box documents of this render are built from (F99b). Created on
+    /// the first cache miss, so a document without margin boxes pays nothing. Owned by this renderer, hence by
+    /// one `render_v2` call; nothing outlives it.
+    env: std::cell::OnceCell<crate::blitz_adapter::MarginDocEnv>,
+}
+
+/// The environment of `cell`, created on first use from the render's CSS, fonts and generic families.
+fn margin_env<'e>(
+    cell: &'e std::cell::OnceCell<crate::blitz_adapter::MarginDocEnv>,
+    margin_css: &str,
+    font_data: &[Arc<Vec<u8>>],
+    system_fonts: bool,
+    generics: &BTreeMap<String, String>,
+) -> &'e crate::blitz_adapter::MarginDocEnv {
+    cell.get_or_init(|| {
+        crate::blitz_adapter::MarginDocEnv::new(margin_css, font_data, system_fonts, generics)
+    })
+}
+
+/// The `<style>` element a margin-box wrapper carries: none when the environment attaches the render's CSS.
+fn margin_wrapper_style(env: &crate::blitz_adapter::MarginDocEnv, margin_css: &str) -> String {
+    if env.author_sheet_attached() {
+        String::new()
+    } else {
+        format!("<style>{margin_css}</style>")
+    }
 }
 
 impl<'a> MarginBoxRenderer<'a> {
@@ -4423,6 +4449,7 @@ impl<'a> MarginBoxRenderer<'a> {
             height_cache: HashMap::new(),
             render_cache: HashMap::new(),
             implicit_href_by_page,
+            env: std::cell::OnceCell::new(),
         }
     }
 
@@ -4560,17 +4587,23 @@ impl<'a> MarginBoxRenderer<'a> {
                 width_key(content_width),
             );
             self.measure_cache.entry(measure_key).or_insert_with(|| {
-                let measure_html = format!(
-                    "<html><head><style>{}</style></head><body style=\"margin:0;padding:0;\"><div style=\"display:inline-block\">{}</div></body></html>",
-                    self.margin_css, html
-                );
-                let measure_doc = crate::blitz_adapter::parse_and_layout_with_generics(
-                    &measure_html,
-                    content_width.as_pt().in_px(),
-                    page_size.height.as_pt().in_px(),
+                let env = margin_env(
+                    &self.env,
+                    &self.margin_css,
                     self.font_data,
                     self.system_fonts,
                     self.generics,
+                );
+                let measure_html = format!(
+                    "<html><head>{}</head><body style=\"margin:0;padding:0;\"><div style=\"display:inline-block\">{}</div></body></html>",
+                    margin_wrapper_style(env, &self.margin_css),
+                    html
+                );
+                let measure_doc = crate::blitz_adapter::parse_and_layout_margin_doc(
+                    env,
+                    &measure_html,
+                    content_width.as_pt().in_px(),
+                    page_size.height.as_pt().in_px(),
                 );
                 get_body_child_dimension(&measure_doc, true)
             });
@@ -4596,17 +4629,23 @@ impl<'a> MarginBoxRenderer<'a> {
                 width_key(page_size.height),
             );
             self.height_cache.entry(hc_key).or_insert_with(|| {
-                let measure_html = format!(
-                    "<html><head><style>{}</style></head><body style=\"margin:0;padding:0;\"><div>{}</div></body></html>",
-                    self.margin_css, html
-                );
-                let measure_doc = crate::blitz_adapter::parse_and_layout_with_generics(
-                    &measure_html,
-                    fixed_width.as_pt().in_px(),
-                    page_size.height.as_pt().in_px(),
+                let env = margin_env(
+                    &self.env,
+                    &self.margin_css,
                     self.font_data,
                     self.system_fonts,
                     self.generics,
+                );
+                let measure_html = format!(
+                    "<html><head>{}</head><body style=\"margin:0;padding:0;\"><div>{}</div></body></html>",
+                    margin_wrapper_style(env, &self.margin_css),
+                    html
+                );
+                let measure_doc = crate::blitz_adapter::parse_and_layout_margin_doc(
+                    env,
+                    &measure_html,
+                    fixed_width.as_pt().in_px(),
+                    page_size.height.as_pt().in_px(),
                 );
                 get_body_child_dimension(&measure_doc, false)
             });
@@ -4669,17 +4708,23 @@ impl<'a> MarginBoxRenderer<'a> {
                 width_key(rect.height.to_f32()),
             );
             if !self.render_cache.contains_key(&cache_key) {
-                let render_html = format!(
-                    "<html><head><style>{}</style></head><body style=\"margin:0;padding:0;\">{}</body></html>",
-                    self.margin_css, html
-                );
-                let mut render_doc = crate::blitz_adapter::parse_and_layout_with_generics(
-                    &render_html,
-                    rect.width.in_px(),
-                    rect.height.in_px(),
+                let env = margin_env(
+                    &self.env,
+                    &self.margin_css,
                     self.font_data,
                     self.system_fonts,
                     self.generics,
+                );
+                let render_html = format!(
+                    "<html><head>{}</head><body style=\"margin:0;padding:0;\">{}</body></html>",
+                    margin_wrapper_style(env, &self.margin_css),
+                    html
+                );
+                let mut render_doc = crate::blitz_adapter::parse_and_layout_margin_doc(
+                    env,
+                    &render_html,
+                    rect.width.in_px(),
+                    rect.height.in_px(),
                 );
                 let empty_column_styles = crate::column_css::ColumnStyleTable::new();
                 let geometry = crate::pagination_layout::run_pass_with_break_styles(
@@ -7116,6 +7161,215 @@ mod tests {
             &BTreeMap::new(),
             1,
             &implicit,
+        );
+    }
+
+    // --- F99b: margin-box documents built from the render's shared environment ---
+
+    fn noto_faces() -> Vec<Arc<Vec<u8>>> {
+        ["Regular", "Bold"]
+            .iter()
+            .map(|w| {
+                Arc::new(
+                    std::fs::read(format!(
+                        "{}/../../examples/.fonts/NotoSans-{w}.ttf",
+                        env!("CARGO_MANIFEST_DIR")
+                    ))
+                    .expect("bundled Noto Sans"),
+                )
+            })
+            .collect()
+    }
+
+    /// Every generic family the UA sheet and the default `font-family` use, mapped to the bundled face: without a
+    /// mapping the text of a document with bundled fonts only has no glyph run, and the dumps below would be empty.
+    fn noto_generics() -> BTreeMap<String, String> {
+        ["serif", "sans-serif", "monospace"]
+            .iter()
+            .map(|g| (g.to_string(), "Noto Sans".to_string()))
+            .collect()
+    }
+
+    /// What `MarginBoxRenderer::render_page` does with a laid-out margin document (stage 3), as a string.
+    fn margin_doc_dump(mut doc: blitz_html::HtmlDocument, height_px: crate::units::Px) -> String {
+        let geometry = crate::pagination_layout::run_pass_with_break_styles(
+            &mut doc,
+            height_px,
+            &crate::column_css::ColumnStyleTable::new(),
+        );
+        let store = RunningElementStore::new();
+        let mut ctx = crate::convert::ConvertContext {
+            running_store: &store,
+            assets: None,
+            font_cache: HashMap::new(),
+            string_set_by_node: HashMap::new(),
+            counter_ops_by_node: HashMap::new(),
+            bookmark_by_node: HashMap::new(),
+            column_styles: crate::column_css::ColumnStyleTable::new(),
+            multicol_geometry: crate::multicol_layout::MulticolGeometryTable::new(),
+            pagination_geometry: geometry,
+            link_cache: Default::default(),
+            dropped_text: Default::default(),
+            viewport_size_px: None,
+        };
+        let drawables = crate::convert::dom_to_drawables(&doc, &mut ctx);
+        // `ParagraphEntry`'s `Debug` prints only the line count: spell out what is shaped.
+        let mut text = String::new();
+        for (id, entry) in drawables.paragraphs.iter() {
+            for line in &entry.lines {
+                text.push_str(&format!(
+                    "node {id}: line h={:?} baseline={:?}\n",
+                    line.height, line.baseline
+                ));
+                for item in &line.items {
+                    if let crate::paragraph::LineItem::Text(run) = item {
+                        text.push_str(&format!(
+                            "  run {:?} size={:?} color={:?} x={:?} font={}#{} glyphs={:?}\n",
+                            run.text,
+                            run.font_size,
+                            run.color,
+                            run.x_offset,
+                            run.font_data.len(),
+                            run.font_index,
+                            run.glyphs
+                        ));
+                    }
+                }
+            }
+        }
+        format!("{drawables:#?}\n{text}{:#?}", ctx.pagination_geometry)
+    }
+
+    /// The document of `margin_wrapper_style`: the old wrapper (`<style>` in `<head>`) or, when the environment
+    /// carries the CSS, the new one. The new one has a `<title>` where the old had a `<style>`, so that both
+    /// documents have the same node ids (a `<title>` with text is two nodes, like a `<style>` with text) and
+    /// their drawables can be compared as they are. The production wrapper has no such element.
+    fn wrapper_pair(
+        css: &str,
+        body: &str,
+        env: &crate::blitz_adapter::MarginDocEnv,
+    ) -> (String, String) {
+        let old = format!(
+            "<html><head><style>{css}</style></head><body style=\"margin:0;padding:0;\">{body}</body></html>"
+        );
+        let head = if env.author_sheet_attached() {
+            format!("<title>{}</title>", if css.is_empty() { "" } else { "x" })
+        } else {
+            margin_wrapper_style(env, css)
+        };
+        let new = format!(
+            "<html><head>{head}</head><body style=\"margin:0;padding:0;\">{body}</body></html>"
+        );
+        (old, new)
+    }
+
+    /// The margin documents of `MarginDocEnv` and the ones the old per-document wrapper built are the same
+    /// document: same drawables, same geometry, same measured widths.
+    #[test]
+    fn margin_env_matches_fresh_document() {
+        let fonts = noto_faces();
+        let generics = noto_generics();
+        let contents = [
+            "Strana 7 / 200",
+            "<div style=\"font-weight:700;letter-spacing:1px\">Faktura <b>2026</b> <i>x</i></div>",
+            "<div class=\"c\">klasa</div><p class=\"d\">Odstavec</p><pre>mono</pre>",
+            // A `<style>` inside the content comes after the shared sheet.
+            "<style>.c{color:green;font-size:23px}</style><div class=\"c\">vlastni styl</div>",
+            // ... also when it repeats the render's CSS.
+            "<style>.c{color:blue;font-size:20px}</style><div class=\"c\">stejny styl</div>",
+            "<div style=\"position:fixed;bottom:0\">pevne</div>",
+        ];
+        let sheets = [
+            "",
+            ".c{color:blue;font-size:20px}",
+            "a{color:red}\r\n.c{font-size:20px}\r\n.d{margin:3px}\r\n",
+            ".c::before{content:\"a &amp; b \"} .c{font-size:11px} .d{color:#123}",
+            "@import url(other.css); .c{margin:3px;font-weight:700}",
+            "@media print{.c{display:none}} @media screen{.c{letter-spacing:2px}}",
+            // Ends the wrapper's own `<style>` early, so the environment keeps the old wrapper for it.
+            ".c{color:red} /* </style> */ .d{font-size:9px}",
+        ];
+        let (w, h) = (300.0_f32.as_px(), 60.0_f32.as_px());
+        let mut attached = 0;
+        for css in sheets {
+            let env = crate::blitz_adapter::MarginDocEnv::new(css, &fonts, false, &generics);
+            attached += usize::from(env.author_sheet_attached());
+            for body in contents {
+                for (what, body) in [
+                    ("render", body.to_string()),
+                    (
+                        "measure",
+                        format!("<div style=\"display:inline-block\">{body}</div>"),
+                    ),
+                ] {
+                    let (old, new) = wrapper_pair(css, &body, &env);
+                    let old_doc = crate::blitz_adapter::parse_and_layout_with_generics(
+                        &old, w, h, &fonts, false, &generics,
+                    );
+                    let new_doc =
+                        crate::blitz_adapter::parse_and_layout_margin_doc(&env, &new, w, h);
+                    assert_eq!(
+                        get_body_child_dimension(&old_doc, true),
+                        get_body_child_dimension(&new_doc, true),
+                        "{what} width: css {css:?}, content {body:?}"
+                    );
+                    assert_eq!(
+                        get_body_child_dimension(&old_doc, false),
+                        get_body_child_dimension(&new_doc, false),
+                        "{what} height: css {css:?}, content {body:?}"
+                    );
+                    let (old_dump, new_dump) =
+                        (margin_doc_dump(old_doc, h), margin_doc_dump(new_doc, h));
+                    assert_eq!(
+                        old_dump, new_dump,
+                        "{what} drawables: css {css:?}, content {body:?}"
+                    );
+                    // (Text directly in `<body>` gets no paragraph in either path; boxes with declarations, which
+                    // is every real one, wrap their content in a `<div>`.)
+                    assert!(
+                        !body.contains('<') || old_dump.contains("  run "),
+                        "no shaped text, the comparison is empty: {what}, css {css:?}, content {body:?}\n{old_dump:.2000}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            attached,
+            sheets.len() - 1,
+            "all but the `</style>` sheet are attached"
+        );
+    }
+
+    /// The wrapper of the production path really has no `<style>` when the environment carries the CSS, and the
+    /// CSS reaches the document anyway.
+    #[test]
+    fn margin_env_attaches_the_render_css_without_a_style_element() {
+        let fonts = noto_faces();
+        let env = crate::blitz_adapter::MarginDocEnv::new(
+            ".c{font-size:30px}",
+            &fonts,
+            false,
+            &noto_generics(),
+        );
+        assert!(env.author_sheet_attached());
+        assert_eq!(margin_wrapper_style(&env, ".c{font-size:30px}"), "");
+        let (w, h) = (300.0_f32.as_px(), 60.0_f32.as_px());
+        let doc = crate::blitz_adapter::parse_and_layout_margin_doc(
+            &env,
+            "<html><head></head><body style=\"margin:0\"><div class=\"c\">x</div></body></html>",
+            w,
+            h,
+        );
+        let big = get_body_child_dimension(&doc, false);
+        let plain = crate::blitz_adapter::parse_and_layout_margin_doc(
+            &env,
+            "<html><head></head><body style=\"margin:0\"><div>x</div></body></html>",
+            w,
+            h,
+        );
+        assert!(
+            big > get_body_child_dimension(&plain, false),
+            "the class rule of the render's CSS applies"
         );
     }
 
