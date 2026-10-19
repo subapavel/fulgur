@@ -187,6 +187,21 @@ pub fn render_v2(
     // Raster images are validated once per render, not once per draw (F32a).
     let images = crate::image::ImageCache::default();
 
+    // The content box the fragmenter paginated every page against is page 1's (F109).
+    let page_one_box = {
+        let (size, margin, landscape) = crate::gcpm::page_settings::resolve_page_settings(
+            &gcpm.page_settings,
+            1,
+            page_count,
+            config,
+            drawables.root_dir_rtl,
+        );
+        let size = if landscape { size.landscape() } else { size };
+        content_box_pt(size, margin)
+    };
+    let mut warned_empty_box = false;
+    let mut warned_other_box = false;
+
     for (page_idx, page_node_ids) in per_page_node_ids.iter().enumerate() {
         let page_num = page_idx + 1;
         // Pass the full `gcpm.page_settings` (including selector
@@ -205,6 +220,42 @@ pub fn render_v2(
         } else {
             resolved_size
         };
+        let this_box = content_box_pt(page_size, resolved_margin);
+        if !warned_empty_box && (this_box.0 <= 0.0 || this_box.1 <= 0.0) {
+            warned_empty_box = true;
+            log::warn!(
+                "the content box of page {page_num} is {:.1} x {:.1} pt (page {:.1} x {:.1} pt, margins {:.1} / {:.1} / {:.1} / {:.1} pt): the margins leave no room, so nothing of the body is drawn",
+                this_box.0,
+                this_box.1,
+                page_size.width,
+                page_size.height,
+                resolved_margin.top,
+                resolved_margin.right,
+                resolved_margin.bottom,
+                resolved_margin.left
+            );
+        }
+        if page_idx > 0
+            && !warned_other_box
+            && page_one_box.0 > 0.0
+            && page_one_box.1 > 0.0
+            && ((this_box.0 - page_one_box.0).abs() > 0.5
+                || (this_box.1 - page_one_box.1).abs() > 0.5)
+        {
+            warned_other_box = true;
+            let effect = if this_box.0 < page_one_box.0 - 0.5 || this_box.1 < page_one_box.1 - 0.5 {
+                "smaller, so content may be clipped or lost, or drawn into the margin"
+            } else {
+                "larger, so the page is filled only as far as page 1's box"
+            };
+            log::warn!(
+                "pages are paginated against page 1's content box ({:.1} x {:.1} pt); the box of page {page_num} is {:.1} x {:.1} pt, {effect} (F109)",
+                page_one_box.0,
+                page_one_box.1,
+                this_box.0,
+                this_box.1
+            );
+        }
         let settings = krilla::page::PageSettings::from_wh(page_size.width, page_size.height)
             .ok_or_else(|| Error::PdfGeneration("Invalid page dimensions".into()))?;
         let content_area = resolved_content_area(page_size, resolved_margin);
@@ -437,6 +488,14 @@ pub fn render_v2(
 /// renderer width, and body-link annotation clip rect — so a future
 /// change to how `resolved_margin` subtracts from `page_size` shifts
 /// all three together instead of leaving one behind.
+/// Width and height in pt of the box a page's margins leave, which may be zero or negative.
+fn content_box_pt(size: crate::config::PageSize, margin: crate::config::Margin) -> (f32, f32) {
+    (
+        size.width - margin.left - margin.right,
+        size.height - margin.top - margin.bottom,
+    )
+}
+
 fn resolved_content_area(
     page_size: crate::config::PageSize,
     resolved_margin: crate::config::Margin,
@@ -5014,6 +5073,16 @@ fn build_tag_group(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn content_box_pt_may_be_empty() {
+        use crate::config::{Margin, PageSize};
+        let (w, h) = content_box_pt(PageSize::LETTER, Margin::uniform(72.0));
+        assert_eq!((w, h), (468.0, 648.0));
+        // Margins larger than the page leave a negative box, which the caller reports.
+        let (w, h) = content_box_pt(PageSize::LETTER, Margin::uniform(400.0));
+        assert!(w < 0.0 && h < 0.0);
+    }
+
     use super::*;
 
     // --- escape_attr ---
