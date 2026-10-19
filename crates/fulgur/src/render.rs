@@ -854,10 +854,40 @@ fn dispatch_page_node(
     }
 
     // Body block bg is painted by the per-page pre-pass (paint_root_block_v2)
-    // with content_area_h clamping. Body is never a paragraph/image/svg root,
-    // so its inline children render under their own node IDs via the loop below.
-    // Skip here to avoid a double-paint of the block background.
-    if Some(node_id) == drawables.body_id && drawables.block_styles.contains_key(&node_id) {
+    // with content_area_h clamping. Skip the block here to avoid a double-paint
+    // of the background.
+    //
+    // F111: body is the inline root when all its in-flow children are inline-level
+    // (CSS 2.1 §9.4.2). It then carries a paragraph of its own, next to the block
+    // style that a background, border, padding or shadow gives it; that paragraph
+    // is body's text and nothing else paints it. Draw it on every page body has a
+    // fragment on (the fragmenter splits it between its line boxes), at the
+    // content box of the block, under the block's opacity.
+    if Some(node_id) == drawables.body_id
+        && let Some(block) = drawables.block_styles.get(&node_id)
+    {
+        if let Some(para) = drawables.paragraphs.get(&node_id) {
+            let (inset_x, inset_y) = block.style.content_inset();
+            for frag in geom.fragments.iter().filter(|f| f.page_index == page_index) {
+                let x_pt = margin_left_pt + frag.x.in_pt().to_f32() + inset_x;
+                let y_pt = margin_top_pt + frag.y.in_pt().to_f32() + inset_y;
+                crate::draw_primitives::draw_with_opacity(canvas, block.opacity, |canvas| {
+                    draw_paragraph_dispatch(
+                        canvas,
+                        node_id,
+                        para,
+                        geom,
+                        x_pt,
+                        y_pt,
+                        drawables,
+                        geometry,
+                        margin_left_pt,
+                        margin_top_pt,
+                        page_index,
+                    );
+                });
+            }
+        }
         return;
     }
 
@@ -1700,33 +1730,66 @@ pub(crate) fn dispatch_fragment(
         return;
     }
     if let Some(para) = drawables.paragraphs.get(&node_id) {
-        let run_tag_node_id = run_tag_target(drawables, node_id);
-        let use_run_tagging =
-            canvas.tag_collector.is_some() && para_has_link_runs(para) && run_tag_node_id.is_some();
-        let tag_info = if use_run_tagging {
-            canvas.link_run_node_id = run_tag_node_id;
-            None
-        } else {
-            try_start_tagged(canvas, node_id, drawables)
-        };
-        draw_paragraph_v2(
+        draw_paragraph_dispatch(
             canvas,
+            node_id,
             para,
+            geom,
             x_pt,
             y_pt,
-            &geom.fragments,
-            &geom.line_slices,
-            page_index,
-            is_split,
             drawables,
             geometry,
             margin_left_pt,
             margin_top_pt,
+            page_index,
         );
-        finish_tagged(canvas, tag_info);
-        if use_run_tagging {
-            canvas.link_run_node_id = None;
-        }
+    }
+}
+
+/// The paragraph of `node_id` at `(x_pt, y_pt)` for the fragment of `geom` on `page_index`, with its tagging (a
+/// marked-content sequence, or per-run link tags when it holds links). The tail of [`dispatch_fragment`] for a node
+/// whose paragraph is not drawn together with a block, and what [`dispatch_page_node`] draws for `<body>` as the
+/// inline root (F111).
+#[allow(clippy::too_many_arguments)]
+fn draw_paragraph_dispatch(
+    canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
+    node_id: usize,
+    para: &crate::drawables::ParagraphEntry,
+    geom: &crate::pagination_layout::PaginationGeometry,
+    x_pt: f32,
+    y_pt: f32,
+    drawables: &Drawables,
+    geometry: &crate::pagination_layout::PaginationGeometryTable,
+    margin_left_pt: f32,
+    margin_top_pt: f32,
+    page_index: u32,
+) {
+    let run_tag_node_id = run_tag_target(drawables, node_id);
+    let use_run_tagging =
+        canvas.tag_collector.is_some() && para_has_link_runs(para) && run_tag_node_id.is_some();
+    let tag_info = if use_run_tagging {
+        canvas.link_run_node_id = run_tag_node_id;
+        None
+    } else {
+        try_start_tagged(canvas, node_id, drawables)
+    };
+    draw_paragraph_v2(
+        canvas,
+        para,
+        x_pt,
+        y_pt,
+        &geom.fragments,
+        &geom.line_slices,
+        page_index,
+        geom.is_split(),
+        drawables,
+        geometry,
+        margin_left_pt,
+        margin_top_pt,
+    );
+    finish_tagged(canvas, tag_info);
+    if use_run_tagging {
+        canvas.link_run_node_id = None;
     }
 }
 

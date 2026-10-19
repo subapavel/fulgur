@@ -7982,3 +7982,64 @@ fn test_render_unknown_page_size_keyword_keeps_the_default_page() {
     let pdf = Engine::builder().build().render(html).expect("render");
     assert!(media_box(&pdf).starts_with("0 0 419.5"));
 }
+
+/// F111 (htmltopdf): text directly in `<body>` that is taller than a page. `<body>` is the inline root; the fragmenter
+/// used to place all of it on page 0 and the lines below the page were not printed. `block` wraps the lines in a
+/// `<div>`, the shape that always paginated.
+fn body_lines_document(body_style: &str, n: usize, block: bool) -> String {
+    let text = (1..=n)
+        .map(|i| format!("Line{i:03}"))
+        .collect::<Vec<_>>()
+        .join("<br>");
+    let content = if block {
+        format!("<div>{text}</div>")
+    } else {
+        text
+    };
+    format!(
+        "<!doctype html><html><body style=\"margin:0;line-height:20px;{body_style}\">{content}</body></html>"
+    )
+}
+
+#[test]
+fn test_render_text_directly_in_body_taller_than_a_page_paginates() {
+    let engine = Engine::builder().build();
+    let pdf = engine
+        .render(&body_lines_document("", 200, false))
+        .expect("render");
+    assert!(pdf.starts_with(b"%PDF"));
+    let pages = page_count(&pdf);
+    let wrapped = engine
+        .render(&body_lines_document("", 200, true))
+        .expect("render");
+    assert!(pages >= 4, "{pages} pages");
+    assert_eq!(pages, page_count(&wrapped), "as many pages as in a <div>");
+}
+
+#[test]
+fn test_render_body_with_a_background_or_padding_prints_its_text() {
+    // A body with its own box (background, padding) used to paint no text at all: the body block hid the paragraph
+    // the body inline root carries.
+    for style in ["background:#fafafa", "padding:24px"] {
+        let pdf = Engine::builder()
+            .build()
+            .render(&body_lines_document(style, 3, false))
+            .expect("render");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("out.pdf");
+        std::fs::write(&path, &pdf).unwrap();
+        let Ok(out) = std::process::Command::new("pdftotext")
+            .arg(&path)
+            .arg("-")
+            .output()
+        else {
+            eprintln!("pdftotext not available; skipping the text assertion");
+            return;
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("Line001") && text.contains("Line003"),
+            "{style}: {text:?}"
+        );
+    }
+}
