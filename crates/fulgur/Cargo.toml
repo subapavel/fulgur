@@ -14,6 +14,11 @@ categories = ["text-processing", "command-line-utilities"]
 [features]
 ## Enable rayon-based thread parallelism in `Engine::render_batch`.
 parallel = ["dep:rayon"]
+## Shape the inline layouts of a document on rayon's global pool (Blitz `parallel-construct`). Each worker shapes with a
+## per-document snapshot of the document's font context, so the output does not depend on earlier documents or on the
+## number of threads. Off by default: the pool needs threads (not wasm32-unknown-unknown), and the global pool is shared
+## with the caller.
+parallel-construct = ["blitz-dom/parallel-construct"]
 
 [dependencies]
 rayon = { version = "1", optional = true }
