@@ -1346,8 +1346,12 @@ impl<'a> PaginationLayoutTree<'a> {
                 }
                 None => {
                     // A barrier (clip, multicol, transform, ...) keeps body whole: say so, as for any paragraph
-                    // that is placed whole and ends below the page.
-                    if let Some(html) = body.parent.and_then(|id| self.doc.get_node(id)) {
+                    // that is placed whole and ends below the page. Not when body is kept for another reason (it
+                    // fits, or it holds a box taller than a page that the walk below fragments): that is not a
+                    // loss, and the walk warns where it is one.
+                    if let Some(html) = body.parent.and_then(|id| self.doc.get_node(id))
+                        && split_barrier(self.doc, html, body).is_some()
+                    {
                         warn_unprinted_inline_lines(
                             self.doc,
                             html,
@@ -5148,7 +5152,7 @@ fn nested_line_split(
 /// its own lines, and it is taller than the first page (or than any page). The same rule and the same barriers as
 /// for a paragraph nested in a block ([`nested_line_split`], [`split_barrier`]), with `<html>` as the parent and
 /// body placed at the top of page 0 (the body offset is already in `strips`). `None` when body is not an inline root,
-/// fits, or a barrier keeps it whole.
+/// fits, a barrier keeps it whole, or one of its lines is taller than a page.
 fn body_line_split(
     doc: &BaseDocument,
     body: &blitz_dom::Node,
@@ -5158,7 +5162,16 @@ fn body_line_split(
         return None;
     }
     let html = doc.get_node(body.parent?)?;
-    nested_line_split(doc, html, body, 0.0, 0.0, strips, 0)
+    let split = nested_line_split(doc, html, body, 0.0, 0.0, strips, 0)?;
+    // A line taller than a page holds a box (an `inline-block` alone on its line, F30f) that the walk over body's
+    // children fragments on its own; one line of it cannot be split here, and splitting around it would place the
+    // box whole. Leave such a body to the walk, as before.
+    let fresh = strips.fresh();
+    (!split
+        .lines
+        .iter()
+        .any(|&(top, bottom)| bottom - top > fresh))
+    .then_some(split)
 }
 
 /// F30: whether `cell_id`, a cell of table `parent`, shares its row with a cell
@@ -8048,6 +8061,30 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(body.fragments[0].height.to_f32(), height);
         assert!(body.line_slices.is_empty());
         assert_eq!(implied_page_count(&table), 1);
+    }
+
+    /// F111: a body with a line taller than a page (a box alone on its line) is left to the walk over its children,
+    /// which fragments the box (F30f): the body is not split around a line it cannot split.
+    #[test]
+    fn body_inline_root_with_a_line_taller_than_a_page_is_left_to_the_walk() {
+        let html = "<html><body style=\"margin:0;line-height:20px\">Intro<br>\
+                    <div id=\"box\" style=\"display:inline-block;width:100%;height:1700px\">x</div></body></html>";
+        let mut doc = parse(html, 600.0);
+        let body_id = body_node(&doc);
+        assert!(doc.get_node(body_id).unwrap().flags.is_inline_root());
+        let table = run_pass(&mut doc, 800.0);
+        assert_eq!(
+            table[&body_id].fragments.len(),
+            1,
+            "body keeps its single fragment"
+        );
+        assert!(table[&body_id].line_slices.is_empty());
+        let box_id = node_with_id(&doc, "box");
+        assert!(
+            table[&box_id].fragments.len() >= 2,
+            "the box is fragmented on its own: {:?}",
+            table[&box_id].fragments
+        );
     }
 
     /// F111: a barrier keeps body whole (the pagination warning names it, see `warn_unprinted_inline_lines`).
