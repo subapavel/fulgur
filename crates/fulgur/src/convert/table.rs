@@ -16,7 +16,10 @@ pub(super) fn try_convert(
     let Some(elem_data) = node.element_data() else {
         return false;
     };
-    if elem_data.name.local.as_ref() != "table" {
+    // A `<table>`, and every other box that is a table by its computed `display` (`display: table`, `inline-table`):
+    // Blitz lays them all out as tables (and, under `border-collapse: collapse`, gives their cells half borders that
+    // only `table_borders` paints), and pagination takes them for tables as well (F22).
+    if elem_data.name.local.as_ref() != "table" && !crate::blitz_adapter::is_table_box(node) {
         return false;
     }
     convert_table(doc, node, ctx, depth, out);
@@ -744,6 +747,32 @@ mod tests {
             drawables.block_styles[&td_id].style.border_styles,
             [BorderStyleValue::Solid; 4]
         );
+    }
+
+    #[test]
+    fn a_div_table_records_collapsed_edges_like_a_table() {
+        // Blitz gives the cells of a `display: table` box half borders like those of a `<table>`; they are painted
+        // from the table, so the box is converted as one.
+        let (doc, drawables) = convert(
+            r#"<!doctype html><html><body>
+              <div style="display:table;border-collapse:collapse">
+                <div style="display:table-row;border-bottom:3px solid red">
+                  <div style="display:table-cell;border:1px solid #000;padding:5px">a</div>
+                  <div style="display:table-cell;border:1px solid #000;padding:5px">b</div></div>
+              </div></body></html>"#,
+        );
+        let table_id = find_tag(doc.deref(), doc.root_element().id, "div").unwrap();
+        let edges = &drawables.table_collapsed_borders[&table_id];
+        assert_eq!((edges.rows, edges.tracks), (1, 2));
+        assert!(drawables.tables.contains_key(&table_id));
+        // The row's 3 px rule wins over the cells' 1 px bottom border.
+        assert_eq!(edges.horizontal[2].width.to_f32(), 3.0);
+        for cell in &edges.cells {
+            assert_eq!(
+                drawables.block_styles[&cell.node].style.border_styles,
+                [BorderStyleValue::None; 4]
+            );
+        }
     }
 
     #[test]

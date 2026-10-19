@@ -664,6 +664,8 @@ fn draw_v2_page(
                 transformed_descendants.contains(&table)
                     || clipped_descendants.contains(&table)
                     || opacity_wrapped_descendants.contains(&table)
+                    // Inside an inline box: painted by `dispatch_inline_box_content`, under the box's translation.
+                    || drawables.inline_box_subtree_skip.contains(&table)
                     || is_wrapper_key(drawables, table)
             },
         },
@@ -1203,7 +1205,10 @@ pub(crate) fn dispatch_inline_box_content(
         margin_top_pt,
         page_index,
     );
-    if let Some(descs) = inline_box_subtree_descendants.get(&content_id) {
+    let descs: &[usize] = inline_box_subtree_descendants
+        .get(&content_id)
+        .map_or(&[], Vec::as_slice);
+    {
         for &desc_id in descs {
             let Some(desc_geom) = geometry.get(&desc_id) else {
                 continue;
@@ -1233,6 +1238,18 @@ pub(crate) fn dispatch_inline_box_content(
                 page_index,
             );
         }
+        // F22: the collapsed borders of the tables in the box (the box itself when it is an `inline-table`), where
+        // their cells were dispatched: body-relative, under the caller's translation.
+        paint_wrapper_tables(
+            canvas,
+            content_id,
+            descs,
+            page_index,
+            margin_left_pt + drawables.body_offset_pt.0.to_f32(),
+            margin_top_pt + drawables.body_offset_pt.1.to_f32(),
+            geometry,
+            drawables,
+        );
     }
 }
 

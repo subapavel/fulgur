@@ -8072,3 +8072,82 @@ fn long_table_with_tfoot_before_tbody_renders_every_row() {
     let pdf = Engine::builder().build().render(&html).expect("render");
     assert!(page_count(&pdf) >= 2, "a 120-row table spans pages");
 }
+
+/// F22: the lines of a collapsed table are page furniture. In a tagged PDF every stroke of them is inside an
+/// `/Artifact` sequence (ISO 32000-1 §14.8.2.2; PDF/UA-1 §7.1), on the page, in the wrappers (transform, overflow
+/// clip, opacity, inline box) and in the repeated header copy; no stroke operator is outside any marked content.
+#[test]
+fn collapsed_table_lines_are_artifacts_in_tagged_output() {
+    fn strokes_outside_marked_content(pdf: &[u8]) -> (usize, usize) {
+        let doc = lopdf::Document::load_mem(pdf).expect("PDF must parse");
+        // The page streams and the form XObjects (an opacity group is one).
+        let mut streams: Vec<Vec<u8>> = doc
+            .get_pages()
+            .values()
+            .map(|&id| doc.get_page_content(id).expect("page content"))
+            .collect();
+        for object in doc.objects.values() {
+            if let lopdf::Object::Stream(stream) = object
+                && matches!(stream.dict.get(b"Subtype"), Ok(lopdf::Object::Name(n)) if n == b"Form")
+                && let Ok(bytes) = stream.decompressed_content()
+            {
+                streams.push(bytes);
+            }
+        }
+        let (mut outside, mut artifacts) = (0, 0);
+        for bytes in streams {
+            let content = lopdf::content::Content::decode(&bytes).expect("content decodes");
+            let mut depth = 0usize;
+            for op in &content.operations {
+                match op.operator.as_str() {
+                    "BDC" | "BMC" => {
+                        depth += 1;
+                        if op.operator == "BMC" {
+                            artifacts += 1;
+                        }
+                    }
+                    "EMC" => depth = depth.saturating_sub(1),
+                    "S" | "s" | "B" | "b" if depth == 0 => outside += 1,
+                    _ => {}
+                }
+            }
+        }
+        (outside, artifacts)
+    }
+    let rows: String = (0..110)
+        .map(|i| format!("<tr><td>Row {i}</td><td>x</td></tr>"))
+        .collect();
+    let css = "<style>table{border-collapse:collapse;width:100%}td,th{padding:4px;border:1px solid #888}\
+               thead{border-bottom:3px solid blue}tr{border-bottom:2px solid red}</style>";
+    let table =
+        format!("<table><thead><tr><th>A</th><th>B</th></tr></thead><tbody>{rows}</tbody></table>");
+    for (what, wrapper_open, wrapper_close) in [
+        ("page", "", ""),
+        (
+            "transform",
+            "<div style=\"transform:rotate(1deg)\">",
+            "</div>",
+        ),
+        ("overflow clip", "<div style=\"overflow:hidden\">", "</div>"),
+        ("opacity", "<div style=\"opacity:0.5\">", "</div>"),
+        (
+            "inline-block",
+            "<div style=\"display:inline-block\">",
+            "</div>",
+        ),
+    ] {
+        let pdf = Engine::builder()
+            .tagged(true)
+            .build()
+            .render(&format!(
+                "<!doctype html><html><head>{css}</head><body>{wrapper_open}{table}{wrapper_close}</body></html>"
+            ))
+            .expect("render");
+        let (outside, artifacts) = strokes_outside_marked_content(&pdf);
+        assert!(artifacts > 0, "{what}: no /Artifact sequence at all");
+        assert_eq!(
+            outside, 0,
+            "{what}: {outside} stroke operators outside any marked content"
+        );
+    }
+}

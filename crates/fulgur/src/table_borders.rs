@@ -22,7 +22,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::draw_primitives::{BorderStyleValue, Canvas, alpha_to_opacity, draw_border_line};
+use crate::draw_primitives::{
+    BorderStyleValue, Canvas, alpha_to_opacity, apply_border_style, colored_stroke,
+    draw_border_line,
+};
 use crate::drawables::{CollapsedEdges, Drawables, EdgeSegment};
 use crate::pagination_layout::PaginationGeometryTable;
 use crate::units::F32Units;
@@ -188,16 +191,18 @@ fn paint_table(
         })
     });
     let skip_line = if copy_here { first_row } else { None };
-    crate::draw_primitives::draw_with_opacity(canvas, entry.opacity, |canvas| {
-        paint_lines(
-            canvas,
-            edges,
-            &rows,
-            x_off,
-            margin_left_pt,
-            margin_top_pt,
-            Mode::Page { skip_line },
-        );
+    as_artifact(canvas, |canvas| {
+        crate::draw_primitives::draw_with_opacity(canvas, entry.opacity, |canvas| {
+            paint_lines(
+                canvas,
+                edges,
+                &rows,
+                x_off,
+                margin_left_pt,
+                margin_top_pt,
+                Mode::Page { skip_line },
+            );
+        });
     });
 }
 
@@ -311,7 +316,9 @@ fn style_rank(style: BorderStyleValue) -> u8 {
 }
 
 /// The segment that wins between two for the same line (rules 3 to 5 of §17.6.2.1: width, style, then the kind of
-/// element); `a` wins a tie.
+/// element). `a` is the header's own bottom line and `b` the line the page break cut: at a full tie `b` wins, as in
+/// Chrome 141 (a header rule `border-gray-300` and body rows `border-gray-100`, fixtures 02 and 09: the line under the
+/// copy is the body row's).
 fn better(a: EdgeSegment, b: EdgeSegment) -> EdgeSegment {
     let key = |s: &EdgeSegment| {
         let painted = s.is_painted();
@@ -322,7 +329,7 @@ fn better(a: EdgeSegment, b: EdgeSegment) -> EdgeSegment {
             s.origin,
         )
     };
-    if key(&b) > key(&a) { b } else { a }
+    if key(&b) >= key(&a) { b } else { a }
 }
 
 /// `x` of the start of a run ending at a crossing of width `w` (`0`: nothing crosses): the left edge of the crossing's
@@ -436,6 +443,7 @@ fn paint_lines(
     canvas.surface.set_fill(None);
 
     // Horizontal runs.
+    let mut horizontal_lines: Vec<Line> = Vec::new();
     for hl in hlines.values() {
         let width_at = |row: Option<u32>, line: usize| {
             row.map_or(0.0, |r| {
@@ -477,19 +485,21 @@ fn paint_lines(
             };
             let x0 = band_start(x_of(t), cross(t));
             let x1 = band_end(x_of(end), cross(end));
-            stroke(
-                canvas,
-                (pt_x(x0), pt_y((lo + hi) / 2.0)),
-                (pt_x(x1), pt_y((lo + hi) / 2.0)),
-                (hi - lo).as_px().in_pt().to_f32(),
-                &seg,
-                -1.0,
-            );
+            horizontal_lines.push(Line {
+                from: (pt_x(x0), pt_y((lo + hi) / 2.0)),
+                to: (pt_x(x1), pt_y((lo + hi) / 2.0)),
+                width_pt: (hi - lo).as_px().in_pt().to_f32(),
+                seg,
+                outward_sign: -1.0,
+            });
             t = end;
         }
     }
 
+    emit(canvas, &horizontal_lines);
+
     // Vertical runs, painted after the horizontal ones.
+    let mut vertical_lines: Vec<Line> = Vec::new();
     let row_ids: Vec<u32> = rows.keys().copied().collect();
     for line in 0..=tracks {
         let mut k = 0;
@@ -532,41 +542,118 @@ fn paint_lines(
             let w = seg.width.to_f32();
             let left = (x_of(line) - w / 2.0).floor();
             let mid = left + w / 2.0;
-            stroke(
-                canvas,
-                (pt_x(mid), pt_y(y0)),
-                (pt_x(mid), pt_y(y1)),
-                w.as_px().in_pt().to_f32(),
-                &seg,
-                1.0,
-            );
+            vertical_lines.push(Line {
+                from: (pt_x(mid), pt_y(y0)),
+                to: (pt_x(mid), pt_y(y1)),
+                width_pt: w.as_px().in_pt().to_f32(),
+                seg,
+                outward_sign: 1.0,
+            });
             k = last + 1;
         }
     }
+    emit(canvas, &vertical_lines);
     canvas.surface.set_stroke(None);
 }
 
-fn stroke(
-    canvas: &mut Canvas<'_, '_>,
+/// A line to paint, in page pt, before it is written to the surface.
+#[derive(Debug, Clone, Copy)]
+struct Line {
     from: (f32, f32),
     to: (f32, f32),
     width_pt: f32,
-    seg: &EdgeSegment,
+    seg: EdgeSegment,
     outward_sign: f32,
-) {
-    draw_border_line(
-        canvas,
-        from.0,
-        from.1,
-        to.0,
-        to.1,
-        width_pt,
-        seg.style,
-        &seg.color,
-        alpha_to_opacity(seg.color[3]),
-        true,
-        outward_sign,
-    );
+}
+
+/// Writes `lines` to the surface. Lines of a style that is one plain stroke (solid, dashed, dotted, and `double`
+/// below 3 px, which is solid) and of one width and colour go into a single path with one subpath per line: a page
+/// of row rules is one stroke instead of a hundred, and a translucent colour is not painted twice where subpaths
+/// touch. The groups come in order of their first line. The 3D styles and `double` of 3 px or more are drawn
+/// line by line, after the groups. The result depends only on the order of `lines`.
+fn emit(canvas: &mut Canvas<'_, '_>, lines: &[Line]) {
+    let batchable = |style: BorderStyleValue| {
+        matches!(
+            style,
+            BorderStyleValue::Solid
+                | BorderStyleValue::Dashed
+                | BorderStyleValue::Dotted
+                | BorderStyleValue::Double
+        )
+    };
+    let mut groups: Vec<Vec<&Line>> = Vec::new();
+    let mut single: Vec<&Line> = Vec::new();
+    for line in lines {
+        let plain = batchable(line.seg.style)
+            && !(line.seg.style == BorderStyleValue::Double && line.width_pt >= 3.0);
+        if !plain {
+            single.push(line);
+        } else if let Some(group) = groups.iter_mut().find(|g| {
+            let first = g[0];
+            first.width_pt == line.width_pt
+                && first.seg.style == line.seg.style
+                && first.seg.color == line.seg.color
+        }) {
+            group.push(line);
+        } else {
+            groups.push(vec![line]);
+        }
+    }
+    for group in groups {
+        let first = group[0];
+        let base = colored_stroke(
+            &first.seg.color,
+            first.width_pt,
+            alpha_to_opacity(first.seg.color[3]),
+        );
+        let Some(stroke) = apply_border_style(base, first.seg.style, first.width_pt) else {
+            continue;
+        };
+        let mut builder = krilla::geom::PathBuilder::new();
+        for line in group {
+            builder.move_to(line.from.0, line.from.1);
+            builder.line_to(line.to.0, line.to.1);
+        }
+        if let Some(path) = builder.finish() {
+            canvas.surface.set_stroke(Some(stroke));
+            canvas.surface.draw_path(&path);
+        }
+    }
+    for line in single {
+        draw_border_line(
+            canvas,
+            line.from.0,
+            line.from.1,
+            line.to.0,
+            line.to.1,
+            line.width_pt,
+            line.seg.style,
+            &line.seg.color,
+            alpha_to_opacity(line.seg.color[3]),
+            true,
+            line.outward_sign,
+        );
+    }
+}
+
+/// Runs `paint` as an artifact when the document is tagged: the lines are page furniture, not content (ISO 32000-1
+/// §14.8.2.2; PDF/UA-1 §7.1), and a stroke outside any marked-content sequence of a tagged page is a defect. Inside a
+/// sequence already (the header copy of F12 is one) it paints as it is.
+fn as_artifact(canvas: &mut Canvas<'_, '_>, paint: impl FnOnce(&mut Canvas<'_, '_>)) {
+    let open = canvas.tag_collector.is_some() && !canvas.in_marked_content;
+    if open {
+        canvas
+            .surface
+            .start_tagged(krilla::tagging::ContentTag::Artifact(
+                krilla::tagging::ArtifactType::Other,
+            ));
+        canvas.in_marked_content = true;
+    }
+    paint(canvas);
+    if open {
+        canvas.surface.end_tagged();
+        canvas.in_marked_content = false;
+    }
 }
 
 #[cfg(test)]
@@ -603,9 +690,10 @@ mod tests {
         let group = seg(2.0, BorderStyleValue::Solid, BLACK, 1);
         assert_eq!(better(group, row), row);
         assert_eq!(better(row, group), row);
-        // A full tie keeps the first.
+        // A full tie goes to the second one, the line the page break cut (Chrome: fixtures 02 and 09).
         let other = seg(2.0, BorderStyleValue::Solid, BLACK, 2);
-        assert_eq!(better(row, other), row);
+        assert_eq!(better(row, other), other);
+        assert_eq!(better(other, row), row);
     }
 
     #[test]

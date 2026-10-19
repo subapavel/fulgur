@@ -1403,7 +1403,7 @@ fn border_3d_colors(
 }
 
 /// Apply border-style dash settings to a stroke.
-fn apply_border_style(
+pub(crate) fn apply_border_style(
     stroke: krilla::paint::Stroke,
     style: BorderStyleValue,
     width: f32,
