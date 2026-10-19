@@ -4488,8 +4488,10 @@ fn record_carrier_slices_after(
 /// repeat header rows on each page spanned by a table").
 ///
 /// Blitz lays a table out as a grid whose `layout_children` are the cells
-/// only, in DOM order (`thead` / `tbody` / `tr` get zero size), so the
-/// header group is represented by the cells that are a prefix of that list.
+/// only, in visual order (`thead` / `tbody` / `tr` get zero size; since F36
+/// the first header group comes first and the first footer group last,
+/// wherever they are written), so the header group is represented by the
+/// cells that are a prefix of that list.
 /// The fragmenter reserves `height` px at the top of each continuation page
 /// and records one extra fragment of `group_id` there; `render` paints the
 /// header cells again at that spot.
@@ -4609,9 +4611,10 @@ fn reserve_header_band(
 /// the fragmenter needs. `None` (no repeat, today's behaviour) unless all hold:
 ///
 /// - `table_id` is a table with a `table-header-group` child;
-/// - the group's cells are a prefix of the table's `layout_children` (a
-///   `tbody` before the `thead` puts body cells first, and Blitz places cells
-///   in DOM order, so the header would not be at the top);
+/// - the group's cells are a prefix of the table's `layout_children` (Blitz
+///   orders them visually, so this holds for a `thead` written after the
+///   `tbody` as well; it fails for a header inside a `display: contents`
+///   wrapper, which Blitz flattens and `first_table_header_group` does not);
 /// - `0 < height <= page_height_px / 4` (Chrome's policy: a header larger
 ///   than a quarter page is not repeated; it also rules out pages holding
 ///   nothing but a header);
@@ -11419,8 +11422,10 @@ h2 { string-set: chapter-title content(text); }
     }
 
     #[test]
-    fn table_with_tbody_before_thead_is_not_repeated() {
-        // Blitz places cells in DOM order, so the "header" is not at the top.
+    fn table_with_tbody_before_thead_repeats_its_header() {
+        // F36: Blitz lays the header group out first wherever it is written
+        // (CSS 2.1 §17.2), so its cells are a prefix of `layout_children`
+        // and F12 repeats it like any other header.
         let rows: String = (0..10)
             .map(|i| format!(r#"<tr><td id="r{i}" style="height:40px;padding:0">x</td></tr>"#))
             .collect();
@@ -11432,7 +11437,62 @@ h2 { string-set: chapter-title content(text); }
         );
         let (doc, geom) = table_geometry(&html, 200.0);
         let thead = find_node_by_local_name(&doc, "thead").unwrap();
-        assert!(!geom.contains_key(&thead));
+        let group = geom.get(&thead).expect("thead has geometry");
+        let pages: Vec<u32> = group.fragments.iter().map(|f| f.page_index).collect();
+        assert_eq!(pages, vec![0, 1, 2], "one header fragment per page");
+        assert!(group.is_repeat);
+        // The header is on top of page 0, above the first row.
+        let first = frag_on_page(&geom, find_by_id(doc.deref(), "r0").unwrap(), 0).unwrap();
+        assert!(first.y.to_f32() >= 20.0 - 0.5, "r0 is below the header");
+    }
+
+    #[test]
+    fn table_footer_written_first_is_last_in_layout_children_and_on_the_last_page() {
+        // F36: `<thead>, <tfoot>, <tbody>` (HTML 4.01 order). The footer cells
+        // are a suffix of the table's `layout_children` (the mirror of F12's
+        // header prefix), and their fragments are on the last page, below
+        // the last body cell.
+        let body: String = (0..10)
+            .map(|i| {
+                format!(
+                    r#"<tr><td id="r{i}a" style="height:40px;padding:0">x</td>
+                       <td id="r{i}b" style="padding:0">y</td></tr>"#
+                )
+            })
+            .collect();
+        let html = format!(
+            r#"<html><body style="margin:0"><table style="border-spacing:0;width:200px">
+                 <thead><tr><th id="h0" style="height:20px;padding:0">a</th>
+                            <th id="h1" style="padding:0">b</th></tr></thead>
+                 <tfoot><tr><td id="f0" style="height:30px;padding:0">t</td>
+                            <td id="f1" style="padding:0">u</td></tr></tfoot>
+                 <tbody>{body}</tbody></table></body></html>"#
+        );
+        let (doc, geom) = table_geometry(&html, 200.0);
+        let id = |name: &str| find_by_id(doc.deref(), name).unwrap();
+        let table = find_node_by_local_name(&doc, "table").unwrap();
+        let children = doc
+            .get_node(table)
+            .unwrap()
+            .layout_children
+            .borrow()
+            .clone();
+        let children = children.expect("a table has layout children");
+        assert_eq!(&children[..2], &[id("h0"), id("h1")], "header cells first");
+        assert_eq!(
+            &children[children.len() - 2..],
+            &[id("f0"), id("f1")],
+            "footer cells last"
+        );
+        let last_body = geom.get(&id("r9a")).unwrap().fragments.last().unwrap();
+        let footer = geom.get(&id("f0")).unwrap();
+        assert_eq!(footer.fragments.len(), 1, "the footer is printed once");
+        let footer = &footer.fragments[0];
+        assert_eq!(footer.page_index, last_body.page_index, "last page");
+        assert!(
+            footer.y.to_f32() >= last_body.y.to_f32() + 40.0 - 0.5,
+            "the footer is below the last body row"
+        );
     }
 
     #[test]

@@ -8043,3 +8043,32 @@ fn test_render_body_with_a_background_or_padding_prints_its_text() {
         );
     }
 }
+
+/// F36: `<thead><tfoot><tbody>` renders (the footer group goes last in Blitz's grid) and a long one spans pages.
+#[test]
+fn table_with_tfoot_before_tbody_renders() {
+    let html = r#"<!DOCTYPE html><html><body><table>
+        <thead><tr><th>H</th></tr></thead>
+        <tfoot><tr><td>F</td></tr></tfoot>
+        <tbody><tr><td>B</td></tr></tbody>
+    </table></body></html>"#;
+    let pdf = Engine::builder().build().render(html).expect("render");
+    assert!(!pdf.is_empty());
+    assert_eq!(page_count(&pdf), 1);
+}
+
+#[test]
+fn long_table_with_tfoot_before_tbody_renders_every_row() {
+    let rows: String = (1..=120)
+        .map(|i| format!("<tr><td>Row{i:03}</td></tr>"))
+        .collect();
+    let html = format!(
+        r#"<!DOCTYPE html><html><body><table>
+        <thead><tr><th>Head</th></tr></thead>
+        <tfoot><tr><td>Foot</td></tr></tfoot>
+        <tbody>{rows}</tbody>
+    </table></body></html>"#
+    );
+    let pdf = Engine::builder().build().render(&html).expect("render");
+    assert!(page_count(&pdf) >= 2, "a 120-row table spans pages");
+}
