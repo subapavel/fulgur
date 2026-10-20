@@ -367,6 +367,7 @@ pub fn render_v2(
                     &clipped_descendants,
                     &opacity_wrapped_descendants,
                     tagging,
+                    page_node_ids,
                 );
                 // Content past the right edge of the page is clipped by the page box (CSS Page 3 §3.2 lets it
                 // overflow the margins; the page box is the medium). Say so: Chrome shrinks the page instead.
@@ -693,6 +694,9 @@ fn draw_v2_page(
 /// running headers, not table headers.
 ///
 /// Iteration is by `BTreeMap` order so the output is deterministic.
+///
+/// `page_node_ids` is the node list of `page_index` (the nodes with a fragment on it); the collapsed borders of the
+/// copy find the first body row of the page in it instead of scanning the table (F99c).
 #[allow(clippy::too_many_arguments)]
 fn paint_repeated_table_headers(
     canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
@@ -705,6 +709,7 @@ fn paint_repeated_table_headers(
     clipped_descendants: &std::collections::BTreeSet<usize>,
     opacity_wrapped_descendants: &std::collections::BTreeSet<usize>,
     tagging: bool,
+    page_node_ids: &[usize],
 ) {
     if drawables.table_header_groups.is_empty()
         && drawables.table_header_background_owners.is_empty()
@@ -806,13 +811,13 @@ fn paint_repeated_table_headers(
                     &mut copy_canvas,
                     table_id,
                     source.page_index,
-                    page_index,
                     margin_left_pt,
                     margin_top_pt,
                     (repeat.x - source.x).to_f32(),
                     (repeat.y - source.y).to_f32(),
                     geometry,
                     drawables,
+                    page_node_ids,
                 );
             }
             if tagging {

@@ -42,7 +42,7 @@ struct RowSpan {
 }
 
 /// One horizontal grid line to paint: where, which halves of it are on this page, and its segments.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct HLine {
     y: f32,
     upper: bool,
@@ -207,20 +207,20 @@ fn paint_table(
 }
 
 /// F12: paints the lines of the header rows of `table` on a continuation page. The header's cells are those of
-/// `source_page`, shifted by `(dx_px, dy_px)` to where the copy stands on `page_index`; the copy is painted into
-/// `canvas`, which is the artifact the cells of the copy are in.
+/// `source_page`, shifted by `(dx_px, dy_px)` to where the copy stands; the copy is painted into `canvas`, which is the
+/// artifact the cells of the copy are in. `page_node_ids` is the node list of the page the copy is on.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_header_copy(
     canvas: &mut Canvas<'_, '_>,
     table: usize,
     source_page: u32,
-    page_index: u32,
     margin_left_pt: f32,
     margin_top_pt: f32,
     dx_px: f32,
     dy_px: f32,
     geometry: &PaginationGeometryTable,
     drawables: &Drawables,
+    page_node_ids: &[usize],
 ) {
     let (Some(edges), Some(entry)) = (
         drawables.table_collapsed_borders.get(&table),
@@ -235,12 +235,7 @@ pub(crate) fn paint_header_copy(
     let Some((rows, x_off)) = page_rows(edges, &header, geometry, source_page, dx_px, dy_px) else {
         return;
     };
-    // The first row of the page the copy is on: the first cell after the header with a fragment there.
-    let rest = &edges.cells[edges.header_cells..];
-    let first_row = rest
-        .iter()
-        .find(|c| on_page(geometry, c.node, page_index))
-        .map(|c| c.row);
+    let first_row = first_body_row(edges, table, page_node_ids, drawables);
     crate::draw_primitives::draw_with_opacity(canvas, entry.opacity, |canvas| {
         paint_lines(
             canvas,
@@ -252,6 +247,25 @@ pub(crate) fn paint_header_copy(
             Mode::Copy { first_row },
         );
     });
+}
+
+/// The row of the first body cell (a cell after the header's, in cell order) that has a fragment on the page, as the
+/// page's own node list tells: the cell of `table` with the lowest index among the page's nodes. That is what a scan
+/// of `edges.cells` for the first cell on the page finds, without looking at the cells of the other pages (F99c: the
+/// scan made every page cost the length of the table).
+fn first_body_row(
+    edges: &CollapsedEdges,
+    table: usize,
+    page_node_ids: &[usize],
+    drawables: &Drawables,
+) -> Option<u32> {
+    page_node_ids
+        .iter()
+        .filter_map(|node| drawables.collapsed_cell_of.get(node))
+        .filter(|&&(t, index)| t == table && index as usize >= edges.header_cells)
+        .map(|&(_, index)| index)
+        .min()
+        .map(|index| edges.cells[index as usize].row)
 }
 
 /// The extent of every row that has a cell among `cells` on `page_index`, shifted by `(dx_px, dy_px)`, and the x of
@@ -355,28 +369,48 @@ fn painted_width(seg: &EdgeSegment) -> f32 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn paint_lines(
-    canvas: &mut Canvas<'_, '_>,
-    edges: &CollapsedEdges,
-    rows: &BTreeMap<u32, RowSpan>,
-    x_off: f32,
-    margin_left_pt: f32,
-    margin_top_pt: f32,
-    mode: Mode,
-) {
-    let tracks = edges.tracks as usize;
-    let line_rows = match mode {
+/// The number of grid lines minus one that `mode` paints: all the table's rows, or the header's.
+fn line_rows(edges: &CollapsedEdges, mode: Mode) -> u32 {
+    match mode {
         Mode::Page { .. } => edges.rows,
         Mode::Copy { .. } => edges.header_rows,
-    };
-    let x_of = |line: usize| x_off + edges.track_x[line].to_f32();
-    let pt_x = |x: f32| margin_left_pt + x.as_px().in_pt().to_f32();
-    let pt_y = |y: f32| margin_top_pt + y.as_px().in_pt().to_f32();
+    }
+}
 
-    // The horizontal lines that are on this page.
+/// The horizontal lines `0..=line_rows` that can be painted from `rows`, ascending: the line above and the line
+/// below each row, and in a header copy the line under the copy. Every other line has neither a row below it nor one
+/// above it, so [`build_hlines`] skips it; visiting only these keeps a page's cost to its own rows (F99c: the loop
+/// over all lines made it the length of the table).
+fn page_lines(rows: &BTreeMap<u32, RowSpan>, line_rows: u32, mode: Mode) -> Vec<u32> {
+    let mut lines: Vec<u32> = Vec::with_capacity(rows.len() + 2);
+    let mut add = |line: u32| {
+        if lines.last().is_none_or(|&last| line > last) {
+            lines.push(line);
+        }
+    };
+    // `rows` ascends, so each row's lines are not below the previous row's.
+    for &row in rows.keys().take_while(|&&r| r < line_rows) {
+        add(row);
+        add(row + 1);
+    }
+    if matches!(mode, Mode::Copy { .. }) {
+        add(line_rows);
+    }
+    lines
+}
+
+/// The horizontal lines among `lines` (ascending, `<= line_rows`) that are on this page, with where they are and
+/// which halves of them are painted.
+fn build_hlines(
+    edges: &CollapsedEdges,
+    rows: &BTreeMap<u32, RowSpan>,
+    mode: Mode,
+    lines: impl IntoIterator<Item = u32>,
+) -> BTreeMap<u32, HLine> {
+    let tracks = edges.tracks as usize;
+    let line_rows = line_rows(edges, mode);
     let mut hlines: BTreeMap<u32, HLine> = BTreeMap::new();
-    for i in 0..=line_rows {
+    for i in lines {
         let lower_row = (i < line_rows)
             .then(|| rows.get(&i).filter(|r| r.started))
             .flatten();
@@ -439,6 +473,27 @@ fn paint_lines(
             },
         );
     }
+    hlines
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_lines(
+    canvas: &mut Canvas<'_, '_>,
+    edges: &CollapsedEdges,
+    rows: &BTreeMap<u32, RowSpan>,
+    x_off: f32,
+    margin_left_pt: f32,
+    margin_top_pt: f32,
+    mode: Mode,
+) {
+    let tracks = edges.tracks as usize;
+    let line_rows = line_rows(edges, mode);
+    let x_of = |line: usize| x_off + edges.track_x[line].to_f32();
+    let pt_x = |x: f32| margin_left_pt + x.as_px().in_pt().to_f32();
+    let pt_y = |y: f32| margin_top_pt + y.as_px().in_pt().to_f32();
+
+    // The horizontal lines that are on this page.
+    let hlines = build_hlines(edges, rows, mode, page_lines(rows, line_rows, mode));
 
     canvas.surface.set_fill(None);
 
@@ -728,5 +783,237 @@ mod tests {
         assert!(!a.same_paint(&seg(1.0, BorderStyleValue::Dashed, BLACK, 1)));
         assert!(!a.same_paint(&seg(1.5, BorderStyleValue::Solid, BLACK, 1)));
         assert!(!a.same_paint(&seg(1.0, BorderStyleValue::Solid, RED, 1)));
+    }
+
+    // ---- F99c: the per-page lookups must give what the whole-table scans gave ----
+
+    use crate::drawables::EdgeCell;
+    use crate::pagination_layout::{Fragment, PaginationGeometry};
+    use crate::units::Px;
+
+    /// A table of `rows` rows x `tracks` one-span cells, the first `header_rows` rows being the header group. Cell `i`
+    /// is node `base + i`. Every segment is distinguishable (its origin is its position).
+    fn grid(base: usize, rows: u32, tracks: u32, header_rows: u32) -> CollapsedEdges {
+        let tr = tracks as usize;
+        let segs = |n: usize| -> Vec<EdgeSegment> {
+            (0..n)
+                .map(|i| {
+                    let style = if i % 5 == 4 {
+                        BorderStyleValue::None
+                    } else {
+                        BorderStyleValue::Solid
+                    };
+                    seg(1.0 + (i % 3) as f32, style, BLACK, (i % 4) as u8)
+                })
+                .collect()
+        };
+        CollapsedEdges {
+            rows,
+            tracks,
+            horizontal: segs((rows as usize + 1) * tr),
+            vertical: segs(rows as usize * (tr + 1)),
+            cells: (0..rows * tracks)
+                .map(|i| EdgeCell {
+                    node: base + i as usize,
+                    row: i / tracks,
+                    track: i % tracks,
+                    span: 1,
+                })
+                .collect(),
+            track_x: (0..=tracks).map(|t| (t as f32 * 50.0).as_px()).collect(),
+            header_group: (header_rows > 0).then_some(base + 10_000),
+            header_cells: (header_rows * tracks) as usize,
+            header_rows,
+        }
+    }
+
+    fn fragment(page_index: u32) -> Fragment {
+        Fragment {
+            page_index,
+            x: Px::ZERO,
+            y: Px::ZERO,
+            width: 10.0_f32.as_px(),
+            height: 10.0_f32.as_px(),
+        }
+    }
+
+    /// What `paint_header_copy` did before F99c: the first body cell, in cell order, with a fragment on the page.
+    fn first_body_row_by_scan(
+        edges: &CollapsedEdges,
+        geometry: &PaginationGeometryTable,
+        page: u32,
+    ) -> Option<u32> {
+        edges.cells[edges.header_cells..]
+            .iter()
+            .find(|c| on_page(geometry, c.node, page))
+            .map(|c| c.row)
+    }
+
+    /// The node list of a page, as `render` builds it: every node with a fragment on the page, in node order.
+    fn page_nodes(geometry: &PaginationGeometryTable, page: u32) -> Vec<usize> {
+        geometry
+            .iter()
+            .filter(|(_, g)| g.fragments.iter().any(|f| f.page_index == page))
+            .map(|(&n, _)| n)
+            .collect()
+    }
+
+    #[test]
+    fn first_body_row_is_what_the_scan_of_the_cells_finds() {
+        for tracks in 1..=5u32 {
+            for header_rows in 0..=2u32 {
+                let rows = 9u32;
+                let edges = grid(100, rows, tracks, header_rows);
+                // A second table whose cells are on the same pages, and nodes that are no cells.
+                let other = grid(5_000, 4, tracks, 1);
+                for cut in [false, true] {
+                    let mut geometry = PaginationGeometryTable::new();
+                    let mut drawables = Drawables::new();
+                    for (table, e) in [(1usize, &edges), (2usize, &other)] {
+                        for (i, c) in e.cells.iter().enumerate() {
+                            // The header on page 0; body rows two to a page; with `cut`, every third body row also
+                            // continues on the next page.
+                            let first = if c.row < e.header_rows {
+                                0
+                            } else {
+                                (c.row - e.header_rows) / 2 + 1
+                            };
+                            let mut fragments = vec![fragment(first)];
+                            if cut && c.row % 3 == 0 && c.row >= e.header_rows {
+                                fragments.push(fragment(first + 1));
+                            }
+                            geometry.insert(
+                                c.node,
+                                PaginationGeometry {
+                                    fragments,
+                                    ..Default::default()
+                                },
+                            );
+                            drawables
+                                .collapsed_cell_of
+                                .insert(c.node, (table, i as u32));
+                        }
+                    }
+                    geometry.insert(
+                        7,
+                        PaginationGeometry {
+                            fragments: (0..8).map(fragment).collect(),
+                            ..Default::default()
+                        },
+                    );
+                    for page in 0..9 {
+                        let nodes = page_nodes(&geometry, page);
+                        assert_eq!(
+                            first_body_row(&edges, 1, &nodes, &drawables),
+                            first_body_row_by_scan(&edges, &geometry, page),
+                            "tracks {tracks} header rows {header_rows} cut {cut} page {page}"
+                        );
+                        assert_eq!(
+                            first_body_row(&other, 2, &nodes, &drawables),
+                            first_body_row_by_scan(&other, &geometry, page),
+                            "other table: tracks {tracks} cut {cut} page {page}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn first_body_row_ignores_the_header_cells_and_other_tables() {
+        let edges = grid(100, 3, 2, 1);
+        let mut drawables = Drawables::new();
+        for (i, c) in edges.cells.iter().enumerate() {
+            drawables.collapsed_cell_of.insert(c.node, (1, i as u32));
+        }
+        drawables.collapsed_cell_of.insert(900, (2, 2));
+        // Only header cells (indices 0 and 1) and a cell of another table are on the page.
+        assert_eq!(
+            first_body_row(&edges, 1, &[100, 101, 900], &drawables),
+            None
+        );
+        assert_eq!(first_body_row(&edges, 1, &[], &drawables), None);
+        // The lowest index wins whatever the order of the list: cell 4 is in row 2, cell 3 in row 1.
+        assert_eq!(first_body_row(&edges, 1, &[104, 103], &drawables), Some(1));
+    }
+
+    fn span(started: bool, continues: bool) -> RowSpan {
+        RowSpan {
+            top: 0.0,
+            bottom: 10.0,
+            started,
+            continues,
+        }
+    }
+
+    /// Every set of rows of a table of 6 rows, with every combination of `started` / `continues` (by row), in every
+    /// mode: the lines of [`page_lines`] give the same `hlines` as the loop over all lines.
+    #[test]
+    fn page_lines_give_the_hlines_of_the_loop_over_every_line() {
+        let total = 6u32;
+        for tracks in 1..=3u32 {
+            for header_rows in 0..=2u32 {
+                let edges = grid(100, total, tracks, header_rows);
+                for mask in 0u32..(1 << total) {
+                    for flags in 0u32..4 {
+                        let rows: BTreeMap<u32, RowSpan> = (0..total)
+                            .filter(|r| mask >> r & 1 == 1)
+                            .map(|r| {
+                                // The flags differ by row, so no two neighbours are alike by accident.
+                                let started = (flags & 1 == 0) ^ (r % 2 == 1);
+                                let continues = (flags & 2 == 0) ^ (r % 3 == 1);
+                                (r, span(started, continues))
+                            })
+                            .collect();
+                        let first_row = rows.keys().next().copied();
+                        for mode in [
+                            Mode::Page { skip_line: None },
+                            Mode::Page {
+                                skip_line: first_row,
+                            },
+                            Mode::Copy { first_row: None },
+                            Mode::Copy { first_row },
+                        ] {
+                            let line_rows = line_rows(&edges, mode);
+                            let all: Vec<u32> = (0..=line_rows).collect();
+                            let lines = page_lines(&rows, line_rows, mode);
+                            assert!(lines.windows(2).all(|w| w[0] < w[1]), "ascending, once");
+                            assert!(lines.iter().all(|&l| l <= line_rows));
+                            assert_eq!(
+                                build_hlines(&edges, &rows, mode, lines.iter().copied()),
+                                build_hlines(&edges, &rows, mode, all.iter().copied()),
+                                "tracks {tracks} header rows {header_rows} rows {mask:b} flags {flags} {mode:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn page_lines_visit_only_the_lines_next_to_the_rows() {
+        let rows: BTreeMap<u32, RowSpan> = [
+            (40, span(true, false)),
+            (41, span(true, false)),
+            (90, span(true, false)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            page_lines(&rows, 4800, Mode::Page { skip_line: None }),
+            vec![40, 41, 42, 90, 91]
+        );
+        // A row past the last line (a header copy's rows are below `line_rows`) has no line.
+        assert_eq!(
+            page_lines(&rows, 41, Mode::Copy { first_row: None }),
+            vec![40, 41]
+        );
+        // The line under a copy is always there.
+        assert_eq!(
+            page_lines(&BTreeMap::new(), 2, Mode::Copy { first_row: None }),
+            vec![2]
+        );
+        assert!(page_lines(&BTreeMap::new(), 2, Mode::Page { skip_line: None }).is_empty());
     }
 }

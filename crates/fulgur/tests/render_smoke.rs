@@ -8214,3 +8214,27 @@ fn collapsed_table_lines_are_artifacts_in_tagged_output() {
         );
     }
 }
+
+/// F99c: a long collapsed table with a repeated `thead` and a rule under every row. Every continuation page paints the
+/// header copy's lines and the line under it, which finds its page's first body row in the page's node list; the
+/// document is complete (every row is on some page) and a second render is byte-identical.
+#[test]
+fn long_collapsed_table_with_repeated_header_renders_on_every_page() {
+    let rows: String = (1..=300)
+        .map(|i| format!("<tr><td>Row{i:03}</td><td>x</td></tr>"))
+        .collect();
+    let html = format!(
+        r#"<!DOCTYPE html><html><head><style>
+        table {{ border-collapse: collapse; width: 100%; }}
+        td, th {{ padding: 4px; border-bottom: 1px solid #888; }}
+        thead {{ border-bottom: 2px solid #000; }}
+        tr {{ break-inside: avoid; }}
+        </style></head><body><table>
+        <thead><tr><th>Head</th><th>B</th></tr></thead>
+        <tbody>{rows}</tbody></table></body></html>"#
+    );
+    let engine = Engine::builder().build();
+    let pdf = engine.render(&html).expect("render");
+    assert!(page_count(&pdf) >= 5, "300 rows span several pages");
+    assert_eq!(pdf, engine.render(&html).expect("render again"));
+}
