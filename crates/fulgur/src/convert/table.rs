@@ -75,6 +75,13 @@ fn convert_table(
             continue;
         }
         last_wrapper = None;
+        // A cell that is a direct child of the table (a `display: table` box with bare `display: table-cell` children,
+        // CSS 2.1 §17.2.1: they sit in an anonymous row) is converted itself; its layout children are what it holds,
+        // not cells to look for.
+        if crate::blitz_adapter::table_part(child_node) == crate::blitz_adapter::TablePart::Cell {
+            convert_node(doc, child_id, ctx, depth + 1, out);
+            continue;
+        }
         let is_thead = is_table_section(child_node, "thead");
         let header_mark = (Some(child_id) == header_group).then(|| out.draw_mark());
         collect_table_cells(doc, child_id, is_thead, ctx, depth, out);
@@ -773,6 +780,25 @@ mod tests {
                 [BorderStyleValue::None; 4]
             );
         }
+    }
+
+    #[test]
+    fn bare_cells_of_a_div_table_are_converted() {
+        // A `display: table` box converts like a `<table>`; a `display: table-cell` that is its direct child (it sits
+        // in an anonymous row) is a cell, not a row to look for cells in.
+        let (doc, drawables) = convert(
+            r#"<!doctype html><html><body><div style="display:table">
+              <div style="display:table-cell;background:#eee">K1</div>
+              <div style="display:table-cell;background:#eee">K2</div></div></body></html>"#,
+        );
+        let table_id = find_tag(doc.deref(), doc.root_element().id, "div").unwrap();
+        assert!(drawables.tables.contains_key(&table_id));
+        let cells: Vec<usize> = doc.deref().get_node(table_id).unwrap().children.clone();
+        let painted = cells
+            .iter()
+            .filter(|id| drawables.block_styles.contains_key(id))
+            .count();
+        assert_eq!(painted, 2, "both bare cells have their block");
     }
 
     #[test]
