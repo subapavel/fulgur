@@ -2063,6 +2063,69 @@ fn render_v2_smoke_margin_box_renderer() {
     assert!(!pdf.is_empty());
 }
 
+#[test]
+fn render_v2_smoke_margin_box_with_fractional_height_is_painted() {
+    // F103: stage 3 lays the content out in a table that is exactly as high as the margin band. A band whose
+    // height is not a whole number of CSS px (25.4 mm = 96 px, 7.5 pt = 10 px, 13.37 pt = 17.83 px) must not make
+    // the table spill out of the margin document's first page, or the box would not be painted.
+    use fulgur::inspect::inspect;
+
+    let items = |html: &str| {
+        let pdf = Engine::builder().build().render(html).expect("render");
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("band.pdf");
+        std::fs::write(&path, &pdf).expect("write pdf");
+        inspect(&path).expect("inspect pdf").text_items.len()
+    };
+    for margin in ["25.4mm", "7.5pt", "13.37pt", "10.3mm"] {
+        let page = |boxes: &str| {
+            format!(
+                "<!DOCTYPE html><html><head><style>@page {{ margin: {margin}; {boxes} }} body {{ margin: 0 }} \
+                 </style></head><body><p style=\"margin:0;font-size:5pt\">Body</p></body></html>"
+            )
+        };
+        let boxes = "@top-center { content: \"BANDTEXT\"; font-size: 5pt; line-height: 1 } \
+                     @bottom-right { content: \"BANDTEXT\"; font-size: 5pt; line-height: 1 }";
+        let without = items(&page(""));
+        let with = items(&page(boxes));
+        assert!(
+            with >= without + 2,
+            "margin {margin}: {with} text items with two margin boxes, {without} without"
+        );
+    }
+}
+
+#[test]
+fn render_v2_smoke_margin_box_with_author_margin_is_painted() {
+    // F103: the margin box's content is in a table cell. Blitz places a cell with a `margin-top` below its row, and
+    // the fragmenter then moved it off the margin document's first page: the box vanished
+    // (`examples/header-footer-split`). The cell's margin is forced to 0.
+    use fulgur::inspect::inspect;
+
+    let items = |html: &str| {
+        let pdf = Engine::builder().build().render(html).expect("render");
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("margin.pdf");
+        std::fs::write(&path, &pdf).expect("write pdf");
+        inspect(&path).expect("inspect pdf").text_items.len()
+    };
+    let page = |decl: &str| {
+        format!(
+            "<!DOCTYPE html><html><head><style>@page {{ @top-right {{ content: \"Page \" counter(page); \
+             font-size: 8px; {decl} }} }} body {{ margin: 0 }}</style></head><body><p>Body</p></body></html>"
+        )
+    };
+    let plain = items(&page(""));
+    assert!(plain >= 2, "the control paints its box: {plain} items");
+    for decl in [
+        "margin-top: 12px",
+        "margin: 5px 3px 4px 2px",
+        "margin-bottom: 9px",
+    ] {
+        assert_eq!(items(&page(decl)), plain, "`{decl}` must not hide the box");
+    }
+}
+
 // ── PR #290 codecov patch coverage uplift ─────────────────────────────────
 
 #[test]

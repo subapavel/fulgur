@@ -4702,6 +4702,80 @@ fn margin_wrapper_style(env: &crate::blitz_adapter::MarginDocEnv, margin_css: &s
     }
 }
 
+/// One margin box of a page after its `content` was resolved.
+struct ResolvedBox<'r> {
+    /// The HTML the measure passes (stages 1a, 1b) and the distribution (stage 2) use: the content, in a `<div>`
+    /// with the author's declarations when the box has any.
+    measure_html: String,
+    /// The resolved content alone.
+    content_html: String,
+    /// The author's declaration block of the box, as written.
+    declarations: &'r str,
+}
+
+impl<'r> ResolvedBox<'r> {
+    /// `measure_html` is what stages 1a, 1b and 2 measured before the box was aligned in its rectangle (F103): the
+    /// content in a `<div>` with the author's declarations, or the bare content when there are none. It is kept
+    /// as it was, so every measured size, every rectangle and every measure-cache entry is the one it always was.
+    fn new(content_html: String, declarations: &'r str) -> Self {
+        let measure_html = if declarations.is_empty() {
+            content_html.clone()
+        } else {
+            format!(
+                "<div style=\"{}\">{}</div>",
+                escape_attr(declarations),
+                content_html
+            )
+        };
+        Self {
+            measure_html,
+            content_html,
+            declarations,
+        }
+    }
+}
+
+/// The HTML stage 3 lays out at the confirmed rectangle: the content in the one cell of a table that is exactly
+/// as large as the rectangle, so that the cell aligns it (css-page-3: `vertical-align` in a margin box acts as in
+/// a table cell, CSS 2.1 section 17.5.3; `text-align` per line, section 16.2). The position's UA defaults
+/// (`MarginBoxPosition::default_text_align` / `default_vertical_align`) come first in the cell's style and the
+/// author's declarations after them, so the author wins.
+///
+/// - The three boxes are `div`s with `display: table*`, not `<table>`: the element brings the UA
+///   `border-spacing: 2px` and Tailwind preflight's `border-collapse: collapse`, and both would move the content.
+/// - `table-layout: fixed` keeps the cell exactly as wide as the rectangle; an unbreakable word overflows it, as
+///   it overflowed the block before.
+/// - The cell carries the width itself (`box-sizing: border-box`, so an author padding stays inside it). Without
+///   it Blitz sizes the cell from its content: a `flex: 1; min-width: 0` item that holds 400 characters (the
+///   `leader()` fill, fixture `gcpm/leader-toc`) then stretches the cell past the rectangle and the page number
+///   behind it is pushed out of the box.
+/// - Margins do not apply to a table cell (CSS 2.1 section 17.5), so the cell's margin is forced to 0 after the
+///   author's declarations. Left alone, Blitz lays a cell with a `margin-top` out below the row's box and the
+///   fragmenter moves it off the margin document's first page: the whole box stopped being painted
+///   (`examples/header-footer-split`, `@top-right { margin-top: 12px }`). A margin on a margin box used to move
+///   its content (a workaround for the missing alignment, F103); it no longer does, `padding` still does.
+/// - The explicit row keeps the cell off the anonymous-box path.
+/// - The table height is a minimum: content taller than the rectangle grows the row and starts at the top.
+fn margin_box_cell_html(
+    pos: MarginBoxPosition,
+    resolved: &ResolvedBox<'_>,
+    rect: MarginBoxRect,
+) -> String {
+    format!(
+        "<div style=\"display:table;table-layout:fixed;width:{}px;height:{}px\">\
+         <div style=\"display:table-row\">\
+         <div style=\"display:table-cell;box-sizing:border-box;width:{}px;text-align:{};vertical-align:{};{};margin:0 !important\">{}</div>\
+         </div></div>",
+        rect.width.in_px().to_f32(),
+        rect.height.in_px().to_f32(),
+        rect.width.in_px().to_f32(),
+        pos.default_text_align(),
+        pos.default_vertical_align(),
+        escape_attr(resolved.declarations),
+        resolved.content_html
+    )
+}
+
 impl<'a> MarginBoxRenderer<'a> {
     /// Build a renderer from raw inputs. `string_set_by_node` /
     /// `counter_ops_by_node` are the per-node maps drained out of
@@ -4849,7 +4923,7 @@ impl<'a> MarginBoxRenderer<'a> {
             .implicit_href_by_page
             .get(&page_idx)
             .map(String::as_str);
-        let mut resolved_htmls: BTreeMap<MarginBoxPosition, String> = BTreeMap::new();
+        let mut resolved_htmls: BTreeMap<MarginBoxPosition, ResolvedBox<'_>> = BTreeMap::new();
         for (&pos, rule) in &effective_boxes {
             let content_html = resolve_content_to_html_with_anchor(
                 &rule.content,
@@ -4864,24 +4938,16 @@ impl<'a> MarginBoxRenderer<'a> {
                 implicit_href,
             );
             if !content_html.is_empty() {
-                let html = if rule.declarations.is_empty() {
-                    content_html
-                } else {
-                    format!(
-                        "<div style=\"{}\">{}</div>",
-                        escape_attr(&rule.declarations),
-                        content_html
-                    )
-                };
-                resolved_htmls.insert(pos, html);
+                resolved_htmls.insert(pos, ResolvedBox::new(content_html, &rule.declarations));
             }
         }
 
         // Stage 1a: measure max-content width for top / bottom boxes.
-        for (&pos, html) in &resolved_htmls {
+        for (&pos, resolved) in &resolved_htmls {
             if !pos.edge().is_some_and(|e| e.is_horizontal()) {
                 continue;
             }
+            let html = &resolved.measure_html;
             // Cache key includes `content_width` because `@page :first` /
             // `:left` / `:right` can override margins per page, changing
             // the available viewport width that Blitz lays the
@@ -4920,12 +4986,13 @@ impl<'a> MarginBoxRenderer<'a> {
         }
 
         // Stage 1b: measure max-content height for left / right boxes.
-        for (&pos, html) in &resolved_htmls {
+        for (&pos, resolved) in &resolved_htmls {
             let fixed_width = match pos.edge() {
                 Some(Edge::Left) => resolved_margin.left,
                 Some(Edge::Right) => resolved_margin.right,
                 _ => continue,
             };
+            let html = &resolved.measure_html;
             // Include `page_size.height` in the key so a `@page :first`
             // (or other matched-page selector) that overrides the page
             // SIZE — not just margins — gets a fresh measurement on
@@ -4964,11 +5031,12 @@ impl<'a> MarginBoxRenderer<'a> {
         // Stage 2: distribute each edge's boxes against the page rect.
         let mut edge_defined: BTreeMap<Edge, BTreeMap<MarginBoxPosition, crate::units::Pt>> =
             BTreeMap::new();
-        for (&pos, html) in &resolved_htmls {
+        for (&pos, resolved) in &resolved_htmls {
             let edge = match pos.edge() {
                 Some(e) => e,
                 None => continue,
             };
+            let html = &resolved.measure_html;
             let size = if edge.is_horizontal() {
                 self.measure_cache
                     .get(&(
@@ -5006,11 +5074,14 @@ impl<'a> MarginBoxRenderer<'a> {
         }
 
         // Stage 3: render at the confirmed rect.
-        for (&pos, html) in &resolved_htmls {
+        for (&pos, resolved) in &resolved_htmls {
             let rect = all_rects
                 .get(&pos)
                 .copied()
                 .unwrap_or_else(|| pos.bounding_rect(page_size, resolved_margin));
+            // The content is aligned in the rectangle (F103); the position's defaults are part of the HTML, so
+            // the cache key tells `@top-left` from `@top-right` with the same text and size.
+            let html = margin_box_cell_html(pos, resolved, rect);
 
             let cache_key = (
                 html.clone(),
@@ -7482,6 +7553,94 @@ mod tests {
             1,
             &implicit,
         );
+    }
+
+    // --- F103: margin-box content aligned in its rectangle ---
+
+    fn rect(w_pt: f32, h_pt: f32) -> MarginBoxRect {
+        MarginBoxRect {
+            x: 0.0.as_pt(),
+            y: 0.0.as_pt(),
+            width: w_pt.as_pt(),
+            height: h_pt.as_pt(),
+        }
+    }
+
+    #[test]
+    fn resolved_box_measure_html_is_what_it_always_was() {
+        // The measure passes and the edge distribution see the content exactly as before the alignment wrapper,
+        // so the measured sizes, the rectangles and the measure-cache keys do not change.
+        let bare = ResolvedBox::new("x".to_string(), "");
+        assert_eq!(bare.measure_html, "x");
+        assert_eq!(bare.content_html, "x");
+        let styled = ResolvedBox::new("x".to_string(), "font-size: 9pt; content: \"a\"");
+        assert_eq!(
+            styled.measure_html,
+            "<div style=\"font-size: 9pt; content: &quot;a&quot;\">x</div>"
+        );
+        assert_eq!(styled.content_html, "x");
+    }
+
+    #[test]
+    fn cell_html_puts_the_defaults_first_and_the_authors_declarations_after() {
+        let b = ResolvedBox::new("Hello".to_string(), "text-align: left; vertical-align: top");
+        let html = margin_box_cell_html(MarginBoxPosition::BottomCenter, &b, rect(300.0, 30.0));
+        let defaults = html
+            .find("text-align:center;vertical-align:middle;")
+            .expect("the UA defaults of @bottom-center");
+        let author = html
+            .find("text-align: left; vertical-align: top")
+            .expect("the author's declarations");
+        assert!(
+            defaults < author,
+            "the author's declarations come last: {html}"
+        );
+        assert!(html.contains(">Hello</div>"), "{html}");
+        // 300 pt = 400 px, 30 pt = 40 px: the table is exactly the rectangle.
+        assert!(html.contains("width:400px;height:40px"), "{html}");
+        assert!(html.contains("table-layout:fixed"), "{html}");
+        assert!(
+            html.contains("box-sizing:border-box;width:400px;"),
+            "the cell is as wide as the rectangle: {html}"
+        );
+    }
+
+    #[test]
+    fn cell_html_escapes_the_declarations() {
+        let b = ResolvedBox::new(
+            "x".to_string(),
+            "font-family: \"A\"; background: url(\"a&b\") /* <b> */",
+        );
+        let html = margin_box_cell_html(MarginBoxPosition::TopLeft, &b, rect(100.0, 30.0));
+        assert!(
+            html.contains(
+                "font-family: &quot;A&quot;; background: url(&quot;a&amp;b&quot;) /* &lt;b&gt; */"
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("<b>"), "{html}");
+        // The forced zero margin comes after the author's declarations (Blitz cannot place a cell with a margin).
+        assert!(
+            html.find("a&amp;b").unwrap() < html.find("margin:0 !important").unwrap(),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn top_left_and_top_right_same_text_differ() {
+        // The render cache is keyed by the HTML and the size: two boxes with the same text and the same
+        // rectangle size must not share one entry, or one of them would be painted with the other's alignment.
+        let b = ResolvedBox::new("Same".to_string(), "");
+        let r = rect(150.0, 40.0);
+        let left = margin_box_cell_html(MarginBoxPosition::TopLeft, &b, r);
+        let right = margin_box_cell_html(MarginBoxPosition::TopRight, &b, r);
+        assert_ne!(left, right);
+        assert!(left.contains("text-align:left;"), "{left}");
+        assert!(right.contains("text-align:right;"), "{right}");
+        // Boxes with the same alignment share the entry, as before.
+        let center_a = margin_box_cell_html(MarginBoxPosition::TopCenter, &b, r);
+        let center_b = margin_box_cell_html(MarginBoxPosition::BottomCenter, &b, r);
+        assert_eq!(center_a, center_b);
     }
 
     // --- F99b: margin-box documents built from the render's shared environment ---

@@ -88,6 +88,39 @@ impl MarginBoxPosition {
         }
     }
 
+    /// The UA default `text-align` of this box (css-page-3, the margin-box table: "page-margin box" defaults).
+    /// The left corners and the `-right` boxes align right, the right corners and the `-left` boxes left, the
+    /// `-center` and the side boxes centre. An author declaration in the box beats it.
+    pub fn default_text_align(self) -> &'static str {
+        match self {
+            Self::TopLeftCorner | Self::BottomLeftCorner | Self::TopRight | Self::BottomRight => {
+                "right"
+            }
+            Self::TopLeft | Self::BottomLeft | Self::TopRightCorner | Self::BottomRightCorner => {
+                "left"
+            }
+            Self::TopCenter
+            | Self::BottomCenter
+            | Self::LeftTop
+            | Self::LeftMiddle
+            | Self::LeftBottom
+            | Self::RightTop
+            | Self::RightMiddle
+            | Self::RightBottom => "center",
+        }
+    }
+
+    /// The UA default `vertical-align` of this box (same table): `top` for `@left-top` / `@right-top`, `bottom`
+    /// for `@left-bottom` / `@right-bottom`, `middle` for every other box. In a margin box it acts as in a table
+    /// cell (CSS 2.1 section 17.5.3).
+    pub fn default_vertical_align(self) -> &'static str {
+        match self {
+            Self::LeftTop | Self::RightTop => "top",
+            Self::LeftBottom | Self::RightBottom => "bottom",
+            _ => "middle",
+        }
+    }
+
     /// Compute the bounding rectangle for this margin box position.
     ///
     /// Coordinates are in page-space points with origin at top-left of page.
@@ -1056,5 +1089,37 @@ mod tests {
         // First-only: gets full available width; starts at margin.left
         assert!(approx(rect.width, content_width));
         assert!(approx(rect.x, m.left));
+    }
+
+    #[test]
+    fn default_alignment_of_the_sixteen_boxes() {
+        use MarginBoxPosition::*;
+        // css-page-3 margin-box table: (position, text-align, vertical-align).
+        let table = [
+            (TopLeftCorner, "right", "middle"),
+            (TopLeft, "left", "middle"),
+            (TopCenter, "center", "middle"),
+            (TopRight, "right", "middle"),
+            (TopRightCorner, "left", "middle"),
+            (LeftTop, "center", "top"),
+            (LeftMiddle, "center", "middle"),
+            (LeftBottom, "center", "bottom"),
+            (RightTop, "center", "top"),
+            (RightMiddle, "center", "middle"),
+            (RightBottom, "center", "bottom"),
+            (BottomLeftCorner, "right", "middle"),
+            (BottomLeft, "left", "middle"),
+            (BottomCenter, "center", "middle"),
+            (BottomRight, "right", "middle"),
+            (BottomRightCorner, "left", "middle"),
+        ];
+        for (pos, text_align, vertical_align) in table {
+            assert_eq!(pos.default_text_align(), text_align, "{pos:?} text-align");
+            assert_eq!(
+                pos.default_vertical_align(),
+                vertical_align,
+                "{pos:?} vertical-align"
+            );
+        }
     }
 }
