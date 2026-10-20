@@ -12102,12 +12102,15 @@ h2 { string-set: chapter-title content(text); }
     }
 
     #[test]
-    fn tables_under_display_contents_are_not_counted_as_a_column() {
-        // Blitz lays the tables of a `display: contents` wrapper out side by
-        // side (it treats them as inline-level). They share a top, so the
-        // cursor must not advance for each of them: 60 tables of 21px in rows
-        // of seven are ~190px, not 1260px, and nothing may be pushed past the
-        // end of the document's pages.
+    fn tables_under_display_contents_are_stacked_like_tables_outside_it() {
+        // Blitz places the children of a `display: contents` wrapper as if they
+        // were children of the wrapper's parent (css-display-3 §2.5), so the
+        // tables are block-level boxes stacked one below the other. Before that
+        // fix a wrapper that was the only child of `body` made `body` an inline
+        // root and the tables sat side by side (seven to a row), and the cursor
+        // had to be told not to advance for each of them. 60 tables of 21px on
+        // pages of 400px: 19 fit a page, so 4 pages, every table placed once,
+        // and the same pages as the document without the wrapper.
         let tables: String = (0..60)
             .map(|i| {
                 format!(
@@ -12115,13 +12118,19 @@ h2 { string-set: chapter-title content(text); }
                 )
             })
             .collect();
-        let html = format!(
+        let wrapped = format!(
             r#"<html><body style="margin:0"><div style="display:contents">{tables}</div></body></html>"#
         );
-        let (doc, geom) = table_geometry(&html, 400.0);
+        let (doc, geom) = table_geometry(&wrapped, 400.0);
         let cells = assert_placed_once_inside_pages(&doc, &geom, &ids("c", 60), 400.0);
-        assert!(cells.iter().all(|&p| p == 0), "{cells:?}");
-        assert_eq!(implied_page_count(&geom), 1);
+        assert_eq!(implied_page_count(&geom), 4);
+        assert_eq!(cells.iter().filter(|&&p| p == 0).count(), 19, "{cells:?}");
+
+        let plain = format!(r#"<html><body style="margin:0">{tables}</body></html>"#);
+        let (plain_doc, plain_geom) = table_geometry(&plain, 400.0);
+        let plain_cells =
+            assert_placed_once_inside_pages(&plain_doc, &plain_geom, &ids("c", 60), 400.0);
+        assert_eq!(cells, plain_cells);
     }
 
     /// `n` lines of 20px: `(0, 20), (20, 40), ...`.
