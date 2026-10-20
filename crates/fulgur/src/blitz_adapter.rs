@@ -1655,6 +1655,14 @@ pub(crate) fn is_display_contents(node: &blitz_dom::Node) -> bool {
             .is_some_and(|s| s.clone_display().inside() == DisplayInside::Contents)
 }
 
+/// Whether a direct box child of the multicol container `node_id` has `column-span: all`: the children are looked up
+/// through `display: contents` elements ([`box_tree_children`]), which generate no box.
+pub(crate) fn multicol_has_span_all_child(doc: &BaseDocument, node_id: usize) -> bool {
+    box_tree_children(doc, node_id)
+        .into_iter()
+        .any(|id| doc.get_node(id).is_some_and(has_column_span_all))
+}
+
 /// The DOM children of `node_id` with every `display: contents` element replaced by its own children, recursively
 /// (the order Blitz gives the layout children). Without a contents child this is the plain `children` list. A walk
 /// that needs boxes must use this instead of `node.children`; `depth` bounds the nesting like the other DOM walks.
@@ -6766,6 +6774,41 @@ mod tests {
                 assert!((p - 0.5).abs() < 1e-4, "expected 0.5, got {p}");
             }
             other => panic!("expected VerticalAlign::Percent(0.5), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multicol_span_all_child_is_found_through_display_contents() {
+        // html-to-pdf F150 review: a wrapper hid the spanner from the DOM-children check, and the container was
+        // treated as atomic by the fragmenter (a multi-page flow was cut short).
+        for (inner, expected) in [
+            (r#"<h2 style="column-span: all;">t</h2><p>a</p>"#, true),
+            (
+                r#"<div style="display: contents"><h2 style="column-span: all;">t</h2></div><p>a</p>"#,
+                true,
+            ),
+            (
+                r#"<div style="display: contents"><div style="display: contents"><h2 style="column-span: all;">t</h2></div></div>"#,
+                true,
+            ),
+            (
+                r#"<div style="display: contents"><p>a</p></div><p>b</p>"#,
+                false,
+            ),
+        ] {
+            let html = format!(
+                r#"<html><body><div id="mc" style="columns: 2;">{inner}</div></body></html>"#
+            );
+            let doc = parse_and_layout(&html, 400.0_f32.as_px(), 2000.0_f32.as_px(), &[], true);
+            let mc = doc
+                .root_element()
+                .children
+                .iter()
+                .copied()
+                .find_map(|b| doc.get_node(b)?.children.first().copied())
+                .expect("multicol");
+            assert!(is_multicol_container(doc.get_node(mc).unwrap()), "{inner}");
+            assert_eq!(multicol_has_span_all_child(&doc, mc), expected, "{inner}");
         }
     }
 

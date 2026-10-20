@@ -385,10 +385,7 @@ fn multicol_container<'a>(
     if !crate::blitz_adapter::is_multicol_container(node) {
         return None;
     }
-    if node.children.iter().any(|&id| {
-        doc.get_node(id)
-            .is_some_and(crate::blitz_adapter::has_column_span_all)
-    }) {
+    if crate::blitz_adapter::multicol_has_span_all_child(doc, node_id) {
         return None;
     }
     let [group] = multicol?.get(&node_id)?.groups.as_slice() else {
@@ -1920,13 +1917,7 @@ impl<'a> PaginationLayoutTree<'a> {
             // atomic.
             let is_multicol = child_node.is_some_and(crate::blitz_adapter::is_multicol_container);
             let multicol_has_span_all = is_multicol
-                && child_node.is_some_and(|n| {
-                    n.children.iter().any(|&id| {
-                        self.doc
-                            .get_node(id)
-                            .is_some_and(crate::blitz_adapter::has_column_span_all)
-                    })
-                });
+                && crate::blitz_adapter::multicol_has_span_all_child(self.doc, child_id);
             let strips = self.strips;
             let page_height_px = strips.fresh();
             // F83b: in-flow content precedes this child on the page: the
