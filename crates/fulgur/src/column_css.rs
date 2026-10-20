@@ -181,6 +181,24 @@ impl ColumnStyleProps {
 /// determinism is a project-wide invariant (see `CLAUDE.md`).
 pub(crate) type ColumnStyleTable = BTreeMap<usize, ColumnStyleProps>;
 
+/// F144: true if some node of `table` declares a forced page break (`break-before: page` or `break-after: page`).
+/// When none does, no walk for "a forced break below" can find one.
+pub(crate) fn has_forced_page_break(table: &ColumnStyleTable) -> bool {
+    table.values().any(|p| {
+        matches!(p.break_before, Some(BreakBefore::Page))
+            || matches!(p.break_after, Some(BreakAfter::Page))
+    })
+}
+
+/// F144: true if some node of `table` names a page (`page: <custom-ident>`). With none, every used page-name is the
+/// unnamed page, so there is nothing to compute or compare.
+#[allow(dead_code)] // wired in the next commit
+pub(crate) fn has_named_page(table: &ColumnStyleTable) -> bool {
+    table
+        .values()
+        .any(|p| matches!(p.page, Some(PageName::Named(_))))
+}
+
 /// A single parsed stylesheet rule: one or more selectors and the properties
 /// that apply when any of them matches.
 #[derive(Clone, Debug)]

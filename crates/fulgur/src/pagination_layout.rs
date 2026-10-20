@@ -74,6 +74,8 @@
 
 mod abspos_flow;
 pub use abspos_flow::fragment_abspos_flows;
+#[allow(dead_code)] // wired into the fragmenter in the next commit
+mod subtree_facts;
 
 use crate::units::F32Units;
 use blitz_dom::BaseDocument;
@@ -2793,6 +2795,62 @@ fn has_forced_break_below(
     false
 }
 
+/// fulgur-uebl: true if [`has_page_name_change_below`] does not look inside `node` at all. An atomic inline container
+/// (`inline-block`, `inline-flex`, ...) is fully opaque: its internal block flow does not paginate independently from
+/// the parent line box. A node in an orthogonal flow to its own parent is atomic from the outer flow's perspective
+/// (CSS Writing Modes 4 §9), so a call made directly with it as the target treats its subtree as opaque too: the
+/// recursion gate must not enter it, which would interact with Taffy's orthogonal-flow sizing and produce layout
+/// drift not present in the whole-emit baseline.
+///
+/// Shared with [`subtree_facts`], so that the table and the walk cannot drift apart on these predicates.
+fn page_name_walk_is_opaque(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
+    if crate::blitz_adapter::is_atomic_inline_container_node(node) {
+        return true;
+    }
+    if let Some(gp_id) = node.parent
+        && let Some(gp) = doc.get_node(gp_id)
+        && crate::blitz_adapter::is_orthogonal_to_parent(gp, node)
+    {
+        return true;
+    }
+    false
+}
+
+/// fulgur-uebl: the child of `node` that [`has_page_name_change_below`] compares and recurses into, or `None` for one it
+/// skips: a missing node, whitespace-only text, a non-element, a child orthogonal to `node` (fully atomic from this
+/// node's perspective, CSS Writing Modes 4 §9), an absolutely positioned or fixed child, and a float (CSS 2.1 §9.5) —
+/// the same filters as the fragmenter loop, so the predicate matches exactly what `fragment_block_subtree` would
+/// compare. Shared with [`subtree_facts`].
+fn page_name_walk_child<'a>(
+    doc: &'a BaseDocument,
+    node: &blitz_dom::Node,
+    child_id: usize,
+) -> Option<&'a blitz_dom::Node> {
+    let child = doc.get_node(child_id)?;
+    if let Some(text) = child.text_data()
+        && text.content.chars().all(char::is_whitespace)
+    {
+        return None;
+    }
+    child.element_data()?;
+    if crate::blitz_adapter::is_orthogonal_to_parent(node, child) {
+        return None;
+    }
+    {
+        use ::style::properties::longhands::position::computed_value::T as Pos;
+        let is_out_of_flow = child
+            .primary_styles()
+            .is_some_and(|s| matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed));
+        if is_out_of_flow {
+            return None;
+        }
+    }
+    if crate::blitz_adapter::node_is_floating(child) {
+        return None;
+    }
+    Some(child)
+}
+
 /// fulgur-uebl: true if any sibling pair inside `node_id`'s subtree
 /// has different used page-names. Used as a recursion gate so that
 /// `fragment_block_subtree` is entered for subtrees that fit the page
@@ -2815,24 +2873,7 @@ fn has_page_name_change_below(
     let Some(node) = doc.get_node(node_id) else {
         return false;
     };
-    // Atomic inline containers (`inline-block`, `inline-flex`, etc.)
-    // are fully opaque: their internal block flow does not paginate
-    // independently from the parent line box. Skip the entire subtree
-    // so the recursion gate doesn't fire on them.
-    if crate::blitz_adapter::is_atomic_inline_container_node(node) {
-        return false;
-    }
-    // Orthogonal-flow nodes (writing-mode different from their own
-    // parent) are also atomic from the outer flow's perspective (CSS
-    // Writing Modes 4 §9). Even when called directly with the
-    // orthogonal node as the target, treat its subtree as opaque so
-    // the recursion gate doesn't trigger a `fragment_block_subtree`
-    // entry that would interact with Taffy's orthogonal-flow sizing
-    // and produce layout drift not present in the whole-emit baseline.
-    if let Some(gp_id) = node.parent
-        && let Some(gp) = doc.get_node(gp_id)
-        && crate::blitz_adapter::is_orthogonal_to_parent(gp, node)
-    {
+    if page_name_walk_is_opaque(doc, node) {
         return false;
     }
     // Flex / grid containers suppress sibling comparison among their
@@ -2843,41 +2884,7 @@ fn has_page_name_change_below(
     let suppress_direct_compare = crate::blitz_adapter::is_flex_or_grid_container_node(node);
     let mut prev_used: Option<Option<String>> = None;
     for &child_id in &node.children {
-        let Some(child) = doc.get_node(child_id) else {
-            continue;
-        };
-        // Skip whitespace-only text and out-of-flow children — same
-        // filters as the fragmenter loop, so the predicate matches
-        // exactly what `fragment_block_subtree` would compare.
-        if let Some(text) = child.text_data()
-            && text.content.chars().all(char::is_whitespace)
-        {
-            continue;
-        }
-        if child.element_data().is_none() {
-            continue;
-        }
-        // Orthogonal-to-this-node child: fully atomic from this node's
-        // perspective (CSS Writing Modes 4 §9). Skip the entire
-        // subtree — no comparison, no recursion.
-        if crate::blitz_adapter::is_orthogonal_to_parent(node, child) {
-            continue;
-        }
-        {
-            use ::style::properties::longhands::position::computed_value::T as Pos;
-            let is_out_of_flow = child.primary_styles().is_some_and(|s| {
-                matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed)
-            });
-            if is_out_of_flow {
-                continue;
-            }
-        }
-        // Floats are out of normal flow (CSS 2.1 §9.5) — match
-        // `fragment_pagination_root` / `fragment_block_subtree` which
-        // skip them from `prev_used_page` comparisons. Without this,
-        // a float-only page-name change would force recursion through
-        // a subtree the real comparison would treat as unchanged.
-        if crate::blitz_adapter::node_is_floating(child) {
+        if page_name_walk_child(doc, node, child_id).is_none() {
             continue;
         }
         let (child_start, child_end) = table.get(&child_id).cloned().unwrap_or((None, None));
