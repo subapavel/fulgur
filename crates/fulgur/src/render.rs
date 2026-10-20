@@ -5304,6 +5304,7 @@ fn build_struct_tree(
         .map(|(&id, _)| id)
         .collect();
 
+    let mut attached_links = std::collections::BTreeSet::new();
     for root_id in roots {
         let group = build_tag_group(
             root_id,
@@ -5313,11 +5314,13 @@ fn build_struct_tree(
             &children_map,
             &run_entries,
             link_annot_ids,
+            &mut attached_links,
         );
         tree.push(Node::Group(group));
     }
 }
 
+#[allow(clippy::too_many_arguments)] // one recursive walk over seven read-only maps and the set of attached links
 fn build_tag_group(
     node_id: crate::drawables::NodeId,
     drawables: &Drawables,
@@ -5326,6 +5329,7 @@ fn build_tag_group(
     children_map: &BTreeMap<crate::drawables::NodeId, Vec<crate::drawables::NodeId>>,
     run_entries: &BTreeMap<crate::drawables::NodeId, Vec<crate::draw_primitives::ParagraphRunItem>>,
     link_annot_ids: &BTreeMap<usize, Vec<Identifier>>,
+    attached_links: &mut std::collections::BTreeSet<usize>,
 ) -> TagGroup {
     let entry = &drawables.semantics[&node_id]; // invariant: node_id always derived from drawables.semantics
     let title = heading_titles.get(&node_id).cloned();
@@ -5365,7 +5369,15 @@ fn build_tag_group(
                     }
                     // Annotation identifiers (OBJR) follow content identifiers.
                     // A cross-page link produces one identifier per page.
-                    if let Some(annot_ids) = link_annot_ids.get(&ptr) {
+                    // Every annotation has exactly one parent in the tag tree
+                    // (ISO 32000-1 §14.7.4.3, PDF/UA-1 7.18.5), and one link
+                    // can span several paragraphs (`<a><p>A</p><div>B</div></a>`,
+                    // or an `<a>` with `display: contents` around flex items):
+                    // the first `/Link` group that holds the link takes its
+                    // annotations, the later ones hold their content only.
+                    if attached_links.insert(ptr)
+                        && let Some(annot_ids) = link_annot_ids.get(&ptr)
+                    {
                         for &annot_id in annot_ids {
                             link_group.push(Node::Leaf(annot_id));
                         }
@@ -5390,6 +5402,7 @@ fn build_tag_group(
                 children_map,
                 run_entries,
                 link_annot_ids,
+                attached_links,
             );
             group.push(Node::Group(child));
         }
@@ -5650,6 +5663,7 @@ mod tests {
             &children_map,
             &run_entries,
             &link_annot_ids,
+            &mut std::collections::BTreeSet::new(),
         );
 
         // The group should have two children: one Leaf (Content) and one Group (Link).
@@ -5659,6 +5673,61 @@ mod tests {
             matches!(group.children[1], Node::Group(_)),
             "second child should be a Link Group"
         );
+    }
+
+    #[test]
+    fn build_tag_group_attaches_a_links_annotations_to_one_group_only() {
+        // One link (ptr 55) with text in two paragraphs: the annotation identifier may have only one parent
+        // in the tag tree, so only the first paragraph's `/Link` group holds it.
+        let (a, b): (crate::drawables::NodeId, crate::drawables::NodeId) = (3, 4);
+        let (id_a, id_b, annot) = (make_identifier(), make_identifier(), make_identifier());
+        let mut run_entries: BTreeMap<
+            crate::drawables::NodeId,
+            Vec<crate::draw_primitives::ParagraphRunItem>,
+        > = BTreeMap::new();
+        for (node, id) in [(a, id_a), (b, id_b)] {
+            run_entries.insert(
+                node,
+                vec![crate::draw_primitives::ParagraphRunItem::LinkContent {
+                    span_ptr: 55,
+                    identifier: id,
+                }],
+            );
+        }
+        let mut link_annot_ids: BTreeMap<usize, Vec<Identifier>> = BTreeMap::new();
+        link_annot_ids.entry(55).or_default().push(annot);
+        let mut drawables = drawables_with_para(a);
+        drawables.semantics.insert(
+            b,
+            crate::tagging::SemanticEntry {
+                tag: crate::tagging::PdfTag::P,
+                parent: None,
+                alt_text: None,
+            },
+        );
+        let identifiers = BTreeMap::new();
+        let heading_titles = BTreeMap::new();
+        let children_map = BTreeMap::new();
+        let mut attached = std::collections::BTreeSet::new();
+        let mut build = |node| {
+            build_tag_group(
+                node,
+                &drawables,
+                &identifiers,
+                &heading_titles,
+                &children_map,
+                &run_entries,
+                &link_annot_ids,
+                &mut attached,
+            )
+        };
+        let (first, second) = (build(a), build(b));
+        let link_children = |g: &TagGroup| match &g.children[0] {
+            Node::Group(l) => l.children.len(),
+            _ => panic!("expected a Link group"),
+        };
+        assert_eq!(link_children(&first), 2, "content + annotation");
+        assert_eq!(link_children(&second), 1, "content only");
     }
 
     #[test]
@@ -5695,6 +5764,7 @@ mod tests {
             &children_map,
             &run_entries,
             &link_annot_ids,
+            &mut std::collections::BTreeSet::new(),
         );
 
         assert_eq!(

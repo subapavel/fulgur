@@ -8266,3 +8266,18 @@ fn long_table_in_a_named_page_with_a_forced_break_renders() {
     assert!(page_count(&pdf) >= 6, "got {} pages", page_count(&pdf));
     assert_eq!(pdf, engine.render(&html).expect("render again"));
 }
+
+/// html-to-pdf F150 review: a link that becomes several boxes (an `<a>` around two paragraphs, or `display: contents`
+/// around flex items) put the same annotation identifier into the `/Link` group of each paragraph, and krilla
+/// panicked ("AnnotationIdentifier appears twice in the tag tree") on a tagged render.
+#[test]
+fn test_render_tagged_link_over_several_boxes_does_not_panic() {
+    for html in [
+        r#"<a href="https://example.cz"><p>A</p><div>B</div></a>"#,
+        r#"<div style="display:flex"><a href="https://example.cz" style="display:contents"><span>a</span><span>b</span></a></div>"#,
+        r#"<div style="display:grid;grid-template-columns:1fr 1fr"><a href="https://example.cz" style="display:contents"><span>a</span><span>b</span></a></div>"#,
+    ] {
+        let pdf = tagged_render_with_noto(html);
+        assert!(!pdf.is_empty(), "{html}");
+    }
+}

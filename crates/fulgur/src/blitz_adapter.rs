@@ -1644,6 +1644,39 @@ pub struct MulticolProps {
     pub column_gap: f32,
 }
 
+/// Whether `node` is an element with `display: contents`: it generates no box and its children take its place
+/// (css-display-3 §2.5). Blitz places those children as layout children of the contents element's parent, so a walk
+/// of the DOM `children` that expects the box tree must look through such elements ([`box_tree_children`]).
+pub(crate) fn is_display_contents(node: &blitz_dom::Node) -> bool {
+    use ::style::values::specified::box_::DisplayInside;
+    node.is_element()
+        && node
+            .primary_styles()
+            .is_some_and(|s| s.clone_display().inside() == DisplayInside::Contents)
+}
+
+/// The DOM children of `node_id` with every `display: contents` element replaced by its own children, recursively
+/// (the order Blitz gives the layout children). Without a contents child this is the plain `children` list. A walk
+/// that needs boxes must use this instead of `node.children`; `depth` bounds the nesting like the other DOM walks.
+pub(crate) fn box_tree_children(doc: &BaseDocument, node_id: usize) -> Vec<usize> {
+    fn collect(doc: &BaseDocument, node_id: usize, depth: usize, out: &mut Vec<usize>) {
+        let Some(node) = doc.get_node(node_id) else {
+            return;
+        };
+        for &child_id in &node.children {
+            match doc.get_node(child_id) {
+                Some(child) if depth < crate::MAX_DOM_DEPTH && is_display_contents(child) => {
+                    collect(doc, child_id, depth + 1, out)
+                }
+                _ => out.push(child_id),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    collect(doc, node_id, 0, &mut out);
+    out
+}
+
 /// Extract multicol container properties from a node.
 ///
 /// Returns `None` when the node is not a multicol container (i.e. both

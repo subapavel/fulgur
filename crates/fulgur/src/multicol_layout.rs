@@ -172,10 +172,9 @@ pub(crate) fn partition_children_into_segments(
     doc: &BaseDocument,
     container_id: usize,
 ) -> Vec<Segment> {
-    let children: Vec<usize> = doc
-        .get_node(container_id)
-        .map(|n| n.children.clone())
-        .unwrap_or_default();
+    // `display: contents` children generate no box: their children are the container's (as in Blitz's layout
+    // children). The wrapper itself has no geometry to lay out in a column.
+    let children: Vec<usize> = crate::blitz_adapter::box_tree_children(doc, container_id);
 
     let mut out: Vec<Segment> = Vec::new();
     let mut group: Vec<NodeId> = Vec::new();
@@ -2333,6 +2332,47 @@ mod tests {
         match &segments[0] {
             Segment::ColumnGroup(ids) => assert_eq!(ids.len(), 3),
             _ => panic!("expected ColumnGroup"),
+        }
+    }
+
+    #[test]
+    fn partition_looks_through_display_contents_wrappers() {
+        // A `display: contents` element generates no box: its children are the container's children (html-to-pdf
+        // F150 review: the walk used the DOM children and got a wrapper with no geometry, so the text vanished).
+        let html = r#"<!doctype html><html><body>
+            <div style="column-count: 2;">
+              <div style="display: contents"><div style="display: contents"><p id="a">a</p></div><p id="b">b</p></div>
+              <p id="c">c</p>
+              <div style="display: contents"><h1 id="t" style="column-span: all;">title</h1></div>
+              <p id="d">d</p>
+            </div>
+        </body></html>"#;
+        let (doc, mc_id) = parse_multicol(html);
+        fn find(doc: &BaseDocument, id: usize, name: &str) -> Option<usize> {
+            let node = doc.get_node(id)?;
+            if node
+                .element_data()
+                .and_then(|e| crate::blitz_adapter::get_attr(e, "id"))
+                == Some(name)
+            {
+                return Some(id);
+            }
+            node.children.iter().find_map(|&c| find(doc, c, name))
+        }
+        let id_of = |name: &str| -> NodeId {
+            NodeId::from(
+                find(&doc, doc.root_element().id, name).unwrap_or_else(|| panic!("#{name}")),
+            )
+        };
+        let segments = partition_children_into_segments(&doc, mc_id);
+        assert_eq!(segments.len(), 3, "{segments:?}");
+        match (&segments[0], &segments[1], &segments[2]) {
+            (Segment::ColumnGroup(first), Segment::SpanAll(span), Segment::ColumnGroup(last)) => {
+                assert_eq!(first, &vec![id_of("a"), id_of("b"), id_of("c")]);
+                assert_eq!(*span, id_of("t"));
+                assert_eq!(last, &vec![id_of("d")]);
+            }
+            other => panic!("unexpected segments {other:?}"),
         }
     }
 
