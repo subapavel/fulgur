@@ -74,8 +74,8 @@
 
 mod abspos_flow;
 pub use abspos_flow::fragment_abspos_flows;
-#[allow(dead_code)] // wired into the fragmenter in the next commit
 mod subtree_facts;
+use subtree_facts::SubtreeFacts;
 
 use crate::units::F32Units;
 use blitz_dom::BaseDocument;
@@ -988,6 +988,10 @@ pub struct PaginationLayoutTree<'a> {
     /// `page` declarations and the fragmenter skips the comparison
     /// entirely.
     pub(crate) used_page_names: Option<crate::blitz_adapter::UsedPageNameTable>,
+    /// F144: the answers to "is there a forced break below" and "is there a page-name change below" for every node,
+    /// built from `column_styles` and `used_page_names` at the start of the pass. `None` (unit-test entry points
+    /// that build the tree by hand) makes the gates walk the subtree instead.
+    pub(crate) subtree_facts: Option<SubtreeFacts>,
 }
 
 /// One-shot entry: run the block-level fragmenter for `doc` against a
@@ -1091,13 +1095,19 @@ fn run_pass_inner<'a>(
     // styles are available. The walk takes one DOM pass and produces a
     // `BTreeMap` keyed by node id, matching the determinism convention
     // used by the rest of the side-tables.
-    let used_page_names =
-        column_styles.map(|cs| crate::blitz_adapter::compute_used_page_names(doc, cs));
+    //
+    // F144: only when some node names a page. Without one every entry would be `(None, None)`, which is also what
+    // every reader makes of a missing table.
+    let used_page_names = column_styles
+        .filter(|cs| crate::column_css::has_named_page(cs))
+        .map(|cs| crate::blitz_adapter::compute_used_page_names(doc, cs));
+    let subtree_facts = SubtreeFacts::build(doc, column_styles, used_page_names.as_ref());
     let mut tree = PaginationLayoutTree::new(doc, page_height_px);
     tree.column_styles = column_styles;
     tree.running_store = running_store;
     tree.multicol = multicol;
     tree.used_page_names = used_page_names;
+    tree.subtree_facts = Some(subtree_facts);
     if tree.body_id.is_some() && page_height_px > 0.0 {
         // Read body's children's existing `final_layout` (populated by
         // Blitz's `resolve()` and `multicol_layout::run_pass`) and
@@ -1134,6 +1144,7 @@ impl<'a> PaginationLayoutTree<'a> {
             running_store: None,
             multicol: None,
             used_page_names: None,
+            subtree_facts: None,
         }
     }
 
@@ -1201,6 +1212,7 @@ impl<'a> PaginationLayoutTree<'a> {
         if self.used_page_names.is_none() {
             self.used_page_names = self
                 .column_styles
+                .filter(|cs| crate::column_css::has_named_page(cs))
                 .map(|cs| crate::blitz_adapter::compute_used_page_names(self.doc, cs));
         }
         let Some(body_id) = self.body_id else {
@@ -1973,12 +1985,17 @@ impl<'a> PaginationLayoutTree<'a> {
                 has_splittable_children
                     && (!is_multicol || multicol_has_span_all)
                     && (relaxed_frame
-                        || has_forced_break_below(doc, child_id, self.column_styles, 0)
-                        || has_page_name_change_below(
+                        || forced_break_below(
+                            self.subtree_facts.as_ref(),
                             doc,
+                            self.column_styles,
                             child_id,
+                        )
+                        || page_name_change_below(
+                            self.subtree_facts.as_ref(),
+                            doc,
                             self.used_page_names.as_ref(),
-                            0,
+                            child_id,
                         )
                         || (!keeps_whole
                             && would_split_block_subtree(
@@ -2042,6 +2059,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     self.doc,
                     self.column_styles,
                     self.used_page_names.as_ref(),
+                    self.subtree_facts.as_ref(),
                     self.multicol,
                     child_id,
                     child_w,
@@ -2754,6 +2772,46 @@ fn leading_block_size(
     leading.min(own_h)
 }
 
+/// F144: [`has_forced_break_below`] at depth 0, answered from `facts` when the pass built them. Under
+/// `debug_assertions` the table is checked against the walk on every call, so the whole test suite runs the
+/// oracle; with `None` (the abspos flow, hand-built trees in tests) it is the walk.
+fn forced_break_below(
+    facts: Option<&SubtreeFacts>,
+    doc: &BaseDocument,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    node_id: usize,
+) -> bool {
+    let Some(facts) = facts else {
+        return has_forced_break_below(doc, node_id, column_styles, 0);
+    };
+    let answer = facts.forced_break_below(node_id);
+    debug_assert_eq!(
+        answer,
+        has_forced_break_below(doc, node_id, column_styles, 0),
+        "SubtreeFacts: forced break below node {node_id}"
+    );
+    answer
+}
+
+/// F144: [`has_page_name_change_below`] at depth 0, answered from `facts`; see [`forced_break_below`].
+fn page_name_change_below(
+    facts: Option<&SubtreeFacts>,
+    doc: &BaseDocument,
+    used_page_names: Option<&crate::blitz_adapter::UsedPageNameTable>,
+    node_id: usize,
+) -> bool {
+    let Some(facts) = facts else {
+        return has_page_name_change_below(doc, node_id, used_page_names, 0);
+    };
+    let answer = facts.page_name_change_below(node_id);
+    debug_assert_eq!(
+        answer,
+        has_page_name_change_below(doc, node_id, used_page_names, 0),
+        "SubtreeFacts: page-name change below node {node_id}"
+    );
+    answer
+}
+
 /// fulgur-a36m (Phase 3.1.5b): true if any descendant of `node_id`
 /// declares `break-before: page` or `break-after: page` in
 /// `column_styles`. Walks the entire DOM subtree, bails at
@@ -3121,6 +3179,7 @@ fn fragment_block_subtree(
     doc: &BaseDocument,
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
     used_page_names: Option<&crate::blitz_adapter::UsedPageNameTable>,
+    facts: Option<&SubtreeFacts>,
     multicol: Option<&crate::multicol_layout::MulticolGeometryTable>,
     parent_id: usize,
     parent_w: f32,
@@ -3683,8 +3742,8 @@ fn fragment_block_subtree(
                 && !is_multicol
                 && (relaxed_frame
                     || (!keeps_whole && tail_over)
-                    || has_forced_break_below(doc, child_id, column_styles, 0)
-                    || has_page_name_change_below(doc, child_id, used_page_names, 0)
+                    || forced_break_below(facts, doc, column_styles, child_id)
+                    || page_name_change_below(facts, doc, used_page_names, child_id)
                     || (!keeps_whole
                         && would_split_block_subtree(
                             doc,
@@ -4001,6 +4060,7 @@ fn fragment_block_subtree(
                     doc,
                     column_styles,
                     used_page_names,
+                    facts,
                     multicol,
                     child_id,
                     child_w,
@@ -7283,6 +7343,7 @@ mod tests {
             &doc, // &BaseDocument via deref coercion
             None, // column_styles
             None, // used_page_names
+            None, // facts
             None, // multicol
             parent_id,
             600.0, // parent_w
@@ -14241,5 +14302,72 @@ h2 { string-set: chapter-title content(text); }
         let g = &geom[&node_by_class(&doc, "mc")];
         assert_eq!(g.fragments.len(), 1);
         assert!(g.multicol_pages.is_empty());
+    }
+
+    /// F144: the geometry is the same with the full used page-name table (all `(None, None)` when no node names a
+    /// page, which is what the pass used to build), with `None` (what it builds now), with the walks and with the
+    /// `SubtreeFacts`. Forced breaks and named pages are in the documents, so the gates fire.
+    #[test]
+    fn geometry_does_not_depend_on_the_used_page_name_table_or_the_facts() {
+        let rows = |n: usize| "<tr><td>row</td><td>cell</td></tr>".repeat(n);
+        let docs = [
+            // No page names: the table is skipped.
+            format!(
+                "<html><body style=\"margin:0\"><div><table><tbody>{}</tbody></table>\
+                 <div style=\"break-before:page\">after</div><p>tail</p></div>\
+                 <section><div style=\"height:300px\"></div><div style=\"height:200px;break-after:page\"></div>\
+                 <div style=\"height:100px\"></div></section></body></html>",
+                rows(60)
+            ),
+            // No breaks of any kind.
+            format!(
+                "<html><body style=\"margin:0\"><table><tbody>{}</tbody></table></body></html>",
+                rows(80)
+            ),
+            // Named pages: the table is built.
+            format!(
+                "<html><body style=\"margin:0\"><main><section style=\"page:a\"><table><tbody>{}</tbody></table></section>\
+                 <section style=\"page:b\"><div style=\"height:120px\"></div></section>\
+                 <section style=\"page:a;break-before:page\"><div style=\"height:120px\"></div></section></main></body></html>",
+                rows(40)
+            ),
+        ];
+        for (i, html) in docs.iter().enumerate() {
+            let mut doc = parse(html, 600.0);
+            let cs = blitz_adapter::extract_column_style_table(&doc);
+            let named = crate::column_css::has_named_page(&cs);
+            assert_eq!(named, i == 2, "document {i}");
+            let current =
+                run_pass_with_break_styles(doc.deref_mut(), 300.0_f32.as_pt().in_px(), &cs);
+            let mut with = |facts: bool, full_table: bool| {
+                let table = blitz_adapter::compute_used_page_names(&doc, &cs);
+                let mut tree = PaginationLayoutTree::new(doc.deref_mut(), 400.0);
+                tree.column_styles = Some(&cs);
+                tree.used_page_names = full_table.then_some(table);
+                if facts {
+                    tree.subtree_facts = Some(SubtreeFacts::build(
+                        tree.doc,
+                        Some(&cs),
+                        tree.used_page_names.as_ref(),
+                    ));
+                }
+                tree.fragment_pagination_root();
+                tree.take_geometry()
+            };
+            let want = format!("{current:?}");
+            assert!(current.len() > 5, "document {i} has geometry");
+            // Without a used page-name table the named document would lose its implicit breaks: that is not the
+            // same geometry, and the pass never builds it.
+            for (facts, full) in [(false, true), (true, true), (false, false)] {
+                if named && !full {
+                    continue;
+                }
+                assert_eq!(
+                    format!("{:?}", with(facts, full)),
+                    want,
+                    "document {i}: facts {facts}, full used page-name table {full}"
+                );
+            }
+        }
     }
 }

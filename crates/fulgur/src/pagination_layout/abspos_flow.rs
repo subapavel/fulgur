@@ -939,6 +939,7 @@ fn flow_box(
         doc,
         column_styles,
         None,
+        None,
         multicol,
         id,
         w,

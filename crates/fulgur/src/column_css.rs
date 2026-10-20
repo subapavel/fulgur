@@ -192,7 +192,6 @@ pub(crate) fn has_forced_page_break(table: &ColumnStyleTable) -> bool {
 
 /// F144: true if some node of `table` names a page (`page: <custom-ident>`). With none, every used page-name is the
 /// unnamed page, so there is nothing to compute or compare.
-#[allow(dead_code)] // wired in the next commit
 pub(crate) fn has_named_page(table: &ColumnStyleTable) -> bool {
     table
         .values()

@@ -8238,3 +8238,31 @@ fn long_collapsed_table_with_repeated_header_renders_on_every_page() {
     assert!(page_count(&pdf) >= 5, "300 rows span several pages");
     assert_eq!(pdf, engine.render(&html).expect("render again"));
 }
+
+/// F144: a long table in a named-page wrapper with a forced break after it. The fragmenter's "forced break below" and
+/// "page-name change below" questions are answered from the per-pass table (`SubtreeFacts`) at body level, at the
+/// wrapper, at the table and at every row; under `debug_assertions` each answer is checked against the old walk.
+#[test]
+fn long_table_in_a_named_page_with_a_forced_break_renders() {
+    let rows: String = (1..=300)
+        .map(|i| format!("<tr><td>Row{i:03}</td><td>x</td></tr>"))
+        .collect();
+    let html = format!(
+        r#"<!DOCTYPE html><html><head><style>
+        @page {{ size: A4; margin: 15mm; }}
+        .items {{ page: items; }}
+        .totals {{ break-before: page; }}
+        tr {{ break-inside: avoid; }}
+        </style></head><body><main>
+        <p>Header</p>
+        <table class="items"><tbody>{rows}</tbody></table>
+        <section class="totals"><p>Total</p></section>
+        </main></body></html>"#
+    );
+    let engine = Engine::builder().build();
+    let pdf = engine.render(&html).expect("render");
+    assert!(!pdf.is_empty());
+    // Header page, at least four pages of rows, the totals page.
+    assert!(page_count(&pdf) >= 6, "got {} pages", page_count(&pdf));
+    assert_eq!(pdf, engine.render(&html).expect("render again"));
+}

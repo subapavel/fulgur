@@ -752,8 +752,7 @@ pub fn relayout_position_fixed(doc: &mut HtmlDocument, viewport_w_px: f32, viewp
         if let Some(before_id) = node.before {
             collect_position_fixed_ids(doc, before_id, out, depth + 1);
         }
-        let children = node.children.clone();
-        for child_id in children {
+        for &child_id in &node.children {
             collect_position_fixed_ids(doc, child_id, out, depth + 1);
         }
         if let Some(after_id) = node.after {
