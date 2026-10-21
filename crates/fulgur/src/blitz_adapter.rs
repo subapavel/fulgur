@@ -1153,6 +1153,23 @@ pub fn anonymous_table_wrapper(
     (node.is_anonymous() && node.parent == Some(table_id)).then_some(wrapper)
 }
 
+/// F163: the children of the table box `table` as its table sees them: the `::before` box, the DOM children, the
+/// `::after` box (css-pseudo-4 §3.1). Blitz places the pseudo boxes in the table's fixup like any other child, so
+/// a pseudo is a cell or a row of the grid or sits in an anonymous cell ([`anonymous_table_wrapper`]), and the walks
+/// over a table's parts must reach it.
+pub fn table_box_children(table: &Node) -> impl Iterator<Item = usize> + '_ {
+    table
+        .before
+        .into_iter()
+        .chain(table.children.iter().copied())
+        .chain(table.after)
+}
+
+/// F163: `child_id` is the `::before` or `::after` box of the table box `table`.
+pub fn is_table_pseudo(table: &Node, child_id: usize) -> bool {
+    table.before == Some(child_id) || table.after == Some(child_id)
+}
+
 /// F19: true if `node`'s computed `display` is `table` or `inline-table`.
 pub fn is_table_box(node: &Node) -> bool {
     use ::style::values::specified::box_::DisplayInside;
@@ -1166,8 +1183,9 @@ pub fn is_table_box(node: &Node) -> bool {
 /// Blitz wraps text, inline content and boxes that are not table parts in an anonymous row and cell (F50). The cell
 /// is an anonymous block whose computed `display` is `inline`, so `table_part` does not see it as one. It is told
 /// by its `layout_parent`, which is the table for every cell of the grid, also when the row it stands in is a
-/// `display: table-row` element (its `parent` is that row). The pseudo-element boxes are anonymous blocks too and are
-/// pushed into a table's layout children (`construct.rs`), but they are not cells.
+/// `display: table-row` element (its `parent` is that row). The pseudo-element boxes are anonymous blocks too, but
+/// they are not cells: since F163 Blitz places them in the table's fixup, so a `table-cell` pseudo is a cell by its
+/// display and any other one sits in an anonymous cell, which is what this tells.
 pub fn is_anonymous_table_cell(table: &Node, child: &Node) -> bool {
     is_table_box(table)
         && child.is_anonymous()
@@ -7171,11 +7189,12 @@ mod tests {
         assert_eq!(anonymous_cells_of(&doc, "b"), [true], "row-level run");
         // A real cell is not anonymous.
         assert_eq!(anonymous_cells_of(&doc, "c"), [false], "real cell");
-        // The pseudo-element box is an anonymous block in the table's layout children, and not a cell.
+        // F163: the `::before` box (an inline) sits in an anonymous cell of the table, like text; the pseudo-element
+        // box itself is never a layout child of the table.
         assert_eq!(
             anonymous_cells_of(&doc, "d"),
-            [false, false],
-            "::before, cell"
+            [true, false],
+            "::before in an anonymous cell, cell"
         );
         // The anonymous block wrapper of a plain `div` is not a table cell.
         assert!(

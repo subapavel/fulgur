@@ -8281,3 +8281,31 @@ fn test_render_tagged_link_over_several_boxes_does_not_panic() {
         assert!(!pdf.is_empty(), "{html}");
     }
 }
+
+/// F163: a table box with a `::before` / `::after` box and fewer rows than pseudo-elements used to panic in Blitz;
+/// the boxes are table children now and are laid out and painted.
+#[test]
+fn table_pseudo_elements_render() {
+    for html in [
+        // No rows at all.
+        r#"<style>table::before{content:"B"}</style><table></table>"#,
+        // Both pseudos around one row.
+        r#"<style>table::before{content:"B"}table::after{content:"A"}</style>
+           <table><tr><td>b</td></tr></table>"#,
+        // A `display: table` box with a bare cell and an `::after`.
+        r#"<style>#t::after{content:"A"}</style>
+           <div id="t" style="display:table"><div style="display:table-cell">x</div></div>"#,
+        // Pseudos that are a cell, a row, a caption, or hidden.
+        r#"<style>table::before{content:"B";display:table-cell}
+                  table::after{content:"A";display:table-row}</style>
+           <table><tr><td>b</td></tr></table>"#,
+        r#"<style>table::before{content:"C";display:table-caption}
+                  table::after{content:"N";display:none}</style><table></table>"#,
+    ] {
+        let pdf = Engine::builder()
+            .build()
+            .render(html)
+            .unwrap_or_else(|e| panic!("{html}: {e}"));
+        assert!(!pdf.is_empty(), "{html}");
+    }
+}

@@ -60,7 +60,7 @@ fn convert_table(
 
     // Walk table children to recurse cells.
     let mut last_wrapper = None;
-    for &child_id in &node.children {
+    for child_id in crate::blitz_adapter::table_box_children(node) {
         let Some(child_node) = doc.get_node(child_id) else {
             continue;
         };
@@ -75,6 +75,15 @@ fn convert_table(
             continue;
         }
         last_wrapper = None;
+        // F163: the table's `::before` / `::after` box is reached through its anonymous cell (above), as a cell or
+        // as a row. A box that is none of them (a `table-caption` or `display: none` pseudo) has no box in the table
+        // and nothing to convert.
+        if crate::blitz_adapter::is_table_pseudo(node, child_id)
+            && crate::blitz_adapter::table_part(child_node)
+                == crate::blitz_adapter::TablePart::Other
+        {
+            continue;
+        }
         // A cell that is a direct child of the table (a `display: table` box with bare `display: table-cell` children,
         // CSS 2.1 §17.2.1: they sit in an anonymous row) is converted itself; its layout children are what it holds,
         // not cells to look for.
@@ -276,7 +285,7 @@ fn collect_row_backgrounds(
     }
     let mut groups = Vec::new();
     let mut rows = Vec::new();
-    for &child_id in &table.children {
+    for child_id in crate::blitz_adapter::table_box_children(table) {
         let Some(child) = doc.get_node(child_id) else {
             continue;
         };
@@ -672,7 +681,22 @@ mod tests {
     }
 
     fn convert(html: &str) -> (HtmlDocument, crate::drawables::Drawables) {
-        let mut doc = parse_doc(html);
+        convert_doc(parse_doc(html))
+    }
+
+    /// Like [`convert`], with Noto Sans bundled so that text has a size.
+    fn convert_with_font(html: &str) -> (HtmlDocument, crate::drawables::Drawables) {
+        const NOTO_SANS: &[u8] = include_bytes!("../../../../examples/.fonts/NotoSans-Regular.ttf");
+        convert_doc(crate::blitz_adapter::parse_and_layout(
+            html,
+            595.0_f32.as_px(),
+            842.0_f32.as_px(),
+            &[std::sync::Arc::new(NOTO_SANS.to_vec())],
+            false,
+        ))
+    }
+
+    fn convert_doc(mut doc: HtmlDocument) -> (HtmlDocument, crate::drawables::Drawables) {
         let column_styles = crate::blitz_adapter::extract_column_style_table(&doc);
         let multicol_geometry = crate::multicol_layout::run_pass(&mut doc, &column_styles);
         let pagination_geometry = crate::pagination_layout::run_pass(&mut doc, 842.0);
@@ -693,6 +717,76 @@ mod tests {
         };
         let drawables = dom_to_drawables(&doc, &mut ctx);
         (doc, drawables)
+    }
+
+    /// F163: the `::before` / `::after` box of a table box is converted through its anonymous cell, or as a cell
+    /// or a row of its own; one that is none of them (a caption, `display: none`) is skipped.
+    #[test]
+    fn the_pseudo_boxes_of_a_table_are_converted() {
+        let (doc, drawables) = convert_with_font(
+            r#"<!doctype html><html><head><style>
+              body{font-family:"Noto Sans"}
+              table::before{content:"B"}
+              table::after{content:"A";display:block}
+              td{padding:0}</style></head><body>
+              <table><tr><td>b</td></tr></table>
+              <table id="empty"></table></body></html>"#,
+        );
+        let base = doc.deref();
+        let table = find_tag(base, base.root_element().id, "table").unwrap();
+        for pseudo in [
+            base.get_node(table).unwrap().before,
+            base.get_node(table).unwrap().after,
+        ] {
+            let pseudo = pseudo.expect("a pseudo box");
+            let wrapper = base.get_node(pseudo).unwrap().layout_parent.get().unwrap();
+            let wrapper_node = base.get_node(wrapper).unwrap();
+            assert!(wrapper_node.is_anonymous());
+            assert_eq!(wrapper_node.parent, Some(table));
+            assert!(
+                drawables.paragraphs.contains_key(&wrapper)
+                    || drawables.paragraphs.contains_key(&pseudo)
+                    || drawables.block_styles.contains_key(&pseudo),
+                "pseudo {pseudo} / wrapper {wrapper} produce no drawable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_caption_pseudo_is_skipped_and_a_row_pseudo_keeps_its_background() {
+        let (doc, drawables) = convert_with_font(
+            r#"<!doctype html><html><head><style>
+              body{font-family:"Noto Sans"}
+              table::before{content:"C";display:table-caption}
+              table::after{content:"R";display:table-row;background:#abc}
+              td{padding:0}</style></head><body>
+              <table><tr><td>b</td></tr></table></body></html>"#,
+        );
+        let base = doc.deref();
+        let table = find_tag(base, base.root_element().id, "table").unwrap();
+        let node = base.get_node(table).unwrap();
+        let (before, after) = (node.before.unwrap(), node.after.unwrap());
+        assert!(!drawables.block_styles.contains_key(&before));
+        let rows = &drawables.table_row_backgrounds[&table];
+        assert!(rows.iter().any(|r| r.source == after), "{rows:?}");
+    }
+
+    #[test]
+    fn table_box_children_are_before_the_dom_children_and_after() {
+        let doc = parse_doc(
+            r#"<!doctype html><html><head><style>
+              table::before{content:"B"}table::after{content:"A"}</style></head><body>
+              <table><tr><td>b</td></tr></table></body></html>"#,
+        );
+        let base = doc.deref();
+        let table = find_tag(base, base.root_element().id, "table").unwrap();
+        let node = base.get_node(table).unwrap();
+        let all: Vec<usize> = crate::blitz_adapter::table_box_children(node).collect();
+        assert_eq!(all.first().copied(), node.before);
+        assert_eq!(all.last().copied(), node.after);
+        assert_eq!(all.len(), node.children.len() + 2);
+        assert!(crate::blitz_adapter::is_table_pseudo(node, all[0]));
+        assert!(!crate::blitz_adapter::is_table_pseudo(node, all[1]));
     }
 
     const COLLAPSED: &str = "<style>table{border-collapse:collapse}td{width:100px;height:40px;padding:0;\
