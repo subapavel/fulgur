@@ -8309,3 +8309,52 @@ fn table_pseudo_elements_render() {
         assert!(!pdf.is_empty(), "{html}");
     }
 }
+
+/// Words of the form `w0000` in `text`, as printed by `pdftotext -raw`.
+fn printed_words(pdf: &[u8]) -> Vec<String> {
+    let Some(text) = extract_pdf_text(pdf) else {
+        return Vec::new();
+    };
+    text.split_whitespace().map(str::to_string).collect()
+}
+
+/// F161 (R1): a paragraph that starts in a column with less than one line of room is not cut after its first
+/// line; every word of a multi-column container that fits its page is printed once.
+#[test]
+fn multicol_paragraph_at_a_column_end_loses_no_words() {
+    let html = "<!doctype html><html><head><style>@page{size:200pt 400pt;margin:10pt}\
+        body{margin:0;font-size:16px;line-height:20px}p{margin:0}</style></head><body>\
+        <div style=\"columns:2\"><p>w0009</p><p>w0014 w0015 w0016 w0017</p></div></body></html>";
+    let pdf = noto_engine().render(html).expect("render");
+    let mut words = printed_words(&pdf);
+    words.sort();
+    assert_eq!(words, ["w0009", "w0014", "w0015", "w0016", "w0017"]);
+}
+
+/// F161 (R2): a multi-column container with a `column-span: all` child that is cut over pages prints every word.
+#[test]
+fn multicol_span_all_over_pages_loses_no_words() {
+    let mut body = String::new();
+    let mut expected = Vec::new();
+    for (prefix, count) in [("a", 120), ("b", 120)] {
+        for i in 0..count {
+            body.push_str(&format!("<p>{prefix}{i:03}</p>"));
+            expected.push(format!("{prefix}{i:03}"));
+        }
+        if prefix == "a" {
+            body.push_str("<h2 style=\"column-span:all\">SPAN</h2>");
+            expected.push("SPAN".to_string());
+        }
+    }
+    let html = format!(
+        "<!doctype html><html><head><style>@page{{size:300pt 300pt;margin:10pt}}\
+         body{{margin:0;font-size:16px;line-height:20px}}p,h2{{margin:0;font-size:16px}}</style></head><body>\
+         <div style=\"columns:2\">{body}</div></body></html>"
+    );
+    let pdf = noto_engine().render(&html).expect("render");
+    let mut words = printed_words(&pdf);
+    words.sort();
+    expected.sort();
+    assert_eq!(words.len(), expected.len(), "printed word count");
+    assert_eq!(words, expected);
+}

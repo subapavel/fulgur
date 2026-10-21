@@ -792,9 +792,8 @@ fn convert_multicol_paragraph_slices(
         .get(&node_id)
         .map(|g| g.multicol_pages.clone())
         .filter(|pages| !pages.is_empty())
-        && let [group] = geometry.groups.as_slice()
     {
-        convert_paged_multicol_slices(doc, node_id, group, &pages, ctx, out);
+        convert_paged_multicol_slices(doc, node_id, &geometry.groups, &pages, ctx, out);
         return;
     }
     for group in &geometry.groups {
@@ -895,30 +894,35 @@ fn convert_multicol_paragraph_slices(
 /// not derived again from heights (the F78 rule).
 ///
 /// Each slice holds the lines `[first, end)` of its source, rebased like the continuation fragments of a split
-/// paragraph (by the advances of the lines before `first`), and sits at the column's x and the piece's y, below
-/// the container's top padding and border on the first page and at the top of the fragment on every other.
+/// paragraph (by the advances of the lines before `first`), and sits at the column's x and the piece's y below
+/// the top of its row (F161: [`crate::pagination_layout::McPage::y`], measured from the top of the container's
+/// fragment on that page, below the container's top padding and border on the first page). `groups` are the
+/// container's column groups; every row names its own.
 fn convert_paged_multicol_slices(
     doc: &BaseDocument,
     node_id: usize,
-    group: &crate::multicol_layout::ColumnGroupGeometry,
+    groups: &[crate::multicol_layout::ColumnGroupGeometry],
     pages: &[(u32, crate::pagination_layout::McPage)],
     ctx: &mut ConvertContext<'_>,
     out: &mut crate::drawables::Drawables,
 ) {
     use crate::pagination_layout::McPiece;
     use crate::units::F32Units;
-    let first_page = pages.first().map_or(0, |(page, _)| *page);
-    let stride = group.col_w.to_f32() + group.gap.to_f32();
-    let col_w_pt = group.col_w.in_pt();
     let mut shaped: BTreeMap<usize, Vec<ShapedLine>> = BTreeMap::new();
     let mut slices_by_source: BTreeMap<usize, Vec<crate::drawables::ParagraphSlice>> =
         BTreeMap::new();
     for (page, mc_page) in pages {
-        let top = if *page == first_page {
-            group.y_offset.to_f32()
-        } else {
-            0.0
+        let Some(group) = groups.get(mc_page.group as usize) else {
+            debug_assert!(
+                false,
+                "multicol row names the missing group {}",
+                mc_page.group
+            );
+            continue;
         };
+        let stride = group.col_w.to_f32() + group.gap.to_f32();
+        let col_w_pt = group.col_w.in_pt();
+        let top = mc_page.y.to_f32();
         for (col, pieces) in mc_page.columns.iter().enumerate() {
             for piece in pieces {
                 let McPiece::Lines {

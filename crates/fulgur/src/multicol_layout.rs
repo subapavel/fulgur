@@ -142,6 +142,18 @@ pub struct ColumnGroupGeometry {
 #[derive(Clone, Debug, Default)]
 pub struct MulticolGeometry {
     pub groups: Vec<ColumnGroupGeometry>,
+    /// F161: the container's segments in source order, which `groups` alone does not say (a `column-span: all`
+    /// child sits between two groups). The fragmenter walks them to cut a container with spanners over pages.
+    pub segments: Vec<SegmentGeom>,
+}
+
+/// F161: one segment of a multicol container, as recorded by the multicol pass (see [`Segment`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SegmentGeom {
+    /// Index into [`MulticolGeometry::groups`].
+    Group(usize),
+    /// A direct child with `column-span: all`: the DOM node id. It spans the full container width.
+    SpanAll { node: usize },
 }
 
 /// Side-table mapping multicol container `usize` NodeIds to their geometry.
@@ -693,6 +705,7 @@ pub fn compute_multicol_layout(
     let mut cursor_y: f32 = 0.0;
     let mut placements: Vec<(NodeId, Point<f32>, Size<f32>)> = Vec::new();
     let mut group_geometries: Vec<ColumnGroupGeometry> = Vec::new();
+    let mut segment_geoms: Vec<SegmentGeom> = Vec::new();
     for segment in segments {
         match segment {
             Segment::ColumnGroup(children) => {
@@ -714,6 +727,7 @@ pub fn compute_multicol_layout(
                     .map(crate::units::Px::to_f32)
                     .fold(0.0_f32, f32::max);
                 placements.extend(group_placements);
+                segment_geoms.push(SegmentGeom::Group(group_geometries.len()));
                 group_geometries.push(geometry);
                 cursor_y += seg_h;
             }
@@ -724,6 +738,9 @@ pub fn compute_multicol_layout(
                     y: cursor_y,
                 };
                 placements.push((child_id, location, output.size));
+                segment_geoms.push(SegmentGeom::SpanAll {
+                    node: usize::from(child_id),
+                });
                 cursor_y += output.size.height;
             }
         }
@@ -757,6 +774,7 @@ pub fn compute_multicol_layout(
         usize::from(node_id),
         MulticolGeometry {
             groups: group_geometries,
+            segments: segment_geoms,
         },
     );
 
@@ -911,6 +929,7 @@ fn layout_self_inline_root_container(
             usize::from(node_id),
             MulticolGeometry {
                 groups: vec![geometry],
+                segments: vec![SegmentGeom::Group(0)],
             },
         );
         let container_h = (original_h + inset_top + inset_bottom).max(0.0);
@@ -1040,6 +1059,7 @@ fn layout_self_inline_root_container(
         usize::from(node_id),
         MulticolGeometry {
             groups: vec![geometry],
+            segments: vec![SegmentGeom::Group(0)],
         },
     );
 
@@ -1134,6 +1154,9 @@ fn layout_column_group(
             source_id: NodeId,
             line_range: std::ops::Range<usize>,
             size: Size<f32>,
+            /// F161: the column the slicer chose, absolute. The distribution places the slice there and does
+            /// not decide again (two derivations of one decision lost lines).
+            col: u32,
         },
     }
 
@@ -1179,6 +1202,7 @@ fn layout_column_group(
                 let slices = slice_lines_with_first_col_remainder(
                     &line_heights,
                     first_remainder,
+                    virt_col_y > 0.0,
                     budget,
                     remaining_cols,
                 );
@@ -1198,6 +1222,7 @@ fn layout_column_group(
                                 width: col_w,
                                 height: *slice_h,
                             },
+                            col: virt_col_idx + offset as u32,
                         });
                         last_non_empty_col_offset = Some(offset);
                         last_non_empty_height = *slice_h;
@@ -1253,10 +1278,25 @@ fn layout_column_group(
             DistItem::InlineRootSlice { size, .. } => *size,
         };
 
-        // Same column-advance check used for atomic children today.
-        if col_y > 0.0 && col_y + size.height > budget && col_idx + 1 < n {
-            col_idx += 1;
-            col_y = 0.0;
+        match item {
+            // Same column-advance check used for atomic children today.
+            DistItem::Atomic { .. } => {
+                if col_y > 0.0 && col_y + size.height > budget && col_idx + 1 < n {
+                    col_idx += 1;
+                    col_y = 0.0;
+                }
+            }
+            // F161: a slice goes to the column the slicer chose.
+            DistItem::InlineRootSlice { col, .. } => {
+                debug_assert!(
+                    *col >= col_idx,
+                    "slice column {col} before column {col_idx}"
+                );
+                if *col > col_idx {
+                    col_idx = *col;
+                    col_y = 0.0;
+                }
+            }
         }
 
         let col_x = col_idx as f32 * (col_w + gap);
@@ -1367,7 +1407,15 @@ fn layout_column_group(
             let mut by_col: Vec<Option<ColumnLineSlice>> = (0..n).map(|_| None).collect();
             for slice in slices.drain(..) {
                 let idx = resolve_col_idx(slice.origin.x.to_f32());
-                by_col[idx] = Some(slice);
+                // F161: one slice per column of a paragraph. Two in the same column would hide lines, so
+                // they are merged (contiguous ranges); `debug_assert` says it should not happen.
+                match by_col[idx].take() {
+                    None => by_col[idx] = Some(slice),
+                    Some(prev) => {
+                        debug_assert!(false, "two slices of one paragraph in column {idx}");
+                        by_col[idx] = Some(merge_line_slices(prev, slice));
+                    }
+                }
             }
             let column_slices: Vec<ColumnLineSlice> =
                 by_col.into_iter().map(|s| s.unwrap_or_default()).collect();
@@ -1399,6 +1447,24 @@ fn layout_column_group(
     };
 
     (placements, geometry)
+}
+
+/// F161: two slices of one paragraph in the same column as one: the union of their line ranges, at the
+/// higher one's origin (so every line is still painted).
+fn merge_line_slices(a: ColumnLineSlice, b: ColumnLineSlice) -> ColumnLineSlice {
+    let (first, second) = if a.line_range.start <= b.line_range.start {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    ColumnLineSlice {
+        line_range: first.line_range.start..first.line_range.end.max(second.line_range.end),
+        origin: first.origin,
+        size: taffy::Size {
+            width: first.size.width,
+            height: first.size.height + second.size.height,
+        },
+    }
 }
 
 /// F30d: the children of a column group as a [`FlowItem`] sequence. A plain paragraph (the predicate of the
@@ -1502,12 +1568,19 @@ fn slice_lines_by_budget(
 /// zero or negative — in that case the first column produces an empty
 /// range (no line forced in, since the column has no room) unless it's
 /// also the only / last remaining column. All subsequent columns use
-/// `full_budget`. The same monolithic-line rule (first non-skipped line
-/// always fits) and "last column absorbs overflow" rule from
-/// [`slice_lines_by_budget`] apply.
+/// `full_budget`. The "last column absorbs overflow" rule from
+/// [`slice_lines_by_budget`] applies.
+///
+/// F161: the monolithic-line rule (the first line of a column always fits) holds for an empty column
+/// only. `first_col_has_content` says the first column already holds earlier siblings: a line that does
+/// not fit its remainder then goes to the next column, as a whole box would
+/// (css-break-3 §4.1: the break falls between line boxes; a line box is never split). Placing it in
+/// the full column anyway made the slicer and the distribution of `layout_column_group` disagree about the
+/// column of the slice and lines were lost.
 fn slice_lines_with_first_col_remainder(
     line_heights: &[f32],
     first_col_remainder: f32,
+    first_col_has_content: bool,
     full_budget: f32,
     remaining_cols: u32,
 ) -> Vec<(std::ops::Range<usize>, f32)> {
@@ -1523,6 +1596,9 @@ fn slice_lines_with_first_col_remainder(
         } else {
             full_budget
         };
+        // The first line of an empty column always fits (monolithic-line rule); in the first column
+        // that already holds content it has to fit like any other.
+        let first_line_is_exempt = !(col == 0 && first_col_has_content);
         // First column with zero remainder: emit an empty slice so the
         // existing column carries no extra lines, and let the next
         // column take its first line at full budget. Skip this guard
@@ -1534,10 +1610,11 @@ fn slice_lines_with_first_col_remainder(
         while end < line_heights.len() {
             let h = line_heights[end];
             let line_count = end - start;
-            // First line in this column always fits (monolithic-line rule).
-            // Otherwise stop when adding this line would overflow,
-            // unless we are the final column (absorb remainder).
-            if line_count > 0 && consumed + h > this_budget && !last_col {
+            // Stop when adding this line would overflow, unless it is
+            // the exempt first line or we are the final column (absorb
+            // remainder).
+            let exempt = line_count == 0 && first_line_is_exempt;
+            if !exempt && consumed + h > this_budget && !last_col {
                 break;
             }
             consumed += h;
@@ -1633,6 +1710,27 @@ fn clear_subtree_cache_inner(doc: &mut BaseDocument, node_id: usize, depth: usiz
     }
 }
 
+/// F165: shift the boxes that `id` stands for down by `delta`: `id` itself when it has a box, otherwise (a
+/// `display: contents` element generates none, css-display-3 §2.5) the boxes of its children, which are laid
+/// out as children of the box above. The element's own layout, which has no meaning, is left alone.
+fn shift_box_roots(doc: &mut BaseDocument, id: usize, delta: f32, depth: usize) {
+    if depth >= crate::MAX_DOM_DEPTH {
+        return;
+    }
+    let Some(node) = doc.get_node_mut(id) else {
+        return;
+    };
+    if crate::blitz_adapter::is_display_contents(node) {
+        let children = node.children.clone();
+        for child in children {
+            shift_box_roots(doc, child, delta, depth + 1);
+        }
+    } else {
+        node.unrounded_layout.location.y += delta;
+        node.final_layout.location.y += delta;
+    }
+}
+
 /// After a multicol subtree has been re-laid-out with a new height,
 /// walk up the ancestor chain and keep the tree's geometry consistent:
 ///
@@ -1656,10 +1754,7 @@ fn propagate_height_delta(doc: &mut BaseDocument, node_id: usize, delta: f32) {
             parent_node.children[idx + 1..].to_vec()
         };
         for sibling in siblings_after {
-            if let Some(node) = doc.get_node_mut(sibling) {
-                node.unrounded_layout.location.y += delta;
-                node.final_layout.location.y += delta;
-            }
+            shift_box_roots(doc, sibling, delta, 0);
         }
         if let Some(node) = doc.get_node_mut(parent_id) {
             node.unrounded_layout.size.height += delta;
@@ -1810,6 +1905,45 @@ mod tests {
         assert!(
             post_hook_height < pre_hook_height,
             "balanced height ({post_hook_height}) should be smaller than blitz's single-column total ({pre_hook_height})"
+        );
+    }
+
+    /// F165: a `display: contents` sibling after the multicol has no box, so its children are the boxes to move
+    /// by the height delta: `Q` sits exactly where it does without the wrapper.
+    #[test]
+    fn propagate_delta_shifts_children_of_a_contents_sibling() {
+        fn y_of_q(after: &str) -> f32 {
+            let html = format!(
+                "<!doctype html><html><body style=\"margin:0\">\
+                 <div style=\"column-count:3;column-gap:0\">\
+                 <div style=\"height:60px\"></div><div style=\"height:60px\"></div>\
+                 <div style=\"height:60px\"></div></div>{after}</body></html>"
+            );
+            let mut doc = crate::blitz_adapter::parse(&html, 300.0, &[]);
+            crate::blitz_adapter::resolve(&mut doc);
+            let column_styles = crate::column_css::ColumnStyleTable::new();
+            let _ = run_pass(&mut doc, &column_styles);
+            fn find_q(doc: &BaseDocument, id: usize) -> Option<usize> {
+                let node = doc.get_node(id)?;
+                if node
+                    .element_data()
+                    .and_then(|e| e.attrs().iter().find(|a| a.name.local.as_ref() == "id"))
+                    .is_some_and(|a| a.value.as_str() == "q")
+                {
+                    return Some(id);
+                }
+                node.children.iter().find_map(|&c| find_q(doc, c))
+            }
+            let q = find_q(&doc, doc.root_element().id).expect("Q");
+            doc.get_node(q).unwrap().final_layout.location.y
+        }
+        let plain = y_of_q("<p id=\"q\" style=\"margin:0\">Q</p>");
+        let wrapped =
+            y_of_q("<div style=\"display:contents\"><p id=\"q\" style=\"margin:0\">Q</p></div>");
+        assert!(plain > 0.0);
+        assert!(
+            (plain - wrapped).abs() < 0.01,
+            "Q at {wrapped} px in a display: contents wrapper, {plain} px without"
         );
     }
 
@@ -2151,8 +2285,8 @@ mod tests {
         let heights = [10.0_f32; 10];
         let slices_basic = slice_lines_by_budget(&heights, /*budget*/ 50.0, /*n*/ 2);
         let slices_rem = slice_lines_with_first_col_remainder(
-            &heights, /*first_remainder*/ 50.0, /*full_budget*/ 50.0,
-            /*remaining_cols*/ 2,
+            &heights, /*first_remainder*/ 50.0, /*first_col_has_content*/ false,
+            /*full_budget*/ 50.0, /*remaining_cols*/ 2,
         );
         assert_eq!(slices_basic, slices_rem);
     }
@@ -2164,8 +2298,8 @@ mod tests {
         // budget (without forcing a line into the empty col 0).
         let heights = [10.0_f32; 5];
         let slices = slice_lines_with_first_col_remainder(
-            &heights, /*first_remainder*/ 0.0, /*full_budget*/ 30.0,
-            /*remaining_cols*/ 2,
+            &heights, /*first_remainder*/ 0.0, /*first_col_has_content*/ false,
+            /*full_budget*/ 30.0, /*remaining_cols*/ 2,
         );
         assert_eq!(slices.len(), 2);
         assert_eq!(slices[0], (0..0, 0.0));
@@ -2180,8 +2314,8 @@ mod tests {
         // it advances. Subsequent columns at full budget take the rest.
         let heights = [10.0_f32; 5]; // total 50
         let slices = slice_lines_with_first_col_remainder(
-            &heights, /*first_remainder*/ 15.0, /*full_budget*/ 30.0,
-            /*remaining_cols*/ 3,
+            &heights, /*first_remainder*/ 15.0, /*first_col_has_content*/ false,
+            /*full_budget*/ 30.0, /*remaining_cols*/ 3,
         );
         assert_eq!(slices.len(), 3);
         assert_eq!(slices[0], (0..1, 10.0));
@@ -2196,16 +2330,38 @@ mod tests {
         // still absorb the rest (overflow), never silently drop.
         let heights = [20.0_f32; 5];
         let slices = slice_lines_with_first_col_remainder(
-            &heights, /*first_remainder*/ 20.0, /*full_budget*/ 20.0,
-            /*remaining_cols*/ 2,
+            &heights, /*first_remainder*/ 20.0, /*first_col_has_content*/ false,
+            /*full_budget*/ 20.0, /*remaining_cols*/ 2,
         );
         assert_eq!(slices[0], (0..1, 20.0));
         assert_eq!(slices[1].0, 1..5);
     }
 
     #[test]
+    fn slice_lines_with_remainder_partly_filled_column_does_not_force_a_line() {
+        // F161: the first line of a column that already holds content has to fit its remainder (10 of
+        // 15 needed). It goes to the next column, which takes both lines (it is the last one).
+        let heights = [15.0_f32; 2];
+        let slices = slice_lines_with_first_col_remainder(
+            &heights, /*first_remainder*/ 10.0, /*first_col_has_content*/ true,
+            /*full_budget*/ 22.5, /*remaining_cols*/ 2,
+        );
+        assert_eq!(slices[0], (0..0, 0.0));
+        assert_eq!(slices[1].0, 0..2);
+        // An empty column keeps the monolithic-line rule: the line goes in although it is taller.
+        let slices = slice_lines_with_first_col_remainder(
+            &heights, 10.0, /*first_col_has_content*/ false, 22.5, 2,
+        );
+        assert_eq!(slices[0], (0..1, 15.0));
+        assert_eq!(slices[1].0, 1..2);
+        // Nowhere else to go: the last column keeps the line rather than lose it.
+        let slices = slice_lines_with_first_col_remainder(&heights, 10.0, true, 22.5, 1);
+        assert_eq!(slices[0].0, 0..2);
+    }
+
+    #[test]
     fn slice_lines_with_remainder_empty_input_returns_n_empty_slices() {
-        let slices = slice_lines_with_first_col_remainder(&[], 50.0, 100.0, 3);
+        let slices = slice_lines_with_first_col_remainder(&[], 50.0, false, 100.0, 3);
         assert_eq!(slices.len(), 3);
         for (range, h) in &slices {
             assert!(range.is_empty());
@@ -3252,6 +3408,65 @@ mod tests {
         );
     }
 
+    /// F161: whatever the paragraphs' lengths and the column count, the slices of every split paragraph tile
+    /// its lines (no line lost, none twice) and no two slices of a paragraph share a column. A paragraph that
+    /// starts in a column with less than one line of room used to be cut after its first line, and the
+    /// distribution moved that slice to the column of the next one, which overwrote it.
+    #[test]
+    fn layout_column_group_never_drops_lines() {
+        let words = |n: usize| (0..n).map(|_| "alpha").collect::<Vec<_>>().join(" ");
+        let mut checked = 0;
+        for n in 2..=4_u32 {
+            for lead in 1..=3_usize {
+                for second in 1..=40_usize {
+                    let html = format!(
+                        "<!doctype html><html><body style=\"margin:0;font-size:16px;line-height:20px\">\
+                         <div id=\"mc\" style=\"column-count:{n};column-gap:0\">\
+                         <p style=\"margin:0\">{}</p><p style=\"margin:0\">{}</p></div></body></html>",
+                        words(lead * 2),
+                        words(second)
+                    );
+                    let mut doc = crate::blitz_adapter::parse(&html, 300.0, &[]);
+                    crate::blitz_adapter::resolve(&mut doc);
+                    let mc_id = collect_multicol_node_ids(&doc)[0];
+                    let column_styles = crate::column_css::ColumnStyleTable::new();
+                    let table = run_pass(&mut doc, &column_styles);
+                    let group = &table.get(&mc_id).expect("geometry").groups[0];
+                    for split in &group.paragraph_splits {
+                        let node = doc.get_node(split.source_node_id).expect("source");
+                        let layout = &node
+                            .element_data()
+                            .and_then(|e| e.inline_layout_data.as_ref())
+                            .expect("inline layout")
+                            .layout;
+                        let lines = crate::blitz_adapter::parley_line_heights(layout).len();
+                        let mut next = 0;
+                        let mut columns = std::collections::BTreeSet::new();
+                        for (col, slice) in split.column_slices.iter().enumerate() {
+                            if slice.line_range.is_empty() {
+                                continue;
+                            }
+                            assert_eq!(
+                                slice.line_range.start, next,
+                                "n={n} lead={lead} second={second}: slices {:?}",
+                                split.column_slices
+                            );
+                            next = slice.line_range.end;
+                            assert!(columns.insert(col));
+                        }
+                        assert_eq!(
+                            next, lines,
+                            "n={n} lead={lead} second={second}: {lines} lines, slices {:?}",
+                            split.column_slices
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 50, "only {checked} split paragraphs were checked");
+    }
+
     /// fulgur-6q5 Fix 3: when an inline-root paragraph follows an atomic
     /// sibling that already consumed part of column 0, the slicer must
     /// see the reduced first-column remainder so its per-column line
@@ -3558,8 +3773,9 @@ mod tests {
         // "zero-budget early emit" guard (`!last_col`) is never satisfied
         // even when first_col_remainder is zero. All lines are absorbed.
         let heights = [10.0_f32; 5];
-        let slices =
-            slice_lines_with_first_col_remainder(&heights, 0.0, /*full_budget*/ 30.0, 1);
+        let slices = slice_lines_with_first_col_remainder(
+            &heights, 0.0, false, /*full_budget*/ 30.0, 1,
+        );
         assert_eq!(slices.len(), 1);
         assert_eq!(slices[0].0, 0..5, "single column must absorb all lines");
         assert_eq!(slices[0].1, 50.0);
@@ -3573,7 +3789,7 @@ mod tests {
         let heights = [10.0_f32; 5];
         let slices = slice_lines_with_first_col_remainder(
             &heights, -5.0, // negative → clamped to 0.0
-            /*full_budget*/ 30.0, /*remaining_cols*/ 2,
+            false, /*full_budget*/ 30.0, /*remaining_cols*/ 2,
         );
         assert_eq!(slices.len(), 2);
         // col 0: remainder was 0 and it's not the last col → empty slice.

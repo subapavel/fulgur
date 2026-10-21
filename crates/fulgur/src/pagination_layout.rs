@@ -157,13 +157,23 @@ pub enum McPiece {
     },
 }
 
-/// F30d: one page of a fragmented multicol container: the pieces of every column (`columns.len()` is the
-/// used column count; a column without content is empty) and the height of the tallest, the block-size of the
-/// content on that page.
+/// F30d: one row of columns of a fragmented multicol container, on one page: the pieces of every column
+/// (`columns.len()` is the used column count; a column without content is empty) and the height of the
+/// tallest, the block-size of the content on that page.
+///
+/// F161: a container with `column-span: all` children has several rows, one per column group and page, and a
+/// page can hold more than one (the rows above and below a spanner). The rows of a container are therefore
+/// not parallel to its fragments (those are one per page).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct McPage {
     pub height: crate::units::Px,
     pub columns: Vec<Vec<McPiece>>,
+    /// Index of the column group (`MulticolGeometry::groups`) this row belongs to.
+    pub group: u32,
+    /// The distance from the top of the container's fragment on this page to the top of the columns of this
+    /// row: its top padding and border on the first page (above the first row), the heights of the rows and
+    /// spanners above it on the page.
+    pub y: crate::units::Px,
 }
 
 /// An indivisible unit of a multicol flow: a box, or one line of a paragraph.
@@ -313,6 +323,7 @@ pub(crate) fn plan_multicol_pages(
         pages.push(McPage {
             height: filled.height.as_px(),
             columns: filled.columns,
+            ..McPage::default()
         });
     }
     pages
@@ -345,68 +356,96 @@ fn balance_multicol_columns(atoms: &[McAtom], start: usize, n: usize, room: f32)
 
 /// F30d: a multi-column container the fragmenter can cut over pages, and what it needs to know about it.
 struct McContainer<'a> {
-    group: &'a crate::multicol_layout::ColumnGroupGeometry,
+    /// The container's column groups, in source order (F161: more than one when `column-span: all` children
+    /// separate them).
+    groups: &'a [crate::multicol_layout::ColumnGroupGeometry],
+    /// The segments in source order: a group, or a spanner between two groups.
+    segments: &'a [crate::multicol_layout::SegmentGeom],
     fill: crate::column_css::ColumnFill,
+    /// The container's top padding and border, px: it sits above the columns of the first page only.
+    top_inset: f32,
     /// The container's bottom padding and border, px.
     bottom_inset: f32,
+    /// The block-size of the first segment's first unit (see [`McContainer::first_unit`]), px.
+    first_unit: f32,
 }
 
 impl McContainer<'_> {
     /// The container's top padding and border, px: it sits above the columns of the first page only.
     fn top_inset(&self) -> f32 {
-        self.group.y_offset.to_f32()
+        self.top_inset
     }
 
-    /// Block-size of the first thing in the flow (a box, or the first line of a paragraph), px.
+    /// Block-size of the first thing in the flow (a box, a spanner, or the first line of a paragraph), px.
     fn first_unit(&self) -> f32 {
-        use crate::multicol_layout::FlowItem;
-        self.group
-            .flow
-            .iter()
-            .find_map(|item| match item {
-                FlowItem::Block { height, .. } => Some(height.to_f32()),
-                FlowItem::Lines { advances, .. } => advances.first().map(|h| h.to_f32()),
-            })
-            .unwrap_or(0.0)
+        self.first_unit
     }
 }
 
+/// F30d: the block-size of the first unit of a flow (a box, or the first line of a paragraph), px.
+fn flow_first_unit(flow: &[crate::multicol_layout::FlowItem]) -> f32 {
+    use crate::multicol_layout::FlowItem;
+    flow.iter()
+        .find_map(|item| match item {
+            FlowItem::Block { height, .. } => Some(height.to_f32()),
+            FlowItem::Lines { advances, .. } => advances.first().map(|h| h.to_f32()),
+        })
+        .unwrap_or(0.0)
+}
+
 /// F30d: the container `node_id`, when it is a multi-column container with a flow the fragmenter can place:
-/// the multicol pass recorded one column group for it (no `column-span: all` child: that path is unchanged)
-/// and the group has something in it.
+/// the multicol pass recorded its column groups, and every group has something in it.
+///
+/// F161: `column-span: all` children are segments between the groups; a container with spanners is placed
+/// like any other. A group whose flow is empty (a text node among its children, say) cannot be described, and
+/// the container keeps the old paths.
 fn multicol_container<'a>(
     doc: &BaseDocument,
     multicol: Option<&'a crate::multicol_layout::MulticolGeometryTable>,
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
     node_id: usize,
 ) -> Option<McContainer<'a>> {
-    use crate::multicol_layout::FlowItem;
+    use crate::multicol_layout::{FlowItem, SegmentGeom};
     let node = doc.get_node(node_id)?;
     if !crate::blitz_adapter::is_multicol_container(node) {
         return None;
     }
-    if crate::blitz_adapter::multicol_has_span_all_child(doc, node_id) {
+    let geometry = multicol?.get(&node_id)?;
+    if geometry.groups.is_empty() || geometry.segments.is_empty() {
         return None;
     }
-    let [group] = multicol?.get(&node_id)?.groups.as_slice() else {
-        return None;
+    for group in &geometry.groups {
+        let has_content = group.flow.iter().any(|item| match item {
+            FlowItem::Block { .. } => true,
+            FlowItem::Lines { advances, .. } => !advances.is_empty(),
+        });
+        if !has_content || group.n == 0 {
+            return None;
+        }
+    }
+    let layout = node.final_layout;
+    let (top_inset, first_unit) = match geometry.segments.first()? {
+        // The group sits below the container's top padding and border.
+        SegmentGeom::Group(g) => {
+            let group = geometry.groups.get(*g)?;
+            (group.y_offset.to_f32(), flow_first_unit(&group.flow))
+        }
+        SegmentGeom::SpanAll { node: span } => (
+            layout.border.top + layout.padding.top,
+            doc.get_node(*span)?.final_layout.size.height,
+        ),
     };
-    let has_content = group.flow.iter().any(|item| match item {
-        FlowItem::Block { .. } => true,
-        FlowItem::Lines { advances, .. } => !advances.is_empty(),
-    });
-    if !has_content || group.n == 0 {
-        return None;
-    }
     let fill = column_styles
         .and_then(|t| t.get(&node_id))
         .and_then(|p| p.fill)
         .unwrap_or_default();
-    let layout = node.final_layout;
     Some(McContainer {
-        group,
+        groups: &geometry.groups,
+        segments: &geometry.segments,
         fill,
+        top_inset,
         bottom_inset: layout.border.bottom + layout.padding.bottom,
+        first_unit,
     })
 }
 
@@ -689,15 +728,49 @@ fn starts_with_relaxed_avoid(
     false
 }
 
+/// What [`fragment_multicol_container`] needs to cut a `column-span: all` child that is taller than a page: the
+/// tables [`fragment_block_subtree`] reads.
+#[derive(Clone, Copy)]
+struct McEnv<'a> {
+    column_styles: Option<&'a crate::column_css::ColumnStyleTable>,
+    used_page_names: Option<&'a crate::blitz_adapter::UsedPageNameTable>,
+    facts: Option<&'a SubtreeFacts>,
+    multicol: Option<&'a crate::multicol_layout::MulticolGeometryTable>,
+}
+
+/// The container's fragment on one page while [`fragment_multicol_container`] walks the segments: it starts at
+/// `top` (page-local y) and holds `used` px of content so far (the top padding and border included on the first
+/// page).
+struct McFragment {
+    page: u32,
+    top: f32,
+    used: f32,
+    /// Whether a row or a spanner has been placed on it (the top padding and border are not content).
+    has_content: bool,
+}
+
+impl McFragment {
+    /// Page-local y of the next row.
+    fn cursor(&self) -> f32 {
+        self.top + self.used
+    }
+}
+
 /// F30d: cut the multi-column container `container_id` over pages from `(page_in, cursor_in)` and record
 /// what each page holds.
 ///
-/// The flow the multicol pass recorded is distributed by [`plan_multicol_pages`]; this records the result:
-/// one fragment of the container per page (the first below `cursor_in` with the container's top padding
-/// and border, the last with its bottom ones), [`PaginationGeometry::multicol_pages`] on the container, a
-/// fragment (and its subtree) of every box at the column and page y the plan gave it, and one fragment per page
-/// of every paragraph that has lines on it, which convert and the renderer paint as given. Returns the page and
-/// the page-local y below the last fragment.
+/// The flow of every column group the multicol pass recorded is distributed by [`plan_multicol_pages`]; this
+/// records the result: one fragment of the container per page (the first below `cursor_in` with the
+/// container's top padding and border, the last with its bottom ones), [`PaginationGeometry::multicol_pages`] on
+/// the container (one entry per row of columns), a fragment (and its subtree) of every box at the column and
+/// page y the plan gave it, and one fragment per page of every paragraph that has lines on it, which convert and
+/// the renderer paint as given. Returns the page and the page-local y below the last fragment.
+///
+/// F161: the segments are walked in source order. A column group is planned from the room under the previous
+/// segment; one followed by a `column-span: all` child is balanced on its last page (css-multicol-1 §6.1: the
+/// columns above a spanner end together), the last group follows the container's `column-fill`. A spanner takes
+/// the full width below the row above it, on the next page when it does not fit the room and fits a page, and
+/// is cut like any other block when it is taller than a page.
 ///
 /// The caller has already moved the container to the next page when its first unit does not fit below the
 /// cursor (F28).
@@ -705,6 +778,7 @@ fn starts_with_relaxed_avoid(
 fn fragment_multicol_container(
     geometry: &mut PaginationGeometryTable,
     doc: &BaseDocument,
+    env: McEnv<'_>,
     c: &McContainer<'_>,
     container_id: usize,
     x_in_body: f32,
@@ -713,18 +787,212 @@ fn fragment_multicol_container(
     cursor_in: f32,
     strips: PageStrips,
 ) -> (u32, f32) {
+    use crate::multicol_layout::SegmentGeom;
+    let mut frag = McFragment {
+        page: page_in,
+        top: cursor_in,
+        used: c.top_inset(),
+        has_content: false,
+    };
+    let close = |geometry: &mut PaginationGeometryTable, frag: &McFragment, height: f32| {
+        geometry
+            .entry(container_id)
+            .or_default()
+            .fragments
+            .push(Fragment {
+                page_index: frag.page,
+                x: x_in_body.as_px(),
+                y: frag.top.as_px(),
+                width: width.as_px(),
+                height: height.as_px(),
+            });
+    };
+    // Start the next page: close the fragment on this one at its content and open a fresh one.
+    let next_page = |geometry: &mut PaginationGeometryTable, frag: &mut McFragment| {
+        close(geometry, frag, frag.used);
+        *frag = McFragment {
+            page: frag.page + 1,
+            top: 0.0,
+            used: 0.0,
+            has_content: false,
+        };
+    };
+    let last_segment = c.segments.len().saturating_sub(1);
+    for (i, segment) in c.segments.iter().enumerate() {
+        let last = i == last_segment;
+        match *segment {
+            SegmentGeom::Group(g) => {
+                let Some(group) = c.groups.get(g) else {
+                    continue;
+                };
+                // F28 for a group below a spanner: when its first unit does not fit the room under it, the
+                // group starts on the next page.
+                if i > 0 && frag.has_content {
+                    let unit = flow_first_unit(&group.flow);
+                    if unit > strips.bottom(frag.page) - frag.cursor() && unit <= strips.fresh() {
+                        next_page(geometry, &mut frag);
+                    }
+                }
+                let fill = if last {
+                    c.fill
+                } else {
+                    crate::column_css::ColumnFill::Balance
+                };
+                let plan = plan_multicol_pages(
+                    &group.flow,
+                    group.n,
+                    (strips.bottom(frag.page) - frag.cursor()).max(0.0),
+                    strips.fresh(),
+                    fill,
+                    if last { c.bottom_inset } else { 0.0 },
+                );
+                let plan_len = plan.len();
+                for (k, mut page) in plan.into_iter().enumerate() {
+                    if k > 0 {
+                        next_page(geometry, &mut frag);
+                    }
+                    page.group = g as u32;
+                    page.y = frag.used.as_px();
+                    let row_top = frag.cursor();
+                    record_multicol_row(
+                        geometry,
+                        doc,
+                        group,
+                        &page,
+                        frag.page,
+                        row_top,
+                        x_in_body,
+                        container_id,
+                        strips,
+                    );
+                    frag.used += page.height.to_f32();
+                    frag.has_content = true;
+                    if last && k + 1 == plan_len {
+                        frag.used += c.bottom_inset;
+                    }
+                    geometry
+                        .entry(container_id)
+                        .or_default()
+                        .multicol_pages
+                        .push((frag.page, page));
+                }
+            }
+            SegmentGeom::SpanAll { node: span } => {
+                let Some(n) = doc.get_node(span) else {
+                    continue;
+                };
+                let h = n.final_layout.size.height.max(0.0);
+                let span_x = x_in_body + n.final_layout.location.x;
+                let span_w = n.final_layout.size.width;
+                let fits = |frag: &McFragment| frag.cursor() + h <= strips.bottom(frag.page) + 0.5;
+                if !fits(&frag) && frag.has_content && h <= strips.fresh() + 1.0 {
+                    next_page(geometry, &mut frag);
+                }
+                if fits(&frag) || h <= strips.fresh() + 1.0 {
+                    // Whole on this page.
+                    record_descendant(
+                        geometry,
+                        doc,
+                        span,
+                        frag.page,
+                        frag.cursor() - n.final_layout.location.y,
+                        x_in_body,
+                        0,
+                    );
+                    frag.used += h;
+                    frag.has_content = true;
+                } else {
+                    // Taller than a page: cut like a block of the page flow, from where it starts.
+                    let parent = doc.get_node(container_id);
+                    let split = parent.and_then(|parent| {
+                        nested_line_split(
+                            doc,
+                            parent,
+                            n,
+                            frag.cursor(),
+                            frag.cursor(),
+                            strips,
+                            frag.page,
+                        )
+                    });
+                    let (end_page, end_y) = match split {
+                        Some(split) => fragment_nested_inline_root(
+                            geometry,
+                            doc,
+                            span,
+                            span_x,
+                            span_w,
+                            frag.cursor(),
+                            frag.page,
+                            strips,
+                            0.0,
+                            0.0,
+                            &split,
+                            1,
+                        ),
+                        None => {
+                            let (np, nc, _, _) = fragment_block_subtree(
+                                geometry,
+                                doc,
+                                env.column_styles,
+                                env.used_page_names,
+                                env.facts,
+                                env.multicol,
+                                span,
+                                span_w,
+                                span_x,
+                                frag.page,
+                                frag.cursor(),
+                                strips,
+                                1,
+                                0.0,
+                                0.0,
+                                frag.has_content,
+                            );
+                            (np, nc)
+                        }
+                    };
+                    // The container's fragments on the pages the spanner covers: to the bottom of each, and
+                    // to where the spanner ends on the last.
+                    while frag.page < end_page {
+                        let bottom = strips.bottom(frag.page).max(frag.cursor());
+                        close(geometry, &frag, bottom - frag.top);
+                        frag = McFragment {
+                            page: frag.page + 1,
+                            top: 0.0,
+                            used: 0.0,
+                            has_content: true,
+                        };
+                    }
+                    frag.used = (end_y - frag.top).max(0.0);
+                    frag.has_content = true;
+                }
+                if last {
+                    frag.used += c.bottom_inset;
+                }
+            }
+        }
+    }
+    close(geometry, &frag, frag.used);
+    (frag.page, frag.cursor())
+}
+
+/// F30d: record what one row of columns of a cut multicol container holds on `page`, whose top is at the
+/// page-local `row_top`: a fragment (and its subtree) for every box piece at its column x and y, and one
+/// fragment per paragraph that has lines in the row.
+#[allow(clippy::too_many_arguments)]
+fn record_multicol_row(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    group: &crate::multicol_layout::ColumnGroupGeometry,
+    row: &McPage,
+    page: u32,
+    row_top: f32,
+    x_in_body: f32,
+    container_id: usize,
+    strips: PageStrips,
+) {
     use crate::multicol_layout::FlowItem;
-    let group = c.group;
-    let top_inset = c.top_inset();
-    let first_room = (strips.bottom(page_in) - cursor_in - top_inset).max(0.0);
-    let plan = plan_multicol_pages(
-        &group.flow,
-        group.n,
-        first_room,
-        strips.fresh(),
-        c.fill,
-        c.bottom_inset,
-    );
     let advances: BTreeMap<usize, &[crate::units::Px]> = group
         .flow
         .iter()
@@ -735,89 +1003,70 @@ fn fragment_multicol_container(
         .collect();
     let col_w = group.col_w.to_f32();
     let stride = col_w + group.gap.to_f32();
-    let mut end = (page_in, cursor_in);
-    for (k, page) in plan.iter().enumerate() {
-        let abs_page = page_in + k as u32;
-        let last = k + 1 == plan.len();
-        let y = if k == 0 { cursor_in } else { 0.0 };
-        let top = if k == 0 { top_inset } else { 0.0 };
-        let height = top + page.height.to_f32() + if last { c.bottom_inset } else { 0.0 };
-        let entry = geometry.entry(container_id).or_default();
-        entry.fragments.push(Fragment {
-            page_index: abs_page,
-            x: x_in_body.as_px(),
-            y: y.as_px(),
-            width: width.as_px(),
-            height: height.as_px(),
-        });
-        entry.multicol_pages.push((abs_page, page.clone()));
-        end = (abs_page, y + height);
-        let mut paragraphs_on_page: BTreeSet<usize> = BTreeSet::new();
-        for (col, pieces) in page.columns.iter().enumerate() {
-            let col_x = x_in_body + group.x_offset.to_f32() + col as f32 * stride;
-            for piece in pieces {
-                match piece {
-                    McPiece::Block { node, y: piece_y } => {
-                        let piece_y = y + top + piece_y.to_f32();
-                        let Some(n) = doc.get_node(*node) else {
-                            continue;
-                        };
-                        if n.final_layout.size.height > strips.fresh() + 1.0 {
-                            log::warn!(
-                                "pagination: a <{}> {}px tall inside a multi-column container is taller than a \
-                                 page; it is placed whole in its column and overflows the page",
-                                n.element_data().map_or("box", |e| e.name.local.as_ref()),
-                                n.final_layout.size.height
-                            );
-                        }
-                        // `record_descendant` adds the box's own offset in its parent: take it off, the plan
-                        // placed the box.
-                        record_descendant(
-                            geometry,
-                            doc,
-                            *node,
-                            abs_page,
-                            piece_y - n.final_layout.location.y,
-                            col_x - n.final_layout.location.x,
-                            0,
+    let mut paragraphs_on_page: BTreeSet<usize> = BTreeSet::new();
+    for (col, pieces) in row.columns.iter().enumerate() {
+        let col_x = x_in_body + group.x_offset.to_f32() + col as f32 * stride;
+        for piece in pieces {
+            match piece {
+                McPiece::Block { node, y: piece_y } => {
+                    let piece_y = row_top + piece_y.to_f32();
+                    let Some(n) = doc.get_node(*node) else {
+                        continue;
+                    };
+                    if n.final_layout.size.height > strips.fresh() + 1.0 {
+                        log::warn!(
+                            "pagination: a <{}> {}px tall inside a multi-column container is taller than a \
+                             page; it is placed whole in its column and overflows the page",
+                            n.element_data().map_or("box", |e| e.name.local.as_ref()),
+                            n.final_layout.size.height
                         );
                     }
-                    McPiece::Lines {
-                        source,
-                        first,
-                        end: end_line,
-                        y: piece_y,
-                    } => {
-                        // A container that is itself the paragraph is painted from its own fragments.
-                        if *source == container_id || !paragraphs_on_page.insert(*source) {
-                            continue;
-                        }
-                        let h: f32 = advances
-                            .get(source)
-                            .map(|a| {
-                                a[*first as usize..*end_line as usize]
-                                    .iter()
-                                    .map(|h| h.to_f32())
-                                    .sum()
-                            })
-                            .unwrap_or(0.0);
-                        geometry
-                            .entry(*source)
-                            .or_default()
-                            .fragments
-                            .push(Fragment {
-                                page_index: abs_page,
-                                x: col_x.as_px(),
-                                y: (y + top + piece_y.to_f32()).as_px(),
-                                width: col_w.as_px(),
-                                height: h.as_px(),
-                            });
+                    // `record_descendant` adds the box's own offset in its parent: take it off, the plan
+                    // placed the box.
+                    record_descendant(
+                        geometry,
+                        doc,
+                        *node,
+                        page,
+                        piece_y - n.final_layout.location.y,
+                        col_x - n.final_layout.location.x,
+                        0,
+                    );
+                }
+                McPiece::Lines {
+                    source,
+                    first,
+                    end: end_line,
+                    y: piece_y,
+                } => {
+                    // A container that is itself the paragraph is painted from its own fragments.
+                    if *source == container_id || !paragraphs_on_page.insert(*source) {
+                        continue;
                     }
+                    let h: f32 = advances
+                        .get(source)
+                        .map(|a| {
+                            a[*first as usize..*end_line as usize]
+                                .iter()
+                                .map(|h| h.to_f32())
+                                .sum()
+                        })
+                        .unwrap_or(0.0);
+                    geometry
+                        .entry(*source)
+                        .or_default()
+                        .fragments
+                        .push(Fragment {
+                            page_index: page,
+                            x: col_x.as_px(),
+                            y: (row_top + piece_y.to_f32()).as_px(),
+                            width: col_w.as_px(),
+                            height: h.as_px(),
+                        });
                 }
             }
         }
     }
-    end
 }
 
 /// Per-source-node geometry: every page on which the node has a placement.
@@ -1731,6 +1980,12 @@ impl<'a> PaginationLayoutTree<'a> {
                         let (new_page_index, new_cursor_y) = fragment_multicol_container(
                             &mut self.geometry,
                             self.doc,
+                            McEnv {
+                                column_styles: self.column_styles,
+                                used_page_names: self.used_page_names.as_ref(),
+                                facts: self.subtree_facts.as_ref(),
+                                multicol: self.multicol,
+                            },
                             &mc,
                             child_id,
                             body_x + layout.location.x,
@@ -4019,6 +4274,12 @@ fn fragment_block_subtree(
                     let (np, nc) = fragment_multicol_container(
                         geometry,
                         doc,
+                        McEnv {
+                            column_styles,
+                            used_page_names,
+                            facts,
+                            multicol,
+                        },
                         mc,
                         child_id,
                         child_x_in_body,
@@ -14287,6 +14548,96 @@ h2 { string-set: chapter-title content(text); }
         for (_, page) in &g.multicol_pages[..g.multicol_pages.len() - 1] {
             assert_eq!(page.height.to_f32(), 200.0);
         }
+    }
+
+    /// F161: a container with a `column-span: all` child that does not fit its page is cut by the multicol
+    /// fragmenter: every box once, nothing above the page top, the spanner full width below the balanced row above it
+    /// and the columns continuing under it, rows named by group.
+    #[test]
+    fn multicol_span_all_is_cut_over_pages() {
+        // 8 + 8 boxes of 40 px in two columns on 200 px pages, a 30 px spanner between the groups.
+        let html = format!(
+            "<!doctype html><html><head><style>body{{margin:0}}\
+             .mc{{column-count:2;column-gap:20px}}.b{{height:40px}}.s{{height:30px;column-span:all}}</style></head><body>\
+             <div class=\"mc\">{a}<div class=\"s\"></div>{a}</div></body></html>",
+            a = "<div class=\"b\"></div>".repeat(8)
+        );
+        let (doc, mc, geom) = multicol_fragments(&html, 200.0);
+        let mc_id = node_by_class(&doc, "mc");
+        let g = &geom[&mc_id];
+        assert_eq!(mc[&mc_id].groups.len(), 2);
+        // Group 0: 8 boxes balanced in two columns of 4 (160 px). Spanner at 160..190. Group 1 has 10 px left on the
+        // page: its first box does not fit, the group starts on page 1: 4 + 4 balanced.
+        let rows: Vec<(u32, u32, f32)> = g
+            .multicol_pages
+            .iter()
+            .map(|(page, row)| (*page, row.group, row.y.to_f32()))
+            .collect();
+        assert_eq!(rows, vec![(0, 0, 0.0), (1, 1, 0.0)], "{rows:?}");
+        assert_eq!(
+            g.fragments.iter().map(|f| f.page_index).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        for (id, gg) in &geom {
+            for f in &gg.fragments {
+                assert!(f.y.to_f32() >= 0.0, "node {id}: fragment at y {:?}", f.y);
+            }
+        }
+        // The spanner sits on page 0 below the first row, at the container's x, full width.
+        let span = &geom[&node_by_class(&doc, "s")];
+        assert_eq!(span.fragments.len(), 1);
+        assert_eq!(span.fragments[0].page_index, 0);
+        assert!((span.fragments[0].y.to_f32() - 160.0).abs() < 0.6);
+        assert_eq!(span.fragments[0].x.to_f32(), 0.0);
+        // Every box once: 16.
+        let boxes = nodes_by_class(&doc, "b");
+        let placed: usize = geom
+            .iter()
+            .filter(|(id, _)| boxes.contains(id))
+            .map(|(_, gg)| gg.fragments.len())
+            .sum();
+        assert_eq!(placed, 16);
+    }
+
+    /// F161: a spanner taller than a page is cut like a block; the container has a fragment on every page it
+    /// covers, and the group after it continues below its end.
+    #[test]
+    fn multicol_span_all_taller_than_a_page_is_cut() {
+        let html = format!(
+            "<!doctype html><html><head><style>body{{margin:0}}\
+             .mc{{column-count:2;column-gap:20px}}.b{{height:40px}}\
+             .s{{column-span:all;display:flex;flex-direction:column}}.r{{height:90px}}</style></head><body>\
+             <div class=\"mc\">{before}\
+             <div class=\"s\"><div class=\"r\"></div><div class=\"r\"></div><div class=\"r\"></div>\
+             <div class=\"r\"></div></div>\
+             {after}</div></body></html>",
+            before = "<div class=\"b\"></div>".repeat(14),
+            after = "<div class=\"b\"></div>".repeat(6)
+        );
+        let (doc, _mc, geom) = multicol_fragments(&html, 200.0);
+        let g = &geom[&node_by_class(&doc, "mc")];
+        assert!(
+            !g.multicol_pages.is_empty(),
+            "not cut by the multicol fragmenter"
+        );
+        let pages: Vec<u32> = g.fragments.iter().map(|f| f.page_index).collect();
+        assert!(pages.len() >= 4, "{pages:?}");
+        assert!(pages.windows(2).all(|w| w[1] == w[0] + 1), "{pages:?}");
+        for (id, gg) in &geom {
+            for f in &gg.fragments {
+                assert!(f.y.to_f32() >= 0.0, "node {id}: fragment at y {:?}", f.y);
+            }
+        }
+        let boxes = nodes_by_class(&doc, "b");
+        let rows = nodes_by_class(&doc, "r");
+        let count = |ids: &[usize]| -> usize {
+            geom.iter()
+                .filter(|(id, _)| ids.contains(id))
+                .map(|(_, gg)| gg.fragments.len())
+                .sum()
+        };
+        assert_eq!(count(&boxes), 20);
+        assert_eq!(count(&rows), 4);
     }
 
     /// A container that fits the page keeps the path it had: one fragment, no pages recorded.
