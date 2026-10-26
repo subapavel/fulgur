@@ -155,6 +155,17 @@ pub enum McPiece {
         end: u32,
         y: crate::units::Px,
     },
+    /// F174: the row bands `[first, end)` of the table `table` ([`McTable::bands`]): the renderer paints one table
+    /// fragment for them at the column's x and this y, and each cell of the bands below it. `head` is set when the
+    /// piece opens a column the table continues in and the table's repeated header ([`McHead`]) stands at its
+    /// top: the bands then start `McHead::height` below `y`.
+    Rows {
+        table: usize,
+        first: u32,
+        end: u32,
+        y: crate::units::Px,
+        head: bool,
+    },
 }
 
 /// F30d: one row of columns of a fragmented multicol container, on one page: the pieces of every column
@@ -176,16 +187,83 @@ pub struct McPage {
     pub y: crate::units::Px,
 }
 
-/// An indivisible unit of a multicol flow: a box, or one line of a paragraph.
+/// F174: one run of cells of a table whose rows are joined by `rowspan`: the unit a table is cut at (css-break-3
+/// §4.1: the boundary between two rows is a class A break point; a row is not cut, §4.4).
+///
+/// `cells` are indices into the table's `layout_children` (its cells, in visual order). `top` is where the band
+/// starts in the table, from `final_layout` (the first band starts at 0: whatever is above its cells, the table's
+/// top border and padding and the spacing, belongs to it), and `height` runs to the next band's `top` (the last to
+/// the table's height), so the bands of a table add up to its height.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)] // `cells` is read by the recording of the next commit
+struct RowBand {
+    cells: std::ops::Range<u32>,
+    top: f32,
+    height: f32,
+}
+
+/// F174: the header rows a table repeats at the top of every column piece but its first (F12's policy, see
+/// [`repeating_table_header`]).
+#[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)] // `group` is read by the recording of the next commit
+pub(crate) struct McHead {
+    /// The `thead` node: its fragments are the source and the repeats.
+    group: usize,
+    /// The first `bands` bands of the table are the header's.
+    bands: u32,
+    /// The block-size reserved for the repeat at the top of a continuation column (F12's band: from the table's
+    /// top edge to the bottom of the lowest header cell).
+    height: f32,
+}
+
+/// F174: a table the multicol fragmenter cuts between rows ([`mc_table`]).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct McTable {
+    bands: Vec<RowBand>,
+    head: Option<McHead>,
+}
+
+impl McTable {
+    /// The block-size of the bands `[first, end)`.
+    fn height_of(&self, first: usize, end: usize) -> f32 {
+        self.bands[first..end].iter().map(|b| b.height).sum()
+    }
+
+    /// The bands of the first unit of the table: its header and the first body band (a header is never left
+    /// alone at the bottom of a column), or the first band.
+    fn first_unit_end(&self) -> usize {
+        self.head
+            .as_ref()
+            .map_or(1, |h| h.bands as usize + 1)
+            .min(self.bands.len())
+    }
+}
+
+/// An indivisible unit of a multicol flow: a box, one line of a paragraph, or the bands `[first, end)` of a table
+/// (F174: one band, except the first unit of a table that repeats its header, which holds the header bands and the
+/// first body band).
 enum McAtom {
-    Block { node: usize, h: f32 },
-    Line { source: usize, index: u32, h: f32 },
+    Block {
+        node: usize,
+        h: f32,
+    },
+    Line {
+        source: usize,
+        index: u32,
+        h: f32,
+    },
+    Row {
+        table: usize,
+        first: u32,
+        end: u32,
+        h: f32,
+    },
 }
 
 impl McAtom {
     fn height(&self) -> f32 {
         match self {
-            Self::Block { h, .. } | Self::Line { h, .. } => *h,
+            Self::Block { h, .. } | Self::Line { h, .. } | Self::Row { h, .. } => *h,
         }
     }
 }
@@ -209,8 +287,13 @@ const MC_EPS: f32 = 1e-3;
 /// may fit the next one (html-to-pdf F161: a `<div>` shorter than a page but taller than the room under a
 /// spanner was put in the second column and ran past the page bottom). Stops when the columns are full or the
 /// atoms are used up. A line is never split (css-break-3 §4.1, CSS 2.1 §13.3.3).
+///
+/// F174: a row of a table that opens a column the table continues in (the atom before it is a row of the same
+/// table) starts below the table's repeated header, `McHead::height` down, when the header and the row fit the
+/// column together; a row that fits the column only without the header gets the column without it (F12's rule).
 fn fill_multicol_columns(
     atoms: &[McAtom],
+    tables: &BTreeMap<usize, McTable>,
     start: usize,
     n: usize,
     budget: f32,
@@ -234,6 +317,16 @@ fn fill_multicol_columns(
             break;
         }
         let y = used.as_px();
+        let mut band = 0.0f32;
+        if let McAtom::Row { table, .. } = &atoms[at]
+            && columns[col].is_empty()
+            && at > 0
+            && matches!(&atoms[at - 1], McAtom::Row { table: t, .. } if t == table)
+            && let Some(head) = tables.get(table).and_then(|t| t.head.as_ref())
+            && head.height + h <= budget + MC_EPS
+        {
+            band = head.height;
+        }
         match &atoms[at] {
             McAtom::Block { node, .. } => columns[col].push(McPiece::Block { node: *node, y }),
             McAtom::Line { source, index, .. } => match columns[col].last_mut() {
@@ -247,8 +340,22 @@ fn fill_multicol_columns(
                     y,
                 }),
             },
+            McAtom::Row {
+                table, first, end, ..
+            } => match columns[col].last_mut() {
+                Some(McPiece::Rows {
+                    table: t, end: e, ..
+                }) if *t == *table && *e == *first => *e = *end,
+                _ => columns[col].push(McPiece::Rows {
+                    table: *table,
+                    first: *first,
+                    end: *end,
+                    y,
+                    head: band > 0.0,
+                }),
+            },
         }
-        used += h;
+        used += band + h;
         height = height.max(used);
         at += 1;
     }
@@ -268,6 +375,10 @@ fn fill_multicol_columns(
 /// way for `column-fill: auto` and balanced (the smallest budget in which the rest fits `n` columns) for
 /// `balance`, the only fragment that is balanced in a fragmented context (css-multicol-1 §7.1). Lines are never
 /// split, every column gets at least one unit, so a box taller than a page is placed alone and overflows.
+///
+/// F174: a box of `tables` (keyed by node) is not one atom but one per row band, cut between rows; its header
+/// repeats at the top of the columns it continues in (see [`fill_multicol_columns`]). The header bands and the
+/// first body band are one atom: a header is never left alone at the bottom of a column.
 pub(crate) fn plan_multicol_pages(
     flow: &[crate::multicol_layout::FlowItem],
     n: u32,
@@ -275,16 +386,36 @@ pub(crate) fn plan_multicol_pages(
     page_room: f32,
     fill: crate::column_css::ColumnFill,
     last_inset: f32,
+    tables: &BTreeMap<usize, McTable>,
 ) -> Vec<McPage> {
     use crate::multicol_layout::FlowItem;
     let n = n.max(1) as usize;
     let mut atoms: Vec<McAtom> = Vec::new();
     for item in flow {
         match item {
-            FlowItem::Block { node, height } => atoms.push(McAtom::Block {
-                node: *node,
-                h: height.to_f32().max(0.0),
-            }),
+            FlowItem::Block { node, height } => match tables.get(node) {
+                Some(table) => {
+                    let lead = table.first_unit_end();
+                    atoms.push(McAtom::Row {
+                        table: *node,
+                        first: 0,
+                        end: lead as u32,
+                        h: table.height_of(0, lead).max(0.0),
+                    });
+                    for (b, band) in table.bands.iter().enumerate().skip(lead) {
+                        atoms.push(McAtom::Row {
+                            table: *node,
+                            first: b as u32,
+                            end: b as u32 + 1,
+                            h: band.height.max(0.0),
+                        });
+                    }
+                }
+                None => atoms.push(McAtom::Block {
+                    node: *node,
+                    h: height.to_f32().max(0.0),
+                }),
+            },
             FlowItem::Lines { source, advances } => {
                 for (index, h) in advances.iter().enumerate() {
                     atoms.push(McAtom::Line {
@@ -314,21 +445,21 @@ pub(crate) fn plan_multicol_pages(
         }
         .max(0.0);
         let room_for_end = (room - last_inset).max(0.0);
-        let trial = fill_multicol_columns(&atoms, at, n, room_for_end, fresh_page);
+        let trial = fill_multicol_columns(&atoms, tables, at, n, room_for_end, fresh_page);
         let filled = if trial.next >= atoms.len() {
             // The rest fits on this page: it is the last one.
             match fill {
                 crate::column_css::ColumnFill::Auto => trial,
                 crate::column_css::ColumnFill::Balance => {
-                    balance_multicol_columns(&atoms, at, n, room_for_end, fresh_page)
+                    balance_multicol_columns(&atoms, tables, at, n, room_for_end, fresh_page)
                 }
             }
         } else {
-            let full = fill_multicol_columns(&atoms, at, n, room, fresh_page);
+            let full = fill_multicol_columns(&atoms, tables, at, n, room, fresh_page);
             if full.next >= atoms.len() && fill == crate::column_css::ColumnFill::Balance {
                 // The rest fits only when the bottom padding is allowed to hang below the page: balance it
                 // within the room anyway.
-                balance_multicol_columns(&atoms, at, n, room, fresh_page)
+                balance_multicol_columns(&atoms, tables, at, n, room, fresh_page)
             } else {
                 full
             }
@@ -347,6 +478,7 @@ pub(crate) fn plan_multicol_pages(
 /// them fit. Next-fit never needs more columns for a larger budget, so a bisection finds it.
 fn balance_multicol_columns(
     atoms: &[McAtom],
+    tables: &BTreeMap<usize, McTable>,
     start: usize,
     n: usize,
     room: f32,
@@ -356,12 +488,12 @@ fn balance_multicol_columns(
     let total: f32 = rest.iter().map(McAtom::height).sum();
     let tallest = rest.iter().map(McAtom::height).fold(0.0f32, f32::max);
     let fits = |budget: f32| {
-        fill_multicol_columns(atoms, start, n, budget, fresh_page).next >= atoms.len()
+        fill_multicol_columns(atoms, tables, start, n, budget, fresh_page).next >= atoms.len()
     };
     let mut lo = tallest.max(total / n as f32);
     let mut hi = room.max(lo);
     if fits(lo) {
-        return fill_multicol_columns(atoms, start, n, lo, fresh_page);
+        return fill_multicol_columns(atoms, tables, start, n, lo, fresh_page);
     }
     // `lo` does not fit, `hi` is the room the rest was already known to fit in (or more, when `room` is below
     // the tallest atom: then nothing smaller helps either).
@@ -373,7 +505,7 @@ fn balance_multicol_columns(
             lo = mid;
         }
     }
-    fill_multicol_columns(atoms, start, n, hi, fresh_page)
+    fill_multicol_columns(atoms, tables, start, n, hi, fresh_page)
 }
 
 /// F30d: a multi-column container the fragmenter can cut over pages, and what it needs to know about it.
@@ -405,11 +537,20 @@ impl McContainer<'_> {
 }
 
 /// F30d: the block-size of the first unit of a flow (a box, or the first line of a paragraph), px.
-fn flow_first_unit(flow: &[crate::multicol_layout::FlowItem]) -> f32 {
+///
+/// F174: of a table in `tables` the first unit is its header and first body row, not the whole table (F28 would
+/// otherwise move a container that starts with a long table to the next page).
+fn flow_first_unit(
+    flow: &[crate::multicol_layout::FlowItem],
+    tables: &BTreeMap<usize, McTable>,
+) -> f32 {
     use crate::multicol_layout::FlowItem;
     flow.iter()
         .find_map(|item| match item {
-            FlowItem::Block { height, .. } => Some(height.to_f32()),
+            FlowItem::Block { node, height } => Some(match tables.get(node) {
+                Some(table) => table.height_of(0, table.first_unit_end()),
+                None => height.to_f32(),
+            }),
             FlowItem::Lines { advances, .. } => advances.first().map(|h| h.to_f32()),
         })
         .unwrap_or(0.0)
@@ -479,7 +620,10 @@ fn multicol_container<'a>(
         // The group sits below the container's top padding and border.
         SegmentGeom::Group(g) => {
             let group = geometry.groups.get(*g)?;
-            (group.y_offset.to_f32(), flow_first_unit(&group.flow))
+            (
+                group.y_offset.to_f32(),
+                flow_first_unit(&group.flow, &BTreeMap::new()),
+            )
         }
         SegmentGeom::SpanAll { node: span } => (
             layout.border.top + layout.padding.top,
@@ -498,6 +642,105 @@ fn multicol_container<'a>(
         bottom_inset: layout.border.bottom + layout.padding.bottom,
         first_unit,
     })
+}
+
+/// F174: the row bands of a table from the `(y, height)` of its cells in visual order, and the table's `height`.
+/// A row starts a band unless a cell of the band above reaches into it (`rowspan`: a cell spans the rows it
+/// covers, so no cut between them may separate it from its row). `None` when the cells are not in non-decreasing
+/// `y`, a position is not finite, or there are fewer than two bands.
+fn row_bands(cells: &[(f32, f32)], height: f32) -> Option<Vec<RowBand>> {
+    const EPS: f32 = 0.01;
+    let mut starts: Vec<(usize, f32)> = Vec::new();
+    let mut band_bottom = f32::NEG_INFINITY;
+    let mut prev_y = f32::NEG_INFINITY;
+    for (i, &(y, h)) in cells.iter().enumerate() {
+        if !y.is_finite() || !h.is_finite() || y < prev_y - EPS {
+            return None;
+        }
+        if i == 0 || (y > prev_y + EPS && y >= band_bottom - EPS) {
+            starts.push((i, if i == 0 { 0.0 } else { y }));
+            band_bottom = y + h;
+        } else {
+            band_bottom = band_bottom.max(y + h);
+        }
+        prev_y = prev_y.max(y);
+    }
+    if starts.len() < 2 || cells.len() > u32::MAX as usize {
+        return None;
+    }
+    Some(
+        starts
+            .iter()
+            .enumerate()
+            .map(|(b, &(first, top))| {
+                let (end, next_top) = starts
+                    .get(b + 1)
+                    .map_or((cells.len(), height), |&(i, t)| (i, t));
+                RowBand {
+                    cells: first as u32..end as u32,
+                    top,
+                    height: (next_top - top).max(0.0),
+                }
+            })
+            .collect(),
+    )
+}
+
+/// F174: whether `node_id`, a child box of a multi-column container, is a table the fragmenter cuts between rows,
+/// and where. `None` (the box stays one atom, today's behaviour) unless all hold:
+///
+/// - its `display` is a table (`inside` is `table`) and it has at least two row bands ([`RowBand`]);
+/// - its cells come in non-decreasing `y`, as Blitz's visual order gives them (F36, F163c): a table the order of
+///   which the bands cannot follow is not cut;
+/// - neither it nor an ancestor below `<body>` clips its overflow, is transformed or translucent
+///   ([`table_subtree_is_wrapped`]: those subtrees are painted through wrappers the pieces would not pass through);
+/// - it is not `break-inside: avoid` while it fits a fresh page (`fresh`), as everywhere else
+///   ([`avoid_inside_holds`]).
+///
+/// The header repeats for a `<table>` element only, by F12's rules ([`repeating_table_header`]: at most a quarter
+/// of a page, a prefix of the cells) and only when the header's bands end where a body band starts.
+#[allow(dead_code)] // called by `multicol_container` in the next commit
+fn mc_table(
+    doc: &BaseDocument,
+    node_id: usize,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    fresh: f32,
+) -> Option<McTable> {
+    use ::style::values::specified::box_::DisplayInside;
+    let node = doc.get_node(node_id)?;
+    if node.primary_styles()?.clone_display().inside() != DisplayInside::Table {
+        return None;
+    }
+    let height = node.final_layout.size.height;
+    if !height.is_finite() || height <= 0.0 {
+        return None;
+    }
+    if avoid_inside_holds(has_avoid(column_styles, node_id), height, fresh) {
+        return None;
+    }
+    if table_subtree_is_wrapped(doc, node_id) {
+        return None;
+    }
+    let cells = node.layout_children.borrow();
+    let cells: &[usize] = cells.as_deref()?;
+    let extents: Vec<(f32, f32)> = cells
+        .iter()
+        .map(|&cell| {
+            let layout = doc.get_node(cell)?.final_layout;
+            Some((layout.location.y, layout.size.height))
+        })
+        .collect::<Option<_>>()?;
+    let bands = row_bands(&extents, height)?;
+    let head = repeating_table_header(doc, node_id, fresh).and_then(|repeat| {
+        let n = repeat.cells.len() as u32;
+        let header_bands = bands.iter().position(|b| b.cells.start == n)?;
+        (header_bands > 0).then_some(McHead {
+            group: repeat.group_id,
+            bands: header_bands as u32,
+            height: repeat.height,
+        })
+    });
+    Some(McTable { bands, head })
 }
 
 /// F30d: whether a multi-column container of block-size `height` is cut over pages when `room` is what is
@@ -879,7 +1122,7 @@ fn fragment_multicol_container(
                 // F28 for a group below a spanner: when its first unit does not fit the room under it, the
                 // group starts on the next page.
                 if i > 0 && frag.has_content {
-                    let unit = flow_first_unit(&group.flow);
+                    let unit = flow_first_unit(&group.flow, &BTreeMap::new());
                     if unit > strips.bottom(frag.page) - frag.cursor() && unit <= strips.fresh() {
                         next_page(geometry, &mut frag);
                     }
@@ -896,6 +1139,7 @@ fn fragment_multicol_container(
                     strips.fresh(),
                     fill,
                     if last { c.bottom_inset } else { 0.0 },
+                    &BTreeMap::new(),
                 );
                 let plan_len = plan.len();
                 for (k, mut page) in plan.into_iter().enumerate() {
@@ -1115,6 +1359,8 @@ fn record_multicol_row(
                             height: h.as_px(),
                         });
                 }
+                // F174: the planner is not given tables yet, so no piece of rows is planned.
+                McPiece::Rows { .. } => {}
             }
         }
     }
@@ -14190,6 +14436,26 @@ h2 { string-set: chapter-title content(text); }
         }
     }
 
+    /// [`plan_multicol_pages`] for a flow without tables.
+    fn plan_no_tables(
+        flow: &[FlowItem],
+        n: u32,
+        first_room: f32,
+        page_room: f32,
+        fill: ColumnFill,
+        last_inset: f32,
+    ) -> Vec<McPage> {
+        plan_multicol_pages(
+            flow,
+            n,
+            first_room,
+            page_room,
+            fill,
+            last_inset,
+            &BTreeMap::new(),
+        )
+    }
+
     fn block(node: usize, h: f32) -> FlowItem {
         FlowItem::Block {
             node,
@@ -14237,7 +14503,7 @@ h2 { string-set: chapter-title content(text); }
     #[test]
     fn plan_lines_over_many_pages_tile_without_gaps_or_repeats() {
         // 1000 lines of 20 px, two columns of 50 lines per page after a first page of 10 lines per column.
-        let pages = plan_multicol_pages(
+        let pages = plan_no_tables(
             &[lines(7, 1000, 20.0)],
             2,
             200.0,
@@ -14272,7 +14538,7 @@ h2 { string-set: chapter-title content(text); }
         // A first room smaller than a line: the first column still takes a line (the caller moves the container
         // to the next page when its first unit does not fit, F28), the second does not: a line below the room of
         // a partial page goes to the next page, which it fits (html-to-pdf F161).
-        let pages = plan_multicol_pages(
+        let pages = plan_no_tables(
             &[lines(1, 10, 20.0)],
             2,
             5.0,
@@ -14289,8 +14555,7 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(line_range(&pages[1], 0, 1), Some((1, 6)));
         assert_eq!(line_range(&pages[1], 1, 1), Some((6, 10)));
         // On fresh pages every column takes a unit, whatever its height.
-        let pages =
-            plan_multicol_pages(&[lines(1, 4, 20.0)], 2, 5.0, 5.0, ColumnFill::Balance, 0.0);
+        let pages = plan_no_tables(&[lines(1, 4, 20.0)], 2, 5.0, 5.0, ColumnFill::Balance, 0.0);
         assert_lines_tile(&pages, 1, 4);
         assert_eq!(pages.len(), 2);
     }
@@ -14298,20 +14563,20 @@ h2 { string-set: chapter-title content(text); }
     #[test]
     fn plan_balance_and_auto_differ_only_on_the_last_page() {
         let flow = [lines(1, 30, 20.0)];
-        let balanced = plan_multicol_pages(&flow, 2, 1000.0, 1000.0, ColumnFill::Balance, 0.0);
+        let balanced = plan_no_tables(&flow, 2, 1000.0, 1000.0, ColumnFill::Balance, 0.0);
         assert_eq!(balanced.len(), 1);
         assert_eq!(line_range(&balanced[0], 0, 1), Some((0, 15)));
         assert_eq!(line_range(&balanced[0], 1, 1), Some((15, 30)));
         assert_eq!(balanced[0].height.to_f32(), 300.0);
         // `auto` never balances: the first column takes all that fits.
-        let auto = plan_multicol_pages(&flow, 2, 1000.0, 1000.0, ColumnFill::Auto, 0.0);
+        let auto = plan_no_tables(&flow, 2, 1000.0, 1000.0, ColumnFill::Auto, 0.0);
         assert_eq!(auto.len(), 1);
         assert_eq!(line_range(&auto[0], 0, 1), Some((0, 30)));
         assert_eq!(line_range(&auto[0], 1, 1), None);
         assert_eq!(auto[0].height.to_f32(), 600.0);
         // Earlier pages are filled in both modes: 45 lines over pages of 10 lines per column.
         for fill in [ColumnFill::Balance, ColumnFill::Auto] {
-            let pages = plan_multicol_pages(&[lines(1, 45, 20.0)], 2, 200.0, 200.0, fill, 0.0);
+            let pages = plan_no_tables(&[lines(1, 45, 20.0)], 2, 200.0, 200.0, fill, 0.0);
             assert_lines_tile(&pages, 1, 45);
             assert_eq!(line_range(&pages[0], 1, 1), Some((10, 20)));
             assert_eq!(line_range(&pages[1], 0, 1), Some((20, 30)));
@@ -14325,7 +14590,7 @@ h2 { string-set: chapter-title content(text); }
         // on the first page (under a spanner) and 800 on a fresh one. The box does not fit the second column of
         // the first page but fits a fresh page: it goes there instead of running past the page bottom.
         let flow = [lines(1, 5, 20.0), block(2, 300.0), lines(3, 4, 20.0)];
-        let pages = plan_multicol_pages(&flow, 2, 200.0, 800.0, ColumnFill::Balance, 0.0);
+        let pages = plan_no_tables(&flow, 2, 200.0, 800.0, ColumnFill::Balance, 0.0);
         assert_eq!(pages.len(), 2);
         assert_eq!(line_range(&pages[0], 0, 1), Some((0, 5)));
         assert!(pages[0].height.to_f32() <= 200.0, "{:?}", pages[0].height);
@@ -14338,7 +14603,7 @@ h2 { string-set: chapter-title content(text); }
             }
         );
         // A box taller than a fresh page still goes in whole (and overflows) rather than loop.
-        let pages = plan_multicol_pages(
+        let pages = plan_no_tables(
             &[block(4, 900.0)],
             2,
             200.0,
@@ -14347,7 +14612,7 @@ h2 { string-set: chapter-title content(text); }
             0.0,
         );
         assert_eq!(pages.len(), 1);
-        let pages = plan_multicol_pages(
+        let pages = plan_no_tables(
             &[lines(5, 1, 20.0), block(4, 900.0)],
             2,
             200.0,
@@ -14369,7 +14634,7 @@ h2 { string-set: chapter-title content(text); }
     fn plan_mixed_blocks_and_lines() {
         // A heading, a paragraph of 12 lines, another box: room of 160 per column.
         let flow = [block(10, 30.0), lines(11, 12, 20.0), block(12, 50.0)];
-        let pages = plan_multicol_pages(&flow, 2, 160.0, 160.0, ColumnFill::Balance, 0.0);
+        let pages = plan_no_tables(&flow, 2, 160.0, 160.0, ColumnFill::Balance, 0.0);
         // Page 0: heading 30 + 6 lines (150 <= 160); column 2: 6 lines (120), then the 50 px box does not fit.
         assert_eq!(pages.len(), 2);
         assert_eq!(
@@ -14404,7 +14669,7 @@ h2 { string-set: chapter-title content(text); }
     #[test]
     fn plan_a_block_taller_than_a_page_is_placed_alone() {
         let flow = [lines(1, 3, 20.0), block(2, 3000.0), lines(3, 3, 20.0)];
-        let pages = plan_multicol_pages(&flow, 2, 1000.0, 1000.0, ColumnFill::Balance, 0.0);
+        let pages = plan_no_tables(&flow, 2, 1000.0, 1000.0, ColumnFill::Balance, 0.0);
         // The block does not fit under the three lines: it opens column 2 and overflows it.
         assert_eq!(line_range(&pages[0], 0, 1), Some((0, 3)));
         assert_eq!(
@@ -14420,7 +14685,7 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(line_range(&pages[1], 0, 3), Some((0, 2)));
         assert_eq!(line_range(&pages[1], 1, 3), Some((2, 3)));
         // A block taller than the page is also alone in the first column of a page.
-        let pages = plan_multicol_pages(
+        let pages = plan_no_tables(
             &[block(2, 3000.0)],
             2,
             100.0,
@@ -14434,7 +14699,7 @@ h2 { string-set: chapter-title content(text); }
 
     #[test]
     fn plan_three_columns() {
-        let pages = plan_multicol_pages(
+        let pages = plan_no_tables(
             &[lines(1, 100, 20.0)],
             3,
             400.0,
@@ -14460,7 +14725,7 @@ h2 { string-set: chapter-title content(text); }
     fn plan_keeps_the_bottom_inset_free_on_the_last_page_only() {
         // 50 lines of 20 px, columns of 10 lines, 30 px of bottom padding under the last page's columns.
         let flow = [lines(1, 50, 20.0)];
-        let pages = plan_multicol_pages(&flow, 2, 200.0, 200.0, ColumnFill::Auto, 30.0);
+        let pages = plan_no_tables(&flow, 2, 200.0, 200.0, ColumnFill::Auto, 30.0);
         assert_lines_tile(&pages, 1, 50);
         assert_eq!(pages.len(), 3);
         // Not the last page: filled to the room, ignoring the inset.
@@ -14471,7 +14736,7 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(line_range(&pages[2], 1, 1), Some((48, 50)));
         // A rest that fits the room but not the room less the inset hangs the padding below the page and
         // is balanced like any last page.
-        let pages = plan_multicol_pages(
+        let pages = plan_no_tables(
             &[lines(1, 18, 20.0)],
             2,
             200.0,
@@ -14486,9 +14751,9 @@ h2 { string-set: chapter-title content(text); }
 
     #[test]
     fn plan_empty_flow_and_empty_paragraph() {
-        assert!(plan_multicol_pages(&[], 2, 100.0, 100.0, ColumnFill::Balance, 0.0).is_empty());
+        assert!(plan_no_tables(&[], 2, 100.0, 100.0, ColumnFill::Balance, 0.0).is_empty());
         assert!(
-            plan_multicol_pages(
+            plan_no_tables(
                 &[lines(1, 0, 20.0)],
                 2,
                 100.0,
@@ -14498,6 +14763,367 @@ h2 { string-set: chapter-title content(text); }
             )
             .is_empty()
         );
+    }
+
+    // ── F174: tables in the multicol planner ────────────────────────────────
+
+    /// A table of bands of `heights`, the first `head_bands` of which are a header of block-size `head_h`.
+    fn table_of(heights: &[f32], head: Option<(u32, f32)>) -> McTable {
+        let mut top = 0.0;
+        let bands = heights
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| {
+                let band = RowBand {
+                    cells: i as u32..i as u32 + 1,
+                    top,
+                    height: h,
+                };
+                top += h;
+                band
+            })
+            .collect();
+        McTable {
+            bands,
+            head: head.map(|(bands, height)| McHead {
+                group: 900,
+                bands,
+                height,
+            }),
+        }
+    }
+
+    fn tables_of(node: usize, table: McTable) -> BTreeMap<usize, McTable> {
+        BTreeMap::from([(node, table)])
+    }
+
+    /// `(first, end, y, head)` of the `Rows` pieces of `table` in `page.columns[col]`.
+    fn row_pieces(page: &McPage, col: usize, table: usize) -> Vec<(u32, u32, f32, bool)> {
+        page.columns[col]
+            .iter()
+            .filter_map(|p| match p {
+                McPiece::Rows {
+                    table: t,
+                    first,
+                    end,
+                    y,
+                    head,
+                } if *t == table => Some((*first, *end, y.to_f32(), *head)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every band of `table` once, in order: pages in order, columns in order, pieces in order.
+    fn assert_rows_tile(pages: &[McPage], table: usize, bands: u32) {
+        let mut next = 0;
+        for (p, page) in pages.iter().enumerate() {
+            for c in 0..page.columns.len() {
+                for (first, end, _, _) in row_pieces(page, c, table) {
+                    assert_eq!(first, next, "page {p} column {c} starts at band {first}");
+                    assert!(end > first, "empty piece on page {p} column {c}");
+                    next = end;
+                }
+            }
+        }
+        assert_eq!(next, bands, "every band placed once");
+    }
+
+    #[test]
+    fn plan_table_rows_tile_and_add_up_to_the_table() {
+        // 30 bands of 20 px in two columns of 100 px, 200 px pages: 5 + 5 bands on every full page.
+        let table = table_of(&[20.0; 30], None);
+        assert_eq!(table.height_of(0, 30), 600.0);
+        let pages = plan_multicol_pages(
+            &[block(7, 600.0)],
+            2,
+            200.0,
+            200.0,
+            ColumnFill::Auto,
+            0.0,
+            &tables_of(7, table),
+        );
+        assert_rows_tile(&pages, 7, 30);
+        assert_eq!(pages.len(), 2, "20 bands a page, 10 on the second");
+        assert_eq!(row_pieces(&pages[0], 0, 7), vec![(0, 10, 0.0, false)]);
+        assert_eq!(row_pieces(&pages[0], 1, 7), vec![(10, 20, 0.0, false)]);
+        assert_eq!(row_pieces(&pages[1], 0, 7), vec![(20, 30, 0.0, false)]);
+        assert!(pages[1].columns[1].is_empty());
+        assert_eq!(pages[0].height.to_f32(), 200.0);
+        assert_eq!(pages[1].height.to_f32(), 200.0);
+    }
+
+    #[test]
+    fn plan_table_balances_its_last_page_and_a_short_table_splits_over_the_columns() {
+        // 20 bands of 20 px, a 1000 px page: balanced 10 + 10 (c_short).
+        let pages = plan_multicol_pages(
+            &[block(7, 400.0)],
+            2,
+            1000.0,
+            1000.0,
+            ColumnFill::Balance,
+            0.0,
+            &tables_of(7, table_of(&[20.0; 20], None)),
+        );
+        assert_eq!(pages.len(), 1);
+        assert_eq!(row_pieces(&pages[0], 0, 7), vec![(0, 10, 0.0, false)]);
+        assert_eq!(row_pieces(&pages[0], 1, 7), vec![(10, 20, 0.0, false)]);
+        assert_eq!(pages[0].height.to_f32(), 200.0);
+    }
+
+    #[test]
+    fn plan_table_reserves_the_header_band_at_continuation_columns() {
+        // A header band of 20 px and 40 body bands of 20 px; columns of 100 px.
+        let table = table_of(&[vec![20.0], vec![20.0; 40]].concat(), Some((1, 20.0)));
+        let pages = plan_multicol_pages(
+            &[block(7, 820.0)],
+            2,
+            100.0,
+            100.0,
+            ColumnFill::Auto,
+            0.0,
+            &tables_of(7, table),
+        );
+        assert_rows_tile(&pages, 7, 41);
+        // Column 1: the header and four rows. Every later column: the repeated header (20 px) and four rows.
+        assert_eq!(row_pieces(&pages[0], 0, 7), vec![(0, 5, 0.0, false)]);
+        assert_eq!(row_pieces(&pages[0], 1, 7), vec![(5, 9, 0.0, true)]);
+        assert_eq!(row_pieces(&pages[1], 0, 7), vec![(9, 13, 0.0, true)]);
+        assert_eq!(row_pieces(&pages[1], 1, 7), vec![(13, 17, 0.0, true)]);
+        for page in &pages {
+            for col in 0..2 {
+                for (first, end, _, head) in row_pieces(page, col, 7) {
+                    if head {
+                        assert_eq!(end - first, 4);
+                    }
+                }
+            }
+            assert_eq!(page.height.to_f32(), 100.0);
+        }
+        // 41 bands: 5 + 4 * k; the last page holds the rest.
+        let last = pages.last().unwrap();
+        assert!(last.height.to_f32() <= 100.0);
+    }
+
+    #[test]
+    fn plan_table_header_and_first_row_never_end_a_column() {
+        // 80 px of lines fill a 100 px column but 20 px; the header (20 px) and the first row (20 px) are one
+        // atom, which does not fit the 20 px left: the table starts in the second column.
+        let table = table_of(&[vec![20.0], vec![20.0; 6]].concat(), Some((1, 20.0)));
+        let pages = plan_multicol_pages(
+            &[lines(1, 4, 20.0), block(7, 140.0)],
+            2,
+            100.0,
+            100.0,
+            ColumnFill::Auto,
+            0.0,
+            &tables_of(7, table),
+        );
+        assert_eq!(pages[0].columns[0].len(), 1, "only the lines");
+        assert_eq!(row_pieces(&pages[0], 1, 7), vec![(0, 5, 0.0, false)]);
+        assert_rows_tile(&pages, 7, 7);
+        // Without a header the first row alone fits the 20 px left.
+        let pages = plan_multicol_pages(
+            &[lines(1, 4, 20.0), block(7, 140.0)],
+            2,
+            100.0,
+            100.0,
+            ColumnFill::Auto,
+            0.0,
+            &tables_of(7, table_of(&[20.0; 7], None)),
+        );
+        assert_eq!(row_pieces(&pages[0], 0, 7), vec![(0, 1, 80.0, false)]);
+    }
+
+    #[test]
+    fn plan_table_row_that_does_not_fit_with_the_band_gets_none() {
+        // Columns of 100 px, a header of 30 px: a 75 px row fits a column alone but not with the band.
+        let table = table_of(
+            &[vec![30.0], vec![40.0], vec![75.0; 3]].concat(),
+            Some((1, 30.0)),
+        );
+        let pages = plan_multicol_pages(
+            &[block(7, 295.0)],
+            2,
+            100.0,
+            100.0,
+            ColumnFill::Auto,
+            0.0,
+            &tables_of(7, table),
+        );
+        assert_rows_tile(&pages, 7, 5);
+        assert_eq!(row_pieces(&pages[0], 0, 7), vec![(0, 2, 0.0, false)]);
+        assert_eq!(row_pieces(&pages[0], 1, 7), vec![(2, 3, 0.0, false)]);
+        assert_eq!(row_pieces(&pages[1], 0, 7), vec![(3, 4, 0.0, false)]);
+        // The rows fit alone: no band was reserved.
+        assert_eq!(pages[0].columns[1].len(), 1);
+    }
+
+    #[test]
+    fn plan_table_band_taller_than_a_column_is_placed_alone() {
+        let table = table_of(&[20.0, 250.0, 20.0], None);
+        let pages = plan_multicol_pages(
+            &[block(7, 290.0)],
+            2,
+            100.0,
+            100.0,
+            ColumnFill::Auto,
+            0.0,
+            &tables_of(7, table),
+        );
+        assert_rows_tile(&pages, 7, 3);
+        assert_eq!(row_pieces(&pages[0], 0, 7), vec![(0, 1, 0.0, false)]);
+        assert_eq!(row_pieces(&pages[0], 1, 7), vec![(1, 2, 0.0, false)]);
+        assert_eq!(pages.len(), 2);
+    }
+
+    #[test]
+    fn plan_flow_without_tables_places_a_table_box_whole() {
+        // A box whose node is not in the map is one atom, as before F174.
+        let pages = plan_no_tables(&[block(7, 300.0)], 2, 100.0, 100.0, ColumnFill::Auto, 0.0);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(
+            pages[0].columns[0],
+            vec![McPiece::Block {
+                node: 7,
+                y: 0.0.as_px()
+            }]
+        );
+        assert!(pages[0].columns[1].is_empty());
+    }
+
+    #[test]
+    fn flow_first_unit_of_a_table_is_its_header_and_first_row() {
+        let flow = [block(7, 400.0)];
+        assert_eq!(flow_first_unit(&flow, &BTreeMap::new()), 400.0);
+        let with_head = tables_of(
+            7,
+            table_of(&[vec![30.0], vec![20.0; 18]].concat(), Some((1, 30.0))),
+        );
+        assert_eq!(flow_first_unit(&flow, &with_head), 50.0);
+        let plain = tables_of(7, table_of(&[20.0; 20], None));
+        assert_eq!(flow_first_unit(&flow, &plain), 20.0);
+    }
+
+    // ── F174: mc_table ──────────────────────────────────────────────────────
+
+    /// Lay `html` out at 600 px and return the document and the node with class `t`.
+    fn table_doc(html: &str) -> (blitz_html::HtmlDocument, usize) {
+        let doc = parse(
+            &format!(
+                "<!doctype html><html><head><style>body{{margin:0}}\
+                 table{{border-spacing:0}}td,th{{padding:0;line-height:20px}}</style></head>\
+                 <body>{html}</body></html>"
+            ),
+            600.0,
+        );
+        let id = node_by_class(&doc, "t");
+        (doc, id)
+    }
+
+    #[test]
+    fn mc_table_bands_tile_the_table() {
+        let (doc, t) = table_doc(
+            "<table class=\"t\"><tbody>\
+             <tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr>\
+             <tr><td>e</td><td>f</td></tr></tbody></table>",
+        );
+        let table = mc_table(&doc, t, None, 1000.0).expect("a table with bands");
+        let h = doc.get_node(t).unwrap().final_layout.size.height;
+        assert_eq!(h, 60.0);
+        let spans: Vec<_> = table.bands.iter().map(|b| b.cells.clone()).collect();
+        assert_eq!(spans, vec![0..2, 2..4, 4..6]);
+        assert_eq!(
+            table.bands.iter().map(|b| b.top).collect::<Vec<_>>(),
+            vec![0.0, 20.0, 40.0]
+        );
+        assert_eq!(table.height_of(0, 3), h);
+        assert!(table.head.is_none());
+    }
+
+    #[test]
+    fn row_bands_join_rowspans_and_refuse_cells_out_of_order() {
+        // Two cells in the first row, one of them spanning the next (a `rowspan="2"` cell is 40 px tall), then
+        // two rows: the first two rows are one band.
+        let cells = [
+            (0.0, 40.0),
+            (0.0, 20.0),
+            (20.0, 20.0),
+            (40.0, 20.0),
+            (40.0, 20.0),
+            (60.0, 20.0),
+        ];
+        let bands = row_bands(&cells, 80.0).expect("bands");
+        assert_eq!(
+            bands.iter().map(|b| b.cells.clone()).collect::<Vec<_>>(),
+            vec![0..3, 3..5, 5..6]
+        );
+        assert_eq!(
+            bands.iter().map(|b| (b.top, b.height)).collect::<Vec<_>>(),
+            vec![(0.0, 40.0), (40.0, 20.0), (60.0, 20.0)]
+        );
+        // A rowspan over every row leaves one band: nothing to cut between.
+        assert!(row_bands(&[(0.0, 60.0), (20.0, 20.0), (40.0, 20.0)], 60.0).is_none());
+        // Cells that are not in order are not cut.
+        assert!(row_bands(&[(0.0, 20.0), (40.0, 20.0), (20.0, 20.0)], 60.0).is_none());
+        // Spacing between the rows belongs to the band above; the first band starts at the table's top.
+        let spaced = row_bands(&[(2.0, 20.0), (24.0, 20.0)], 46.0).expect("bands");
+        assert_eq!(
+            spaced.iter().map(|b| (b.top, b.height)).collect::<Vec<_>>(),
+            vec![(0.0, 24.0), (24.0, 22.0)]
+        );
+        assert!(row_bands(&[(0.0, f32::NAN), (20.0, 20.0)], 40.0).is_none());
+        assert!(row_bands(&[], 40.0).is_none());
+    }
+
+    #[test]
+    fn mc_table_finds_the_header_bands() {
+        let (doc, t) = table_doc(
+            "<table class=\"t\"><thead><tr><th>h</th><th>i</th></tr></thead><tbody>\
+             <tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></tbody></table>",
+        );
+        let table = mc_table(&doc, t, None, 1000.0).expect("table");
+        assert_eq!(table.bands.len(), 3);
+        let head = table.head.as_ref().expect("header");
+        assert_eq!((head.bands, head.height), (1, 20.0));
+        // A header taller than a quarter of the page is not repeated (F12), the table is still cut.
+        let cut = mc_table(&doc, t, None, 60.0).expect("table");
+        assert!(cut.head.is_none());
+        assert_eq!(cut.bands.len(), 3);
+    }
+
+    #[test]
+    fn mc_table_refuses_what_it_cannot_cut() {
+        // One row is one band.
+        let (doc, t) = table_doc("<table class=\"t\"><tr><td>a</td><td>b</td></tr></table>");
+        assert!(mc_table(&doc, t, None, 1000.0).is_none());
+        // A box that is not a table.
+        let (doc, t) = table_doc("<div class=\"t\"><p>a</p><p>b</p></div>");
+        assert!(mc_table(&doc, t, None, 1000.0).is_none());
+        // A clipping table.
+        let (doc, t) = table_doc(
+            "<table class=\"t\" style=\"overflow:hidden\"><tr><td>a</td></tr><tr><td>b</td></tr></table>",
+        );
+        assert!(mc_table(&doc, t, None, 1000.0).is_none());
+    }
+
+    #[test]
+    fn mc_table_keeps_an_avoid_table_that_fits_a_page_whole() {
+        let html = "<table class=\"t\" style=\"break-inside:avoid\">\
+                    <tr><td>a</td></tr><tr><td>b</td></tr><tr><td>c</td></tr></table>";
+        let doc = parse(
+            &format!(
+                "<!doctype html><html><head><style>body{{margin:0}}\
+                 table{{border-spacing:0}}td{{padding:0;height:20px}}</style></head><body>{html}</body></html>"
+            ),
+            600.0,
+        );
+        let styles = blitz_adapter::extract_column_style_table(&doc);
+        let t = node_by_class(&doc, "t");
+        // Fits a 1000 px page: not cut. Taller than the page: relaxed, cut.
+        assert!(mc_table(&doc, t, Some(&styles), 1000.0).is_none());
+        assert!(mc_table(&doc, t, Some(&styles), 30.0).is_some());
+        assert!(mc_table(&doc, t, None, 1000.0).is_some());
     }
 
     // ── F30d: fragment_multicol_container ───────────────────────────────────
