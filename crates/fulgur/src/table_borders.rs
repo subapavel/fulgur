@@ -175,49 +175,79 @@ fn paint_table(
     if !entry.visible {
         return;
     }
-    let Some((rows, x_off)) = page_rows(edges, cells, geometry, page_index, 0.0, 0.0) else {
+    let pieces = pieces_on_page(geometry, table, page_index);
+    let Some(slots) = page_rows(edges, cells, geometry, page_index, 0.0, 0.0, &pieces) else {
         return;
     };
-    // The header group is painted again on this page (F12): the copy paints the line under it, which is the first
-    // line of this page.
-    let first_row = rows.keys().next().copied();
-    let copy_here = edges.header_group.is_some_and(|group| {
-        geometry.get(&group).is_some_and(|g| {
-            g.is_repeat
-                && g.fragments
-                    .iter()
-                    .skip(1)
-                    .any(|f| f.page_index == page_index)
-        })
-    });
-    let skip_line = if copy_here { first_row } else { None };
+    // A page with the table in one place paints it as one; one with several (the columns of a multicol container
+    // that cut the table, F174) paints each by itself, at its own x.
+    let several = slots.len() > 1;
     as_artifact(canvas, |canvas| {
         crate::draw_primitives::draw_with_opacity(canvas, entry.opacity, |canvas| {
-            paint_lines(
-                canvas,
-                edges,
-                &rows,
-                x_off,
-                margin_left_pt,
-                margin_top_pt,
-                Mode::Page { skip_line },
-            );
+            for (&slot, Slot { rows, x_off }) in &slots {
+                // The header group is painted again on this page (F12): the copy paints the line under it, which
+                // is the first line of this slot.
+                let first_row = rows.keys().next().copied();
+                let skip_line = if copy_here(edges, geometry, page_index, several.then_some(slot)) {
+                    first_row
+                } else {
+                    None
+                };
+                paint_lines(
+                    canvas,
+                    edges,
+                    rows,
+                    *x_off,
+                    margin_left_pt,
+                    margin_top_pt,
+                    Mode::Page { skip_line },
+                );
+            }
         });
     });
 }
 
+/// Whether the header group of `edges` is painted again on `page_index` (F12), in the place `slot` of the page
+/// ([`slot_key`] of the x of a repeat; every place when `slot` is `None`: the page holds the table in one place).
+fn copy_here(
+    edges: &CollapsedEdges,
+    geometry: &PaginationGeometryTable,
+    page_index: u32,
+    slot: Option<i64>,
+) -> bool {
+    let Some(g) = edges
+        .header_group
+        .and_then(|group| geometry.get(&group))
+        .filter(|g| g.is_repeat)
+    else {
+        return false;
+    };
+    let mut repeats = g
+        .fragments
+        .iter()
+        .skip(1)
+        .filter(|f| f.page_index == page_index);
+    match slot {
+        None => repeats.next().is_some(),
+        Some(slot) => repeats.any(|f| slot_key(f.x.to_f32()) == slot),
+    }
+}
+
 /// F12: paints the lines of the header rows of `table` on a continuation page. The header's cells are those of
-/// `source_page`, shifted by `(dx_px, dy_px)` to where the copy stands; the copy is painted into `canvas`, which is the
-/// artifact the cells of the copy are in. `page_node_ids` is the node list of the page the copy is on.
+/// `source_page`, shifted by `(dx_px, dy_px)` to where the copy stands on `page_index`, at the table x `copy_x_px`; the
+/// copy is painted into `canvas`, which is the artifact the cells of the copy are in. `page_node_ids` is the node list
+/// of the page the copy is on.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_header_copy(
     canvas: &mut Canvas<'_, '_>,
     table: usize,
     source_page: u32,
+    page_index: u32,
     margin_left_pt: f32,
     margin_top_pt: f32,
     dx_px: f32,
     dy_px: f32,
+    copy_x_px: f32,
     geometry: &PaginationGeometryTable,
     drawables: &Drawables,
     page_node_ids: &[usize],
@@ -232,20 +262,24 @@ pub(crate) fn paint_header_copy(
         return;
     }
     let header: Vec<u32> = (0..edges.header_cells as u32).collect();
-    let Some((rows, x_off)) = page_rows(edges, &header, geometry, source_page, dx_px, dy_px) else {
+    // The header cells are in one place on the source page; the copy stands where `copy_x` is.
+    let Some(slots) = page_rows(edges, &header, geometry, source_page, dx_px, dy_px, &[]) else {
         return;
     };
-    let first_row = first_body_row(edges, table, page_node_ids, drawables);
+    let place = (geometry, page_index, slot_key(copy_x_px));
     crate::draw_primitives::draw_with_opacity(canvas, entry.opacity, |canvas| {
-        paint_lines(
-            canvas,
-            edges,
-            &rows,
-            x_off,
-            margin_left_pt,
-            margin_top_pt,
-            Mode::Copy { first_row },
-        );
+        for Slot { rows, x_off } in slots.values() {
+            let first_row = first_body_row(edges, table, page_node_ids, drawables, Some(place));
+            paint_lines(
+                canvas,
+                edges,
+                rows,
+                *x_off,
+                margin_left_pt,
+                margin_top_pt,
+                Mode::Copy { first_row },
+            );
+        }
     });
 }
 
@@ -253,24 +287,101 @@ pub(crate) fn paint_header_copy(
 /// page's own node list tells: the cell of `table` with the lowest index among the page's nodes. That is what a scan
 /// of `edges.cells` for the first cell on the page finds, without looking at the cells of the other pages (F99c: the
 /// scan made every page cost the length of the table).
+///
+/// `place` names the place of the page the header copy stands in (F174: the columns of a multicol container each
+/// hold a piece of the table): the page's geometry, its index and the slot of the copy ([`slot_key`]). Only the
+/// cells in that piece count, when the page has more than one; `None` counts every cell.
 fn first_body_row(
     edges: &CollapsedEdges,
     table: usize,
     page_node_ids: &[usize],
     drawables: &Drawables,
+    place: Option<(&PaginationGeometryTable, u32, i64)>,
 ) -> Option<u32> {
+    let pieces = place.map_or_else(Vec::new, |(geometry, page_index, _)| {
+        pieces_on_page(geometry, table, page_index)
+    });
+    let wanted = place
+        .map(|(_, _, slot)| slot)
+        .filter(|_| !pieces.is_empty());
     page_node_ids
         .iter()
-        .filter_map(|node| drawables.collapsed_cell_of.get(node))
-        .filter(|&&(t, index)| t == table && index as usize >= edges.header_cells)
-        .map(|&(_, index)| index)
+        .filter_map(|node| drawables.collapsed_cell_of.get(node).map(|c| (*node, c)))
+        .filter(|&(_, &(t, index))| t == table && index as usize >= edges.header_cells)
+        .filter(|&(node, _)| {
+            let (Some(slot), Some((geometry, page_index, _))) = (wanted, place) else {
+                return true;
+            };
+            geometry
+                .get(&node)
+                .and_then(|g| g.fragments.iter().find(|f| f.page_index == page_index))
+                .is_some_and(|f| piece_of(&pieces, f).is_some_and(|p| slot_key(p.x) == slot))
+        })
+        .map(|(_, &(_, index))| index)
         .min()
         .map(|index| edges.cells[index as usize].row)
 }
 
-/// The extent of every row that has a cell among `cells` on `page_index`, shifted by `(dx_px, dy_px)`, and the x of
-/// the table's left edge on the page (the offset the table's `track_x` is added to). `None` when no cell has a
-/// fragment on the page.
+/// One place on a page where cells of a table are: the extent of every row with a cell there, and the x of the table's
+/// left edge there (the offset the table's `track_x` is added to, that of the first cell of the place).
+#[derive(Debug)]
+struct Slot {
+    rows: BTreeMap<u32, RowSpan>,
+    x_off: f32,
+}
+
+/// The key of a place: the x of the table piece in it, in 1/64 px.
+fn slot_key(x: f32) -> i64 {
+    (x * 64.0).round() as i64
+}
+
+/// A piece of a table on a page (CSS px): where a multicol container put the rows of one column.
+#[derive(Debug, Clone, Copy)]
+struct Piece {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+/// The pieces of `table` on `page_index`, when a multicol container cut it ([`PaginationGeometry::table_pieces`]) and
+/// more than one piece is on the page; otherwise none: the table is in one place and its cells are painted as one.
+fn pieces_on_page(geometry: &PaginationGeometryTable, table: usize, page_index: u32) -> Vec<Piece> {
+    let Some(g) = geometry.get(&table).filter(|g| g.table_pieces) else {
+        return Vec::new();
+    };
+    let pieces: Vec<Piece> = g
+        .fragments
+        .iter()
+        .filter(|f| f.page_index == page_index)
+        .map(|f| Piece {
+            x: f.x.to_f32(),
+            y: f.y.to_f32(),
+            width: f.width.to_f32(),
+            height: f.height.to_f32(),
+        })
+        .collect();
+    if pieces.len() > 1 { pieces } else { Vec::new() }
+}
+
+/// The piece that holds the middle of the fragment `frag`.
+fn piece_of<'a>(
+    pieces: &'a [Piece],
+    frag: &crate::pagination_layout::Fragment,
+) -> Option<&'a Piece> {
+    let (cx, cy) = (
+        frag.x.to_f32() + frag.width.to_f32() / 2.0,
+        frag.y.to_f32() + frag.height.to_f32() / 2.0,
+    );
+    pieces
+        .iter()
+        .find(|p| cx >= p.x && cx < p.x + p.width && cy >= p.y && cy < p.y + p.height)
+}
+
+/// The extent of every row that has a cell among `cells` on `page_index`, shifted by `(dx_px, dy_px)`, by place on the
+/// page: a table on the page in one place has one slot (`pieces` is empty), one cut into `pieces` has a slot for each
+/// that has cells ([`slot_key`] of its x). The first cell of a place gives its `x_off`, the x of the table's left edge
+/// there. `None` when no cell has a fragment on the page.
 fn page_rows(
     edges: &CollapsedEdges,
     cells: &[u32],
@@ -278,9 +389,9 @@ fn page_rows(
     page_index: u32,
     dx_px: f32,
     dy_px: f32,
-) -> Option<(BTreeMap<u32, RowSpan>, f32)> {
-    let mut rows: BTreeMap<u32, RowSpan> = BTreeMap::new();
-    let mut x_off = None;
+    pieces: &[Piece],
+) -> Option<BTreeMap<i64, Slot>> {
+    let mut slots: BTreeMap<i64, Slot> = BTreeMap::new();
     for &index in cells {
         let cell = edges.cells[index as usize];
         let Some(geom) = geometry.get(&cell.node) else {
@@ -289,16 +400,18 @@ fn page_rows(
         let earlier = geom.fragments.iter().any(|f| f.page_index < page_index);
         let later = geom.fragments.iter().any(|f| f.page_index > page_index);
         for frag in geom.fragments.iter().filter(|f| f.page_index == page_index) {
+            let place = piece_of(pieces, frag).map_or(0, |p| slot_key(p.x));
             let frag = crate::render::frame_fragment(geom, frag);
             let (x, y) = (frag.x.to_f32() + dx_px, frag.y.to_f32() + dy_px);
             let (w, h) = (frag.width.to_f32(), frag.height.to_f32());
             if w <= 0.0 || h <= 0.0 {
                 continue;
             }
-            if x_off.is_none() {
-                x_off = Some(x - edges.track_x[cell.track as usize].to_f32());
-            }
-            let row = rows.entry(cell.row).or_insert(RowSpan {
+            let slot = slots.entry(place).or_insert_with(|| Slot {
+                rows: BTreeMap::new(),
+                x_off: x - edges.track_x[cell.track as usize].to_f32(),
+            });
+            let row = slot.rows.entry(cell.row).or_insert(RowSpan {
                 top: y,
                 bottom: y + h,
                 started: true,
@@ -310,7 +423,7 @@ fn page_rows(
             row.continues |= later;
         }
     }
-    x_off.map(|x_off| (rows, x_off))
+    (!slots.is_empty()).then_some(slots)
 }
 
 /// Style ranking of rule 4 of CSS 2.1 §17.6.2.1: `double`, `solid`, `dashed`, `dotted`, `ridge`, `outset`, `groove`,
@@ -904,12 +1017,12 @@ mod tests {
                     for page in 0..9 {
                         let nodes = page_nodes(&geometry, page);
                         assert_eq!(
-                            first_body_row(&edges, 1, &nodes, &drawables),
+                            first_body_row(&edges, 1, &nodes, &drawables, None),
                             first_body_row_by_scan(&edges, &geometry, page),
                             "tracks {tracks} header rows {header_rows} cut {cut} page {page}"
                         );
                         assert_eq!(
-                            first_body_row(&other, 2, &nodes, &drawables),
+                            first_body_row(&other, 2, &nodes, &drawables, None),
                             first_body_row_by_scan(&other, &geometry, page),
                             "other table: tracks {tracks} cut {cut} page {page}"
                         );
@@ -929,12 +1042,260 @@ mod tests {
         drawables.collapsed_cell_of.insert(900, (2, 2));
         // Only header cells (indices 0 and 1) and a cell of another table are on the page.
         assert_eq!(
-            first_body_row(&edges, 1, &[100, 101, 900], &drawables),
+            first_body_row(&edges, 1, &[100, 101, 900], &drawables, None),
             None
         );
-        assert_eq!(first_body_row(&edges, 1, &[], &drawables), None);
+        assert_eq!(first_body_row(&edges, 1, &[], &drawables, None), None);
         // The lowest index wins whatever the order of the list: cell 4 is in row 2, cell 3 in row 1.
-        assert_eq!(first_body_row(&edges, 1, &[104, 103], &drawables), Some(1));
+        assert_eq!(
+            first_body_row(&edges, 1, &[104, 103], &drawables, None),
+            Some(1)
+        );
+    }
+
+    /// `page_rows` as it was before the places of a page were told apart (F174): the first cell's `x_off` for every
+    /// row of the page.
+    fn page_rows_in_one_place(
+        edges: &CollapsedEdges,
+        cells: &[u32],
+        geometry: &PaginationGeometryTable,
+        page_index: u32,
+        dx_px: f32,
+        dy_px: f32,
+    ) -> Option<(BTreeMap<u32, RowSpan>, f32)> {
+        let mut rows: BTreeMap<u32, RowSpan> = BTreeMap::new();
+        let mut x_off = None;
+        for &index in cells {
+            let cell = edges.cells[index as usize];
+            let Some(geom) = geometry.get(&cell.node) else {
+                continue;
+            };
+            let earlier = geom.fragments.iter().any(|f| f.page_index < page_index);
+            let later = geom.fragments.iter().any(|f| f.page_index > page_index);
+            for frag in geom.fragments.iter().filter(|f| f.page_index == page_index) {
+                let frag = crate::render::frame_fragment(geom, frag);
+                let (x, y) = (frag.x.to_f32() + dx_px, frag.y.to_f32() + dy_px);
+                let (w, h) = (frag.width.to_f32(), frag.height.to_f32());
+                if w <= 0.0 || h <= 0.0 {
+                    continue;
+                }
+                if x_off.is_none() {
+                    x_off = Some(x - edges.track_x[cell.track as usize].to_f32());
+                }
+                let row = rows.entry(cell.row).or_insert(RowSpan {
+                    top: y,
+                    bottom: y + h,
+                    started: true,
+                    continues: false,
+                });
+                row.top = row.top.min(y);
+                row.bottom = row.bottom.max(y + h);
+                row.started &= !earlier;
+                row.continues |= later;
+            }
+        }
+        x_off.map(|x_off| (rows, x_off))
+    }
+
+    fn fragment_at(page_index: u32, x: f32, y: f32) -> Fragment {
+        Fragment {
+            page_index,
+            x: x.as_px(),
+            y: y.as_px(),
+            width: 10.0_f32.as_px(),
+            height: 10.0_f32.as_px(),
+        }
+    }
+
+    /// A table in one place on every page (what every table was before F174) has one slot, the rows and the `x_off`
+    /// the one-place version gave, whatever x the cells of a row have against their track (collapsed borders give
+    /// every cell its own offset of half a border): header on page 0, body rows two to a page, some rows continued.
+    #[test]
+    fn a_table_in_one_place_has_one_slot_with_the_rows_of_the_old_page_rows() {
+        for tracks in 1..=4u32 {
+            for header_rows in 0..=2u32 {
+                let edges = grid(100, 9, tracks, header_rows);
+                let cells: Vec<u32> = (0..edges.cells.len() as u32).collect();
+                for (cut, x0) in [(false, 0.0), (true, 12.3456), (true, 100.0)] {
+                    let mut geometry = PaginationGeometryTable::new();
+                    for c in &edges.cells {
+                        let first = if c.row < edges.header_rows {
+                            0
+                        } else {
+                            (c.row - edges.header_rows) / 2 + 1
+                        };
+                        // Cell x is the track's plus a border offset that differs from cell to cell.
+                        let x = x0 + 50.0 * c.track as f32 + (c.node % 3) as f32;
+                        let mut fragments =
+                            vec![fragment_at(first, x, 7.0 + 10.0 * (c.row % 2) as f32)];
+                        if cut && c.row % 3 == 0 && c.row >= edges.header_rows {
+                            fragments.push(fragment_at(first + 1, x, 0.0));
+                        }
+                        geometry.insert(
+                            c.node,
+                            PaginationGeometry {
+                                fragments,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    for page in 0..8 {
+                        assert!(pieces_on_page(&geometry, 1, page).is_empty());
+                        for (dx, dy) in [(0.0, 0.0), (3.5, -2.25)] {
+                            let old =
+                                page_rows_in_one_place(&edges, &cells, &geometry, page, dx, dy);
+                            let new = page_rows(&edges, &cells, &geometry, page, dx, dy, &[]);
+                            assert_eq!(old.is_some(), new.is_some(), "page {page}");
+                            let (Some((rows, x_off)), Some(slots)) = (old, new) else {
+                                continue;
+                            };
+                            assert_eq!(slots.len(), 1, "page {page}: {slots:?}");
+                            let slot = slots.values().next().unwrap();
+                            assert_eq!(slot.x_off.to_bits(), x_off.to_bits());
+                            assert_eq!(format!("{:?}", slot.rows), format!("{rows:?}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A table of 6 rows of 2 tracks (track `t` at `50 t`, node 1) with the first row the header, cut in two columns on
+    /// page 0: rows 1-2 at x 0, rows 3-4 at x 200 (below a repeat of the header), row 5 on page 1 at x 0.
+    fn two_columns() -> (CollapsedEdges, PaginationGeometryTable) {
+        let edges = grid(100, 6, 2, 1);
+        let mut geometry = PaginationGeometryTable::new();
+        for c in &edges.cells {
+            let (page, col, slot) = match c.row {
+                0 => (0, 0.0, 0),
+                1 | 2 => (0, 0.0, c.row - 1),
+                3 | 4 => (0, 200.0, c.row - 3),
+                _ => (1, 0.0, 0),
+            };
+            // Header at the top of column 1; the body rows below it; the cells of a row side by side. The cells
+            // are a pixel or two off their track, as under collapsed borders.
+            let y = if c.row == 0 {
+                0.0
+            } else {
+                20.0 + 10.0 * slot as f32
+            };
+            geometry.insert(
+                c.node,
+                PaginationGeometry {
+                    fragments: vec![fragment_at(
+                        page,
+                        col + 50.0 * c.track as f32 + c.track as f32,
+                        y,
+                    )],
+                    ..Default::default()
+                },
+            );
+        }
+        // The header group: the source, a repeat at the top of column 2 and one on page 1.
+        geometry.insert(
+            edges.header_group.unwrap(),
+            PaginationGeometry {
+                fragments: vec![
+                    fragment_at(0, 0.0, 0.0),
+                    fragment_at(0, 200.0, 0.0),
+                    fragment_at(1, 0.0, 0.0),
+                ],
+                is_repeat: true,
+                ..Default::default()
+            },
+        );
+        // The table: a piece per column on page 0, one on page 1.
+        let piece = |page, x, h: f32| Fragment {
+            width: 120.0_f32.as_px(),
+            height: h.as_px(),
+            ..fragment_at(page, x, 0.0)
+        };
+        geometry.insert(
+            1,
+            PaginationGeometry {
+                fragments: vec![
+                    piece(0, 0.0, 50.0),
+                    piece(0, 200.0, 50.0),
+                    piece(1, 0.0, 30.0),
+                ],
+                table_pieces: true,
+                ..Default::default()
+            },
+        );
+        (edges, geometry)
+    }
+
+    #[test]
+    fn a_page_with_the_table_in_two_columns_has_a_slot_per_piece() {
+        let (edges, geometry) = two_columns();
+        let cells: Vec<u32> = (0..edges.cells.len() as u32).collect();
+        let pieces = pieces_on_page(&geometry, 1, 0);
+        assert_eq!(pieces.len(), 2);
+        let slots =
+            page_rows(&edges, &cells, &geometry, 0, 0.0, 0.0, &pieces).expect("cells on page 0");
+        assert_eq!(
+            slots
+                .iter()
+                .map(|(k, s)| (*k, s.x_off, s.rows.keys().copied().collect::<Vec<_>>()))
+                .collect::<Vec<_>>(),
+            vec![(0, 0.0, vec![0, 1, 2]), (200 * 64, 200.0, vec![3, 4])]
+        );
+        // Page 1 has one piece: the table is in one place.
+        assert!(pieces_on_page(&geometry, 1, 1).is_empty());
+        let slots = page_rows(&edges, &cells, &geometry, 1, 0.0, 0.0, &[]).unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[&0].rows.keys().copied().collect::<Vec<_>>(), vec![5]);
+    }
+
+    #[test]
+    fn the_header_copy_belongs_to_its_column_alone() {
+        let (edges, geometry) = two_columns();
+        // Page 0: the copy is at the top of column 2 (x 200), not column 1, which has the header itself.
+        assert!(copy_here(&edges, &geometry, 0, Some(200 * 64)));
+        assert!(!copy_here(&edges, &geometry, 0, Some(0)));
+        // A page that holds the table in one place has the copy wherever it is.
+        assert!(copy_here(&edges, &geometry, 0, None));
+        assert!(copy_here(&edges, &geometry, 1, None));
+        assert!(!copy_here(&edges, &geometry, 2, None));
+    }
+
+    #[test]
+    fn the_first_body_row_under_a_copy_is_that_of_its_column() {
+        let (edges, geometry) = two_columns();
+        let mut drawables = Drawables::new();
+        for (i, c) in edges.cells.iter().enumerate() {
+            drawables.collapsed_cell_of.insert(c.node, (1, i as u32));
+        }
+        let nodes = page_nodes(&geometry, 0);
+        // Without a place, the lowest cell of the page: row 1 (column 1).
+        assert_eq!(first_body_row(&edges, 1, &nodes, &drawables, None), Some(1));
+        // In column 2 it is row 3, in column 1 row 1.
+        assert_eq!(
+            first_body_row(
+                &edges,
+                1,
+                &nodes,
+                &drawables,
+                Some((&geometry, 0, 200 * 64))
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            first_body_row(&edges, 1, &nodes, &drawables, Some((&geometry, 0, 0))),
+            Some(1)
+        );
+        // On a page with the table in one place the slot does not matter.
+        let page1 = page_nodes(&geometry, 1);
+        assert_eq!(
+            first_body_row(
+                &edges,
+                1,
+                &page1,
+                &drawables,
+                Some((&geometry, 1, 200 * 64))
+            ),
+            Some(5)
+        );
     }
 
     fn span(started: bool, continues: bool) -> RowSpan {
