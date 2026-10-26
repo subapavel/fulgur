@@ -8358,3 +8358,25 @@ fn multicol_span_all_over_pages_loses_no_words() {
     assert_eq!(words.len(), expected.len(), "printed word count");
     assert_eq!(words, expected);
 }
+
+/// html-to-pdf F173: a `<div>` taller than a page under a `column-span: all` heading. The multicol fragmenter
+/// places a box whole, so such a container keeps the old path, whose block recursion cuts the `<div>` between
+/// its lines; no word is lost.
+#[test]
+fn multicol_span_all_with_a_block_taller_than_a_page_loses_no_words() {
+    let words: Vec<String> = (0..300).map(|i| format!("x{i:03}")).collect();
+    let html = format!(
+        "<!doctype html><html><head><style>@page{{size:300pt 300pt;margin:10pt}}\
+         body{{margin:0;font-size:16px;line-height:20px}}p,h2{{margin:0;font-size:16px}}</style></head><body>\
+         <div style=\"columns:3;column-gap:20px\"><h2 style=\"column-span:all\">SPAN</h2><div><p>{}</p></div></div>\
+         </body></html>",
+        words.join(" ")
+    );
+    let pdf = noto_engine().render(&html).expect("render");
+    let mut printed = printed_words(&pdf);
+    printed.sort();
+    let mut expected = words;
+    expected.push("SPAN".to_string());
+    expected.sort();
+    assert_eq!(printed, expected);
+}
