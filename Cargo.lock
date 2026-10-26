@@ -1907,6 +1907,7 @@ dependencies = [
  "once_cell",
  "pdf-writer",
  "png",
+ "rayon",
  "rustc-hash",
  "rustybuzz",
  "siphasher",
