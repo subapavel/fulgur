@@ -150,6 +150,12 @@ pub(crate) fn offline_resolver() -> usvg::ImageHrefResolver<'static> {
 pub fn offline_options() -> usvg::Options<'static> {
     usvg::Options {
         image_href_resolver: offline_resolver(),
+        // Nothing to choose from, so say nothing: usvg's default selector logs "No match for '…' font-family" for
+        // every text it cannot draw, which is noise for a parse that only validates or measures.
+        font_resolver: usvg::FontResolver {
+            select_font: Box::new(|_, _| None),
+            select_fallback: Box::new(|_, _, _| None),
+        },
         ..usvg::Options::default()
     }
 }
@@ -805,6 +811,33 @@ mod tests {
         assert_eq!(load(&gif_url(GIF)), 1);
         assert_eq!(load(on_disk.to_str().unwrap()), 0);
         assert_eq!(load(&format!("file://{}", on_disk.display())), 0);
+    }
+
+    #[test]
+    fn offline_options_have_no_fonts_and_log_nothing_for_text() {
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl log::Log for Capture {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, r: &log::Record<'_>) {
+                if r.target().starts_with("usvg") {
+                    self.0.lock().unwrap().push(r.args().to_string());
+                }
+            }
+            fn flush(&self) {}
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        // The logger is process-wide: if another test installed one first, only the tree is checked.
+        let installed = log::set_boxed_logger(Box::new(Capture(Arc::clone(&seen)))).is_ok();
+        log::set_max_level(log::LevelFilter::Trace);
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="50" height="20"><text y="15" font-family="sans-serif">Aa</text></svg>"#;
+        let tree = usvg::Tree::from_str(svg, &offline_options()).unwrap();
+        assert!(tree.root().children().is_empty(), "no font, no text");
+        if installed {
+            let seen = seen.lock().unwrap();
+            assert!(!seen.iter().any(|m| m.contains("No match")), "{seen:?}");
+        }
     }
 
     #[test]
