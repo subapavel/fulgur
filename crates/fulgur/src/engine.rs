@@ -691,7 +691,7 @@ impl Engine {
         let mut convert_ctx = ConvertContext {
             running_store: &running_store,
             assets: self.assets.as_ref(),
-            font_cache: HashMap::new(),
+            font_bytes: crate::convert::FontBytes::seeded(fonts),
             string_set_by_node,
             counter_ops_by_node: counter_ops_map,
             bookmark_by_node,
@@ -943,7 +943,7 @@ impl Engine {
         let mut convert_ctx = ConvertContext {
             running_store: &running_store,
             assets: self.assets.as_ref(),
-            font_cache: HashMap::new(),
+            font_bytes: crate::convert::FontBytes::seeded(fonts),
             string_set_by_node: HashMap::new(),
             counter_ops_by_node: HashMap::new(),
             bookmark_by_node: HashMap::new(),
@@ -1061,7 +1061,7 @@ impl Engine {
         let mut convert_ctx = ConvertContext {
             running_store: &running_store,
             assets: self.assets.as_ref(),
-            font_cache: HashMap::new(),
+            font_bytes: crate::convert::FontBytes::seeded(fonts),
             string_set_by_node: HashMap::new(),
             counter_ops_by_node: HashMap::new(),
             bookmark_by_node: HashMap::new(),

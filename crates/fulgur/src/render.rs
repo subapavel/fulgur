@@ -5177,7 +5177,7 @@ impl<'a> MarginBoxRenderer<'a> {
                 let mut dummy_ctx = crate::convert::ConvertContext {
                     running_store: &dummy_store,
                     assets: None,
-                    font_cache: HashMap::new(),
+                    font_bytes: crate::convert::FontBytes::seeded(self.font_data),
                     string_set_by_node: HashMap::new(),
                     counter_ops_by_node: HashMap::new(),
                     bookmark_by_node: HashMap::new(),
@@ -7843,7 +7843,7 @@ mod tests {
         let mut ctx = crate::convert::ConvertContext {
             running_store: &store,
             assets: None,
-            font_cache: HashMap::new(),
+            font_bytes: Default::default(),
             string_set_by_node: HashMap::new(),
             counter_ops_by_node: HashMap::new(),
             bookmark_by_node: HashMap::new(),

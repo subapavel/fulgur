@@ -509,7 +509,9 @@ fn parse_inner(
             source_cache: parley::fontique::SourceCache::new(Default::default()),
         };
         for data in font_data {
-            let blob: parley::fontique::Blob<u8> = (**data).clone().into();
+            // The bundle's own bytes, not a copy per document: the blob's address is then the bundle's, which is
+            // how `convert::FontBytes` recognises a bundled font.
+            let blob = parley::fontique::Blob::new(Arc::clone(data) as _);
             ctx.collection.register_fonts(blob, None);
         }
         apply_generic_families(&mut ctx.collection, generics);

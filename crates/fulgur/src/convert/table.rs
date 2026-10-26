@@ -704,7 +704,7 @@ mod tests {
         let mut ctx = ConvertContext {
             running_store: &store,
             assets: None,
-            font_cache: Default::default(),
+            font_bytes: Default::default(),
             string_set_by_node: Default::default(),
             counter_ops_by_node: Default::default(),
             bookmark_by_node: Default::default(),
@@ -923,7 +923,7 @@ mod tests {
         let mut ctx = ConvertContext {
             running_store: &store,
             assets: None,
-            font_cache: Default::default(),
+            font_bytes: Default::default(),
             string_set_by_node: Default::default(),
             counter_ops_by_node: Default::default(),
             bookmark_by_node: Default::default(),

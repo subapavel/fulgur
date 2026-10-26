@@ -135,8 +135,8 @@ impl DroppedTexts {
 pub struct ConvertContext<'a> {
     pub running_store: &'a RunningElementStore,
     pub assets: Option<&'a AssetBundle>,
-    /// Cache font data by (data pointer address, font index) to avoid redundant .to_vec() copies.
-    pub(crate) font_cache: HashMap<(usize, u32), Arc<Vec<u8>>>,
+    /// The `Arc` every glyph run holds for its font's bytes; bundled fonts are shared, never copied (see [`FontBytes`]).
+    pub(crate) font_bytes: FontBytes,
     /// String-set entries from DOM walk, keyed by node_id for O(1) lookup.
     pub string_set_by_node: HashMap<usize, Vec<(String, String)>>,
     /// Counter operations from CounterPass, keyed by node_id for O(1) lookup.
@@ -194,19 +194,55 @@ impl ConvertContext<'_> {
         self.dropped_text.push(DroppedText { element, excerpt });
     }
 
-    /// Return a shared Arc for the given font data, caching by data pointer + index.
-    ///
-    /// Safety assumption: Parley font data pointers remain stable for the lifetime of
-    /// this ConvertContext (scoped to a single `dom_to_drawables` call). HashMap is used
-    /// (not BTreeMap) because this cache is lookup-only — iteration order does not
-    /// affect PDF output.
+    /// The shared bytes of `font` (see [`FontBytes`]).
     fn get_or_insert_font(&mut self, font: &parley::FontData) -> Arc<Vec<u8>> {
-        let key = (font.data.data().as_ptr() as usize, font.index);
-        Arc::clone(
-            self.font_cache
-                .entry(key)
-                .or_insert_with(|| Arc::new(font.data.data().to_vec())),
-        )
+        self.font_bytes.get_or_copy(font)
+    }
+}
+
+/// The `Arc<Vec<u8>>` of the font bytes of every glyph run of one conversion.
+///
+/// Parley hands out a [`parley::FontData`] whose [`Blob`](parley::fontique::Blob) is the blob a font was registered
+/// with. For the bundled fonts that blob wraps the very `Arc<Vec<u8>>` of the [`AssetBundle`] (both the main document
+/// and the margin-box documents register the bundle's `Arc`, see `blitz_adapter::parse_inner` and `MarginDocEnv`),
+/// so the data address of the blob is the address of the bundle's buffer. [`FontBytes::seeded`] maps those addresses to
+/// the bundle's `Arc`s, and a run then shares the bundle's bytes instead of a copy of about 400 KB per context. Only a
+/// blob that is not in the bundle (a system font, a font a document brings itself) is copied, once per context.
+///
+/// The key is the data address, checked against the length of the blob. The addresses stay valid for the lifetime of
+/// the context: a seeded entry holds an `Arc` of its buffer, and the document that owns any other blob outlives the
+/// conversion. The map is only looked up, never iterated, so a `HashMap` does not affect the PDF.
+#[derive(Default)]
+pub(crate) struct FontBytes {
+    by_address: HashMap<usize, Arc<Vec<u8>>>,
+}
+
+impl FontBytes {
+    /// A cache that already knows the bundled fonts: their blobs resolve to the bundle's own `Arc`s.
+    pub(crate) fn seeded(bundle: &[Arc<Vec<u8>>]) -> Self {
+        let mut by_address = HashMap::with_capacity(bundle.len());
+        for font in bundle {
+            if !font.is_empty() {
+                by_address
+                    .entry(font.as_ptr() as usize)
+                    .or_insert_with(|| Arc::clone(font));
+            }
+        }
+        Self { by_address }
+    }
+
+    /// The bytes of `font` as an `Arc`: the bundle's own for a seeded blob, else a copy made on first use.
+    pub(crate) fn get_or_copy(&mut self, font: &parley::FontData) -> Arc<Vec<u8>> {
+        let bytes = font.data.data();
+        let key = bytes.as_ptr() as usize;
+        if let Some(known) = self.by_address.get(&key)
+            && known.len() == bytes.len()
+        {
+            return Arc::clone(known);
+        }
+        let copy = Arc::new(bytes.to_vec());
+        self.by_address.insert(key, Arc::clone(&copy));
+        copy
     }
 }
 
@@ -1437,7 +1473,7 @@ mod semantics_tests {
         let mut ctx = super::ConvertContext {
             running_store: &running_store,
             assets: None,
-            font_cache: Default::default(),
+            font_bytes: Default::default(),
             string_set_by_node: Default::default(),
             counter_ops_by_node: Default::default(),
             bookmark_by_node: Default::default(),
@@ -1481,7 +1517,7 @@ mod semantics_tests {
         let mut ctx = super::ConvertContext {
             running_store: &running_store,
             assets: None,
-            font_cache: Default::default(),
+            font_bytes: Default::default(),
             string_set_by_node: Default::default(),
             counter_ops_by_node: Default::default(),
             bookmark_by_node: Default::default(),
@@ -2230,5 +2266,69 @@ mod dropped_texts_tests {
             }
             assert_eq!(t.list.len(), 50_000, "round {round}");
         }
+    }
+}
+
+#[cfg(test)]
+mod font_bytes_tests {
+    use super::FontBytes;
+    use std::sync::Arc;
+
+    fn font_data(bytes: &Arc<Vec<u8>>, index: u32) -> parley::FontData {
+        parley::FontData::new(parley::fontique::Blob::new(Arc::clone(bytes) as _), index)
+    }
+
+    #[test]
+    fn a_bundled_blob_resolves_to_the_bundles_own_arc() {
+        let a = Arc::new(vec![1_u8; 64]);
+        let b = Arc::new(vec![2_u8; 64]);
+        let mut bytes = FontBytes::seeded(&[Arc::clone(&a), Arc::clone(&b)]);
+        assert!(Arc::ptr_eq(&bytes.get_or_copy(&font_data(&a, 0)), &a));
+        assert!(Arc::ptr_eq(&bytes.get_or_copy(&font_data(&b, 0)), &b));
+        // The face index does not matter: it is the same buffer.
+        assert!(Arc::ptr_eq(&bytes.get_or_copy(&font_data(&a, 3)), &a));
+    }
+
+    #[test]
+    fn an_unknown_blob_is_copied_once() {
+        let bundled = Arc::new(vec![1_u8; 64]);
+        let other = Arc::new(vec![7_u8; 32]);
+        let mut bytes = FontBytes::seeded(&[bundled]);
+        let first = bytes.get_or_copy(&font_data(&other, 0));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(*first, *other);
+        assert!(Arc::ptr_eq(
+            &first,
+            &bytes.get_or_copy(&font_data(&other, 1))
+        ));
+    }
+
+    #[test]
+    fn an_entry_of_another_length_is_not_reused() {
+        // The same address with another length is not the bundled buffer: copy, do not trust the entry.
+        struct Prefix(Arc<Vec<u8>>, usize);
+        impl AsRef<[u8]> for Prefix {
+            fn as_ref(&self) -> &[u8] {
+                &self.0[..self.1]
+            }
+        }
+        let a = Arc::new(vec![1_u8; 64]);
+        let mut bytes = FontBytes::seeded(&[Arc::clone(&a)]);
+        let prefix = parley::FontData::new(
+            parley::fontique::Blob::new(Arc::new(Prefix(Arc::clone(&a), 32)) as _),
+            0,
+        );
+        let got = bytes.get_or_copy(&prefix);
+        assert_eq!(got.len(), 32);
+        assert!(!Arc::ptr_eq(&got, &a));
+    }
+
+    #[test]
+    fn an_empty_cache_copies_every_blob() {
+        let a = Arc::new(vec![1_u8; 16]);
+        let mut bytes = FontBytes::default();
+        let copy = bytes.get_or_copy(&font_data(&a, 0));
+        assert!(!Arc::ptr_eq(&copy, &a));
+        assert_eq!(*copy, *a);
     }
 }

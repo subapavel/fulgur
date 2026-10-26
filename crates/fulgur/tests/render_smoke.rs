@@ -8476,3 +8476,34 @@ fn table_in_columns_with_collapsed_borders_and_row_backgrounds_renders() {
         }
     }
 }
+
+/// F99e: a glyph run shares the bytes of the bundled font; converting a document must not copy the font
+/// (about 400 KB per context for a real face).
+#[test]
+fn glyph_runs_share_the_bundled_font_bytes() {
+    let font_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/.fonts/NotoSans-Regular.ttf");
+    let mut assets = AssetBundle::default();
+    assets
+        .add_font_file(&font_path)
+        .unwrap_or_else(|e| panic!("failed to load Noto Sans from {}: {e}", font_path.display()));
+    let bundled = std::sync::Arc::clone(&assets.fonts[0]);
+    // No host fonts, so that every run is set in the bundled face.
+    let engine = Engine::builder().assets(assets).system_fonts(false).build();
+    let drawables = engine.build_drawables_for_testing_no_gcpm(
+        "<p style=\"font-family: 'Noto Sans'\">Faktura <b>2026</b></p>",
+    );
+    let mut runs = 0;
+    for entry in drawables.paragraphs.values() {
+        for item in entry.lines.iter().flat_map(|line| line.items.iter()) {
+            if let fulgur::paragraph::LineItem::Text(run) = item {
+                runs += 1;
+                assert!(
+                    std::sync::Arc::ptr_eq(&run.font_data, &bundled),
+                    "the run holds a copy of the font bytes"
+                );
+            }
+        }
+    }
+    assert!(runs > 0, "no glyph run was shaped");
+}
