@@ -195,7 +195,6 @@ pub struct McPage {
 /// top border and padding and the spacing, belongs to it), and `height` runs to the next band's `top` (the last to
 /// the table's height), so the bands of a table add up to its height.
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)] // `cells` is read by the recording of the next commit
 struct RowBand {
     cells: std::ops::Range<u32>,
     top: f32,
@@ -205,7 +204,6 @@ struct RowBand {
 /// F174: the header rows a table repeats at the top of every column piece but its first (F12's policy, see
 /// [`repeating_table_header`]).
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)] // `group` is read by the recording of the next commit
 pub(crate) struct McHead {
     /// The `thead` node: its fragments are the source and the repeats.
     group: usize,
@@ -522,6 +520,8 @@ struct McContainer<'a> {
     bottom_inset: f32,
     /// The block-size of the first segment's first unit (see [`McContainer::first_unit`]), px.
     first_unit: f32,
+    /// F174: the tables of the container's flows (boxes of the groups) the fragmenter cuts between rows, by node.
+    tables: BTreeMap<usize, McTable>,
 }
 
 impl McContainer<'_> {
@@ -592,6 +592,17 @@ fn multicol_container<'a>(
             return None;
         }
     }
+    // F174: the tables among the boxes of the flows, which are cut between rows.
+    let mut tables: BTreeMap<usize, McTable> = BTreeMap::new();
+    for group in &geometry.groups {
+        for item in &group.flow {
+            if let FlowItem::Block { node, .. } = item
+                && let Some(table) = mc_table(doc, *node, column_styles, fresh)
+            {
+                tables.insert(*node, table);
+            }
+        }
+    }
     let has_spanner = geometry
         .segments
         .iter()
@@ -609,7 +620,9 @@ fn multicol_container<'a>(
     if has_spanner
         && geometry.groups.iter().any(|g| {
             g.flow.iter().any(
-            |item| matches!(item, FlowItem::Block { height, .. } if height.to_f32() > fresh + 1.0),
+            |item| matches!(item, FlowItem::Block { node, height } if height.to_f32() > fresh + 1.0
+                // F174: a table is cut between its rows, which each fit a page.
+                && !tables.get(node).is_some_and(|t| t.bands.iter().all(|b| b.height <= fresh + 1.0))),
         )
         })
     {
@@ -641,6 +654,7 @@ fn multicol_container<'a>(
         top_inset,
         bottom_inset: layout.border.bottom + layout.padding.bottom,
         first_unit,
+        tables,
     })
 }
 
@@ -699,7 +713,6 @@ fn row_bands(cells: &[(f32, f32)], height: f32) -> Option<Vec<RowBand>> {
 ///
 /// The header repeats for a `<table>` element only, by F12's rules ([`repeating_table_header`]: at most a quarter
 /// of a page, a prefix of the cells) and only when the header's bands end where a body band starts.
-#[allow(dead_code)] // called by `multicol_container` in the next commit
 fn mc_table(
     doc: &BaseDocument,
     node_id: usize,
@@ -1122,7 +1135,7 @@ fn fragment_multicol_container(
                 // F28 for a group below a spanner: when its first unit does not fit the room under it, the
                 // group starts on the next page.
                 if i > 0 && frag.has_content {
-                    let unit = flow_first_unit(&group.flow, &BTreeMap::new());
+                    let unit = flow_first_unit(&group.flow, &c.tables);
                     if unit > strips.bottom(frag.page) - frag.cursor() && unit <= strips.fresh() {
                         next_page(geometry, &mut frag);
                     }
@@ -1139,7 +1152,7 @@ fn fragment_multicol_container(
                     strips.fresh(),
                     fill,
                     if last { c.bottom_inset } else { 0.0 },
-                    &BTreeMap::new(),
+                    &c.tables,
                 );
                 let plan_len = plan.len();
                 for (k, mut page) in plan.into_iter().enumerate() {
@@ -1159,6 +1172,7 @@ fn fragment_multicol_container(
                         x_in_body,
                         container_id,
                         strips,
+                        &c.tables,
                     );
                     frag.used += page.height.to_f32();
                     frag.has_content = true;
@@ -1286,6 +1300,7 @@ fn record_multicol_row(
     x_in_body: f32,
     container_id: usize,
     strips: PageStrips,
+    tables: &BTreeMap<usize, McTable>,
 ) {
     use crate::multicol_layout::FlowItem;
     let advances: BTreeMap<usize, &[crate::units::Px]> = group
@@ -1359,8 +1374,93 @@ fn record_multicol_row(
                             height: h.as_px(),
                         });
                 }
-                // F174: the planner is not given tables yet, so no piece of rows is planned.
-                McPiece::Rows { .. } => {}
+                McPiece::Rows {
+                    table,
+                    first,
+                    end: end_band,
+                    y: piece_y,
+                    head,
+                } => {
+                    let (Some(t), Some(n)) = (tables.get(table), doc.get_node(*table)) else {
+                        continue;
+                    };
+                    let (first, end_band) = (*first as usize, *end_band as usize);
+                    let cells = n.layout_children.borrow();
+                    let Some(cells) = cells.as_deref() else {
+                        continue;
+                    };
+                    if first >= end_band || end_band > t.bands.len() {
+                        debug_assert!(
+                            false,
+                            "table piece {first}..{end_band} of {} bands",
+                            t.bands.len()
+                        );
+                        continue;
+                    }
+                    let bands = &t.bands[first..end_band];
+                    if bands.iter().any(|b| b.height > strips.fresh() + 1.0) {
+                        log::warn!(
+                            "pagination: a table row inside a multi-column container is taller than a page; \
+                             it is placed alone in its column and overflows the page"
+                        );
+                    }
+                    // The piece is one table fragment: a closed box at the column's x and the piece's y, as
+                    // tall as the bands in it (and the repeated header above them).
+                    let top = row_top + piece_y.to_f32();
+                    let head_h = match (*head, &t.head) {
+                        (true, Some(h)) => h.height,
+                        _ => 0.0,
+                    };
+                    let table_geometry = geometry.entry(*table).or_default();
+                    table_geometry.table_pieces = true;
+                    table_geometry.fragments.push(Fragment {
+                        page_index: page,
+                        x: col_x.as_px(),
+                        y: top.as_px(),
+                        width: n.final_layout.size.width.as_px(),
+                        height: (head_h + t.height_of(first, end_band)).as_px(),
+                    });
+                    // F12: the header stands at the top of a piece that continues the table, the first
+                    // repeat records where the header was first placed (the table's first fragment).
+                    if let (true, Some(h)) = (*head, &t.head) {
+                        let source = table_geometry.fragments.first().map(|f| Fragment {
+                            height: h.height.as_px(),
+                            ..f.clone()
+                        });
+                        if let Some(source) = source {
+                            let repeat = Fragment {
+                                page_index: page,
+                                y: top.as_px(),
+                                x: col_x.as_px(),
+                                ..source.clone()
+                            };
+                            let group = geometry.entry(h.group).or_default();
+                            if group.fragments.is_empty() {
+                                group.fragments.push(source);
+                                group.is_repeat = true;
+                            }
+                            group.fragments.push(repeat);
+                        }
+                    }
+                    for band in bands {
+                        let band_y = top + head_h + (band.top - bands[0].top);
+                        for &cell in cells
+                            .iter()
+                            .skip(band.cells.start as usize)
+                            .take(band.cells.len())
+                        {
+                            record_descendant(
+                                geometry,
+                                doc,
+                                cell,
+                                page,
+                                band_y - band.top,
+                                col_x,
+                                0,
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -1405,6 +1505,10 @@ pub struct PaginationGeometry {
     /// F30d: for a multicol container cut by [`fragment_multicol_container`], what each column holds on every
     /// page (absolute page index), parallel to the container's `fragments`. Empty for everything else.
     pub multicol_pages: Vec<(u32, McPage)>,
+    /// F174: set for a table that a multicol container cut between rows: each fragment is a closed piece of the
+    /// table (its frame is as tall as the fragment), not a slice of one table box, and the header group repeats
+    /// at the top of the pieces that continue it. `false` for everything else.
+    pub table_pieces: bool,
 }
 
 impl PaginationGeometry {
@@ -15373,6 +15477,184 @@ h2 { string-set: chapter-title content(text); }
         let g = &geom[&node_by_class(&doc, "mc")];
         assert_eq!(g.fragments.len(), 1);
         assert!(g.multicol_pages.is_empty());
+    }
+
+    // ── F174: a table in columns ────────────────────────────────────────────
+
+    /// A container of two columns around a table of `rows` body rows of 20 px (and a one-row header when `thead`),
+    /// every row one cell `r<N>`; `after` is a paragraph below the container.
+    fn table_columns_html(rows: usize, thead: bool, extra: &str) -> String {
+        let head = if thead {
+            "<thead><tr><th class=\"h\">Head</th></tr></thead>"
+        } else {
+            ""
+        };
+        let body: String = (1..=rows)
+            .map(|i| format!("<tr><td class=\"c\">r{i}</td></tr>"))
+            .collect();
+        format!(
+            "<!doctype html><html><head><style>body{{margin:0;line-height:20px}}\
+             .mc{{column-count:2;column-gap:20px}}table{{border-spacing:0;width:100%}}\
+             td,th{{padding:0;text-align:left}}p{{margin:0}}</style></head><body>\
+             <div class=\"mc\"><table class=\"t\">{head}<tbody>{body}</tbody></table></div>{extra}</body></html>"
+        )
+    }
+
+    /// `(page, x, y)` of the fragments of the nodes with class `class`, in row order.
+    fn placed(
+        doc: &BaseDocument,
+        geom: &PaginationGeometryTable,
+        class: &str,
+    ) -> Vec<(u32, f32, f32)> {
+        let mut out = Vec::new();
+        for id in nodes_by_class(doc, class) {
+            for f in &geom[&id].fragments {
+                out.push((f.page_index, f.x.to_f32(), f.y.to_f32()));
+            }
+        }
+        out
+    }
+
+    /// F174: a table of 30 rows and a header in two columns on 200 px pages: cut between rows, every cell once,
+    /// the cells of the second column at its x, the header repeated at the top of the three pieces that continue
+    /// the table (one source fragment and three repeats), nothing below the page.
+    #[test]
+    fn multicol_table_is_cut_between_rows_with_the_header_repeated() {
+        let (doc, mc, geom) = multicol_fragments(&table_columns_html(30, true, ""), 200.0);
+        let mc_id = node_by_class(&doc, "mc");
+        let table = node_by_class(&doc, "t");
+        let col2 = mc[&mc_id].groups[0].col_w.to_f32() + 20.0;
+        let cells = placed(&doc, &geom, "c");
+        assert_eq!(cells.len(), 30, "every body cell once: {cells:?}");
+        let mut by_row = cells.clone();
+        by_row.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // Column 1 of page 0: Head + r1-r9 (the header is the first 20 px), column 2: Head + r10-r18.
+        assert_eq!(by_row[0], (0, 0.0, 20.0));
+        assert_eq!(cells[8], (0, 0.0, 180.0), "r9 is the last row of column 1");
+        assert_eq!(
+            cells[9],
+            (0, col2, 20.0),
+            "r10 is below the header copy of column 2"
+        );
+        assert_eq!(
+            cells[18],
+            (1, 0.0, 20.0),
+            "r19 starts page 1 below its header copy"
+        );
+        for (page, _, y) in &cells {
+            assert!(
+                y + 20.0 <= 200.5,
+                "page {page}: a row at {y} runs past the page"
+            );
+        }
+        // The table: one closed fragment per piece, x of its column, as tall as the piece.
+        let pieces = &geom[&table].fragments;
+        assert!(geom[&table].table_pieces);
+        assert_eq!(pieces.len(), 4, "{pieces:?}");
+        assert_eq!(
+            pieces
+                .iter()
+                .map(|f| (f.page_index, f.x.to_f32(), f.y.to_f32()))
+                .collect::<Vec<_>>(),
+            vec![(0, 0.0, 0.0), (0, col2, 0.0), (1, 0.0, 0.0), (1, col2, 0.0)]
+        );
+        assert_eq!(pieces[0].height.to_f32(), 200.0);
+        assert_eq!(pieces[1].height.to_f32(), 200.0);
+        // The header: the source and one repeat per continuing piece; the header cell has one fragment.
+        let thead = find_group(&doc, "thead");
+        let group = &geom[&thead];
+        assert!(group.is_repeat);
+        assert_eq!(
+            group
+                .fragments
+                .iter()
+                .map(|f| (f.page_index, f.x.to_f32(), f.y.to_f32(), f.height.to_f32()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 0.0, 0.0, 20.0),
+                (0, col2, 0.0, 20.0),
+                (1, 0.0, 0.0, 20.0),
+                (1, col2, 0.0, 20.0)
+            ]
+        );
+        assert_eq!(placed(&doc, &geom, "h"), vec![(0, 0.0, 0.0)]);
+    }
+
+    fn find_group(doc: &BaseDocument, tag: &str) -> usize {
+        fn walk(doc: &BaseDocument, id: usize, tag: &str) -> Option<usize> {
+            let n = doc.get_node(id)?;
+            if n.element_data()
+                .is_some_and(|e| e.name.local.as_ref() == tag)
+            {
+                return Some(id);
+            }
+            n.children.iter().find_map(|&c| walk(doc, c, tag))
+        }
+        walk(doc, doc.root_element().id, tag).unwrap_or_else(|| panic!("no <{tag}>"))
+    }
+
+    /// F174: a table without a header is cut the same way and nothing is repeated.
+    #[test]
+    fn multicol_table_without_a_header_repeats_nothing() {
+        let (doc, mc, geom) = multicol_fragments(&table_columns_html(50, false, ""), 200.0);
+        let mc_id = node_by_class(&doc, "mc");
+        let col2 = mc[&mc_id].groups[0].col_w.to_f32() + 20.0;
+        let cells = placed(&doc, &geom, "c");
+        assert_eq!(cells.len(), 50);
+        assert_eq!(cells[0], (0, 0.0, 0.0));
+        assert_eq!(cells[9], (0, 0.0, 180.0));
+        assert_eq!(cells[10], (0, col2, 0.0));
+        assert_eq!(cells[20], (1, 0.0, 0.0));
+        assert!(
+            !geom.contains_key(&find_group(&doc, "tbody"))
+                || !geom[&find_group(&doc, "tbody")].is_repeat
+        );
+        assert!(geom.values().all(|g| !g.is_repeat));
+    }
+
+    /// F174: a table taller than a page with a `column-span: all` sibling is cut by the multicol fragmenter now
+    /// (F161 kept such a container on the old path because the table is a box taller than a page).
+    #[test]
+    fn multicol_table_with_a_spanner_is_cut_between_rows() {
+        let html = "<!doctype html><html><head><style>body{margin:0;line-height:20px}\
+                    .mc{column-count:2;column-gap:20px}table{border-spacing:0}td{padding:0}\
+                    .s{column-span:all;height:20px}</style></head><body><div class=\"mc\">\
+                    <div class=\"s\">title</div><table class=\"t\"><tbody>"
+            .to_string()
+            + &(1..=60)
+                .map(|i| format!("<tr><td class=\"c\">r{i}</td></tr>"))
+                .collect::<String>()
+            + "</tbody></table></div></body></html>";
+        let (doc, _mc, geom) = multicol_fragments(&html, 200.0);
+        let mc_id = node_by_class(&doc, "mc");
+        assert!(!geom[&mc_id].multicol_pages.is_empty());
+        let cells = placed(&doc, &geom, "c");
+        assert_eq!(cells.len(), 60, "every row once");
+        for (page, _, y) in &cells {
+            assert!(
+                y + 20.0 <= 200.5,
+                "page {page}: a row at {y} runs past the page"
+            );
+        }
+    }
+
+    /// F174: a row taller than a page is placed alone in its column and warned about; the planner does not loop.
+    #[test]
+    fn multicol_table_with_a_row_taller_than_a_page_is_placed_alone() {
+        let html = "<!doctype html><html><head><style>body{margin:0;line-height:20px}\
+                    .mc{column-count:2;column-gap:20px}table{border-spacing:0}td{padding:0}\
+                    </style></head><body><div class=\"mc\"><table class=\"t\"><tbody>\
+                    <tr><td class=\"c\">a</td></tr><tr><td class=\"c\" style=\"height:300px\">tall</td></tr>\
+                    <tr><td class=\"c\">b</td></tr></tbody></table></div></body></html>";
+        let (doc, _mc, geom) = multicol_fragments(html, 200.0);
+        let cells = placed(&doc, &geom, "c");
+        assert_eq!(cells.len(), 3, "{cells:?}");
+        assert_eq!(cells[0], (0, 0.0, 0.0));
+        assert_eq!(cells[1].0, 0);
+        assert!(
+            cells[1].1 > 0.0,
+            "the tall row opens the second column: {cells:?}"
+        );
     }
 
     /// F144: the geometry is the same with the full used page-name table (all `(None, None)` when no node names a
