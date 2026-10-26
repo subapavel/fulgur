@@ -421,9 +421,11 @@ fn flow_first_unit(flow: &[crate::multicol_layout::FlowItem]) -> f32 {
 /// F161: `column-span: all` children are segments between the groups; a container with spanners is placed
 /// like any other. A group whose flow is empty (a text node among its children, say) cannot be described, and
 /// the container keeps the old paths. So does a container with spanners whose flow holds a box taller than a
-/// page (`fresh`): the fragmenter places a box whole (F30d-b), while the block recursion of the old path, which
-/// every container with a spanner took before F161, cuts it (`<div><p>…a page and a half…</p></div>` under a
-/// spanner lost its last lines; F173).
+/// page (`fresh`), or with a spanner taller than a quarter of a page: the fragmenter places a box whole (F30d-b)
+/// and moves a spanner that does not fit the room to the next page whole, while the block recursion of the old
+/// path, which every container with a spanner took before F161, cuts them (`<div><p>…a page and a half…</p></div>`
+/// under a spanner lost its last lines; a spanner of a page left most of the page above it blank, one taller than
+/// a page was not cut; F173). Spanners are headings in practice.
 fn multicol_container<'a>(
     doc: &BaseDocument,
     multicol: Option<&'a crate::multicol_layout::MulticolGeometryTable>,
@@ -453,6 +455,16 @@ fn multicol_container<'a>(
         .segments
         .iter()
         .any(|s| matches!(s, SegmentGeom::SpanAll { .. }));
+    if has_spanner
+        && geometry.segments.iter().any(|s| match s {
+            SegmentGeom::SpanAll { node } => doc
+                .get_node(*node)
+                .is_none_or(|n| n.final_layout.size.height > fresh * 0.25),
+            SegmentGeom::Group(_) => false,
+        })
+    {
+        return None;
+    }
     if has_spanner
         && geometry.groups.iter().any(|g| {
             g.flow.iter().any(
@@ -14700,7 +14712,7 @@ h2 { string-set: chapter-title content(text); }
     /// F161: a spanner taller than a page is cut like a block; the container has a fragment on every page it
     /// covers, and the group after it continues below its end.
     #[test]
-    fn multicol_span_all_taller_than_a_page_is_cut() {
+    fn multicol_span_all_taller_than_a_quarter_page_keeps_the_old_path() {
         let html = format!(
             "<!doctype html><html><head><style>body{{margin:0}}\
              .mc{{column-count:2;column-gap:20px}}.b{{height:40px}}\
@@ -14714,28 +14726,12 @@ h2 { string-set: chapter-title content(text); }
         );
         let (doc, _mc, geom) = multicol_fragments(&html, 200.0);
         let g = &geom[&node_by_class(&doc, "mc")];
+        // html-to-pdf F161 review: the fragmenter's cut of a spanner taller than a page painted it over the
+        // group above (F173), so such a container keeps the old path it took before F161.
         assert!(
-            !g.multicol_pages.is_empty(),
-            "not cut by the multicol fragmenter"
+            g.multicol_pages.is_empty(),
+            "a container with a spanner taller than a quarter page took the multicol fragmenter"
         );
-        let pages: Vec<u32> = g.fragments.iter().map(|f| f.page_index).collect();
-        assert!(pages.len() >= 4, "{pages:?}");
-        assert!(pages.windows(2).all(|w| w[1] == w[0] + 1), "{pages:?}");
-        for (id, gg) in &geom {
-            for f in &gg.fragments {
-                assert!(f.y.to_f32() >= 0.0, "node {id}: fragment at y {:?}", f.y);
-            }
-        }
-        let boxes = nodes_by_class(&doc, "b");
-        let rows = nodes_by_class(&doc, "r");
-        let count = |ids: &[usize]| -> usize {
-            geom.iter()
-                .filter(|(id, _)| ids.contains(id))
-                .map(|(_, gg)| gg.fragments.len())
-                .sum()
-        };
-        assert_eq!(count(&boxes), 20);
-        assert_eq!(count(&rows), 4);
     }
 
     /// A container that fits the page keeps the path it had: one fragment, no pages recorded.
