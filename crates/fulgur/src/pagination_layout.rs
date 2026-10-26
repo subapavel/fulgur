@@ -289,12 +289,16 @@ const MC_EPS: f32 = 1e-3;
 /// F174: a row of a table that opens a column the table continues in (the atom before it is a row of the same
 /// table) starts below the table's repeated header, `McHead::height` down, when the header and the row fit the
 /// column together; a row that fits the column only without the header gets the column without it (F12's rule).
+/// "Fit the column" is `head_limit`, the block-size of a column of the page, not a trial `budget` that balancing
+/// tries: a row gets its header whatever the balanced columns turn out to be (Chrome repeats the header over the
+/// last two rows of a table in both columns), and the columns grow to hold it.
 fn fill_multicol_columns(
     atoms: &[McAtom],
     tables: &BTreeMap<usize, McTable>,
     start: usize,
     n: usize,
     budget: f32,
+    head_limit: f32,
     fresh_page: bool,
 ) -> McFill {
     let mut columns: Vec<Vec<McPiece>> = vec![Vec::new(); n];
@@ -321,7 +325,7 @@ fn fill_multicol_columns(
             && at > 0
             && matches!(&atoms[at - 1], McAtom::Row { table: t, .. } if t == table)
             && let Some(head) = tables.get(table).and_then(|t| t.head.as_ref())
-            && head.height + h <= budget + MC_EPS
+            && head.height + h <= head_limit + MC_EPS
         {
             band = head.height;
         }
@@ -443,7 +447,15 @@ pub(crate) fn plan_multicol_pages(
         }
         .max(0.0);
         let room_for_end = (room - last_inset).max(0.0);
-        let trial = fill_multicol_columns(&atoms, tables, at, n, room_for_end, fresh_page);
+        let trial = fill_multicol_columns(
+            &atoms,
+            tables,
+            at,
+            n,
+            room_for_end,
+            room_for_end,
+            fresh_page,
+        );
         let filled = if trial.next >= atoms.len() {
             // The rest fits on this page: it is the last one.
             match fill {
@@ -453,7 +465,7 @@ pub(crate) fn plan_multicol_pages(
                 }
             }
         } else {
-            let full = fill_multicol_columns(&atoms, tables, at, n, room, fresh_page);
+            let full = fill_multicol_columns(&atoms, tables, at, n, room, room, fresh_page);
             if full.next >= atoms.len() && fill == crate::column_css::ColumnFill::Balance {
                 // The rest fits only when the bottom padding is allowed to hang below the page: balance it
                 // within the room anyway.
@@ -486,12 +498,12 @@ fn balance_multicol_columns(
     let total: f32 = rest.iter().map(McAtom::height).sum();
     let tallest = rest.iter().map(McAtom::height).fold(0.0f32, f32::max);
     let fits = |budget: f32| {
-        fill_multicol_columns(atoms, tables, start, n, budget, fresh_page).next >= atoms.len()
+        fill_multicol_columns(atoms, tables, start, n, budget, room, fresh_page).next >= atoms.len()
     };
     let mut lo = tallest.max(total / n as f32);
     let mut hi = room.max(lo);
     if fits(lo) {
-        return fill_multicol_columns(atoms, tables, start, n, lo, fresh_page);
+        return fill_multicol_columns(atoms, tables, start, n, lo, room, fresh_page);
     }
     // `lo` does not fit, `hi` is the room the rest was already known to fit in (or more, when `room` is below
     // the tallest atom: then nothing smaller helps either).
@@ -503,7 +515,7 @@ fn balance_multicol_columns(
             lo = mid;
         }
     }
-    fill_multicol_columns(atoms, tables, start, n, hi, fresh_page)
+    fill_multicol_columns(atoms, tables, start, n, hi, room, fresh_page)
 }
 
 /// F30d: a multi-column container the fragmenter can cut over pages, and what it needs to know about it.
@@ -762,6 +774,24 @@ fn mc_table(
 /// with the text on the first). `break-inside: avoid` is honoured as long as the container fits a page.
 fn multicol_wants_split(height: f32, room: f32, fresh: f32, avoid_inside: bool) -> bool {
     height.is_finite() && height > room && (!avoid_inside || height > fresh)
+}
+
+/// F174: whether the fragmenter places the multi-column container `mc` of block-size `height` (`room` is what is
+/// left of the page below it): when [`multicol_wants_split`] says so, and also when it holds a table in two columns or
+/// more, which it cuts between rows and balances over the columns even where it fits the page: Blitz lays a table
+/// out whole in one column, the first of them. A container `break-inside: avoid` that does not fit the room but fits
+/// a page keeps moving whole, as before.
+fn multicol_cuts(
+    mc: &McContainer<'_>,
+    height: f32,
+    room: f32,
+    fresh: f32,
+    avoid_inside: bool,
+) -> bool {
+    multicol_wants_split(height, room, fresh, avoid_inside)
+        || (!mc.tables.is_empty()
+            && mc.groups.iter().any(|g| g.n >= 2)
+            && !(avoid_inside && height > room))
 }
 
 /// F83: whether `break-inside: avoid` on an inline root whose lines span `height` (bottom of the last line box minus
@@ -2363,7 +2393,8 @@ impl<'a> PaginationLayoutTree<'a> {
             ) {
                 let strips = self.strips;
                 let wants = |page: u32, cursor: f32| {
-                    multicol_wants_split(
+                    multicol_cuts(
+                        &mc,
                         child_h,
                         strips.bottom(page) - cursor,
                         strips.fresh(),
@@ -4424,8 +4455,9 @@ fn fragment_block_subtree(
                 return None;
             }
             multicol_container(doc, multicol, column_styles, child_id, strips.fresh()).filter(
-                |_| {
-                    multicol_wants_split(
+                |mc| {
+                    multicol_cuts(
+                        mc,
                         child_h,
                         strips.bottom(page) - y,
                         strips.fresh(),
@@ -15064,6 +15096,44 @@ h2 { string-set: chapter-title content(text); }
     }
 
     #[test]
+    fn plan_table_balanced_last_page_repeats_the_header_over_every_piece() {
+        // 100 px columns, a header of 20 px and 12 bands of 20 px: 4 + 4 on the first page (the header in the
+        // second column), the last 4 are balanced 2 + 2, each column with the header: 60 px, not 40.
+        let table = table_of(&[vec![20.0], vec![20.0; 12]].concat(), Some((1, 20.0)));
+        let pages = plan_multicol_pages(
+            &[block(7, 260.0)],
+            2,
+            100.0,
+            100.0,
+            ColumnFill::Balance,
+            0.0,
+            &tables_of(7, table),
+        );
+        assert_rows_tile(&pages, 7, 13);
+        assert_eq!(row_pieces(&pages[0], 0, 7), vec![(0, 5, 0.0, false)]);
+        assert_eq!(row_pieces(&pages[0], 1, 7), vec![(5, 9, 0.0, true)]);
+        let last = pages.last().unwrap();
+        assert_eq!(row_pieces(last, 0, 7), vec![(9, 11, 0.0, true)]);
+        assert_eq!(row_pieces(last, 1, 7), vec![(11, 13, 0.0, true)]);
+        assert_eq!(last.height.to_f32(), 60.0);
+        // Two rows left: one per column, each below the header.
+        let table = table_of(&[vec![20.0], vec![20.0; 10]].concat(), Some((1, 20.0)));
+        let pages = plan_multicol_pages(
+            &[block(7, 220.0)],
+            2,
+            100.0,
+            100.0,
+            ColumnFill::Balance,
+            0.0,
+            &tables_of(7, table),
+        );
+        let last = pages.last().unwrap();
+        assert_eq!(row_pieces(last, 0, 7), vec![(9, 10, 0.0, true)]);
+        assert_eq!(row_pieces(last, 1, 7), vec![(10, 11, 0.0, true)]);
+        assert_eq!(last.height.to_f32(), 40.0);
+    }
+
+    #[test]
     fn plan_table_band_taller_than_a_column_is_placed_alone() {
         let table = table_of(&[20.0, 250.0, 20.0], None);
         let pages = plan_multicol_pages(
@@ -15610,6 +15680,26 @@ h2 { string-set: chapter-title content(text); }
                 || !geom[&find_group(&doc, "tbody")].is_repeat
         );
         assert!(geom.values().all(|g| !g.is_repeat));
+    }
+
+    /// F174: a table that fits a column is not split further than balancing does, and the content after the
+    /// container sits below the balanced columns (they are shorter than the one-column table Blitz measured).
+    #[test]
+    fn multicol_table_that_fits_the_page_is_balanced_over_the_columns() {
+        let html = table_columns_html(20, false, "<p class=\"after\">after</p>");
+        let (doc, _mc, geom) = multicol_fragments(&html, 1000.0);
+        let table = node_by_class(&doc, "t");
+        // Taffy lays the table out whole in one column: 400 px. Balanced it is 10 + 10 rows.
+        let mc_id = node_by_class(&doc, "mc");
+        assert!(
+            !geom[&mc_id].multicol_pages.is_empty(),
+            "the planner placed it"
+        );
+        let cells = placed(&doc, &geom, "c");
+        assert_eq!(cells.iter().filter(|c| c.1 == 0.0).count(), 10);
+        assert_eq!(cells.iter().filter(|c| c.1 > 0.0).count(), 10);
+        assert_eq!(geom[&table].fragments.len(), 2);
+        assert!(geom[&mc_id].fragments[0].height.to_f32() <= 200.5);
     }
 
     /// F174: a table taller than a page with a `column-span: all` sibling is cut by the multicol fragmenter now

@@ -8380,3 +8380,99 @@ fn multicol_span_all_with_a_block_taller_than_a_page_loses_no_words() {
     expected.sort();
     assert_eq!(printed, expected);
 }
+
+// ── F174: a table inside a multi-column container ───────────────────────────
+
+/// `rows` body rows of a table with a `HDRCELL` header in a two-column container, `extra_css` added to the page.
+fn table_in_columns_html(rows: usize, extra_css: &str) -> String {
+    let body: String = (0..rows)
+        .map(|i| format!("<tr><td>Row {i}</td><td>{i}</td></tr>"))
+        .collect();
+    format!(
+        r#"<!DOCTYPE html><html lang="en"><head><title>T</title><style>
+        body {{ margin: 0; line-height: 20px }} table {{ border-spacing: 0 }} {extra_css}</style></head><body>
+        <div style="columns: 2; column-gap: 20px">
+        <table><thead><tr><th>HDRCELL</th><th>Value</th></tr></thead>
+        <tbody>{body}</tbody></table></div><p>tail</p></body></html>"#
+    )
+}
+
+#[test]
+fn table_in_columns_prints_every_row_once_and_repeats_its_header_per_column() {
+    let pdf = Engine::builder()
+        .build()
+        .render(&table_in_columns_html(260, ""))
+        .expect("render");
+    let pages = page_count(&pdf);
+    assert!(pages >= 2, "expected a table over pages, got {pages}");
+    if let Some(text) = extract_pdf_text(&pdf) {
+        // `-raw` puts the rows of two columns that are level on one line: count the words.
+        let words: Vec<&str> = text.split_whitespace().collect();
+        for i in 0..260 {
+            let i = i.to_string();
+            assert_eq!(
+                words
+                    .windows(3)
+                    .filter(|w| w[0] == "Row" && w[1] == i && w[2] == i)
+                    .count(),
+                1,
+                "row {i} must be printed exactly once"
+            );
+        }
+        // The source header and one copy per column piece that continues the table: every column of every page.
+        assert_eq!(text.matches("HDRCELL").count(), 2 * pages);
+        assert_eq!(text.matches("tail").count(), 1);
+    }
+}
+
+#[test]
+fn table_in_columns_is_deterministic() {
+    let html = table_in_columns_html(
+        260,
+        "tbody tr:nth-child(odd) { background: rgba(37,99,235,.3) }",
+    );
+    let render = || Engine::builder().build().render(&html).expect("render");
+    assert_eq!(render(), render(), "same input must give identical bytes");
+}
+
+#[test]
+fn tagged_table_in_columns_keeps_one_th_per_header_cell_and_paints_the_copies_as_artifacts() {
+    let columns = tagged_render_with_noto(&table_in_columns_html(260, ""));
+    let one_column = tagged_render_with_noto(&table_with_header_html(260, "HDRCELL"));
+    let pages = page_count(&columns);
+    assert!(pages >= 2, "expected a table over pages, got {pages}");
+    assert_eq!(
+        count_pdf_name(&columns, "/TH"),
+        count_pdf_name(&one_column, "/TH"),
+        "the copies of the header added /TH structure elements"
+    );
+    // One artifact per column piece that is not the first.
+    let artifacts: usize = artifact_sequences_per_page(&columns).iter().sum();
+    assert_eq!(
+        artifacts,
+        2 * pages - 1,
+        "{:?}",
+        artifact_sequences_per_page(&columns)
+    );
+}
+
+#[test]
+fn table_in_columns_with_collapsed_borders_and_row_backgrounds_renders() {
+    let css = "table { border-collapse: collapse } td, th { border: 1px solid #000 } \
+               tbody tr:nth-child(odd) { background: rgba(37,99,235,.3) }";
+    let pdf = Engine::builder()
+        .build()
+        .render(&table_in_columns_html(260, css))
+        .expect("render");
+    assert!(page_count(&pdf) >= 2);
+    if let Some(text) = extract_pdf_text(&pdf) {
+        for i in [0, 59, 60, 130, 259] {
+            let row = format!("Row {i} {i}");
+            assert_eq!(
+                text.lines().filter(|l| l.trim() == row).count(),
+                1,
+                "row {i}"
+            );
+        }
+    }
+}

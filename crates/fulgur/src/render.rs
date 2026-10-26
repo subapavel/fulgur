@@ -777,6 +777,7 @@ fn paint_repeated_table_headers(
                     &mut copy_canvas,
                     table_id,
                     Some(*group_id),
+                    None,
                     geometry,
                     drawables,
                     left_pt,
@@ -1664,6 +1665,7 @@ pub(crate) fn dispatch_fragment(
             x_pt,
             y_pt,
             frag,
+            geom.table_pieces,
             geometry,
             drawables,
             margin_left_pt,
@@ -3727,6 +3729,7 @@ fn draw_table_v2(
     x: f32,
     y: f32,
     frag: &crate::pagination_layout::Fragment,
+    piece: bool,
     geometry: &crate::pagination_layout::PaginationGeometryTable,
     drawables: &Drawables,
     margin_left_pt: f32,
@@ -3736,7 +3739,7 @@ fn draw_table_v2(
     use crate::draw_primitives::draw_with_opacity;
 
     draw_with_opacity(canvas, entry.opacity, |canvas| {
-        let (total_width, total_height) = table_box_size(entry, frag);
+        let (total_width, total_height) = table_box_size(entry, frag, piece);
         if entry.visible {
             paint_table_outer_frame(canvas, entry, x, y, total_width, total_height);
         }
@@ -3747,6 +3750,7 @@ fn draw_table_v2(
             canvas,
             table_id,
             None,
+            piece.then_some(frag),
             geometry,
             drawables,
             margin_left_pt,
@@ -3768,13 +3772,16 @@ fn draw_table_v2(
 /// cell, so one image runs across the row instead of restarting in each cell.
 ///
 /// `only_group` restricts the paint to the backgrounds of one row group and its
-/// rows (the repeated header of F12). `margin_*_pt` are the same offsets the
-/// table's cells are dispatched with, so the rects line up with them.
+/// rows (the repeated header of F12). `piece` is the fragment of a table that a multicol container cut into
+/// pieces (F174): only the cells inside it are painted, so that each piece paints its own rows once, above its own
+/// frame (the table has several fragments on a page, each of which draws the table). `margin_*_pt` are the same
+/// offsets the table's cells are dispatched with, so the rects line up with them.
 #[allow(clippy::too_many_arguments)]
 fn paint_table_row_backgrounds(
     canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
     table_id: usize,
     only_group: Option<usize>,
+    piece: Option<&crate::pagination_layout::Fragment>,
     geometry: &crate::pagination_layout::PaginationGeometryTable,
     drawables: &Drawables,
     margin_left_pt: f32,
@@ -3801,6 +3808,18 @@ fn paint_table_row_backgrounds(
                 // span of its lines in the raw fragment; its frame also covers the
                 // padding and border above and below them.
                 let frag = frame_fragment(cell_geom, frag);
+                if let Some(piece) = piece {
+                    // The middle of the cell is in the piece.
+                    let cx = frag.x.to_f32() + frag.width.to_f32() / 2.0;
+                    let cy = frag.y.to_f32() + frag.height.to_f32() / 2.0;
+                    if cx < piece.x.to_f32()
+                        || cx >= piece.x.to_f32() + piece.width.to_f32()
+                        || cy < piece.y.to_f32()
+                        || cy >= piece.y.to_f32() + piece.height.to_f32()
+                    {
+                        continue;
+                    }
+                }
                 let x = margin_left_pt + frag.x.in_pt().to_f32();
                 let y = margin_top_pt + frag.y.in_pt().to_f32();
                 let w = frag.width.in_pt().to_f32();
@@ -3829,9 +3848,14 @@ fn paint_table_row_backgrounds(
 /// Resolve the table's outer-frame width/height from the cached
 /// layout. Falls back to the current Fragment height (and finally
 /// `cached_height`) when `layout_size` is unset (test-only paths).
+///
+/// F174: a `piece` of a table cut by a multicol container is a closed box as tall as its fragment
+/// (`layout_size.height` is the height of the whole table: every piece would paint the frame that tall, down the
+/// columns).
 fn table_box_size(
     entry: &crate::drawables::TableEntry,
     frag: &crate::pagination_layout::Fragment,
+    piece: bool,
 ) -> (f32, f32) {
     let total_width = entry
         .layout_size
@@ -3839,6 +3863,7 @@ fn table_box_size(
         .unwrap_or(entry.width.to_f32());
     let total_height = entry
         .layout_size
+        .filter(|_| !piece)
         .map(|s| s.height.to_f32())
         .unwrap_or_else(|| {
             let from_frag = frag.height.in_pt().to_f32();
@@ -3896,8 +3921,7 @@ fn draw_under_clip_table(
 ) {
     use crate::draw_primitives::draw_with_opacity;
 
-    let _ = geom;
-    let (total_width, total_height) = table_box_size(table, frag);
+    let (total_width, total_height) = table_box_size(table, frag, geom.table_pieces);
 
     draw_with_opacity(canvas, table.opacity, |canvas| {
         // bg / border / shadow OUTSIDE the clip, mirroring
@@ -3932,6 +3956,7 @@ fn draw_under_clip_table(
             canvas,
             table_id,
             None,
+            geom.table_pieces.then_some(frag),
             geometry,
             drawables,
             margin_left_pt,
@@ -6941,9 +6966,29 @@ mod tests {
         };
         let entry = make_table_entry_for_size(Some(sz), 200.0, 50.0);
         let frag = make_frag_with_height(99.0);
-        let (w, h) = table_box_size(&entry, &frag);
+        let (w, h) = table_box_size(&entry, &frag, false);
         assert!((w - 120.0).abs() < 0.001, "width from layout_size");
         assert!((h - 80.0).abs() < 0.001, "height from layout_size");
+    }
+
+    #[test]
+    fn table_box_size_of_a_piece_uses_the_fragment_height_not_the_table_height() {
+        // F174: a table cut over columns paints each piece as tall as the piece, whatever the layout says.
+        use crate::units::F32Units;
+        let entry = make_table_entry_for_size(
+            Some(crate::draw_primitives::Size {
+                width: 120.0_f32.as_pt(),
+                height: 80.0_f32.as_pt(),
+            }),
+            200.0,
+            50.0,
+        );
+        let frag = make_frag_with_height(20.0);
+        let (w, h) = table_box_size(&entry, &frag, true);
+        assert!((w - 120.0).abs() < 0.001, "the width stays the layout's");
+        assert!((h - 15.0).abs() < 0.001, "20 px is 15 pt, got {h}");
+        let (_, whole) = table_box_size(&entry, &frag, false);
+        assert!((whole - 80.0).abs() < 0.001);
     }
 
     #[test]
@@ -6951,7 +6996,7 @@ mod tests {
         // frag.height = 40 CSS px → 40 × 0.75 = 30 PDF pt (via Px::in_pt)
         let entry = make_table_entry_for_size(None, 150.0, 99.0);
         let frag = make_frag_with_height(40.0);
-        let (w, h) = table_box_size(&entry, &frag);
+        let (w, h) = table_box_size(&entry, &frag, false);
         assert!((w - 150.0).abs() < 0.001, "width falls back to entry.width");
         assert!((h - 30.0).abs() < 0.01, "height = frag.height.in_pt()");
     }
@@ -6962,7 +7007,7 @@ mod tests {
         // guard, so cached_height is used instead.
         let entry = make_table_entry_for_size(None, 150.0, 55.0);
         let frag = make_frag_with_height(0.0);
-        let (w, h) = table_box_size(&entry, &frag);
+        let (w, h) = table_box_size(&entry, &frag, false);
         assert!((w - 150.0).abs() < 0.001, "width falls back to entry.width");
         assert!(
             (h - 55.0).abs() < 0.001,
