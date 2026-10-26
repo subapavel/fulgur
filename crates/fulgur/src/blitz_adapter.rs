@@ -203,8 +203,9 @@ pub(crate) struct MarginDocEnv {
     fonts: Option<FontContext>,
     /// `true` when the render's CSS is part of `styles`, so a wrapper must not carry it in a `<style>` again.
     author_sheet_attached: bool,
-    /// Checks the raster images of the inline `<svg>` elements of the margin-box documents (F177); a finding is
-    /// logged when it is made, as the engine has reported by the time these documents exist.
+    /// Checks the raster images of the inline `<svg>` elements of the margin-box documents (F177) and gives their
+    /// text the bundled fonts (F152); a finding is logged when it is made, as the engine has reported by the time
+    /// these documents exist.
     svg_checks: Arc<crate::svg_images::SvgImageChecks>,
     _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
@@ -241,7 +242,9 @@ impl MarginDocEnv {
             styles: blitz_dom::SharedStyles::new(DOC_BASE_URL),
             fonts,
             author_sheet_attached: false,
-            svg_checks: crate::svg_images::SvgImageChecks::warning_immediately(),
+            svg_checks: crate::svg_images::SvgImageChecks::warning_immediately(
+                crate::svg_fonts::SvgFonts::new(font_data, generics),
+            ),
             _not_sync: std::marker::PhantomData,
         };
         env.attach_author_sheet(margin_css);
@@ -288,7 +291,7 @@ impl MarginDocEnv {
             font_ctx: self.fonts.clone(),
             base_url: Some(DOC_BASE_URL.to_string()),
             shared_styles: Some(self.styles.clone()),
-            svg_image_resolver: Some(self.svg_checks.factory()),
+            svg_options: Some(self.svg_checks.factory()),
             ..DocumentConfig::default()
         };
         HtmlDocument::from_html(html, config)
@@ -536,10 +539,14 @@ fn parse_inner(
         font_ctx,
         base_url: Some(base_url.unwrap_or_else(|| "file:///".to_string())),
         net_provider,
-        svg_image_resolver: Some(match svg_checks {
+        svg_options: Some(match svg_checks {
             Some(checks) => checks.factory(),
-            // No checks: the SVG still reads nothing from the host.
-            None => Arc::new(|_| crate::svg_images::offline_resolver()),
+            // No checks: the SVG still reads nothing from the host, and its text still gets the bundled fonts
+            // only (never Blitz's system font database).
+            None => crate::svg_images::SvgImageChecks::warning_immediately(
+                crate::svg_fonts::SvgFonts::new(font_data, generics),
+            )
+            .factory(),
         }),
         ..DocumentConfig::default()
     };

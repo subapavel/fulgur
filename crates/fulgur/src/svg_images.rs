@@ -17,14 +17,19 @@
 //! is left out is reported with an [`SvgImageCause`]. Code that parses an SVG without checks uses
 //! [`offline_options`].
 //!
+//! The same options carry the fonts of the SVG's `<text>` (html-to-pdf F152): the bundled faces of
+//! [`SvgFonts`](crate::svg_fonts::SvgFonts) and a resolver that reports a `font-family` list matching none of them as
+//! an [`SvgFontFallback`] (the text is drawn in the default family instead).
+//!
 //! One [`SvgImageChecks`] serves one layout pass of a render. Every place fulgur parses an SVG that can hold images
-//! gets its options from [`SvgImageChecks::options`] (the SVG assets of `<img>`, `background-image` and
+//! or text gets its options from [`SvgImageChecks::options`] (the SVG assets of `<img>`, `background-image` and
 //! `list-style-image`) or its factory ([`SvgImageChecks::factory`], the inline `<svg>` elements Blitz parses).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::asset::AssetBundle;
+use crate::svg_fonts::SvgFonts;
 
 /// Longest href, in characters, that is named in a finding as it is; a longer one (a malformed `data:` URL) is cut.
 const MAX_HREF_NAME: usize = 120;
@@ -64,6 +69,22 @@ impl std::fmt::Display for DroppedSvgImage {
     }
 }
 
+/// An SVG whose `font-family` list matches no bundled face, so its text is drawn in the default family (the serif
+/// mapping) instead of being dropped (css-fonts-4 §5).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SvgFontFallback {
+    /// The SVG, named as in [`DroppedSvgImage::svg`].
+    pub svg: String,
+    /// The family list as written, e.g. `Georgia, Palatino`.
+    pub font_family: String,
+}
+
+impl std::fmt::Display for SvgFontFallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: font-family `{}`", self.svg, self.font_family)
+    }
+}
+
 /// Where an SVG comes from. The order is the order of the report: inline SVGs by node id (document order), then
 /// by the name of the asset.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -85,6 +106,8 @@ pub struct SvgImageReport {
     pub dropped: Vec<DroppedSvgImage>,
     /// `reason` is what is wrong with the JPEG (F32a M1: Krilla passes it through and viewers draw what is there).
     pub damaged: Vec<DroppedSvgImage>,
+    /// Family lists of SVG text that matched no bundled face, by site then list.
+    pub font_fallbacks: Vec<SvgFontFallback>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -108,6 +131,8 @@ struct State {
     verdicts: BTreeMap<Arc<Vec<u8>>, Verdict>,
     dropped: BTreeSet<Finding>,
     damaged: BTreeSet<Finding>,
+    /// The SVG and the family list as written; once each.
+    font_fallbacks: BTreeSet<(SvgSite, String)>,
 }
 
 /// usvg's resolvers with the filesystem taken out: `data:` URLs as usvg resolves them, every other href not at all.
@@ -120,7 +145,8 @@ pub(crate) fn offline_resolver() -> usvg::ImageHrefResolver<'static> {
 
 /// `usvg::Options::default()` with resolvers that read nothing from the host: a `data:` image is loaded as usvg
 /// loads it (and not checked, see [`SvgImageChecks`]), any other `href` is not loaded. For parsing an SVG whose
-/// images are not drawn, or are checked by something else.
+/// images are not drawn, or are checked by something else. Its font database is empty: text in an SVG parsed with
+/// these options is not drawn (use [`SvgImageChecks::options`] for SVGs that are rendered).
 pub fn offline_options() -> usvg::Options<'static> {
     usvg::Options {
         image_href_resolver: offline_resolver(),
@@ -134,6 +160,8 @@ pub struct SvgImageChecks {
     /// The bundle an inline `<svg>` finds its non-`data:` hrefs in; `None` finds nothing there (the SVGs of the
     /// `@page` margin boxes).
     images: Option<Arc<AssetBundle>>,
+    /// The fonts of every SVG this serves.
+    fonts: Arc<SvgFonts>,
     /// Log a finding when it is first made instead of keeping it for [`SvgImageChecks::take`]: for the documents of
     /// the `@page` margin boxes, which are converted after the engine has reported.
     immediate: bool,
@@ -141,20 +169,23 @@ pub struct SvgImageChecks {
 
 impl SvgImageChecks {
     /// Checks for one render. `images` is the render's bundle (an `Arc` the engine holds: no copy per render).
-    pub fn new(images: Option<Arc<AssetBundle>>) -> Arc<Self> {
+    /// `fonts` are the faces the SVGs' text is shaped with (one [`SvgFonts`] per render).
+    pub fn new(images: Option<Arc<AssetBundle>>, fonts: Arc<SvgFonts>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::default(),
             images,
+            fonts,
             immediate: false,
         })
     }
 
     /// Checks that `log::warn!` each finding as it is made (once per image) and are not read with
     /// [`SvgImageChecks::take`]. They have no bundle.
-    pub(crate) fn warning_immediately() -> Arc<Self> {
+    pub(crate) fn warning_immediately(fonts: Arc<SvgFonts>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::default(),
             images: None,
+            fonts,
             immediate: true,
         })
     }
@@ -231,18 +262,41 @@ impl SvgImageChecks {
         }
     }
 
-    /// [`offline_options`] with [`SvgImageChecks::resolver`].
+    /// [`offline_options`] with [`SvgImageChecks::resolver`] and the bundled fonts: the database, the face picking
+    /// (an unmatched family list is a finding) and, for text with no `font-family`, the default family.
     pub fn options(self: &Arc<Self>, site: SvgSite) -> usvg::Options<'static> {
+        let checks = Arc::clone(self);
+        let font_site = site.clone();
         usvg::Options {
             image_href_resolver: self.resolver(site),
+            fontdb: self.fonts.database(),
+            font_resolver: self
+                .fonts
+                .resolver(move |list| checks.record_font_fallback(&font_site, list)),
+            font_family: self.fonts.default_family(),
             ..offline_options()
         }
     }
 
     /// The factory Blitz calls with the node id of each inline `<svg>` it parses.
-    pub fn factory(self: &Arc<Self>) -> blitz_dom::SvgImageResolverFactory {
+    pub fn factory(self: &Arc<Self>) -> blitz_dom::SvgOptionsFactory {
         let checks = Arc::clone(self);
-        Arc::new(move |node_id| checks.resolver(SvgSite::Inline(node_id)))
+        Arc::new(move |node_id| checks.options(SvgSite::Inline(node_id)))
+    }
+
+    /// Keeps a family list that matched no bundled face, once, and logs it right away when asked to.
+    fn record_font_fallback(&self, site: &SvgSite, list: String) {
+        let new = self
+            .state()
+            .font_fallbacks
+            .insert((site.clone(), list.clone()));
+        if self.immediate && new {
+            log::warn!(
+                "{}: {}",
+                site_name(site, None),
+                font_fallback_message(&list, &self.fonts.default_family())
+            );
+        }
     }
 
     /// `kind` if it can be drawn, `None` (and a finding) if it cannot.
@@ -330,14 +384,15 @@ impl SvgImageChecks {
     /// The findings so far, named after `doc` (the document the inline SVGs are in), and forgets them. The verdicts
     /// are kept.
     pub fn take(&self, doc: &blitz_dom::BaseDocument) -> SvgImageReport {
-        let (dropped, damaged) = {
+        let (dropped, damaged, font_fallbacks) = {
             let mut state = self.state();
             (
                 std::mem::take(&mut state.dropped),
                 std::mem::take(&mut state.damaged),
+                std::mem::take(&mut state.font_fallbacks),
             )
         };
-        let names = InlineNames::new(doc, &dropped, &damaged);
+        let names = InlineNames::new(doc, &dropped, &damaged, &font_fallbacks);
         let name = |f: Finding| DroppedSvgImage {
             svg: site_name(&f.site, Some(&names)),
             image: f.image,
@@ -347,6 +402,13 @@ impl SvgImageChecks {
         SvgImageReport {
             dropped: dropped.into_iter().map(name).collect(),
             damaged: damaged.into_iter().map(name).collect(),
+            font_fallbacks: font_fallbacks
+                .into_iter()
+                .map(|(site, font_family)| SvgFontFallback {
+                    svg: site_name(&site, Some(&names)),
+                    font_family,
+                })
+                .collect(),
         }
     }
 }
@@ -379,12 +441,15 @@ impl InlineNames {
         doc: &blitz_dom::BaseDocument,
         dropped: &BTreeSet<Finding>,
         damaged: &BTreeSet<Finding>,
+        font_fallbacks: &BTreeSet<(SvgSite, String)>,
     ) -> Self {
         let wanted: BTreeSet<usize> = dropped
             .iter()
             .chain(damaged)
-            .filter_map(|f| match f.site {
-                SvgSite::Inline(id) => Some(id),
+            .map(|f| &f.site)
+            .chain(font_fallbacks.iter().map(|(site, _)| site))
+            .filter_map(|site| match site {
+                SvgSite::Inline(id) => Some(*id),
                 _ => None,
             })
             .collect();
@@ -447,6 +512,14 @@ fn site_name(site: &SvgSite, names: Option<&InlineNames>) -> String {
     }
 }
 
+/// What is said of an SVG whose family list matched no bundled face.
+pub(crate) fn font_fallback_message(list: &str, default_family: &str) -> String {
+    format!(
+        "font-family `{list}` of the SVG text matches no bundled font, so it is drawn in the default family \
+         `{default_family}`"
+    )
+}
+
 /// `svg: image`, for a log line.
 fn describe(f: &Finding, names: Option<&InlineNames>) -> String {
     format!("{}: {}", site_name(&f.site, names), f.image)
@@ -457,6 +530,10 @@ mod tests {
     use super::*;
 
     const GIF: &[u8] = include_bytes!("../tests/fixtures/images/gradient32.gif");
+
+    fn no_fonts() -> Arc<SvgFonts> {
+        SvgFonts::new(&[], &BTreeMap::new())
+    }
 
     fn gif_url(bytes: &[u8]) -> String {
         data_url("image/gif", bytes)
@@ -498,7 +575,7 @@ mod tests {
 
     #[test]
     fn a_valid_raster_stays_and_a_truncated_one_is_dropped() {
-        let checks = SvgImageChecks::new(None);
+        let checks = SvgImageChecks::new(None, no_fonts());
         let good = svg_with(&gif_url(GIF));
         let bad = svg_with(&gif_url(&GIF[..GIF.len() / 2]));
         assert_eq!(parse(&checks, SvgSite::Img("a.svg".into()), &good), 1);
@@ -518,7 +595,7 @@ mod tests {
 
     #[test]
     fn findings_come_out_sorted_by_site_whatever_the_order_of_parsing() {
-        let checks = SvgImageChecks::new(None);
+        let checks = SvgImageChecks::new(None, no_fonts());
         let bad = svg_with(&gif_url(&GIF[..10]));
         for site in [
             SvgSite::ListMarker("l.svg".into()),
@@ -550,7 +627,7 @@ mod tests {
 
     #[test]
     fn an_svg_inside_an_svg_is_left_alone() {
-        let checks = SvgImageChecks::new(None);
+        let checks = SvgImageChecks::new(None, no_fonts());
         let inner = r#"<svg xmlns='http://www.w3.org/2000/svg' width='5' height='5'><rect width='5' height='5'/></svg>"#;
         let svg = svg_with(&data_url("image/svg+xml", inner.as_bytes()));
         assert_eq!(parse(&checks, SvgSite::Img("a.svg".into()), &svg), 1);
@@ -573,7 +650,7 @@ mod tests {
 
     #[test]
     fn an_inline_svg_finds_a_href_by_name_in_the_bundle() {
-        let checks = SvgImageChecks::new(bundle(&[("logo.gif", GIF)]));
+        let checks = SvgImageChecks::new(bundle(&[("logo.gif", GIF)]), no_fonts());
         for href in ["logo.gif", "./logo.gif"] {
             assert_eq!(
                 parse(&checks, SvgSite::Inline(1), &svg_with(href)),
@@ -590,7 +667,7 @@ mod tests {
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="5" height="5"><image href="{}" width="5" height="5"/></svg>"#,
             gif_url(GIF)
         );
-        let checks = SvgImageChecks::new(bundle(&[("card.svg", inner.as_bytes())]));
+        let checks = SvgImageChecks::new(bundle(&[("card.svg", inner.as_bytes())]), no_fonts());
         let tree = usvg::Tree::from_str(&svg_with("card.svg"), &checks.options(SvgSite::Inline(1)))
             .unwrap();
         assert_eq!(images(&tree), 1);
@@ -614,7 +691,7 @@ mod tests {
         // With a bundle that holds something else, and with none (the SVGs of the page margin boxes).
         for images in [bundle(&[("logo.gif", GIF)]), None] {
             let bundled = images.is_some();
-            let checks = SvgImageChecks::new(images);
+            let checks = SvgImageChecks::new(images, no_fonts());
             for href in hrefs {
                 assert_eq!(
                     parse(&checks, SvgSite::Inline(1), &svg_with(href)),
@@ -648,7 +725,7 @@ mod tests {
         let on_disk = dir.path().join("logo.gif");
         std::fs::write(&on_disk, GIF).unwrap();
         let absolute = on_disk.to_str().unwrap().to_string();
-        let checks = SvgImageChecks::new(bundle(&[("logo.gif", GIF)]));
+        let checks = SvgImageChecks::new(bundle(&[("logo.gif", GIF)]), no_fonts());
         let sites = [
             SvgSite::Img("a.svg".into()),
             SvgSite::Background("b.svg".into()),
@@ -674,10 +751,13 @@ mod tests {
 
     #[test]
     fn a_bundled_image_that_cannot_be_drawn_is_undecodable() {
-        let checks = SvgImageChecks::new(bundle(&[
-            ("cut.gif", &GIF[..GIF.len() / 2]),
-            ("text.png", b"this is not an image"),
-        ]));
+        let checks = SvgImageChecks::new(
+            bundle(&[
+                ("cut.gif", &GIF[..GIF.len() / 2]),
+                ("text.png", b"this is not an image"),
+            ]),
+            no_fonts(),
+        );
         for href in ["cut.gif", "text.png"] {
             assert_eq!(
                 parse(&checks, SvgSite::Inline(1), &svg_with(href)),
@@ -702,7 +782,7 @@ mod tests {
     #[test]
     fn a_very_long_href_is_named_in_part() {
         let long = format!("data:image/png;base64,{}", "A".repeat(5000));
-        let checks = SvgImageChecks::new(None);
+        let checks = SvgImageChecks::new(None, no_fonts());
         // A malformed data URL is no data URL to usvg: it reaches the string resolver.
         parse(&checks, SvgSite::Inline(1), &svg_with(&format!("{long}%")));
         let dropped = report(&checks).dropped;
@@ -736,7 +816,7 @@ mod tests {
             images(&usvg::Tree::from_str(&svg, &offline_options()).unwrap()),
             0
         );
-        let checks = SvgImageChecks::new(bundle(&[("logo.gif", GIF)]));
+        let checks = SvgImageChecks::new(bundle(&[("logo.gif", GIF)]), no_fonts());
         for site in [
             SvgSite::Inline(1),
             SvgSite::Img("a.svg".into()),
@@ -756,5 +836,49 @@ mod tests {
                 SvgImageCause::External
             ]
         );
+    }
+
+    #[test]
+    fn a_family_list_with_no_bundled_face_is_one_finding_per_site_and_list() {
+        let noto = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/.fonts/NotoSans-Regular.ttf");
+        let fonts = SvgFonts::new(&[Arc::new(std::fs::read(noto).unwrap())], &BTreeMap::new());
+        let checks = SvgImageChecks::new(None, fonts);
+        let text = |family: &str| {
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="50" height="20"><text y="15" font-family="{family}">Aa</text></svg>"#
+            )
+        };
+        for (site, family) in [
+            (SvgSite::Img("b.svg".into()), "Georgia"),
+            (SvgSite::Img("b.svg".into()), "Georgia"),
+            (SvgSite::Img("a.svg".into()), "Georgia"),
+            (SvgSite::Background("c.svg".into()), "Noto Sans"),
+            (
+                SvgSite::ListMarker("l.svg".into()),
+                "Georgia, 'Times New Roman'",
+            ),
+        ] {
+            parse(&checks, site, &text(family));
+        }
+        let first = report(&checks);
+        let got: Vec<_> = first
+            .font_fallbacks
+            .iter()
+            .map(|f| (f.svg.as_str(), f.font_family.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("<img src=\"a.svg\">", "Georgia"),
+                ("<img src=\"b.svg\">", "Georgia"),
+                ("list-style-image: url(l.svg)", "Georgia, 'Times New Roman'"),
+            ]
+        );
+        assert!(first.dropped.is_empty() && first.damaged.is_empty());
+        // An SVG that names no family is drawn in the default family without a finding.
+        let plain = r#"<svg xmlns="http://www.w3.org/2000/svg" width="50" height="20"><text y="15">Aa</text></svg>"#;
+        parse(&checks, SvgSite::Img("p.svg".into()), plain);
+        assert!(report(&checks).font_fallbacks.is_empty());
     }
 }

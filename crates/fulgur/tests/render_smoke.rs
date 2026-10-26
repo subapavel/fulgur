@@ -9059,3 +9059,84 @@ mod svg_images {
         );
     }
 }
+
+/// SVG `<text>` is shaped with the bundled fonts only (html-to-pdf F152): Noto Sans (the serif / default mapping)
+/// and Noto Sans Mono (`monospace`). Inline, `<img>`, `background-image` and `list-style-image` all draw it.
+fn svg_text_engine(strict_text: bool) -> (Engine, String) {
+    let fonts = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/.fonts");
+    let mut assets = AssetBundle::default();
+    for f in ["NotoSans-Regular.ttf", "NotoSansMono-Regular.ttf"] {
+        assets.add_font_file(fonts.join(f)).expect("bundled font");
+    }
+    for keyword in ["serif", "sans-serif", "cursive", "fantasy"] {
+        assets.set_generic_family(keyword, "Noto Sans");
+    }
+    assets.set_generic_family("monospace", "Noto Sans Mono");
+    let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="300" height="60" viewBox="0 0 300 60"><text x="5" y="25" font-size="16">PlainText</text><text x="5" y="50" font-size="16" font-family="monospace">MonoText</text></svg>"#;
+    assets.add_image("card.svg", svg.as_bytes().to_vec());
+    assets.add_css(
+        "body { font-family: 'Noto Sans' } .bg { width: 300px; height: 60px; background: url(card.svg) no-repeat }",
+    );
+    (
+        Engine::builder()
+            .assets(assets)
+            .strict_text(strict_text)
+            .build(),
+        svg.to_string(),
+    )
+}
+
+#[test]
+fn test_render_svg_text_uses_bundled_fonts_inline_img_and_background() {
+    let (engine, svg) = svg_text_engine(false);
+    for (site, body, text) in [
+        ("inline", svg.clone(), true),
+        ("img", r#"<img src="card.svg">"#.to_string(), true),
+        ("background", r#"<div class="bg"></div>"#.to_string(), true),
+        (
+            "list marker",
+            r#"<ul style="list-style-image:url(card.svg)"><li>item</li></ul>"#.to_string(),
+            false,
+        ),
+    ] {
+        let pdf = engine
+            .render(&format!("<!DOCTYPE html><html><body>{body}</body></html>"))
+            .unwrap_or_else(|e| panic!("{site}: {e}"));
+        if text {
+            if let Some(t) = extract_pdf_text(&pdf) {
+                assert!(
+                    t.contains("PlainText") && t.contains("MonoText"),
+                    "{site}: {t:?}"
+                );
+            }
+        }
+        // Rendered twice: byte-identical.
+        let again = engine
+            .render(&format!("<!DOCTYPE html><html><body>{body}</body></html>"))
+            .unwrap();
+        assert!(pdf == again, "{site}: not deterministic");
+    }
+}
+
+#[test]
+fn test_render_svg_text_with_an_unbundled_family_is_drawn_or_refused_when_strict() {
+    let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="300" height="30" viewBox="0 0 300 30"><text x="5" y="20" font-size="16" font-family="Georgia, Palatino">GeorgiaText</text></svg>"#;
+    let html = format!("<!DOCTYPE html><html><body>{svg}</body></html>");
+    let (engine, _) = svg_text_engine(false);
+    let pdf = engine.render(&html).expect("drawn in the default family");
+    if let Some(t) = extract_pdf_text(&pdf) {
+        assert!(t.contains("GeorgiaText"), "{t:?}");
+    }
+    let (strict, _) = svg_text_engine(true);
+    match strict.render(&html) {
+        Err(fulgur::Error::SvgFontFallback(list)) => {
+            assert_eq!(list.len(), 1, "{list:?}");
+            assert_eq!(list[0].font_family, "Georgia, Palatino");
+            assert!(list[0].svg.contains("svg"), "{list:?}");
+        }
+        other => panic!("strict_text must refuse, got {:?}", other.map(|p| p.len())),
+    }
+    // A list with a bundled entry is fine in strict mode.
+    let ok = html.replace("Georgia, Palatino", "Georgia, Noto Sans");
+    strict.render(&ok).expect("a bundled entry resolves");
+}

@@ -36,6 +36,12 @@ pub enum Error {
     #[error("images inside SVGs that cannot be drawn: {}", join_svg_images(.0))]
     SvgImages(Vec<crate::svg_images::DroppedSvgImage>),
 
+    /// SVG text whose `font-family` list matches no bundled face (`EngineBuilder::strict_text`), in document order:
+    /// the SVG and the list as written, at most 20 in the message. Without strict mode that text is drawn in the
+    /// default family (the serif mapping of the asset bundle) with a warning.
+    #[error("SVG text with no bundled font: {}", join_svg_fonts(.0))]
+    SvgFontFallback(Vec<crate::svg_images::SvgFontFallback>),
+
     #[error("{0}")]
     Other(String),
 }
@@ -60,6 +66,22 @@ fn join_dropped(list: &[crate::convert::DroppedText]) -> String {
 }
 
 fn join_svg_images(list: &[crate::svg_images::DroppedSvgImage]) -> String {
+    let mut out = list
+        .iter()
+        .take(MAX_DROPPED_IN_MESSAGE)
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if list.len() > MAX_DROPPED_IN_MESSAGE {
+        out.push_str(&format!(
+            "; ... and {} more",
+            list.len() - MAX_DROPPED_IN_MESSAGE
+        ));
+    }
+    out
+}
+
+fn join_svg_fonts(list: &[crate::svg_images::SvgFontFallback]) -> String {
     let mut out = list
         .iter()
         .take(MAX_DROPPED_IN_MESSAGE)

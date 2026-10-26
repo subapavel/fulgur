@@ -218,7 +218,10 @@ impl Engine {
         // the margin-box renderer, so headers/footers would appear in
         // default browser styles even though their content resolved
         // correctly.
-        let svg_checks = crate::svg_images::SvgImageChecks::new(self.assets.clone());
+        let svg_checks = crate::svg_images::SvgImageChecks::new(
+            self.assets.clone(),
+            crate::svg_fonts::SvgFonts::new(self.fonts(), self.generics()),
+        );
         let (mut doc, link_gcpm) =
             crate::blitz_adapter::parse_html_with_local_resources_and_generics(
                 &html,
@@ -763,6 +766,9 @@ impl Engine {
 
     /// The raster images inside SVGs that were left out (an error with `strict_images`, otherwise a `log::warn!`
     /// each) and the damaged JPEGs among them that were embedded (a warning in either mode).
+    ///
+    /// SVG text whose `font-family` list matches no bundled face is drawn in the default family and reported here
+    /// (F152): an error with `strict_text`, otherwise a `log::warn!` each.
     fn report_svg_images(&self, report: crate::svg_images::SvgImageReport) -> Result<()> {
         let warn = |list: &[crate::svg_images::DroppedSvgImage], what: &str, more: &str| {
             for d in list.iter().take(MAX_SVG_IMAGE_WARNINGS) {
@@ -780,13 +786,32 @@ impl Engine {
             "is embedded although it is damaged",
             "embedded although damaged",
         );
-        if report.dropped.is_empty() {
-            return Ok(());
+        if !report.dropped.is_empty() {
+            if self.strict_images {
+                return Err(crate::error::Error::SvgImages(report.dropped));
+            }
+            warn(&report.dropped, "is not drawn", "that are not drawn");
         }
-        if self.strict_images {
-            return Err(crate::error::Error::SvgImages(report.dropped));
+        if !report.font_fallbacks.is_empty() {
+            if self.strict_text {
+                return Err(crate::error::Error::SvgFontFallback(report.font_fallbacks));
+            }
+            let default_family =
+                crate::svg_fonts::SvgFonts::new(self.fonts(), self.generics()).default_family();
+            for f in report.font_fallbacks.iter().take(MAX_SVG_IMAGE_WARNINGS) {
+                log::warn!(
+                    "{}: {}",
+                    f.svg,
+                    crate::svg_images::font_fallback_message(&f.font_family, &default_family)
+                );
+            }
+            if report.font_fallbacks.len() > MAX_SVG_IMAGE_WARNINGS {
+                log::warn!(
+                    "... and {} more SVG font-family lists with no bundled font",
+                    report.font_fallbacks.len() - MAX_SVG_IMAGE_WARNINGS
+                );
+            }
         }
-        warn(&report.dropped, "is not drawn", "that are not drawn");
         Ok(())
     }
 
@@ -952,7 +977,10 @@ impl Engine {
     pub fn build_drawables_for_testing_no_gcpm(&self, html: &str) -> crate::drawables::Drawables {
         let fonts = self.fonts();
 
-        let svg_checks = crate::svg_images::SvgImageChecks::new(self.assets.clone());
+        let svg_checks = crate::svg_images::SvgImageChecks::new(
+            self.assets.clone(),
+            crate::svg_fonts::SvgFonts::new(self.fonts(), self.generics()),
+        );
         let (mut doc, _link_gcpm) =
             crate::blitz_adapter::parse_html_with_local_resources_and_generics(
                 html,
@@ -1028,7 +1056,10 @@ impl Engine {
     ) {
         let fonts = self.fonts();
 
-        let svg_checks = crate::svg_images::SvgImageChecks::new(self.assets.clone());
+        let svg_checks = crate::svg_images::SvgImageChecks::new(
+            self.assets.clone(),
+            crate::svg_fonts::SvgFonts::new(self.fonts(), self.generics()),
+        );
         let (mut doc, _link_gcpm) =
             crate::blitz_adapter::parse_html_with_local_resources_and_generics(
                 html,

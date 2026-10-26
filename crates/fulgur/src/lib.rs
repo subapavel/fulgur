@@ -562,6 +562,7 @@ pub mod paragraph;
 pub mod render;
 pub mod schema;
 pub mod svg;
+pub mod svg_fonts;
 pub mod svg_images;
 pub(crate) mod table_borders;
 pub mod tagging;
@@ -574,7 +575,7 @@ pub use convert::{DroppedText, DroppedTexts};
 pub use engine::{Engine, EngineBuilder, LayoutOutput};
 pub use error::{Error, Result};
 pub use outline::build_outline;
-pub use svg_images::{DroppedSvgImage, SvgImageCause};
+pub use svg_images::{DroppedSvgImage, SvgFontFallback, SvgImageCause};
 
 /// Convert HTML to PDF with default settings.
 pub fn convert_html(html: &str) -> Result<Vec<u8>> {
