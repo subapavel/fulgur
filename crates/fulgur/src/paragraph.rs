@@ -838,9 +838,8 @@ pub fn draw_shaped_lines(
                     if let Some(tracker) = run_region.as_mut() {
                         tracker.transition_to(canvas, link_span_ptr(run.link.as_ref()));
                     }
-                    // Create Krilla font from cached data
-                    let data: krilla::Data = Arc::clone(&run.font_data).into();
-                    let Some(font) = krilla::text::Font::new(data, run.font_index) else {
+                    // The Krilla font of this face, parsed once per render
+                    let Some(font) = canvas.fonts.get(&run.font_data, run.font_index) else {
                         continue;
                     };
 
@@ -1266,6 +1265,7 @@ mod tests {
                 link_run_node_id: None,
                 in_marked_content: false,
                 images: Default::default(),
+                fonts: &mut Default::default(),
                 paint_extent: Default::default(),
             };
             // Draw origin (5, 7) pt; rect must land at (5+2, 7+3, 20, 10).

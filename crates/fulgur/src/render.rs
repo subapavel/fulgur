@@ -186,6 +186,8 @@ pub fn render_v2(
 
     // Raster images are validated once per render, not once per draw (F32a).
     let images = crate::image::ImageCache::default();
+    // One Krilla font per face of the render, not one per glyph run (F99e).
+    let mut krilla_fonts = crate::draw_primitives::KrillaFonts::default();
 
     // The content box the fragmenter paginated every page against is page 1's (F109).
     let page_one_box = {
@@ -277,6 +279,7 @@ pub fn render_v2(
                     link_run_node_id: None,
                     in_marked_content: false,
                     images: images.clone(),
+                    fonts: &mut krilla_fonts,
                     paint_extent: Default::default(),
                 };
                 // Root `<html>` + `<body>` background pre-pass. Root
@@ -401,6 +404,7 @@ pub fn render_v2(
                 link_run_node_id: None,
                 in_marked_content: false,
                 images: images.clone(),
+                fonts: &mut krilla_fonts,
                 paint_extent: Default::default(),
             };
             let page_content_width = content_area.width.to_f32();
@@ -758,6 +762,7 @@ fn paint_repeated_table_headers(
                 link_run_node_id: None,
                 in_marked_content: false,
                 images: canvas.images.clone(),
+                fonts: &mut *canvas.fonts,
                 paint_extent: Default::default(),
             };
             if tagging {
@@ -6583,6 +6588,7 @@ mod tests {
             link_run_node_id: None,
             in_marked_content: false,
             images: Default::default(),
+            fonts: &mut Default::default(),
             paint_extent: Default::default(),
         };
         f(&mut canvas)

@@ -647,6 +647,40 @@ impl Default for TagCollector {
     }
 }
 
+/// One [`krilla::text::Font`] per (font bytes, face index) of a render.
+///
+/// `Font::new` parses the face (head, OS/2, name, metrics, glyf / loca) every time, which cost a parse per glyph run.
+/// The key is the address of the `Arc<Vec<u8>>` a run holds (the bundle's own `Arc` for a bundled font, see
+/// `convert::FontBytes`) and the face index. Every entry keeps an `Arc` clone of its key, so the address cannot be
+/// reused by another buffer while the cache lives. A face that does not parse is cached as `None`, which is what
+/// drawing a run of it did before: the run is skipped. Krilla tells fonts apart by their parsed `FontInfo`, not by the
+/// address of the data, so one shared `Font` gives the same font resources as one `Font` per run. The map is only
+/// looked up, never iterated, so a `HashMap` does not affect the PDF.
+#[derive(Default)]
+pub struct KrillaFonts {
+    fonts: std::collections::HashMap<(usize, u32), KrillaFontEntry>,
+    /// How many faces were parsed (cache misses); a test hook.
+    pub(crate) misses: usize,
+}
+
+/// The buffer a cached font was made from (kept alive so its address stays the key) and the font, `None` when it does
+/// not parse.
+type KrillaFontEntry = (Arc<Vec<u8>>, Option<krilla::text::Font>);
+
+impl KrillaFonts {
+    /// The Krilla font of face `index` of `data`, parsed on first use.
+    pub fn get(&mut self, data: &Arc<Vec<u8>>, index: u32) -> Option<krilla::text::Font> {
+        let key = (Arc::as_ptr(data) as usize, index);
+        if let Some((_, font)) = self.fonts.get(&key) {
+            return font.clone();
+        }
+        self.misses += 1;
+        let font = krilla::text::Font::new(Arc::clone(data).into(), index);
+        self.fonts.insert(key, (Arc::clone(data), font.clone()));
+        font
+    }
+}
+
 /// Wrapper around Krilla Surface for drawing commands.
 /// This decouples drawable payloads from Krilla's concrete Surface type.
 pub struct Canvas<'a, 'b> {
@@ -672,6 +706,8 @@ pub struct Canvas<'a, 'b> {
     /// Validated Krilla images of this render (see [`crate::image::krilla_image`]). Shared by every
     /// canvas of a render, so an image is checked once however many pages draw it.
     pub images: crate::image::ImageCache,
+    /// The Krilla fonts of this render (see [`KrillaFonts`]), shared by every canvas of it.
+    pub fonts: &'a mut KrillaFonts,
     /// How far to the right of the page's left edge this canvas has painted (see [`PaintExtent`]).
     pub paint_extent: PaintExtent,
 }
@@ -2895,6 +2931,47 @@ mod dp_unit_tests {
         );
     }
 
+    // ── KrillaFonts (F99e) ───────────────────────────────────
+
+    fn noto() -> Arc<Vec<u8>> {
+        Arc::new(include_bytes!("../../../examples/.fonts/NotoSans-Regular.ttf").to_vec())
+    }
+
+    #[test]
+    fn krilla_fonts_parse_a_face_once() {
+        let data = noto();
+        let mut fonts = KrillaFonts::default();
+        let first = fonts.get(&data, 0).expect("Noto Sans parses");
+        for _ in 0..1000 {
+            let again = fonts.get(&data, 0).expect("cached");
+            assert!(first == again, "the same Font every time");
+        }
+        assert_eq!(fonts.misses, 1);
+    }
+
+    #[test]
+    fn krilla_fonts_key_is_the_buffer_and_the_index() {
+        let (a, b) = (noto(), noto());
+        let mut fonts = KrillaFonts::default();
+        assert!(fonts.get(&a, 0).is_some());
+        // Another buffer with equal bytes is another key; so is another index of the same buffer (a single font
+        // file has no face 1, which is cached as `None`).
+        assert!(fonts.get(&b, 0).is_some());
+        assert!(fonts.get(&a, 1).is_none());
+        assert!(fonts.get(&a, 1).is_none());
+        assert_eq!(fonts.misses, 3);
+    }
+
+    #[test]
+    fn krilla_fonts_cache_a_face_that_does_not_parse() {
+        let junk = Arc::new(vec![0_u8; 256]);
+        let mut fonts = KrillaFonts::default();
+        for _ in 0..1000 {
+            assert!(fonts.get(&junk, 0).is_none());
+        }
+        assert_eq!(fonts.misses, 1);
+    }
+
     // ── draw_block_border canvas smoke tests ─────────────────
     //
     // These tests exercise draw paths that require a real Krilla surface.
@@ -2916,6 +2993,7 @@ mod dp_unit_tests {
             link_run_node_id: None,
             in_marked_content: false,
             images: Default::default(),
+            fonts: &mut Default::default(),
             paint_extent: Default::default(),
         };
         f(&mut canvas);
