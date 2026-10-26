@@ -1107,6 +1107,7 @@ dependencies = [
  "getrandom 0.4.3",
  "gif",
  "image",
+ "image-webp",
  "krilla",
  "krilla-svg",
  "log",

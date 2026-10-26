@@ -225,6 +225,36 @@ fn validate_gif(data: &[u8]) -> Result<(), ImageError> {
     Ok(())
 }
 
+fn validate_webp(data: &[u8]) -> Result<(), ImageError> {
+    let corrupt = |e: image_webp::DecodingError| ImageError::Corrupt(e.to_string());
+    let mut decoder = image_webp::WebPDecoder::new(std::io::Cursor::new(data)).map_err(corrupt)?;
+    let (w, h) = decoder.dimensions();
+    check_size(w, h)?;
+    // Krilla reads the colour profile with the metadata, before it decodes.
+    decoder.icc_profile().map_err(corrupt)?;
+    let size = decoder
+        .output_buffer_size()
+        .ok_or_else(|| ImageError::Corrupt("image is too large".into()))?;
+    decoder.read_image(&mut vec![0; size]).map_err(corrupt)
+}
+
+/// Whether the raster of an `<image>` inside an SVG can be drawn, the way [`validate_detailed`] says it for a
+/// top-level image: `Err` when it cannot (a truncated PNG, GIF or WebP, a header over [`MAX_IMAGE_PIXELS`], a
+/// JPEG no decoder reads), `Ok(Some(why))` for a JPEG that is embedded although it is damaged, `Ok(None)`
+/// otherwise. `krilla-svg` hands these bytes to Krilla without looking at them and Krilla decodes the pixels in
+/// `Document::finish()`, where a failure fails the document and a huge header aborts the process.
+///
+/// An SVG inside the SVG is `Ok(None)`: usvg parsed it already, and with no images of its own.
+pub fn validate_svg_raster(kind: &usvg::ImageKind) -> Result<Option<String>, ImageError> {
+    match kind {
+        usvg::ImageKind::PNG(data) => validate_png(data).map(|()| None),
+        usvg::ImageKind::GIF(data) => validate_gif(data).map(|()| None),
+        usvg::ImageKind::WEBP(data) => validate_webp(data).map(|()| None),
+        usvg::ImageKind::JPEG(data) => validate_jpeg(data),
+        usvg::ImageKind::SVG(_) => Ok(None),
+    }
+}
+
 /// What [`krilla_image`] knows about the images of one render, keyed by the address of the bundle's
 /// `Arc` (the cache holds the `Arc`, so an address is never reused). Lookup only: nothing iterates it,
 /// so it cannot influence the order of anything in the PDF.
@@ -965,5 +995,130 @@ mod tests {
         assert!(cut.damaged.is_some_and(|why| !why.is_empty()));
         let stray = validate_detailed(&with_stray_bytes(JPEG, 3)).unwrap();
         assert!(stray.damaged.is_some_and(|why| why.contains("Extra bytes")));
+    }
+
+    fn webp(w: u32, h: u32) -> Vec<u8> {
+        let pixels: Vec<u8> = (0..w * h * 3).map(|i| (i * 7) as u8).collect();
+        let mut out = Vec::new();
+        image_webp::WebPEncoder::new(&mut out)
+            .encode(&pixels, w, h, image_webp::ColorType::Rgb8)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn svg_rasters_that_decode_are_valid() {
+        let sos = JPEG.windows(2).position(|w| w == [0xff, 0xda]).unwrap();
+        for (what, kind) in [
+            ("png", usvg::ImageKind::PNG(Arc::new(png(40, 30)))),
+            ("jpeg", usvg::ImageKind::JPEG(Arc::new(JPEG.to_vec()))),
+            ("gif", usvg::ImageKind::GIF(Arc::new(GIF.to_vec()))),
+            ("webp", usvg::ImageKind::WEBP(Arc::new(webp(40, 30)))),
+        ] {
+            assert_eq!(validate_svg_raster(&kind), Ok(None), "{what}");
+        }
+        // A damaged JPEG is embedded, with the reason (F32a M1), as for a top-level image.
+        let cut = JPEG[..sos + (JPEG.len() - sos) / 2].to_vec();
+        let damaged = validate_svg_raster(&usvg::ImageKind::JPEG(Arc::new(cut)));
+        assert!(damaged.unwrap().is_some_and(|why| !why.is_empty()));
+    }
+
+    #[test]
+    fn svg_rasters_that_do_not_decode_are_refused() {
+        let full = png(64, 64);
+        let webp = webp(64, 64);
+        for (what, kind) in [
+            (
+                "png",
+                usvg::ImageKind::PNG(Arc::new(full[..full.len() / 2].to_vec())),
+            ),
+            (
+                "gif",
+                usvg::ImageKind::GIF(Arc::new(GIF[..GIF.len() / 2].to_vec())),
+            ),
+            (
+                "webp",
+                usvg::ImageKind::WEBP(Arc::new(webp[..webp.len() / 2].to_vec())),
+            ),
+            ("jpeg", usvg::ImageKind::JPEG(Arc::new(JPEG[..10].to_vec()))),
+            // The MIME type says PNG, the bytes are something else.
+            (
+                "png that is a gif",
+                usvg::ImageKind::PNG(Arc::new(GIF.to_vec())),
+            ),
+            (
+                "webp that is a png",
+                usvg::ImageKind::WEBP(Arc::new(full.clone())),
+            ),
+        ] {
+            assert!(
+                matches!(validate_svg_raster(&kind), Err(ImageError::Corrupt(_))),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn svg_raster_with_a_huge_header_is_refused_without_allocating() {
+        // 100000 x 100000 RGBA would be 40 GB; the IDAT holds a few bytes. The test would abort the process
+        // ("memory allocation failed") if the size were not checked from the header first.
+        let mut huge = png_with_short_idat(&png(16, 16), usize::MAX);
+        huge[16..20].copy_from_slice(&100_000u32.to_be_bytes());
+        huge[20..24].copy_from_slice(&100_000u32.to_be_bytes());
+        let crc = crc32(&huge[12..29]);
+        huge[29..33].copy_from_slice(&crc.to_be_bytes());
+        assert_eq!(
+            validate_svg_raster(&usvg::ImageKind::PNG(Arc::new(huge))),
+            Err(ImageError::TooLarge {
+                w: 100_000,
+                h: 100_000
+            })
+        );
+    }
+
+    #[test]
+    fn a_webp_over_the_pixel_limit_is_refused_from_its_header() {
+        // A lossless WebP's header holds 14 bits per side: 16383 x 16383 = 256 Mi pixels is what `image-webp` reads
+        // as the largest. Set it in a 1 x 1 file (VP8L: signature 0x2f, then width - 1, height - 1, alpha and
+        // version, little endian).
+        let mut data = webp(1, 1);
+        let vp8l = data.windows(5).position(|w| w[0] == 0x2f).unwrap();
+        assert_eq!(&data[vp8l - 8..vp8l - 4], b"VP8L");
+        data[vp8l + 1..vp8l + 5].copy_from_slice(&(0x3ffe_u32 | (0x3ffe << 14)).to_le_bytes());
+        assert_eq!(
+            validate_svg_raster(&usvg::ImageKind::WEBP(Arc::new(data))),
+            Err(ImageError::TooLarge { w: 16383, h: 16383 })
+        );
+    }
+
+    #[test]
+    fn a_raster_is_valid_in_an_svg_when_it_is_valid_alone() {
+        // Same verdicts as `validate`, for the formats an SVG can carry.
+        for (data, make) in [
+            (
+                png(8, 8),
+                (|d| usvg::ImageKind::PNG(d)) as fn(Arc<Vec<u8>>) -> usvg::ImageKind,
+            ),
+            (GIF.to_vec(), |d| usvg::ImageKind::GIF(d)),
+        ] {
+            for cut in [data.len(), data.len() / 2, 20] {
+                let part = data[..cut].to_vec();
+                assert_eq!(
+                    validate(&part).is_ok(),
+                    validate_svg_raster(&make(Arc::new(part))).is_ok(),
+                    "{cut}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_svg_inside_an_svg_is_valid() {
+        let tree = usvg::Tree::from_data(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#,
+            &usvg::Options::default(),
+        )
+        .unwrap();
+        assert_eq!(validate_svg_raster(&usvg::ImageKind::SVG(tree)), Ok(None));
     }
 }

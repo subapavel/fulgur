@@ -36,6 +36,8 @@ usvg = "0.45"
 png = "0.17.16"
 gif = "0.13.1"
 zune-jpeg = "0.5.5"
+# The WebP decoder Krilla 0.7 uses, for the WebP images inside an SVG (`image::validate_svg_raster`; krilla-svg embeds them).
+image-webp = "0.2.1"
 blitz-html = "0.2"
 blitz-dom = "0.2"
 blitz-traits = "0.2"
