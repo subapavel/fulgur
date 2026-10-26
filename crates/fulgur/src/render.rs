@@ -3739,7 +3739,16 @@ fn draw_table_v2(
     use crate::draw_primitives::draw_with_opacity;
 
     draw_with_opacity(canvas, entry.opacity, |canvas| {
-        let (total_width, total_height) = table_box_size(entry, frag, piece);
+        let (total_width, mut total_height) = table_box_size(entry, frag, piece);
+        if piece {
+            total_height += table_piece_bottom(
+                entry,
+                frag,
+                geometry
+                    .get(&table_id)
+                    .map_or(&[][..], |g| &g.fragments[..]),
+            );
+        }
         if entry.visible {
             paint_table_outer_frame(canvas, entry, x, y, total_width, total_height);
         }
@@ -3876,6 +3885,22 @@ fn table_box_size(
     (total_width, total_height)
 }
 
+/// F174: the room a piece of a cut table needs below its last row for the table's bottom border, pt. A piece's
+/// fragment ends at its last row; only the table's last piece holds the bottom border (and padding) in its height, so
+/// every other piece is closed by a border drawn below its rows, not over the last one (a row background painted
+/// after the frame would cover it).
+fn table_piece_bottom(
+    entry: &crate::drawables::TableEntry,
+    frag: &crate::pagination_layout::Fragment,
+    fragments: &[crate::pagination_layout::Fragment],
+) -> f32 {
+    if fragments.last().is_none_or(|last| last == frag) {
+        0.0
+    } else {
+        entry.style.border_widths[2].to_f32()
+    }
+}
+
 /// Paint the table's outer-frame bg / border / shadow at the current
 /// (x, y, width, height). Shared between the no-clip path
 /// ([`draw_table_v2`]) and the clip path ([`draw_under_clip_table`])
@@ -3921,7 +3946,10 @@ fn draw_under_clip_table(
 ) {
     use crate::draw_primitives::draw_with_opacity;
 
-    let (total_width, total_height) = table_box_size(table, frag, geom.table_pieces);
+    let (total_width, mut total_height) = table_box_size(table, frag, geom.table_pieces);
+    if geom.table_pieces {
+        total_height += table_piece_bottom(table, frag, &geom.fragments);
+    }
 
     draw_with_opacity(canvas, table.opacity, |canvas| {
         // bg / border / shadow OUTSIDE the clip, mirroring
@@ -6989,6 +7017,19 @@ mod tests {
         assert!((h - 15.0).abs() < 0.001, "20 px is 15 pt, got {h}");
         let (_, whole) = table_box_size(&entry, &frag, false);
         assert!((whole - 80.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_piece_that_is_not_the_last_has_room_for_the_bottom_border() {
+        // F174: every piece but the last is closed by the table's bottom border below its rows.
+        use crate::units::F32Units;
+        let mut entry = make_table_entry_for_size(None, 200.0, 50.0);
+        entry.style.border_widths = [1.5, 1.5, 1.5, 1.5].map(|v| v.as_pt());
+        let (a, b) = (make_frag_with_height(20.0), make_frag_with_height(30.0));
+        let pieces = [a.clone(), b.clone()];
+        assert!((table_piece_bottom(&entry, &a, &pieces) - 1.5).abs() < 0.001);
+        assert_eq!(table_piece_bottom(&entry, &b, &pieces), 0.0);
+        assert_eq!(table_piece_bottom(&entry, &a, &[]), 0.0);
     }
 
     #[test]
