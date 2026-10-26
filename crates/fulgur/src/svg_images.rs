@@ -9,12 +9,40 @@
 //! `<image>` as it skips an href that does not resolve; one that passes is returned as it is, with the same bytes,
 //! so the tree and the PDF do not change.
 //!
+//! Nothing here, or anywhere else fulgur parses an SVG, reads the host's filesystem (html-to-pdf F177b). usvg's
+//! default string resolver treats every `href` that is not a `data:` URL as a path and reads it; the resolver
+//! of [`SvgImageChecks`] never does: an inline `<svg>` finds a non-`data:` href by name in the
+//! [`AssetBundle`] (the rule of `<img src>`), and an SVG used as an image (`<img>`, `background-image`,
+//! `list-style-image`) loads no external file at all, as SVG Integration's secure static mode says. What
+//! is left out is reported with an [`SvgImageCause`]. Code that parses an SVG without checks uses
+//! [`offline_options`].
+//!
 //! One [`SvgImageChecks`] serves one layout pass of a render. Every place fulgur parses an SVG that can hold images
 //! gets its options from [`SvgImageChecks::options`] (the SVG assets of `<img>`, `background-image` and
 //! `list-style-image`) or its factory ([`SvgImageChecks::factory`], the inline `<svg>` elements Blitz parses).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+use crate::asset::AssetBundle;
+
+/// Longest href, in characters, that is named in a finding as it is; a longer one (a malformed `data:` URL) is cut.
+const MAX_HREF_NAME: usize = 120;
+
+/// Why a raster image inside an SVG is left out of the SVG.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SvgImageCause {
+    /// The image is there and cannot be drawn: truncated, a header that claims more than
+    /// [`crate::image::MAX_IMAGE_PIXELS`], bytes that are no image.
+    Undecodable,
+    /// The `href` of an `<image>` in an inline `<svg>` that is not the name of a bundled image (the lookup of
+    /// `<img src>`: [`AssetBundle::get_image`]), or any `href` of an SVG in a page margin box, which has no
+    /// bundle.
+    NotBundled,
+    /// The `href` of an SVG used as an image (`<img>`, `background-image`, `list-style-image`) that is not a
+    /// `data:` URL. Such an SVG loads no external file, bundled or not.
+    External,
+}
 
 /// A raster image inside an SVG that is left out of the SVG, and why.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -24,8 +52,10 @@ pub struct DroppedSvgImage {
     pub svg: String,
     /// The image: `data:image/png (4096 bytes)` for a `data:` URL, the href otherwise.
     pub image: String,
-    /// Why: `unexpected end of file`, `100000 x 100000 pixels is more than the 134217728 pixel limit`, …
+    /// Why: `unexpected end of file`, `100000 x 100000 pixels is more than the 134217728 pixel limit`,
+    /// `not a bundled image`, …
     pub reason: String,
+    pub cause: SvgImageCause,
 }
 
 impl std::fmt::Display for DroppedSvgImage {
@@ -62,6 +92,7 @@ struct Finding {
     site: SvgSite,
     image: String,
     reason: String,
+    cause: SvgImageCause,
 }
 
 #[derive(Clone)]
@@ -79,27 +110,51 @@ struct State {
     damaged: BTreeSet<Finding>,
 }
 
+/// usvg's resolvers with the filesystem taken out: `data:` URLs as usvg resolves them, every other href not at all.
+pub(crate) fn offline_resolver() -> usvg::ImageHrefResolver<'static> {
+    usvg::ImageHrefResolver {
+        resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+        resolve_string: Box::new(|_, _| None),
+    }
+}
+
+/// `usvg::Options::default()` with resolvers that read nothing from the host: a `data:` image is loaded as usvg
+/// loads it (and not checked, see [`SvgImageChecks`]), any other `href` is not loaded. For parsing an SVG whose
+/// images are not drawn, or are checked by something else.
+pub fn offline_options() -> usvg::Options<'static> {
+    usvg::Options {
+        image_href_resolver: offline_resolver(),
+        ..usvg::Options::default()
+    }
+}
+
 /// See the module documentation.
 pub struct SvgImageChecks {
     state: Mutex<State>,
+    /// The bundle an inline `<svg>` finds its non-`data:` hrefs in; `None` finds nothing there (the SVGs of the
+    /// `@page` margin boxes).
+    images: Option<Arc<AssetBundle>>,
     /// Log a finding when it is first made instead of keeping it for [`SvgImageChecks::take`]: for the documents of
     /// the `@page` margin boxes, which are converted after the engine has reported.
     immediate: bool,
 }
 
 impl SvgImageChecks {
-    pub fn new() -> Arc<Self> {
+    /// Checks for one render. `images` is the render's bundle (an `Arc` the engine holds: no copy per render).
+    pub fn new(images: Option<Arc<AssetBundle>>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::default(),
+            images,
             immediate: false,
         })
     }
 
     /// Checks that `log::warn!` each finding as it is made (once per image) and are not read with
-    /// [`SvgImageChecks::take`].
+    /// [`SvgImageChecks::take`]. They have no bundle.
     pub(crate) fn warning_immediately() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::default(),
+            images: None,
             immediate: true,
         })
     }
@@ -110,10 +165,10 @@ impl SvgImageChecks {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// usvg's default resolvers, refusing the rasters of `site` that cannot be drawn.
+    /// The resolvers of an SVG at `site`: usvg's `data:` resolver, refusing the rasters that cannot be drawn, and
+    /// [`SvgImageChecks::resolve_href`] for everything else.
     pub fn resolver(self: &Arc<Self>, site: SvgSite) -> usvg::ImageHrefResolver<'static> {
         let default_data = usvg::ImageHrefResolver::default_data_resolver();
-        let default_string = usvg::ImageHrefResolver::default_string_resolver();
         let (checks, data_site) = (Arc::clone(self), site.clone());
         let (string_checks, string_site) = (Arc::clone(self), site);
         usvg::ImageHrefResolver {
@@ -123,17 +178,64 @@ impl SvgImageChecks {
                 checks.check(&data_site, name, kind)
             }),
             resolve_string: Box::new(move |href, opts| {
-                let kind = default_string(href, opts)?;
-                string_checks.check(&string_site, href.to_string(), kind)
+                string_checks.resolve_href(&string_site, href, opts)
             }),
         }
     }
 
-    /// `usvg::Options::default()` with [`SvgImageChecks::resolver`].
+    /// An `href` that is not a `data:` URL. Never reads the filesystem (F177b).
+    ///
+    /// - In an inline `<svg>`: the name of a bundled image, looked up as `<img src>` is
+    ///   ([`AssetBundle::get_image`]: the exact key, a leading `./` dropped; an empty href is missing). The
+    ///   bytes are loaded as usvg loads a `data:` image whose type is sniffed from its content, and checked.
+    ///   Not in the bundle (or no bundle): [`SvgImageCause::NotBundled`].
+    /// - In an SVG used as an image: never loaded, bundled or not ([`SvgImageCause::External`]).
+    fn resolve_href(
+        &self,
+        site: &SvgSite,
+        href: &str,
+        opts: &usvg::Options,
+    ) -> Option<usvg::ImageKind> {
+        let name = href_name(href);
+        if !matches!(site, SvgSite::Inline(_)) {
+            self.refuse(
+                site,
+                name,
+                "an SVG used as an image loads no external files",
+                SvgImageCause::External,
+            );
+            return None;
+        }
+        let bytes = self
+            .images
+            .as_ref()
+            .filter(|_| !href.is_empty())
+            .and_then(|bundle| bundle.get_image(href));
+        let Some(bytes) = bytes else {
+            self.refuse(site, name, "not a bundled image", SvgImageCause::NotBundled);
+            return None;
+        };
+        let sniffed =
+            usvg::ImageHrefResolver::default_data_resolver()("text/plain", Arc::clone(bytes), opts);
+        match sniffed {
+            Some(kind) => self.check(site, name, kind),
+            None => {
+                self.refuse(
+                    site,
+                    name,
+                    "not a PNG, JPEG, GIF, WebP or SVG image",
+                    SvgImageCause::Undecodable,
+                );
+                None
+            }
+        }
+    }
+
+    /// [`offline_options`] with [`SvgImageChecks::resolver`].
     pub fn options(self: &Arc<Self>, site: SvgSite) -> usvg::Options<'static> {
         usvg::Options {
             image_href_resolver: self.resolver(site),
-            ..usvg::Options::default()
+            ..offline_options()
         }
     }
 
@@ -170,17 +272,43 @@ impl SvgImageChecks {
                 v
             }
         };
-        let (set_damaged, reason) = match verdict {
-            Verdict::Valid(None) => return Some(kind),
-            Verdict::Valid(Some(why)) => (true, why),
-            Verdict::Refused(why) => (false, why),
-        };
+        drop(state);
+        match verdict {
+            Verdict::Valid(None) => Some(kind),
+            Verdict::Valid(Some(why)) => {
+                self.record(site, name, why, SvgImageCause::Undecodable, true);
+                Some(kind)
+            }
+            Verdict::Refused(why) => {
+                self.record(site, name, why, SvgImageCause::Undecodable, false);
+                None
+            }
+        }
+    }
+
+    /// An image that is left out, not because it is damaged.
+    fn refuse(&self, site: &SvgSite, name: String, why: &str, cause: SvgImageCause) {
+        self.record(site, name, why.to_string(), cause, false);
+    }
+
+    /// Keeps a finding (`damaged`: an embedded JPEG that is damaged; otherwise an image left out), once, and logs
+    /// it right away when asked to.
+    fn record(
+        &self,
+        site: &SvgSite,
+        image: String,
+        reason: String,
+        cause: SvgImageCause,
+        damaged: bool,
+    ) {
         let finding = Finding {
             site: site.clone(),
-            image: name,
+            image,
             reason,
+            cause,
         };
-        let new = if set_damaged {
+        let mut state = self.state();
+        let new = if damaged {
             state.damaged.insert(finding.clone())
         } else {
             state.dropped.insert(finding.clone())
@@ -188,7 +316,7 @@ impl SvgImageChecks {
         drop(state);
         if self.immediate && new {
             let what = describe(&finding, None);
-            if set_damaged {
+            if damaged {
                 log::warn!(
                     "{what} is embedded although it is damaged: {}",
                     finding.reason
@@ -197,7 +325,6 @@ impl SvgImageChecks {
                 log::warn!("{what} is not drawn: {}", finding.reason);
             }
         }
-        (set_damaged).then_some(kind)
     }
 
     /// The findings so far, named after `doc` (the document the inline SVGs are in), and forgets them. The verdicts
@@ -215,11 +342,20 @@ impl SvgImageChecks {
             svg: site_name(&f.site, Some(&names)),
             image: f.image,
             reason: f.reason,
+            cause: f.cause,
         };
         SvgImageReport {
             dropped: dropped.into_iter().map(name).collect(),
             damaged: damaged.into_iter().map(name).collect(),
         }
+    }
+}
+
+/// The href as a finding names it: as it is, unless it is very long.
+fn href_name(href: &str) -> String {
+    match href.char_indices().nth(MAX_HREF_NAME) {
+        Some((end, _)) => format!("{}...", &href[..end]),
+        None => href.to_string(),
     }
 }
 
@@ -362,7 +498,7 @@ mod tests {
 
     #[test]
     fn a_valid_raster_stays_and_a_truncated_one_is_dropped() {
-        let checks = SvgImageChecks::new();
+        let checks = SvgImageChecks::new(None);
         let good = svg_with(&gif_url(GIF));
         let bad = svg_with(&gif_url(&GIF[..GIF.len() / 2]));
         assert_eq!(parse(&checks, SvgSite::Img("a.svg".into()), &good), 1);
@@ -382,7 +518,7 @@ mod tests {
 
     #[test]
     fn findings_come_out_sorted_by_site_whatever_the_order_of_parsing() {
-        let checks = SvgImageChecks::new();
+        let checks = SvgImageChecks::new(None);
         let bad = svg_with(&gif_url(&GIF[..10]));
         for site in [
             SvgSite::ListMarker("l.svg".into()),
@@ -414,11 +550,211 @@ mod tests {
 
     #[test]
     fn an_svg_inside_an_svg_is_left_alone() {
-        let checks = SvgImageChecks::new();
+        let checks = SvgImageChecks::new(None);
         let inner = r#"<svg xmlns='http://www.w3.org/2000/svg' width='5' height='5'><rect width='5' height='5'/></svg>"#;
         let svg = svg_with(&data_url("image/svg+xml", inner.as_bytes()));
         assert_eq!(parse(&checks, SvgSite::Img("a.svg".into()), &svg), 1);
         let doc = blitz_dom::BaseDocument::new(blitz_dom::DocumentConfig::default());
         assert_eq!(checks.take(&doc), SvgImageReport::default());
+    }
+    fn bundle(entries: &[(&str, &[u8])]) -> Option<Arc<AssetBundle>> {
+        let mut bundle = AssetBundle::new();
+        for (name, bytes) in entries {
+            bundle.add_image(*name, bytes.to_vec());
+        }
+        Some(Arc::new(bundle))
+    }
+
+    fn report(checks: &Arc<SvgImageChecks>) -> SvgImageReport {
+        checks.take(&blitz_dom::BaseDocument::new(
+            blitz_dom::DocumentConfig::default(),
+        ))
+    }
+
+    #[test]
+    fn an_inline_svg_finds_a_href_by_name_in_the_bundle() {
+        let checks = SvgImageChecks::new(bundle(&[("logo.gif", GIF)]));
+        for href in ["logo.gif", "./logo.gif"] {
+            assert_eq!(
+                parse(&checks, SvgSite::Inline(1), &svg_with(href)),
+                1,
+                "{href}"
+            );
+        }
+        assert_eq!(report(&checks), SvgImageReport::default());
+    }
+
+    #[test]
+    fn a_bundled_svg_in_an_inline_svg_is_loaded_without_images_of_its_own() {
+        let inner = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="5" height="5"><image href="{}" width="5" height="5"/></svg>"#,
+            gif_url(GIF)
+        );
+        let checks = SvgImageChecks::new(bundle(&[("card.svg", inner.as_bytes())]));
+        let tree = usvg::Tree::from_str(&svg_with("card.svg"), &checks.options(SvgSite::Inline(1)))
+            .unwrap();
+        assert_eq!(images(&tree), 1);
+        assert_eq!(report(&checks), SvgImageReport::default());
+    }
+
+    #[test]
+    fn an_href_that_is_not_bundled_is_dropped_whatever_is_on_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = dir.path().join("logo.gif");
+        std::fs::write(&on_disk, GIF).unwrap();
+        let absolute = on_disk.to_str().unwrap().to_string();
+        let file_url = format!("file://{absolute}");
+        let hrefs = [
+            absolute.as_str(),
+            file_url.as_str(),
+            "http://example.com/logo.gif",
+            "other.gif",
+            "",
+        ];
+        // With a bundle that holds something else, and with none (the SVGs of the page margin boxes).
+        for images in [bundle(&[("logo.gif", GIF)]), None] {
+            let bundled = images.is_some();
+            let checks = SvgImageChecks::new(images);
+            for href in hrefs {
+                assert_eq!(
+                    parse(&checks, SvgSite::Inline(1), &svg_with(href)),
+                    0,
+                    "{href}"
+                );
+            }
+            let dropped = report(&checks).dropped;
+            // An empty href reaches the resolver too, and is not a bundled image either.
+            let named: Vec<_> = dropped.iter().map(|d| d.image.as_str()).collect();
+            let mut want = vec![
+                absolute.as_str(),
+                file_url.as_str(),
+                "http://example.com/logo.gif",
+                "other.gif",
+                "",
+            ];
+            want.sort();
+            assert_eq!(named, want, "bundled {bundled}");
+            for d in &dropped {
+                assert_eq!(d.cause, SvgImageCause::NotBundled);
+                assert_eq!(d.reason, "not a bundled image");
+                assert_eq!(d.svg, "inline <svg> (node 1) in a page margin box");
+            }
+        }
+    }
+
+    #[test]
+    fn an_svg_used_as_an_image_loads_no_external_file_bundled_or_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = dir.path().join("logo.gif");
+        std::fs::write(&on_disk, GIF).unwrap();
+        let absolute = on_disk.to_str().unwrap().to_string();
+        let checks = SvgImageChecks::new(bundle(&[("logo.gif", GIF)]));
+        let sites = [
+            SvgSite::Img("a.svg".into()),
+            SvgSite::Background("b.svg".into()),
+            SvgSite::ListMarker("l.svg".into()),
+        ];
+        for site in &sites {
+            for href in ["logo.gif", absolute.as_str()] {
+                assert_eq!(parse(&checks, site.clone(), &svg_with(href)), 0, "{href}");
+            }
+            // The `data:` twin is drawn.
+            assert_eq!(parse(&checks, site.clone(), &svg_with(&gif_url(GIF))), 1);
+        }
+        let dropped = report(&checks).dropped;
+        assert_eq!(dropped.len(), 6, "{dropped:?}");
+        for d in &dropped {
+            assert_eq!(d.cause, SvgImageCause::External, "{d}");
+            assert_eq!(d.reason, "an SVG used as an image loads no external files");
+        }
+        assert_eq!(dropped[0].svg, "<img src=\"a.svg\">");
+        assert_eq!(dropped[0].image, absolute);
+        assert_eq!(dropped[1].image, "logo.gif");
+    }
+
+    #[test]
+    fn a_bundled_image_that_cannot_be_drawn_is_undecodable() {
+        let checks = SvgImageChecks::new(bundle(&[
+            ("cut.gif", &GIF[..GIF.len() / 2]),
+            ("text.png", b"this is not an image"),
+        ]));
+        for href in ["cut.gif", "text.png"] {
+            assert_eq!(
+                parse(&checks, SvgSite::Inline(1), &svg_with(href)),
+                0,
+                "{href}"
+            );
+        }
+        let dropped = report(&checks).dropped;
+        let causes: Vec<_> = dropped
+            .iter()
+            .map(|d| (d.image.as_str(), d.cause))
+            .collect();
+        assert_eq!(
+            causes,
+            [
+                ("cut.gif", SvgImageCause::Undecodable),
+                ("text.png", SvgImageCause::Undecodable)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_very_long_href_is_named_in_part() {
+        let long = format!("data:image/png;base64,{}", "A".repeat(5000));
+        let checks = SvgImageChecks::new(None);
+        // A malformed data URL is no data URL to usvg: it reaches the string resolver.
+        parse(&checks, SvgSite::Inline(1), &svg_with(&format!("{long}%")));
+        let dropped = report(&checks).dropped;
+        assert!(
+            dropped
+                .iter()
+                .all(|d| d.image.chars().count() <= MAX_HREF_NAME + 3),
+            "{dropped:?}"
+        );
+    }
+
+    #[test]
+    fn offline_options_load_data_urls_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = dir.path().join("logo.gif");
+        std::fs::write(&on_disk, GIF).unwrap();
+        let load = |href: &str| {
+            images(&usvg::Tree::from_str(&svg_with(href), &offline_options()).unwrap())
+        };
+        assert_eq!(load(&gif_url(GIF)), 1);
+        assert_eq!(load(on_disk.to_str().unwrap()), 0);
+        assert_eq!(load(&format!("file://{}", on_disk.display())), 0);
+    }
+
+    #[test]
+    fn no_parse_reads_a_device_file() {
+        let started = std::time::Instant::now();
+        let href = "/dev/zero";
+        let svg = svg_with(href);
+        assert_eq!(
+            images(&usvg::Tree::from_str(&svg, &offline_options()).unwrap()),
+            0
+        );
+        let checks = SvgImageChecks::new(bundle(&[("logo.gif", GIF)]));
+        for site in [
+            SvgSite::Inline(1),
+            SvgSite::Img("a.svg".into()),
+            SvgSite::Background("b.svg".into()),
+            SvgSite::ListMarker("l.svg".into()),
+        ] {
+            assert_eq!(parse(&checks, site, &svg), 0);
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let causes: Vec<_> = report(&checks).dropped.iter().map(|d| d.cause).collect();
+        assert_eq!(
+            causes,
+            [
+                SvgImageCause::NotBundled,
+                SvgImageCause::External,
+                SvgImageCause::External,
+                SvgImageCause::External
+            ]
+        );
     }
 }

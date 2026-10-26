@@ -68,7 +68,7 @@ pub(super) fn apply_to(style: &mut BlockStyle, ctx: &StyleContext<'_>) {
                                 Some(checks) => checks.options(
                                     crate::svg_images::SvgSite::Background(src.to_string()),
                                 ),
-                                None => usvg::Options::default(),
+                                None => crate::svg_images::offline_options(),
                             };
                             match usvg::Tree::from_data(data, &opts) {
                                 Ok(tree) => {

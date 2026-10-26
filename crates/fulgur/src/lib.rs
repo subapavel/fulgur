@@ -574,7 +574,7 @@ pub use convert::{DroppedText, DroppedTexts};
 pub use engine::{Engine, EngineBuilder, LayoutOutput};
 pub use error::{Error, Result};
 pub use outline::build_outline;
-pub use svg_images::DroppedSvgImage;
+pub use svg_images::{DroppedSvgImage, SvgImageCause};
 
 /// Convert HTML to PDF with default settings.
 pub fn convert_html(html: &str) -> Result<Vec<u8>> {

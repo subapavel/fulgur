@@ -134,7 +134,7 @@ pub fn validate_detailed(data: &[u8]) -> Result<Validation, ImageError> {
     let ok = |damaged| Ok(Validation { kind, damaged });
     match kind {
         AssetKind::Unknown => Err(ImageError::Unsupported),
-        AssetKind::Svg => usvg::Tree::from_data(data, &usvg::Options::default())
+        AssetKind::Svg => usvg::Tree::from_data(data, &crate::svg_images::offline_options())
             .map_err(|e| ImageError::Corrupt(e.to_string()))
             .and_then(|_| ok(None)),
         AssetKind::Raster(ImageFormat::Png) => validate_png(data).and_then(|()| ok(None)),
@@ -1120,5 +1120,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(validate_svg_raster(&usvg::ImageKind::SVG(tree)), Ok(None));
+    }
+
+    #[test]
+    fn an_svg_with_a_device_file_href_is_validated_without_reading_it() {
+        // usvg's default string resolver would read `/dev/zero` until the memory ran out.
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><image href="/dev/zero" width="10" height="10"/></svg>"#;
+        let started = std::time::Instant::now();
+        assert_eq!(validate(svg), Ok(AssetKind::Svg));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }

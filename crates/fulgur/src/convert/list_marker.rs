@@ -89,7 +89,7 @@ pub(super) fn resolve_list_marker(
         AssetKind::Svg => {
             let options = match svg_checks {
                 Some(checks) => checks.options(crate::svg_images::SvgSite::ListMarker(src)),
-                None => usvg::Options::default(),
+                None => crate::svg_images::offline_options(),
             };
             let tree = usvg::Tree::from_data(data, &options).ok()?;
             let size = tree.size();

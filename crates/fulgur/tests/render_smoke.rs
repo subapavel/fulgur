@@ -8908,4 +8908,154 @@ mod svg_images {
         let lines = warnings_with("in a page margin box");
         assert!(lines.iter().any(|l| l.contains("not drawn")), "{lines:?}");
     }
+    // -----------------------------------------------------------------------------------------------------------
+    // F177b: no SVG reads the host's filesystem; an inline `<svg>` finds its images by name in the bundle.
+    // -----------------------------------------------------------------------------------------------------------
+
+    fn with_logo(mut assets: AssetBundle) -> AssetBundle {
+        assets.add_image("logo.png", png());
+        assets
+    }
+
+    #[test]
+    fn a_bundled_href_in_an_inline_svg_is_drawn() {
+        start_logging();
+        for (n, href) in ["logo.png", "./logo.png"].into_iter().enumerate() {
+            let name = format!("byname{n}");
+            let html = format!("<!doctype html><body>{}", svg(&name, href));
+            let pdf = render(with_logo(AssetBundle::default()), &html, true)
+                .unwrap_or_else(|e| panic!("{href}: {e}"));
+            assert_eq!(images_in(&pdf), 1, "{href}");
+            assert!(warnings_with(&name).is_empty(), "{href}");
+        }
+    }
+
+    #[test]
+    fn a_href_that_is_not_bundled_is_never_read_from_the_disk() {
+        start_logging();
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = dir.path().join("logo.png");
+        std::fs::write(&on_disk, png()).unwrap();
+        let absolute = on_disk.to_str().unwrap();
+        for (n, href) in [
+            absolute,
+            "/dev/zero",
+            "file:///etc/hostname",
+            "http://example.com/a.png",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("unbundled{n}");
+            let html = format!("<!doctype html><body>{}", svg(&name, href));
+            let started = std::time::Instant::now();
+            let pdf = render(with_logo(AssetBundle::default()), &html, false).unwrap();
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{href}"
+            );
+            assert_eq!(images_in(&pdf), 0, "{href}");
+            let lines = warnings_with(&name);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(
+                lines[0].contains(href) && lines[0].contains("not a bundled image"),
+                "{lines:?}"
+            );
+            // Strict mode refuses it, as a top-level `<img>` that is not bundled.
+            match render(with_logo(AssetBundle::default()), &html, true) {
+                Err(fulgur::Error::SvgImages(list)) => {
+                    assert_eq!(list.len(), 1, "{list:?}");
+                    assert_eq!(list[0].cause, fulgur::SvgImageCause::NotBundled);
+                    assert_eq!(list[0].image, href);
+                    assert_eq!(list[0].svg, format!("<svg id=\"{name}\">"));
+                }
+                other => panic!("{href}: {:?}", other.map(|p| p.len())),
+            }
+        }
+    }
+
+    #[test]
+    fn a_broken_bundled_raster_in_an_inline_svg_is_undecodable() {
+        let mut assets = AssetBundle::default();
+        assets.add_image("cut.png", truncated(&png()));
+        let html = format!("<!doctype html><body>{}", svg("undec", "cut.png"));
+        match render(assets, &html, true) {
+            Err(fulgur::Error::SvgImages(list)) => {
+                assert_eq!(list.len(), 1, "{list:?}");
+                assert_eq!(list[0].cause, fulgur::SvgImageCause::Undecodable);
+                assert_eq!(list[0].image, "cut.png");
+            }
+            other => panic!("{:?}", other.map(|p| p.len())),
+        }
+    }
+
+    #[test]
+    fn an_svg_used_as_an_image_never_loads_an_external_file() {
+        start_logging();
+        // `logo.png` is bundled, and still not loaded by the SVG of an `<img>`, a background or a list marker.
+        for (site, assets, html) in documents("external", &svg("external", "logo.png")) {
+            let assets = with_logo(assets);
+            let pdf =
+                render(assets.clone(), &html, false).unwrap_or_else(|e| panic!("{site}: {e}"));
+            assert_eq!(images_in(&pdf), usize::from(site == "inline"), "{site}");
+            match render(assets, &html, true) {
+                Err(fulgur::Error::SvgImages(list)) => {
+                    assert_ne!(site, "inline");
+                    assert_eq!(list.len(), 1, "{site}: {list:?}");
+                    assert_eq!(list[0].cause, fulgur::SvgImageCause::External, "{site}");
+                    assert_eq!(list[0].image, "logo.png", "{site}");
+                }
+                Ok(_) => assert_eq!(site, "inline"),
+                Err(e) => panic!("{site}: {e}"),
+            }
+        }
+        let lines = warnings_with("loads no external files");
+        for needle in [
+            "<img src=\"external-img.svg\">",
+            "background-image: url(external-bg.svg)",
+            "list-style-image: url(external-li.svg)",
+        ] {
+            assert!(
+                lines.iter().any(|l| l.contains(needle)),
+                "{needle}: {lines:?}"
+            );
+        }
+        // The same SVG with a `data:` URL draws.
+        for (site, assets, html) in documents("twin", &svg("twin", &data_url("image/png", &png())))
+        {
+            let pdf = render(assets, &html, true).unwrap_or_else(|e| panic!("{site}: {e}"));
+            assert_eq!(images_in(&pdf), 1, "{site}");
+        }
+    }
+
+    #[test]
+    fn a_device_file_href_in_an_svg_at_any_site_returns_at_once() {
+        let started = std::time::Instant::now();
+        for (site, assets, html) in documents("zero", &svg("zero", "/dev/zero")) {
+            let pdf = render(assets, &html, false).unwrap_or_else(|e| panic!("{site}: {e}"));
+            assert_eq!(images_in(&pdf), 0, "{site}");
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_margin_box_svg_has_no_bundle_to_find_a_href_in() {
+        start_logging();
+        let bad = svg("marginal2", "logo.png");
+        let html = format!(
+            "<!doctype html><html><head><style>\
+             @page {{ margin: 36pt; @top-center {{ content: element(hdr); }} }}\
+             .hdr {{ position: running(hdr); }}</style></head>\
+             <body><div class=\"hdr\">{bad}</div><p>body</p></body></html>"
+        );
+        let pdf = render(with_logo(AssetBundle::default()), &html, true).expect("margin box svg");
+        assert_eq!(images_in(&pdf), 0);
+        let lines = warnings_with("logo.png");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("in a page margin box") && l.contains("not a bundled image")),
+            "{lines:?}"
+        );
+    }
 }

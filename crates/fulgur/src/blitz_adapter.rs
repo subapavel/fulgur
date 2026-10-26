@@ -536,7 +536,11 @@ fn parse_inner(
         font_ctx,
         base_url: Some(base_url.unwrap_or_else(|| "file:///".to_string())),
         net_provider,
-        svg_image_resolver: svg_checks.map(|checks| checks.factory()),
+        svg_image_resolver: Some(match svg_checks {
+            Some(checks) => checks.factory(),
+            // No checks: the SVG still reads nothing from the host.
+            None => Arc::new(|_| crate::svg_images::offline_resolver()),
+        }),
         ..DocumentConfig::default()
     };
 
@@ -1551,7 +1555,7 @@ pub fn seed_image_natural_sizes(
                     Some(checks) => {
                         checks.options(crate::svg_images::SvgSite::Img(src.to_string()))
                     }
-                    None => usvg::Options::default(),
+                    None => crate::svg_images::offline_options(),
                 };
                 if let Ok(tree) = usvg::Tree::from_data(data, &options) {
                     seeds.push(Resource::Svg(node_id, ImageType::Image, Box::new(tree)));

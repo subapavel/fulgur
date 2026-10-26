@@ -7,6 +7,7 @@ use krilla::SerializeSettings;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Most `log::warn!` lines for text without a font face per render; the rest is counted in one more line.
 const MAX_DROPPED_TEXT_WARNINGS: usize = 20;
@@ -18,7 +19,9 @@ const MAX_SVG_IMAGE_WARNINGS: usize = 20;
 /// Reusable PDF generation engine.
 pub struct Engine {
     config: Config,
-    assets: Option<AssetBundle>,
+    /// Shared with the [`crate::svg_images::SvgImageChecks`] of each render (inline SVGs look their images up
+    /// here), so a render does not copy the bundle.
+    assets: Option<Arc<AssetBundle>>,
     base_path: Option<PathBuf>,
     template: Option<(String, String)>,
     data: Option<serde_json::Value>,
@@ -105,7 +108,7 @@ impl Engine {
     }
 
     pub fn assets(&self) -> Option<&AssetBundle> {
-        self.assets.as_ref()
+        self.assets.as_deref()
     }
 
     /// Font byte-blobs registered on the [`AssetBundle`], or an empty slice
@@ -215,7 +218,7 @@ impl Engine {
         // the margin-box renderer, so headers/footers would appear in
         // default browser styles even though their content resolved
         // correctly.
-        let svg_checks = crate::svg_images::SvgImageChecks::new();
+        let svg_checks = crate::svg_images::SvgImageChecks::new(self.assets.clone());
         let (mut doc, link_gcpm) =
             crate::blitz_adapter::parse_html_with_local_resources_and_generics(
                 &html,
@@ -698,7 +701,7 @@ impl Engine {
 
         let mut convert_ctx = ConvertContext {
             running_store: &running_store,
-            assets: self.assets.as_ref(),
+            assets: self.assets.as_deref(),
             font_bytes: crate::convert::FontBytes::seeded(fonts),
             string_set_by_node,
             counter_ops_by_node: counter_ops_map,
@@ -949,7 +952,7 @@ impl Engine {
     pub fn build_drawables_for_testing_no_gcpm(&self, html: &str) -> crate::drawables::Drawables {
         let fonts = self.fonts();
 
-        let svg_checks = crate::svg_images::SvgImageChecks::new();
+        let svg_checks = crate::svg_images::SvgImageChecks::new(self.assets.clone());
         let (mut doc, _link_gcpm) =
             crate::blitz_adapter::parse_html_with_local_resources_and_generics(
                 html,
@@ -988,7 +991,7 @@ impl Engine {
         let running_store = crate::gcpm::running::RunningElementStore::new();
         let mut convert_ctx = ConvertContext {
             running_store: &running_store,
-            assets: self.assets.as_ref(),
+            assets: self.assets.as_deref(),
             font_bytes: crate::convert::FontBytes::seeded(fonts),
             string_set_by_node: HashMap::new(),
             counter_ops_by_node: HashMap::new(),
@@ -1025,7 +1028,7 @@ impl Engine {
     ) {
         let fonts = self.fonts();
 
-        let svg_checks = crate::svg_images::SvgImageChecks::new();
+        let svg_checks = crate::svg_images::SvgImageChecks::new(self.assets.clone());
         let (mut doc, _link_gcpm) =
             crate::blitz_adapter::parse_html_with_local_resources_and_generics(
                 html,
@@ -1109,7 +1112,7 @@ impl Engine {
         let running_store = crate::gcpm::running::RunningElementStore::new();
         let mut convert_ctx = ConvertContext {
             running_store: &running_store,
-            assets: self.assets.as_ref(),
+            assets: self.assets.as_deref(),
             font_bytes: crate::convert::FontBytes::seeded(fonts),
             string_set_by_node: HashMap::new(),
             counter_ops_by_node: HashMap::new(),
@@ -1488,6 +1491,10 @@ impl EngineBuilder {
     /// a JPEG no decoder reads. Covers inline `<svg>` elements and the SVG assets of `<img>`, `background-image`
     /// and `list-style-image`, in `<image>`, `<pattern>`, `<mask>`, `<clipPath>` and `feImage`; not the SVGs of
     /// `@page` margin boxes (warned only). A damaged JPEG is embedded as it is, with a warning, in either mode.
+    /// Also an `<image href>` that is not a `data:` URL: an inline `<svg>` finds it by name in the [`AssetBundle`]
+    /// as `<img src>` does ([`crate::svg_images::SvgImageCause::NotBundled`] when it is not there); an SVG used as
+    /// an image loads no external file at all ([`crate::svg_images::SvgImageCause::External`]). No SVG reads the
+    /// filesystem.
     /// A top-level `<img>` is not looked at here: check those with [`crate::image::validate`]. Default: off.
     pub fn strict_images(mut self, strict: bool) -> Self {
         self.strict_images = strict;
@@ -1526,7 +1533,7 @@ impl EngineBuilder {
 
         Engine {
             config: self.config_builder.build(),
-            assets: self.assets,
+            assets: self.assets.map(Arc::new),
             base_path: self.base_path,
             template: self.template,
             data: self.data,
