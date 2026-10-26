@@ -22,7 +22,7 @@ pub(super) fn convert(
     let children: &[usize] = layout_children_guard.as_deref().unwrap_or(&node.children);
 
     if children.is_empty() {
-        let style = extract_block_style(node, ctx.assets);
+        let style = extract_block_style(node, ctx.assets, ctx.svg_checks.as_ref());
         let content_box = compute_content_box(node, &style);
         // Check for pseudo images even on childless elements — e.g.
         // `<div class="icon"></div>` with `.icon::before { content: url(...) }`.
@@ -36,7 +36,7 @@ pub(super) fn convert(
 
     // Container node — walk children, snapshot before/after to compute
     // clip / opacity descendants.
-    let style = extract_block_style(node, ctx.assets);
+    let style = extract_block_style(node, ctx.assets, ctx.svg_checks.as_ref());
     let content_box = compute_content_box(node, &style);
     let clipping = style.has_overflow_clip();
     let (opacity, _visible) = extract_opacity_visible(node);

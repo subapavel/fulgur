@@ -45,10 +45,11 @@ pub(super) fn try_convert(
 fn maybe_insert_block_for_replaced(
     node: &Node,
     assets: Option<&AssetBundle>,
+    svg_checks: Option<&Arc<crate::svg_images::SvgImageChecks>>,
     out: &mut crate::drawables::Drawables,
 ) -> (f32, f32, f32, bool) {
     let (width, height) = size_in_pt(node.final_layout.size);
-    let style = extract_block_style(node, assets);
+    let style = extract_block_style(node, assets, svg_checks);
     let (opacity, visible) = extract_opacity_visible(node);
 
     if style.has_visual_style() {
@@ -150,7 +151,7 @@ pub(super) fn make_image_entry(
 /// missing, or the format is unsupported — callers fall through to the
 /// standard conversion path.
 fn convert_content_url(
-    _ctx: &ConvertContext<'_>,
+    ctx: &ConvertContext<'_>,
     node: &Node,
     assets: Option<&AssetBundle>,
     out: &mut crate::drawables::Drawables,
@@ -168,7 +169,7 @@ fn convert_content_url(
     };
 
     let (content_w, content_h, opacity, visible) =
-        maybe_insert_block_for_replaced(node, assets, out);
+        maybe_insert_block_for_replaced(node, assets, ctx.svg_checks.as_ref(), out);
     let entry = make_image_entry(
         data,
         format,
@@ -188,7 +189,7 @@ fn convert_content_url(
 /// the drawn tree is the one that sized the box. Returns `false` (falling through to the generic path)
 /// for an unregistered `src`, an unrecognised format or an SVG that did not parse.
 fn convert_image(
-    _ctx: &ConvertContext<'_>,
+    ctx: &ConvertContext<'_>,
     node: &Node,
     assets: Option<&AssetBundle>,
     out: &mut crate::drawables::Drawables,
@@ -206,7 +207,7 @@ fn convert_image(
     match crate::image::AssetKind::detect(&data) {
         crate::image::AssetKind::Raster(format) => {
             let (content_w, content_h, opacity, visible) =
-                maybe_insert_block_for_replaced(node, assets, out);
+                maybe_insert_block_for_replaced(node, assets, ctx.svg_checks.as_ref(), out);
             let entry = make_image_entry(
                 data,
                 format,
@@ -220,7 +221,7 @@ fn convert_image(
         }
         crate::image::AssetKind::Svg => match extract_inline_svg_tree(elem) {
             Some(tree) => {
-                insert_svg_entry(node, tree, assets, out);
+                insert_svg_entry(node, tree, assets, ctx.svg_checks.as_ref(), out);
                 true
             }
             None => false,
@@ -232,7 +233,7 @@ fn convert_image(
 /// Convert an inline `<svg>` element into an `SvgEntry`, plus a wrapping
 /// `BlockEntry` when the element has visual styling.
 fn convert_svg(
-    _ctx: &ConvertContext<'_>,
+    ctx: &ConvertContext<'_>,
     node: &Node,
     assets: Option<&AssetBundle>,
     out: &mut crate::drawables::Drawables,
@@ -243,7 +244,7 @@ fn convert_svg(
     let Some(tree) = extract_inline_svg_tree(elem) else {
         return false;
     };
-    insert_svg_entry(node, tree, assets, out);
+    insert_svg_entry(node, tree, assets, ctx.svg_checks.as_ref(), out);
     true
 }
 
@@ -253,10 +254,11 @@ fn insert_svg_entry(
     node: &Node,
     tree: std::sync::Arc<usvg::Tree>,
     assets: Option<&AssetBundle>,
+    svg_checks: Option<&Arc<crate::svg_images::SvgImageChecks>>,
     out: &mut crate::drawables::Drawables,
 ) {
     let (content_w, content_h, opacity, visible) =
-        maybe_insert_block_for_replaced(node, assets, out);
+        maybe_insert_block_for_replaced(node, assets, svg_checks, out);
     out.svgs.insert(
         node.id,
         crate::drawables::SvgEntry {
@@ -444,6 +446,7 @@ mod tests {
             pagination_geometry,
             link_cache: Default::default(),
             dropped_text: Default::default(),
+            svg_checks: None,
             viewport_size_px: Some((595.0, 842.0)),
         }
     }
@@ -543,7 +546,8 @@ mod tests {
         let img_id = find_tag(&doc, "img");
         let node = doc.get_node(img_id).unwrap();
         let mut out = Drawables::new();
-        let (_w, _h, opacity, visible) = maybe_insert_block_for_replaced(node, None, &mut out);
+        let (_w, _h, opacity, visible) =
+            maybe_insert_block_for_replaced(node, None, None, &mut out);
         assert!(
             out.block_styles.is_empty(),
             "no BlockEntry for unstyled img"
@@ -568,7 +572,7 @@ mod tests {
         let (layout_w, layout_h) = (layout_w.to_f32(), layout_h.to_f32());
         let mut out = Drawables::new();
         let (content_w, content_h, _opacity, _visible) =
-            maybe_insert_block_for_replaced(node, None, &mut out);
+            maybe_insert_block_for_replaced(node, None, None, &mut out);
         assert!(
             out.block_styles.contains_key(&img_id),
             "BlockEntry must be inserted for img with border"

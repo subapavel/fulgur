@@ -176,6 +176,9 @@ pub struct ConvertContext<'a> {
     /// Text found in inline formatting contexts that no glyph run covers, in document order, each
     /// (element, excerpt) pair once. Filled by `extract_paragraph`; read by the engine after conversion.
     pub dropped_text: DroppedTexts,
+    /// Checks the raster images of the SVG assets this conversion parses (`background-image`, `list-style-image`);
+    /// the engine reads its findings after conversion. `None`: usvg's default resolver (F177).
+    pub svg_checks: Option<Arc<crate::svg_images::SvgImageChecks>>,
 }
 
 impl ConvertContext<'_> {
@@ -1482,6 +1485,7 @@ mod semantics_tests {
             pagination_geometry,
             link_cache: Default::default(),
             dropped_text: Default::default(),
+            svg_checks: None,
             viewport_size_px: Some((595.0, 842.0)),
         };
         super::dom_to_drawables(&doc, &mut ctx)
@@ -1526,6 +1530,7 @@ mod semantics_tests {
             pagination_geometry,
             link_cache: Default::default(),
             dropped_text: Default::default(),
+            svg_checks: None,
             viewport_size_px: Some((595.0, 842.0)),
         };
         let d = super::dom_to_drawables(&doc, &mut ctx);

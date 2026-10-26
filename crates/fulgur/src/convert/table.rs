@@ -34,7 +34,7 @@ fn convert_table(
     out: &mut crate::drawables::Drawables,
 ) {
     let (width, height) = size_in_pt(node.final_layout.size);
-    let style = extract_block_style(node, ctx.assets);
+    let style = extract_block_style(node, ctx.assets, ctx.svg_checks.as_ref());
     let clipping = style.has_overflow_clip();
     let (opacity, visible) = extract_opacity_visible(node);
 
@@ -103,7 +103,7 @@ fn convert_table(
     }
 
     // F19: row and row-group backgrounds, painted from the table.
-    let backgrounds = collect_row_backgrounds(doc, node, ctx.assets);
+    let backgrounds = collect_row_backgrounds(doc, node, ctx.assets, ctx.svg_checks.as_ref());
     if !backgrounds.is_empty() {
         if let Some(group) = header_group
             && backgrounds
@@ -277,6 +277,7 @@ fn collect_row_backgrounds(
     doc: &BaseDocument,
     table: &Node,
     assets: Option<&AssetBundle>,
+    svg_checks: Option<&Arc<crate::svg_images::SvgImageChecks>>,
 ) -> Vec<crate::drawables::RowBackground> {
     use crate::blitz_adapter::{TablePart, is_table_box, table_part};
 
@@ -304,14 +305,26 @@ fn collect_row_backgrounds(
                         continue;
                     }
                     let cells = row_cells(doc, row);
-                    rows.extend(row_background(row, Some(child_id), &cells, assets));
+                    rows.extend(row_background(
+                        row,
+                        Some(child_id),
+                        &cells,
+                        assets,
+                        svg_checks,
+                    ));
                     group_cells.extend(cells);
                 }
-                groups.extend(row_background(child, None, &group_cells, assets));
+                groups.extend(row_background(
+                    child,
+                    None,
+                    &group_cells,
+                    assets,
+                    svg_checks,
+                ));
             }
             TablePart::Row => {
                 let cells = row_cells(doc, child);
-                rows.extend(row_background(child, None, &cells, assets));
+                rows.extend(row_background(child, None, &cells, assets, svg_checks));
             }
             TablePart::Cell | TablePart::Other => {}
         }
@@ -354,6 +367,7 @@ fn row_background(
     group: Option<usize>,
     cells: &[CellBox],
     assets: Option<&AssetBundle>,
+    svg_checks: Option<&Arc<crate::svg_images::SvgImageChecks>>,
 ) -> Option<crate::drawables::RowBackground> {
     use crate::drawables::{RowBackground, RowBackgroundCell};
 
@@ -361,7 +375,7 @@ fn row_background(
     if !extract_opacity_visible(node).1 {
         return None;
     }
-    let mut style = extract_block_style(node, assets);
+    let mut style = extract_block_style(node, assets, svg_checks);
     if style.background_color.is_none() && style.background_layers.is_empty() {
         return None;
     }
@@ -491,7 +505,7 @@ mod tests {
         let doc = parse_doc(html);
         let base = doc.deref();
         let table_id = find_tag(base, base.root_element().id, "table").expect("a <table>");
-        let rows = collect_row_backgrounds(base, base.get_node(table_id).unwrap(), None);
+        let rows = collect_row_backgrounds(base, base.get_node(table_id).unwrap(), None, None);
         (doc, rows)
     }
 
@@ -713,6 +727,7 @@ mod tests {
             pagination_geometry,
             link_cache: Default::default(),
             dropped_text: Default::default(),
+            svg_checks: None,
             viewport_size_px: Some((595.0, 842.0)),
         };
         let drawables = dom_to_drawables(&doc, &mut ctx);
@@ -932,6 +947,7 @@ mod tests {
             pagination_geometry,
             link_cache: Default::default(),
             dropped_text: Default::default(),
+            svg_checks: None,
             viewport_size_px: Some((595.0, 842.0)),
         };
         let drawables = dom_to_drawables(&doc, &mut ctx);

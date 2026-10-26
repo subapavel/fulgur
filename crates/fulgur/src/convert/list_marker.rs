@@ -9,7 +9,7 @@ use crate::units::F32Units;
 fn resolve_list_style_image_asset<'a>(
     node: &Node,
     assets: Option<&'a AssetBundle>,
-) -> Option<(&'a Arc<Vec<u8>>, crate::image::AssetKind)> {
+) -> Option<(&'a Arc<Vec<u8>>, crate::image::AssetKind, String)> {
     use ::style::values::computed::image::Image;
     let assets = assets?;
     let styles = node.primary_styles()?;
@@ -25,7 +25,7 @@ fn resolve_list_style_image_asset<'a>(
     let src = extract_asset_name(raw_src);
     let data = assets.get_image(src)?;
     let kind = crate::image::AssetKind::detect(data);
-    Some((data, kind))
+    Some((data, kind, src.to_string()))
 }
 
 /// Clamp a raster image's intrinsic dimensions (in CSS px) to a marker size
@@ -57,6 +57,7 @@ pub(super) fn resolve_list_marker(
     node: &Node,
     line_height: crate::units::Pt,
     assets: Option<&AssetBundle>,
+    svg_checks: Option<&Arc<crate::svg_images::SvgImageChecks>>,
 ) -> Option<ListItemMarker> {
     use crate::image::AssetKind;
 
@@ -67,7 +68,7 @@ pub(super) fn resolve_list_marker(
     if line_height <= crate::units::Pt::ZERO {
         return None;
     }
-    let (data, kind) = resolve_list_style_image_asset(node, assets)?;
+    let (data, kind, src) = resolve_list_style_image_asset(node, assets)?;
     match kind {
         AssetKind::Raster(format) => {
             let (width, height) = size_raster_marker(data, format, line_height)?;
@@ -86,7 +87,11 @@ pub(super) fn resolve_list_marker(
             })
         }
         AssetKind::Svg => {
-            let tree = usvg::Tree::from_data(data, &usvg::Options::default()).ok()?;
+            let options = match svg_checks {
+                Some(checks) => checks.options(crate::svg_images::SvgSite::ListMarker(src)),
+                None => usvg::Options::default(),
+            };
+            let tree = usvg::Tree::from_data(data, &options).ok()?;
             let size = tree.size();
             let intrinsic_w = size.width().as_px().in_pt();
             let intrinsic_h = size.height().as_px().in_pt();
@@ -130,7 +135,7 @@ pub(super) fn resolve_inside_image_marker(
         return None;
     }
 
-    let (data, kind) = resolve_list_style_image_asset(node, assets)?;
+    let (data, kind, _) = resolve_list_style_image_asset(node, assets)?;
     match kind {
         AssetKind::Raster(format) => {
             let (width, height) = size_raster_marker(data, format, first_line_height)?;

@@ -63,7 +63,13 @@ pub(super) fn apply_to(style: &mut BlockStyle, ctx: &StyleContext<'_>) {
                             ))
                         }
                         AssetKind::Svg => {
-                            let opts = usvg::Options::default();
+                            // The images inside the SVG are checked before Krilla sees them (F177).
+                            let opts = match ctx.svg_checks {
+                                Some(checks) => checks.options(
+                                    crate::svg_images::SvgSite::Background(src.to_string()),
+                                ),
+                                None => usvg::Options::default(),
+                            };
                             match usvg::Tree::from_data(data, &opts) {
                                 Ok(tree) => {
                                     let svg_size = tree.size();

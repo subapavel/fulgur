@@ -21,10 +21,16 @@ pub(super) struct StyleContext<'a> {
     pub(super) current_color: &'a style::color::AbsoluteColor,
     pub(super) layout: &'a taffy::Layout,
     pub(super) assets: Option<&'a AssetBundle>,
+    /// Checks the raster images inside SVG `background-image`s (F177).
+    pub(super) svg_checks: Option<&'a std::sync::Arc<crate::svg_images::SvgImageChecks>>,
 }
 
 /// Extract visual style (background, borders, padding, background-image) from a node.
-pub(super) fn extract_block_style(node: &Node, assets: Option<&AssetBundle>) -> BlockStyle {
+pub(super) fn extract_block_style(
+    node: &Node,
+    assets: Option<&AssetBundle>,
+    svg_checks: Option<&std::sync::Arc<crate::svg_images::SvgImageChecks>>,
+) -> BlockStyle {
     let layout = node.final_layout;
     let mut style = BlockStyle::default();
     box_metrics::apply_to(&mut style, &layout);
@@ -37,6 +43,7 @@ pub(super) fn extract_block_style(node: &Node, assets: Option<&AssetBundle>) -> 
             current_color: &current_color,
             layout: &layout,
             assets,
+            svg_checks,
         };
 
         // Borders (color, radii, styles)

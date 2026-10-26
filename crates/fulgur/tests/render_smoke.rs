@@ -8507,3 +8507,405 @@ fn glyph_runs_share_the_bundled_font_bytes() {
     }
     assert!(runs > 0, "no glyph run was shaped");
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// F177: the raster images inside an SVG are checked before Krilla decodes them.
+// ---------------------------------------------------------------------------------------------------------------
+
+mod svg_images {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Every `log::warn!` of the process; tests pick their lines by the (unique) id of their SVG.
+    struct Collect;
+    static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    impl log::Log for Collect {
+        fn enabled(&self, m: &log::Metadata) -> bool {
+            m.level() <= log::Level::Warn
+        }
+        fn log(&self, r: &log::Record) {
+            if self.enabled(r.metadata()) {
+                LINES.lock().unwrap().push(r.args().to_string());
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    fn warnings_with(needle: &str) -> Vec<String> {
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let _ = log::set_logger(&Collect);
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+        LINES
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains(needle))
+            .cloned()
+            .collect()
+    }
+
+    /// Install the logger before the render whose warnings are looked at.
+    fn start_logging() {
+        warnings_with("");
+    }
+
+    const JPEG: &[u8] = include_bytes!("fixtures/images/gradient64.jpg");
+    const GIF: &[u8] = include_bytes!("fixtures/images/gradient32.gif");
+
+    fn png() -> Vec<u8> {
+        let img = ::image::RgbImage::from_fn(40, 30, |x, y| ::image::Rgb([x as u8, y as u8, 7]));
+        let mut out = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut out),
+            ::image::ImageFormat::Png,
+        )
+        .unwrap();
+        out
+    }
+
+    fn webp() -> Vec<u8> {
+        let pixels: Vec<u8> = (0..40 * 30 * 3).map(|i| (i * 7) as u8).collect();
+        let mut out = Vec::new();
+        image_webp::WebPEncoder::new(&mut out)
+            .encode(&pixels, 40, 30, image_webp::ColorType::Rgb8)
+            .unwrap();
+        out
+    }
+
+    /// `(mime, valid bytes)` of the four formats an SVG `<image>` can hold.
+    fn rasters() -> [(&'static str, Vec<u8>); 4] {
+        [
+            ("image/png", png()),
+            ("image/jpeg", JPEG.to_vec()),
+            ("image/gif", GIF.to_vec()),
+            ("image/webp", webp()),
+        ]
+    }
+
+    /// A `data:` URL without base64: every byte percent-encoded.
+    fn data_url(mime: &str, bytes: &[u8]) -> String {
+        use std::fmt::Write;
+        let mut url = format!("data:{mime},");
+        for b in bytes {
+            write!(url, "%{b:02X}").unwrap();
+        }
+        url
+    }
+
+    /// A 100 x 50 SVG with a blue rect and one `<image>` covering it.
+    fn svg(id: &str, href: &str) -> String {
+        format!(
+            "<svg id=\"{id}\" xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\">\
+             <rect width=\"100\" height=\"50\" fill=\"blue\"/>\
+             <image href=\"{href}\" width=\"100\" height=\"50\"/></svg>"
+        )
+    }
+
+    fn images_in(pdf: &[u8]) -> usize {
+        let needle = b"/Subtype /Image";
+        pdf.windows(needle.len()).filter(|w| *w == needle).count()
+    }
+
+    fn truncated(bytes: &[u8]) -> Vec<u8> {
+        bytes[..bytes.len() / 2].to_vec()
+    }
+
+    /// A 1 x 1 PNG whose header claims `side` x `side` pixels.
+    fn png_claiming(side: u32) -> Vec<u8> {
+        let mut data = png();
+        data[16..20].copy_from_slice(&side.to_be_bytes());
+        data[20..24].copy_from_slice(&side.to_be_bytes());
+        let mut crc = !0u32;
+        for &byte in &data[12..29] {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        data[29..33].copy_from_slice(&(!crc).to_be_bytes());
+        data
+    }
+
+    /// The three ways to put an SVG into a document. `(site, engine, html)` with `name` the SVG's id or asset name.
+    fn documents(name: &str, svg_text: &str) -> Vec<(&'static str, AssetBundle, String)> {
+        let page =
+            |body: &str| format!("<!doctype html><html><body>{body}<p>marker</p></body></html>");
+        let mut img = AssetBundle::default();
+        img.add_image(format!("{name}-img.svg"), svg_text.as_bytes().to_vec());
+        let mut bg = AssetBundle::default();
+        bg.add_image(format!("{name}-bg.svg"), svg_text.as_bytes().to_vec());
+        bg.add_css(format!(
+            "div.b {{ width: 100px; height: 50px; background-image: url({name}-bg.svg); }}"
+        ));
+        let mut list = AssetBundle::default();
+        list.add_image(format!("{name}-li.svg"), svg_text.as_bytes().to_vec());
+        list.add_css(format!("li {{ list-style-image: url({name}-li.svg); }}"));
+        vec![
+            ("inline", AssetBundle::default(), page(svg_text)),
+            ("img", img, page(&format!("<img src=\"{name}-img.svg\">"))),
+            ("background", bg, page("<div class=\"b\"></div>")),
+            ("list", list, page("<ul><li>item</li></ul>")),
+        ]
+    }
+
+    fn render(mut assets: AssetBundle, html: &str, strict: bool) -> fulgur::Result<Vec<u8>> {
+        // A list marker is sized by its line, which needs a font.
+        let font = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/.fonts/NotoSans-Regular.ttf");
+        assets.add_font_file(&font).unwrap();
+        assets.add_css("body { font-family: 'Noto Sans'; }");
+        Engine::builder()
+            .assets(assets)
+            .strict_images(strict)
+            .system_fonts(false)
+            .build()
+            .render(html)
+    }
+
+    #[test]
+    fn a_huge_png_header_in_an_svg_is_dropped_without_allocating() {
+        start_logging();
+        // 100000 x 100000 RGBA is 40 GB: Krilla would abort the process in `finish()`.
+        let href = data_url("image/png", &png_claiming(100_000));
+        for (site, assets, html) in documents("huge", &svg("huge", &href)) {
+            let pdf = render(assets, &html, false).unwrap_or_else(|e| panic!("{site}: {e}"));
+            assert_eq!(images_in(&pdf), 0, "{site}");
+        }
+        let lines = warnings_with("pixel limit");
+        assert!(
+            lines.iter().any(|l| l.contains("<svg id=\"huge\">")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn truncated_rasters_in_an_svg_are_dropped_at_every_site() {
+        start_logging();
+        for (mime, bytes) in [
+            ("image/png", png()),
+            ("image/gif", GIF.to_vec()),
+            ("image/webp", webp()),
+        ] {
+            let name = format!("cut-{}", mime.trim_start_matches("image/"));
+            let href = data_url(mime, &truncated(&bytes));
+            for (site, assets, html) in documents(&name, &svg(&name, &href)) {
+                let pdf =
+                    render(assets, &html, false).unwrap_or_else(|e| panic!("{mime} {site}: {e}"));
+                assert_eq!(images_in(&pdf), 0, "{mime} {site}");
+                assert!(pdf.starts_with(b"%PDF"));
+            }
+            let lines = warnings_with(&name);
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains(&format!("data:{mime} (")) && l.contains("not drawn")),
+                "{mime}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_images_refuses_a_broken_raster_in_an_svg() {
+        for (site, assets, html) in
+            documents("strict", &svg("strict", &data_url("image/gif", &GIF[..20])))
+        {
+            match render(assets, &html, true) {
+                Err(fulgur::Error::SvgImages(list)) => {
+                    assert_eq!(list.len(), 1, "{site}: {list:?}");
+                    assert!(list[0].image.starts_with("data:image/gif ("), "{site}");
+                    assert!(!list[0].reason.is_empty(), "{site}");
+                    let named = match site {
+                        "inline" => list[0].svg == "<svg id=\"strict\">",
+                        "img" => list[0].svg == "<img src=\"strict-img.svg\">",
+                        "background" => list[0].svg == "background-image: url(strict-bg.svg)",
+                        _ => list[0].svg == "list-style-image: url(strict-li.svg)",
+                    };
+                    assert!(named, "{site}: {}", list[0].svg);
+                }
+                other => panic!("{site}: {:?}", other.map(|p| p.len())),
+            }
+            // Not strict: the document is made without the image.
+            let (_, assets, html) =
+                documents("strict", &svg("strict", &data_url("image/gif", &GIF[..20])))
+                    .into_iter()
+                    .find(|d| d.0 == site)
+                    .unwrap();
+            assert!(render(assets, &html, false).is_ok(), "{site}");
+        }
+    }
+
+    #[test]
+    fn strict_images_lists_the_images_in_document_order() {
+        let bad = |id: &str| svg(id, &data_url("image/png", &truncated(&png())));
+        let html = format!(
+            "<!doctype html><html><body>{}{}{}</body></html>",
+            bad("third"),
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"/>",
+            bad("fourth")
+        );
+        let Err(fulgur::Error::SvgImages(list)) = render(AssetBundle::default(), &html, true)
+        else {
+            panic!("not refused");
+        };
+        let svgs: Vec<_> = list.iter().map(|d| d.svg.as_str()).collect();
+        assert_eq!(svgs, ["<svg id=\"third\">", "<svg id=\"fourth\">"]);
+        let message = fulgur::Error::SvgImages(list).to_string();
+        assert!(
+            message.contains("third") && message.contains("fourth"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_svg_without_an_id_is_named_by_its_number() {
+        let html = format!(
+            "<!doctype html><html><body><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"/>{}</body></html>",
+            svg("", &data_url("image/gif", &GIF[..20])).replace(" id=\"\"", "")
+        );
+        let Err(fulgur::Error::SvgImages(list)) = render(AssetBundle::default(), &html, true)
+        else {
+            panic!("not refused");
+        };
+        assert_eq!(list[0].svg, "<svg> no. 2");
+    }
+
+    #[test]
+    fn a_damaged_jpeg_in_an_svg_is_embedded_with_a_warning_in_both_modes() {
+        start_logging();
+        let sos = JPEG.windows(2).position(|w| w == [0xff, 0xda]).unwrap();
+        let cut = &JPEG[..sos + (JPEG.len() - sos) / 2];
+        let href = data_url("image/jpeg", cut);
+        for strict in [false, true] {
+            let name = format!("damaged{strict}");
+            let pdf = render(
+                AssetBundle::default(),
+                &format!("<!doctype html><body>{}", svg(&name, &href)),
+                strict,
+            )
+            .unwrap_or_else(|e| panic!("strict {strict}: {e}"));
+            assert_eq!(images_in(&pdf), 1, "strict {strict}");
+            let lines = warnings_with(&name);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(
+                lines[0].contains("embedded although it is damaged"),
+                "{lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn broken_rasters_in_patterns_masks_clip_paths_and_filters_are_dropped() {
+        let bad = data_url("image/png", &png_claiming(100_000));
+        let cut = data_url("image/gif", &GIF[..20]);
+        let svg_text = |inner: &str| {
+            format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\"><defs>{inner}</defs>\
+                 <rect width=\"100\" height=\"50\" fill=\"blue\"/></svg>"
+            )
+        };
+        for (what, inner) in [
+            (
+                "pattern",
+                format!(
+                    "<pattern id=\"p\" width=\"10\" height=\"10\" patternUnits=\"userSpaceOnUse\"><image href=\"{bad}\" width=\"10\" height=\"10\"/></pattern>"
+                ),
+            ),
+            (
+                "mask",
+                format!(
+                    "<mask id=\"m\"><image href=\"{cut}\" width=\"100\" height=\"50\"/></mask>"
+                ),
+            ),
+            (
+                "feImage",
+                format!("<filter id=\"f\"><feImage href=\"{cut}\"/></filter>"),
+            ),
+        ] {
+            let target = match what {
+                "pattern" => "fill=\"url(#p)\"",
+                "mask" => "mask=\"url(#m)\"",
+                _ => "filter=\"url(#f)\"",
+            };
+            let text =
+                svg_text(&inner).replace("fill=\"blue\"", &format!("fill=\"blue\" {target}"));
+            let pdf = render(
+                AssetBundle::default(),
+                &format!("<!doctype html><body>{text}"),
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+            // resvg rasterises a filtered group, and that picture is an image of the PDF.
+            if what != "feImage" {
+                assert_eq!(images_in(&pdf), 0, "{what}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_svg_inside_an_svg_image_never_loads_its_own_images() {
+        start_logging();
+        let inner = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'><image href='{}' width='10' height='10'/></svg>",
+            data_url("image/gif", &GIF[..20])
+        );
+        let href = data_url("image/svg+xml", inner.as_bytes());
+        let pdf = render(
+            AssetBundle::default(),
+            &format!("<!doctype html><body>{}", svg("nested", &href)),
+            true,
+        )
+        .expect("nested images are never loaded, so there is nothing to refuse");
+        assert_eq!(images_in(&pdf), 0);
+        assert!(warnings_with("nested").is_empty());
+    }
+
+    #[test]
+    fn valid_rasters_in_an_svg_are_drawn_at_every_site() {
+        start_logging();
+        for (mime, bytes) in rasters() {
+            let name = format!("ok-{}", mime.trim_start_matches("image/"));
+            let href = data_url(mime, &bytes);
+            for (site, assets, html) in documents(&name, &svg(&name, &href)) {
+                let pdf =
+                    render(assets, &html, true).unwrap_or_else(|e| panic!("{mime} {site}: {e}"));
+                assert_eq!(images_in(&pdf), 1, "{mime} {site}");
+            }
+            assert!(warnings_with(&name).is_empty(), "{mime}");
+        }
+    }
+
+    #[test]
+    fn an_svg_raster_that_is_checked_gives_the_pdf_it_gave_before() {
+        // The resolver returns the kind and bytes usvg made, so strict and non-strict, and a render twice, agree.
+        let href = data_url("image/png", &png());
+        let html = format!("<!doctype html><body>{}", svg("same", &href));
+        let a = render(AssetBundle::default(), &html, false).unwrap();
+        let b = render(AssetBundle::default(), &html, true).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, render(AssetBundle::default(), &html, false).unwrap());
+    }
+
+    #[test]
+    fn a_broken_raster_in_a_margin_box_svg_is_dropped() {
+        start_logging();
+        let bad = svg("marginal", &data_url("image/gif", &GIF[..20]));
+        let html = format!(
+            "<!doctype html><html><head><style>\
+             @page {{ margin: 36pt; @top-center {{ content: element(hdr); }} }}\
+             .hdr {{ position: running(hdr); }}</style></head>\
+             <body><div class=\"hdr\">{bad}</div><p>body</p></body></html>"
+        );
+        // Not covered by strict mode (the margin documents are made after the engine has reported).
+        let pdf = render(AssetBundle::default(), &html, true).expect("margin box svg");
+        assert_eq!(images_in(&pdf), 0);
+        assert!(pdf.starts_with(b"%PDF"));
+        let lines = warnings_with("in a page margin box");
+        assert!(lines.iter().any(|l| l.contains("not drawn")), "{lines:?}");
+    }
+}

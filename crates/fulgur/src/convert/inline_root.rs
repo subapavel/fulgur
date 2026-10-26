@@ -45,7 +45,7 @@ pub(super) fn try_convert(
     // descendant walks (the top-level dispatch loop, `draw_under_clip`,
     // and `draw_under_opacity`). Dropping that filter double-paints the
     // subtree, and the duplicate compounds exponentially with nesting.
-    let style = extract_block_style(node, ctx.assets);
+    let style = extract_block_style(node, ctx.assets, ctx.svg_checks.as_ref());
     let (opacity, visible) = extract_opacity_visible(node);
     let needs_block_pre = style.needs_block_wrapper()
         || pseudo::node_has_block_pseudo_image(doc, node)

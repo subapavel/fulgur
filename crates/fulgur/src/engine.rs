@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 /// Most `log::warn!` lines for text without a font face per render; the rest is counted in one more line.
 const MAX_DROPPED_TEXT_WARNINGS: usize = 20;
 
+/// Most `log::warn!` lines for images inside SVGs per render and kind (not drawn, embedded although damaged); the
+/// rest is counted in one more line.
+const MAX_SVG_IMAGE_WARNINGS: usize = 20;
+
 /// Reusable PDF generation engine.
 pub struct Engine {
     config: Config,
@@ -21,6 +25,7 @@ pub struct Engine {
     serialize_settings: SerializeSettings,
     system_fonts: bool,
     strict_text: bool,
+    strict_images: bool,
 }
 
 /// Renderer-agnostic layout result produced by [`Engine::layout`].
@@ -87,6 +92,7 @@ impl Engine {
             serialize_settings: SerializeSettings::default(),
             system_fonts: true,
             strict_text: false,
+            strict_images: false,
         }
     }
 
@@ -209,6 +215,7 @@ impl Engine {
         // the margin-box renderer, so headers/footers would appear in
         // default browser styles even though their content resolved
         // correctly.
+        let svg_checks = crate::svg_images::SvgImageChecks::new();
         let (mut doc, link_gcpm) =
             crate::blitz_adapter::parse_html_with_local_resources_and_generics(
                 &html,
@@ -218,11 +225,12 @@ impl Engine {
                 self.system_fonts,
                 self.generics(),
                 self.base_path.as_deref(),
+                Some(&svg_checks),
             );
         // Bundled images are invisible to Blitz's layout until told: give every `<img>` its
         // natural size before anything resolves (F9).
         if let Some(assets) = &self.assets {
-            crate::blitz_adapter::seed_image_natural_sizes(&mut doc, assets);
+            crate::blitz_adapter::seed_image_natural_sizes(&mut doc, assets, Some(&svg_checks));
         }
         gcpm.extend_from(link_gcpm);
 
@@ -700,6 +708,7 @@ impl Engine {
             pagination_geometry,
             link_cache: Default::default(),
             dropped_text: Default::default(),
+            svg_checks: Some(std::sync::Arc::clone(&svg_checks)),
             // Use the resolved `@page` content box so percentage-based
             // fixed/abs descendants size against the same viewport that
             // pagination geometry and `relayout_position_fixed` use.
@@ -714,6 +723,12 @@ impl Engine {
         let pagination_geometry = std::mem::take(&mut convert_ctx.pagination_geometry);
         let dropped_text = std::mem::take(&mut convert_ctx.dropped_text).into_vec();
         drop(convert_ctx);
+        // The inline SVGs were parsed when the layout was resolved, the SVG assets while converting; every raster
+        // inside them has been checked by now. Pass 2 parses the same SVGs again; report them once.
+        let svg_images = svg_checks.take(&doc);
+        if anchor_map.is_none() {
+            self.report_svg_images(svg_images)?;
+        }
         // Pass 2 (`anchor_map` is `Some`) lays out the same text again; report it once.
         if anchor_map.is_none() && !dropped_text.is_empty() {
             if self.strict_text {
@@ -741,6 +756,35 @@ impl Engine {
             collected_anchor_map,
             needs_pass_two: needs_anchor_map_for_pass_two,
         })
+    }
+
+    /// The raster images inside SVGs that were left out (an error with `strict_images`, otherwise a `log::warn!`
+    /// each) and the damaged JPEGs among them that were embedded (a warning in either mode).
+    fn report_svg_images(&self, report: crate::svg_images::SvgImageReport) -> Result<()> {
+        let warn = |list: &[crate::svg_images::DroppedSvgImage], what: &str, more: &str| {
+            for d in list.iter().take(MAX_SVG_IMAGE_WARNINGS) {
+                log::warn!("{}: {} {what}: {}", d.svg, d.image, d.reason);
+            }
+            if list.len() > MAX_SVG_IMAGE_WARNINGS {
+                log::warn!(
+                    "... and {} more images inside SVGs {more}",
+                    list.len() - MAX_SVG_IMAGE_WARNINGS
+                );
+            }
+        };
+        warn(
+            &report.damaged,
+            "is embedded although it is damaged",
+            "embedded although damaged",
+        );
+        if report.dropped.is_empty() {
+            return Ok(());
+        }
+        if self.strict_images {
+            return Err(crate::error::Error::SvgImages(report.dropped));
+        }
+        warn(&report.dropped, "is not drawn", "that are not drawn");
+        Ok(())
     }
 
     /// Serialize a fully-laid-out [`LayoutArtifacts`] into a PDF via
@@ -905,6 +949,7 @@ impl Engine {
     pub fn build_drawables_for_testing_no_gcpm(&self, html: &str) -> crate::drawables::Drawables {
         let fonts = self.fonts();
 
+        let svg_checks = crate::svg_images::SvgImageChecks::new();
         let (mut doc, _link_gcpm) =
             crate::blitz_adapter::parse_html_with_local_resources_and_generics(
                 html,
@@ -914,9 +959,10 @@ impl Engine {
                 self.system_fonts,
                 self.generics(),
                 self.base_path.as_deref(),
+                Some(&svg_checks),
             );
         if let Some(assets) = &self.assets {
-            crate::blitz_adapter::seed_image_natural_sizes(&mut doc, assets);
+            crate::blitz_adapter::seed_image_natural_sizes(&mut doc, assets, Some(&svg_checks));
         }
 
         let ctx = crate::blitz_adapter::PassContext { font_data: fonts };
@@ -952,6 +998,7 @@ impl Engine {
             pagination_geometry,
             link_cache: Default::default(),
             dropped_text: Default::default(),
+            svg_checks: Some(std::sync::Arc::clone(&svg_checks)),
             viewport_size_px: Some((
                 self.config.content_width().as_pt().in_px().to_f32(),
                 self.config.content_height().as_pt().in_px().to_f32(),
@@ -978,6 +1025,7 @@ impl Engine {
     ) {
         let fonts = self.fonts();
 
+        let svg_checks = crate::svg_images::SvgImageChecks::new();
         let (mut doc, _link_gcpm) =
             crate::blitz_adapter::parse_html_with_local_resources_and_generics(
                 html,
@@ -987,9 +1035,10 @@ impl Engine {
                 self.system_fonts,
                 self.generics(),
                 self.base_path.as_deref(),
+                Some(&svg_checks),
             );
         if let Some(assets) = &self.assets {
-            crate::blitz_adapter::seed_image_natural_sizes(&mut doc, assets);
+            crate::blitz_adapter::seed_image_natural_sizes(&mut doc, assets, Some(&svg_checks));
         }
 
         let ctx = crate::blitz_adapter::PassContext { font_data: fonts };
@@ -1070,6 +1119,7 @@ impl Engine {
             pagination_geometry,
             link_cache: Default::default(),
             dropped_text: Default::default(),
+            svg_checks: Some(std::sync::Arc::clone(&svg_checks)),
             viewport_size_px: Some((content_w_px, content_h_px)),
         };
         let drawables = crate::convert::dom_to_drawables(&doc, &mut convert_ctx);
@@ -1324,6 +1374,7 @@ pub struct EngineBuilder {
     serialize_settings: SerializeSettings,
     system_fonts: bool,
     strict_text: bool,
+    strict_images: bool,
 }
 
 impl EngineBuilder {
@@ -1431,6 +1482,18 @@ impl EngineBuilder {
         self
     }
 
+    /// Whether a raster image (PNG, JPEG, GIF, WebP) inside an SVG that cannot be drawn is an error
+    /// ([`crate::Error::SvgImages`]) instead of a `log::warn!` per image. The SVG is drawn without that `<image>`
+    /// either way: a truncated PNG, GIF or WebP, a header that claims more than [`crate::image::MAX_IMAGE_PIXELS`],
+    /// a JPEG no decoder reads. Covers inline `<svg>` elements and the SVG assets of `<img>`, `background-image`
+    /// and `list-style-image`, in `<image>`, `<pattern>`, `<mask>`, `<clipPath>` and `feImage`; not the SVGs of
+    /// `@page` margin boxes (warned only). A damaged JPEG is embedded as it is, with a warning, in either mode.
+    /// A top-level `<img>` is not looked at here: check those with [`crate::image::validate`]. Default: off.
+    pub fn strict_images(mut self, strict: bool) -> Self {
+        self.strict_images = strict;
+        self
+    }
+
     pub fn base_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.base_path = Some(path.into());
         self
@@ -1470,6 +1533,7 @@ impl EngineBuilder {
             serialize_settings: self.serialize_settings,
             system_fonts: self.system_fonts,
             strict_text: self.strict_text,
+            strict_images: self.strict_images,
         }
     }
 }

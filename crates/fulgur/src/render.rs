@@ -5191,6 +5191,7 @@ impl<'a> MarginBoxRenderer<'a> {
                     pagination_geometry: geometry,
                     link_cache: Default::default(),
                     dropped_text: Default::default(),
+                    svg_checks: None,
                     viewport_size_px: None,
                 };
                 let drawables = crate::convert::dom_to_drawables(&render_doc, &mut dummy_ctx);
@@ -7858,6 +7859,7 @@ mod tests {
             pagination_geometry: geometry,
             link_cache: Default::default(),
             dropped_text: Default::default(),
+            svg_checks: None,
             viewport_size_px: None,
         };
         let drawables = crate::convert::dom_to_drawables(&doc, &mut ctx);

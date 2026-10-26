@@ -365,7 +365,9 @@ pub(super) fn walk_absolute_pseudo_children(
         };
         // Try the textless content:url shortcut; if it produces an image
         // entry, record it directly. Otherwise recurse via `convert_node`.
-        if let Some(img) = try_build_absolute_pseudo_image(pseudo, node, _cb, ctx.assets) {
+        if let Some(img) =
+            try_build_absolute_pseudo_image(pseudo, node, _cb, ctx.assets, ctx.svg_checks.as_ref())
+        {
             // PR 8i regression fix: when the pseudo specifies `right` /
             // `bottom`, Taffy resolves them against
             // `pseudo.final_layout.size = (0, 0)` (textless pseudos)
@@ -441,9 +443,10 @@ pub(super) fn try_build_absolute_pseudo_image(
     parent: &Node,
     cb: Option<AbsCb>,
     assets: Option<&AssetBundle>,
+    svg_checks: Option<&Arc<crate::svg_images::SvgImageChecks>>,
 ) -> Option<crate::drawables::ImageEntry> {
     crate::blitz_adapter::extract_content_image_url(pseudo)?;
-    let pseudo_style = extract_block_style(pseudo, assets);
+    let pseudo_style = extract_block_style(pseudo, assets, svg_checks);
     if pseudo_style.has_visual_style() {
         return None;
     }
@@ -523,6 +526,7 @@ mod tests {
             pagination_geometry,
             link_cache: Default::default(),
             dropped_text: Default::default(),
+            svg_checks: None,
             viewport_size_px: Some((595.0, 842.0)),
         }
     }
@@ -627,7 +631,7 @@ mod tests {
         let div_id = find_tag(&doc, "div");
         let node = doc.get_node(div_id).unwrap();
         // A regular element with no `content: url(...)` must return None.
-        assert!(try_build_absolute_pseudo_image(node, node, None, None).is_none());
+        assert!(try_build_absolute_pseudo_image(node, node, None, None, None).is_none());
     }
 
     // ── walk_absolute_non_pseudo_children ────────────────────────────
@@ -1348,7 +1352,8 @@ mod tests {
             border_top_left: (Px::ZERO, Px::ZERO),
             parent_offset_in_cb_bp: (0.0, 0.0),
         };
-        let result = try_build_absolute_pseudo_image(before_node, div_node, Some(ab_cb), None);
+        let result =
+            try_build_absolute_pseudo_image(before_node, div_node, Some(ab_cb), None, None);
         // background → has_visual_style() = true → must return None
         assert!(
             result.is_none(),
@@ -1384,7 +1389,7 @@ mod tests {
             .get_node(before_id)
             .expect("::before node should be retrievable");
         // cb=None → else branch uses parent.final_layout.size as basis
-        let result = try_build_absolute_pseudo_image(before_node, div_node, None, None);
+        let result = try_build_absolute_pseudo_image(before_node, div_node, None, None, None);
         // assets=None → build_pseudo_image_entry returns None,
         // but the else branch was exercised.
         assert!(result.is_none());

@@ -177,6 +177,7 @@ pub fn parse_and_layout_with_generics(
         generics,
         None,
         None,
+        None,
     );
     resolve(&mut doc);
     relayout_position_fixed(&mut doc, viewport_width.to_f32(), viewport_height.to_f32());
@@ -202,6 +203,9 @@ pub(crate) struct MarginDocEnv {
     fonts: Option<FontContext>,
     /// `true` when the render's CSS is part of `styles`, so a wrapper must not carry it in a `<style>` again.
     author_sheet_attached: bool,
+    /// Checks the raster images of the inline `<svg>` elements of the margin-box documents (F177); a finding is
+    /// logged when it is made, as the engine has reported by the time these documents exist.
+    svg_checks: Arc<crate::svg_images::SvgImageChecks>,
     _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
@@ -237,6 +241,7 @@ impl MarginDocEnv {
             styles: blitz_dom::SharedStyles::new(DOC_BASE_URL),
             fonts,
             author_sheet_attached: false,
+            svg_checks: crate::svg_images::SvgImageChecks::warning_immediately(),
             _not_sync: std::marker::PhantomData,
         };
         env.attach_author_sheet(margin_css);
@@ -283,6 +288,7 @@ impl MarginDocEnv {
             font_ctx: self.fonts.clone(),
             base_url: Some(DOC_BASE_URL.to_string()),
             shared_styles: Some(self.styles.clone()),
+            svg_image_resolver: Some(self.svg_checks.factory()),
             ..DocumentConfig::default()
         };
         HtmlDocument::from_html(html, config)
@@ -331,6 +337,7 @@ pub fn parse(html: &str, viewport_width: f32, font_data: &[Arc<Vec<u8>>]) -> Htm
         font_data,
         true,
         &BTreeMap::new(),
+        None,
         None,
         None,
     )
@@ -402,11 +409,14 @@ pub fn parse_html_with_local_resources(
         system_fonts,
         &BTreeMap::new(),
         base_path,
+        None,
     )
 }
 
 /// [`parse_html_with_local_resources`] with the generic font families resolved as
-/// [`AssetBundle::generic_families`](crate::asset::AssetBundle::generic_families) says.
+/// [`AssetBundle::generic_families`](crate::asset::AssetBundle::generic_families) says, and the raster images of
+/// the inline `<svg>` elements checked by `svg_checks` (F177; `None`: usvg's default resolver).
+#[allow(clippy::too_many_arguments)]
 pub fn parse_html_with_local_resources_and_generics(
     html: &str,
     viewport_width: f32,
@@ -415,6 +425,7 @@ pub fn parse_html_with_local_resources_and_generics(
     system_fonts: bool,
     generics: &BTreeMap<String, String>,
     base_path: Option<&Path>,
+    svg_checks: Option<&Arc<crate::svg_images::SvgImageChecks>>,
 ) -> (HtmlDocument, crate::gcpm::GcpmContext) {
     use std::collections::HashSet;
 
@@ -433,6 +444,7 @@ pub fn parse_html_with_local_resources_and_generics(
         generics,
         Some(provider),
         base_url,
+        svg_checks,
     );
 
     // Identify <link rel=stylesheet media=X> nodes *before* mutating so
@@ -487,6 +499,7 @@ fn parse_inner(
     generics: &BTreeMap<String, String>,
     net_provider: Option<Arc<dyn NetProvider<Resource>>>,
     base_url: Option<String>,
+    svg_checks: Option<&Arc<crate::svg_images::SvgImageChecks>>,
 ) -> HtmlDocument {
     let viewport = Viewport::new(
         viewport_width as u32,
@@ -523,6 +536,7 @@ fn parse_inner(
         font_ctx,
         base_url: Some(base_url.unwrap_or_else(|| "file:///".to_string())),
         net_provider,
+        svg_image_resolver: svg_checks.map(|checks| checks.factory()),
         ..DocumentConfig::default()
     };
 
@@ -1487,14 +1501,19 @@ pub fn extract_inline_svg_tree(
 /// - raster (PNG/JPEG/GIF): the header size only. The pixel buffer stays empty because fulgur paints
 ///   from the bundle bytes, never from Blitz's copy, so no full decode is paid for.
 /// - SVG: the parsed `usvg::Tree` (no host fonts); its `width`/`height` are the natural size.
-///   `convert_image` draws that same tree.
+///   `convert_image` draws that same tree. With `svg_checks`, a raster `<image>` inside it that cannot be
+///   drawn is left out of the tree (F177).
 ///
 /// `src` is looked up with [`AssetBundle::get_image`], the key `convert_image` uses. Missing,
 /// unrecognised or corrupt images are skipped, which leaves today's behaviour (nothing painted). An
 /// `<img>` Blitz already has image data for (a file under `base_path`) is left alone. Call this after
 /// parsing and before the first layout; the sizes are CSS px (css-images-3 §5) and are converted to pt
 /// once, in `size_in_pt`.
-pub fn seed_image_natural_sizes(doc: &mut HtmlDocument, assets: &crate::asset::AssetBundle) {
+pub fn seed_image_natural_sizes(
+    doc: &mut HtmlDocument,
+    assets: &crate::asset::AssetBundle,
+    svg_checks: Option<&Arc<crate::svg_images::SvgImageChecks>>,
+) {
     use crate::image::{AssetKind, ImageRender};
     use blitz_dom::util::ImageType;
 
@@ -1507,7 +1526,9 @@ pub fn seed_image_natural_sizes(doc: &mut HtmlDocument, assets: &crate::asset::A
         if elem.name.local.as_ref() != "img" || elem.image_data().is_some() {
             continue;
         }
-        let Some(data) = get_attr(elem, "src").and_then(|src| assets.get_image(src)) else {
+        let Some((src, data)) =
+            get_attr(elem, "src").and_then(|src| Some((src, assets.get_image(src)?)))
+        else {
             continue;
         };
         match AssetKind::detect(data) {
@@ -1525,7 +1546,14 @@ pub fn seed_image_natural_sizes(doc: &mut HtmlDocument, assets: &crate::asset::A
                 }
             }
             AssetKind::Svg => {
-                if let Ok(tree) = usvg::Tree::from_data(data, &usvg::Options::default()) {
+                // The images inside the SVG are checked before Krilla sees them (F177).
+                let options = match svg_checks {
+                    Some(checks) => {
+                        checks.options(crate::svg_images::SvgSite::Img(src.to_string()))
+                    }
+                    None => usvg::Options::default(),
+                };
+                if let Ok(tree) = usvg::Tree::from_data(data, &options) {
                     seeds.push(Resource::Svg(node_id, ImageType::Image, Box::new(tree)));
                 }
             }
@@ -7982,7 +8010,7 @@ mod seed_image_natural_size_tests {
     fn img_size(html: &str, assets: &AssetBundle) -> (f32, f32) {
         let (mut doc, _gcpm) =
             parse_html_with_local_resources(html, 400.0, 10000, &[], false, None);
-        seed_image_natural_sizes(&mut doc, assets);
+        seed_image_natural_sizes(&mut doc, assets, None);
         resolve(&mut doc);
         let id = doc
             .tree()
@@ -8048,7 +8076,7 @@ mod seed_image_natural_size_tests {
     ) -> (Vec<(f32, f32, usize)>, [f32; 4]) {
         let (mut doc, _gcpm) =
             parse_html_with_local_resources(html, viewport, 10000, &[], false, None);
-        seed_image_natural_sizes(&mut doc, assets);
+        seed_image_natural_sizes(&mut doc, assets, None);
         resolve(&mut doc);
         let img = doc
             .tree()
@@ -8269,6 +8297,7 @@ mod seed_image_natural_size_tests {
             &noto(),
             false,
             &generics,
+            None,
             None,
         );
         resolve(&mut doc);

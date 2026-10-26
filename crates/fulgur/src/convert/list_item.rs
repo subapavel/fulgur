@@ -27,14 +27,19 @@ pub(super) fn try_convert(
     {
         let (marker_lines, marker_width, marker_line_height) =
             list_marker::extract_marker_lines(doc, node, ctx);
-        let style = extract_block_style(node, ctx.assets);
+        let style = extract_block_style(node, ctx.assets, ctx.svg_checks.as_ref());
         let (opacity, visible) = extract_opacity_visible(node);
 
-        let marker = list_marker::resolve_list_marker(node, marker_line_height, ctx.assets)
-            .unwrap_or(crate::drawables::ListItemMarker::Text {
-                lines: marker_lines,
-                width: marker_width,
-            });
+        let marker = list_marker::resolve_list_marker(
+            node,
+            marker_line_height,
+            ctx.assets,
+            ctx.svg_checks.as_ref(),
+        )
+        .unwrap_or(crate::drawables::ListItemMarker::Text {
+            lines: marker_lines,
+            width: marker_width,
+        });
 
         out.list_items.insert(
             node_id,
@@ -74,7 +79,7 @@ pub(super) fn try_convert(
             .element_data()
             .is_none_or(|e| e.list_item_data.is_none())
     {
-        let style = extract_block_style(node, ctx.assets);
+        let style = extract_block_style(node, ctx.assets, ctx.svg_checks.as_ref());
         let (opacity, visible) = extract_opacity_visible(node);
 
         let line_height = {
@@ -87,7 +92,9 @@ pub(super) fn try_convert(
             }
         };
 
-        if let Some(marker) = list_marker::resolve_list_marker(node, line_height, ctx.assets) {
+        if let Some(marker) =
+            list_marker::resolve_list_marker(node, line_height, ctx.assets, ctx.svg_checks.as_ref())
+        {
             out.list_items.insert(
                 node_id,
                 crate::drawables::ListItemEntry {
@@ -126,7 +133,7 @@ pub(super) fn try_convert(
         && !node.flags.is_inline_root()
     {
         let marker = &list_data.marker;
-        let style = extract_block_style(node, ctx.assets);
+        let style = extract_block_style(node, ctx.assets, ctx.svg_checks.as_ref());
         let (opacity, visible) = extract_opacity_visible(node);
         let content_box = compute_content_box(node, &style);
 

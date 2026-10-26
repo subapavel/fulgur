@@ -30,6 +30,12 @@ pub enum Error {
     #[error("text without a font face: {}", join_dropped(.0))]
     TextWithoutFont(Vec<crate::convert::DroppedText>),
 
+    /// Raster images inside SVGs that cannot be drawn (`EngineBuilder::strict_images`), in document order: the SVG,
+    /// the image and why, at most 20 in the message. A top-level `<img>` with such an image is refused by the
+    /// caller's own check instead; without strict mode these images are left out of their SVG with a warning.
+    #[error("images inside SVGs that cannot be drawn: {}", join_svg_images(.0))]
+    SvgImages(Vec<crate::svg_images::DroppedSvgImage>),
+
     #[error("{0}")]
     Other(String),
 }
@@ -38,6 +44,22 @@ pub enum Error {
 const MAX_DROPPED_IN_MESSAGE: usize = 20;
 
 fn join_dropped(list: &[crate::convert::DroppedText]) -> String {
+    let mut out = list
+        .iter()
+        .take(MAX_DROPPED_IN_MESSAGE)
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if list.len() > MAX_DROPPED_IN_MESSAGE {
+        out.push_str(&format!(
+            "; ... and {} more",
+            list.len() - MAX_DROPPED_IN_MESSAGE
+        ));
+    }
+    out
+}
+
+fn join_svg_images(list: &[crate::svg_images::DroppedSvgImage]) -> String {
     let mut out = list
         .iter()
         .take(MAX_DROPPED_IN_MESSAGE)
