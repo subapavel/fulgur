@@ -317,18 +317,14 @@ pub fn render_v2(
                         width: root_size.width,
                         height: root_size.height,
                     };
-                    crate::draw_primitives::draw_with_opacity(
+                    // Not under the root's `opacity`: the canvas is not part of the root's stacking context, and Chrome
+                    // paints it at full colour under `html { opacity: .5 }` (F184 vrt-validator).
+                    crate::background::draw_canvas_background(
                         &mut canvas,
-                        root_block.opacity,
-                        |canvas| {
-                            crate::background::draw_canvas_background(
-                                canvas,
-                                &source.style,
-                                &root_block.style,
-                                positioning,
-                                content_area,
-                            );
-                        },
+                        &source.style,
+                        &root_block.style,
+                        positioning,
+                        content_area,
                     );
                 }
                 if let Some(root_id) = drawables.root_id
