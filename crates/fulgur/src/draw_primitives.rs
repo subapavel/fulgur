@@ -1098,8 +1098,10 @@ pub enum BgImageContent {
 #[derive(Clone, Debug)]
 pub struct BackgroundLayer {
     pub content: BgImageContent,
-    pub intrinsic_width: f32,
-    pub intrinsic_height: f32,
+    /// Natural size of the image in PDF pt (px → pt already applied at the construction site in
+    /// `convert/style/background.rs`; html-to-pdf F180, F23). Zero for gradients.
+    pub intrinsic_width: crate::units::Pt,
+    pub intrinsic_height: crate::units::Pt,
     pub size: BgSize,
     pub position_x: BgLengthPercentage,
     pub position_y: BgLengthPercentage,

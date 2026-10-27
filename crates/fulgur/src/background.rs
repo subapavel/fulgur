@@ -1873,8 +1873,9 @@ fn resolve_gradient_size(size: &BgSize, origin_w: f32, origin_h: f32) -> (f32, f
 
 /// Resolve `background-size` for a layer relative to the origin area.
 fn resolve_size(layer: &BackgroundLayer, origin_w: f32, origin_h: f32) -> (f32, f32) {
-    let iw = layer.intrinsic_width;
-    let ih = layer.intrinsic_height;
+    // f32 sink: the rest of the tiling arithmetic is plain pt.
+    let iw = layer.intrinsic_width.to_f32();
+    let ih = layer.intrinsic_height.to_f32();
     if iw <= 0.0 || ih <= 0.0 {
         return (0.0, 0.0);
     }
@@ -2421,10 +2422,10 @@ fn resolve_repeat_axis(
 mod tests {
     use super::*;
     use crate::image::ImageFormat;
-    use crate::units::F32Units;
+    use crate::units::{F32Units, Pt};
     use std::sync::Arc;
 
-    fn make_layer(iw: f32, ih: f32, size: BgSize) -> BackgroundLayer {
+    fn make_layer(iw: Pt, ih: Pt, size: BgSize) -> BackgroundLayer {
         BackgroundLayer {
             content: BgImageContent::Raster {
                 data: Arc::new(vec![]),
@@ -2444,7 +2445,7 @@ mod tests {
 
     #[test]
     fn test_size_auto() {
-        let layer = make_layer(100.0, 50.0, BgSize::Auto);
+        let layer = make_layer(100.0_f32.as_pt(), 50.0_f32.as_pt(), BgSize::Auto);
         let (w, h) = resolve_size(&layer, 200.0, 200.0);
         assert_eq!(w, 100.0);
         assert_eq!(h, 50.0);
@@ -2452,7 +2453,7 @@ mod tests {
 
     #[test]
     fn test_size_cover() {
-        let layer = make_layer(100.0, 50.0, BgSize::Cover);
+        let layer = make_layer(100.0_f32.as_pt(), 50.0_f32.as_pt(), BgSize::Cover);
         let (w, h) = resolve_size(&layer, 200.0, 200.0);
         assert_eq!(w, 400.0);
         assert_eq!(h, 200.0);
@@ -2460,7 +2461,7 @@ mod tests {
 
     #[test]
     fn test_size_contain() {
-        let layer = make_layer(100.0, 50.0, BgSize::Contain);
+        let layer = make_layer(100.0_f32.as_pt(), 50.0_f32.as_pt(), BgSize::Contain);
         let (w, h) = resolve_size(&layer, 200.0, 200.0);
         assert_eq!(w, 200.0);
         assert_eq!(h, 100.0);
@@ -2505,8 +2506,8 @@ mod tests {
             content: BgImageContent::Svg {
                 tree: std::sync::Arc::new(tree),
             },
-            intrinsic_width: 200.0,
-            intrinsic_height: 100.0,
+            intrinsic_width: 200.0_f32.as_pt(),
+            intrinsic_height: 100.0_f32.as_pt(),
             size: BgSize::Contain,
             position_x: BgLengthPercentage::Percentage(0.0),
             position_y: BgLengthPercentage::Percentage(0.0),
@@ -2594,8 +2595,8 @@ mod tests {
     #[test]
     fn resolve_size_explicit_both_axes() {
         let layer = make_layer(
-            100.0,
-            50.0,
+            100.0_f32.as_pt(),
+            50.0_f32.as_pt(),
             BgSize::Explicit(
                 Some(BgLengthPercentage::Length(80.0_f32.as_pt())),
                 Some(BgLengthPercentage::Length(40.0_f32.as_pt())),
@@ -2610,8 +2611,8 @@ mod tests {
     fn resolve_size_explicit_width_only_derives_height_from_aspect() {
         // iw=100, ih=50, aspect=2; explicit width=80 → height=80/2=40
         let layer = make_layer(
-            100.0,
-            50.0,
+            100.0_f32.as_pt(),
+            50.0_f32.as_pt(),
             BgSize::Explicit(Some(BgLengthPercentage::Length(80.0_f32.as_pt())), None),
         );
         let (w, h) = resolve_size(&layer, 200.0, 200.0);
@@ -2623,8 +2624,8 @@ mod tests {
     fn resolve_size_explicit_height_only_derives_width_from_aspect() {
         // iw=100, ih=50, aspect=2; explicit height=40 → width=40*2=80
         let layer = make_layer(
-            100.0,
-            50.0,
+            100.0_f32.as_pt(),
+            50.0_f32.as_pt(),
             BgSize::Explicit(None, Some(BgLengthPercentage::Length(40.0_f32.as_pt()))),
         );
         let (w, h) = resolve_size(&layer, 200.0, 200.0);
@@ -2634,7 +2635,11 @@ mod tests {
 
     #[test]
     fn resolve_size_explicit_neither_falls_back_to_intrinsic() {
-        let layer = make_layer(100.0, 50.0, BgSize::Explicit(None, None));
+        let layer = make_layer(
+            100.0_f32.as_pt(),
+            50.0_f32.as_pt(),
+            BgSize::Explicit(None, None),
+        );
         let (w, h) = resolve_size(&layer, 200.0, 200.0);
         assert_eq!(w, 100.0);
         assert_eq!(h, 50.0);
@@ -2642,7 +2647,7 @@ mod tests {
 
     #[test]
     fn resolve_size_zero_intrinsic_returns_zero() {
-        let layer = make_layer(0.0, 50.0, BgSize::Auto);
+        let layer = make_layer(0.0_f32.as_pt(), 50.0_f32.as_pt(), BgSize::Auto);
         let (w, h) = resolve_size(&layer, 200.0, 200.0);
         assert_eq!(w, 0.0);
         assert_eq!(h, 0.0);

@@ -39,7 +39,7 @@ pub(super) fn apply_to(style: &mut BlockStyle, ctx: &StyleContext<'_>) {
 
             // Resolve `content` + intrinsic size per image kind. URL images
             // require an `AssetBundle`; gradients are self-contained.
-            let resolved: Option<(BgImageContent, f32, f32)> = match image {
+            let resolved: Option<(BgImageContent, Pt, Pt)> = match image {
                 Image::Url(url) => ctx.assets.and_then(|a| {
                     let raw_src = match url {
                         style::servo::url::ComputedUrl::Valid(u) => u.as_str(),
@@ -58,8 +58,9 @@ pub(super) fn apply_to(style: &mut BlockStyle, ctx: &StyleContext<'_>) {
                                     data: Arc::clone(data),
                                     format,
                                 },
-                                iw as f32,
-                                ih as f32,
+                                // One image pixel is one CSS px at 1 dppx (css-images-4 §6.1).
+                                (iw as f32).as_px().in_pt(),
+                                (ih as f32).as_px().in_pt(),
                             ))
                         }
                         AssetKind::Svg => {
@@ -77,8 +78,9 @@ pub(super) fn apply_to(style: &mut BlockStyle, ctx: &StyleContext<'_>) {
                                         BgImageContent::Svg {
                                             tree: Arc::new(tree),
                                         },
-                                        svg_size.width(),
-                                        svg_size.height(),
+                                        // usvg user units are CSS px (css-images-3 §5.1).
+                                        svg_size.width().as_px().in_pt(),
+                                        svg_size.height().as_px().in_pt(),
                                     ))
                                 }
                                 Err(e) => {
@@ -143,14 +145,14 @@ pub(super) fn apply_to(style: &mut BlockStyle, ctx: &StyleContext<'_>) {
 /// - Repeating gradients, `radial-gradient`, `conic-gradient`, color
 ///   interpolation methods, and interpolation hints are unsupported.
 ///
-/// Returned tuple: `(content, intrinsic_w, intrinsic_h)`. Gradients have no
-/// intrinsic size, so we return `(0.0, 0.0)` and the draw path special-cases
+/// Returned tuple: `(content, intrinsic_w, intrinsic_h)`, the natural size in pt. Gradients have no
+/// intrinsic size, so we return `(Pt::ZERO, Pt::ZERO)` and the draw path special-cases
 /// gradients to fill the origin rect directly (`background.rs` does not
 /// route gradients through `resolve_size` / tiling).
 fn resolve_linear_gradient(
     g: &style::values::computed::Gradient,
     current_color: &style::color::AbsoluteColor,
-) -> Option<(BgImageContent, f32, f32)> {
+) -> Option<(BgImageContent, Pt, Pt)> {
     use crate::draw_primitives::{LinearGradientCorner, LinearGradientDirection};
     use style::values::computed::image::{Gradient, LineDirection};
     use style::values::generics::image::GradientFlags;
@@ -209,8 +211,8 @@ fn resolve_linear_gradient(
             stops,
             repeating,
         },
-        0.0,
-        0.0,
+        Pt::ZERO,
+        Pt::ZERO,
     ))
 }
 
@@ -344,7 +346,7 @@ fn resolve_color_stops(
 fn resolve_radial_gradient(
     g: &style::values::computed::Gradient,
     current_color: &style::color::AbsoluteColor,
-) -> Option<(BgImageContent, f32, f32)> {
+) -> Option<(BgImageContent, Pt, Pt)> {
     use crate::draw_primitives::{RadialGradientShape, RadialGradientSize};
     use style::values::computed::image::Gradient;
     use style::values::generics::image::{Circle, Ellipse, EndingShape, GradientFlags};
@@ -410,8 +412,8 @@ fn resolve_radial_gradient(
             stops,
             repeating,
         },
-        0.0,
-        0.0,
+        Pt::ZERO,
+        Pt::ZERO,
     ))
 }
 
@@ -425,7 +427,7 @@ fn resolve_radial_gradient(
 fn resolve_conic_gradient(
     g: &style::values::computed::Gradient,
     current_color: &style::color::AbsoluteColor,
-) -> Option<(BgImageContent, f32, f32)> {
+) -> Option<(BgImageContent, Pt, Pt)> {
     use style::values::computed::AngleOrPercentage;
     use style::values::computed::image::Gradient;
     use style::values::generics::image::{GradientFlags, GradientItem};
@@ -503,8 +505,8 @@ fn resolve_conic_gradient(
             stops,
             repeating,
         },
-        0.0,
-        0.0,
+        Pt::ZERO,
+        Pt::ZERO,
     ))
 }
 
@@ -1010,6 +1012,53 @@ mod tests {
             .render(html)
             .expect("render missing-bundle bg");
         assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    /// The (width, height) in pt of the first background layer of `html` built with `bundle`.
+    fn first_layer_intrinsic(bundle: AssetBundle, html: &str) -> (f32, f32) {
+        let drawables = Engine::builder()
+            .assets(bundle)
+            .build()
+            .build_drawables_for_testing_no_gcpm(html);
+        drawables
+            .block_styles
+            .values()
+            .find_map(|block| block.style.background_layers.first())
+            .map(|l| (l.intrinsic_width.to_f32(), l.intrinsic_height.to_f32()))
+            .expect("a background layer is present")
+    }
+
+    /// html-to-pdf F180: the natural size of an SVG is in user units = CSS px; the layer stores pt.
+    #[test]
+    fn svg_background_intrinsic_size_is_in_pt() {
+        let mut bundle = AssetBundle::default();
+        bundle.add_image(
+            "shape.svg",
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="300" height="60" viewBox="0 0 300 60"><rect width="300" height="60" fill="red"/></svg>"#.to_vec(),
+        );
+        let html = r#"<html><body><div style="width:300px;height:60px;background:url(shape.svg)"></div></body></html>"#;
+        let (w, h) = first_layer_intrinsic(bundle, html);
+        assert_eq!((w, h), (225.0, 45.0), "300 x 60 px = 225 x 45 pt");
+    }
+
+    /// html-to-pdf F23: a raster's natural size is one CSS px per image pixel; the layer stores pt.
+    #[test]
+    fn raster_background_natural_size_is_in_pt() {
+        let mut bundle = AssetBundle::default();
+        bundle.add_image("dot.png", PNG_1X1_RED.to_vec());
+        let html = r#"<html><body><div style="width:40px;height:40px;background:url(dot.png)"></div></body></html>"#;
+        let (w, h) = first_layer_intrinsic(bundle, html);
+        assert_eq!((w, h), (0.75, 0.75), "1 x 1 px = 0.75 x 0.75 pt");
+    }
+
+    /// Gradients have no natural size.
+    #[test]
+    fn gradient_background_intrinsic_size_is_zero() {
+        let html = r#"<html><body><div style="width:40px;height:40px;background:linear-gradient(red,blue)"></div></body></html>"#;
+        assert_eq!(
+            first_layer_intrinsic(AssetBundle::default(), html),
+            (0.0, 0.0)
+        );
     }
 
     /// Return the stop count of the first gradient background layer found in

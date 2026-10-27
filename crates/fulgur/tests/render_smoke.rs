@@ -9220,3 +9220,49 @@ mod rejected_fonts {
         assert!(warned[0].contains("left out of the PDF"), "{warned:?}");
     }
 }
+
+/// html-to-pdf F180: an SVG `background-image` (auto size, repeat) goes through `draw_background_layer`'s SVG arm at
+/// its natural size in pt.
+#[test]
+fn test_render_svg_background_natural_size_smoke() {
+    let mut bundle = AssetBundle::default();
+    bundle.add_image(
+        "tile.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20" viewBox="0 0 40 20"><rect width="20" height="20" fill="#f00"/></svg>"##.to_vec(),
+    );
+    let html = r#"<!doctype html><html><body>
+<div style="width:200px;height:60px;background:url(tile.svg)"></div>
+<div style="width:200px;height:60px;background:url(tile.svg) no-repeat 100% 0"></div>
+</body></html>"#;
+    let pdf = Engine::builder()
+        .assets(bundle)
+        .build()
+        .render(html)
+        .expect("render svg background");
+    assert!(!pdf.is_empty());
+}
+
+/// html-to-pdf F23: a raster `background-image` tiles at one CSS px per image pixel.
+#[test]
+fn test_render_raster_background_natural_size_smoke() {
+    // 1x1 red PNG (same bytes as `test_render_html_marker_content_url_with_image`)
+    let png: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    let mut bundle = AssetBundle::default();
+    bundle.add_image("dot.png", png);
+    let html = r#"<!doctype html><html><body>
+<div style="width:64px;height:32px;background:url(dot.png)"></div>
+<div style="width:64px;height:32px;background:url(dot.png) no-repeat 100% 100%"></div>
+</body></html>"#;
+    let pdf = Engine::builder()
+        .assets(bundle)
+        .build()
+        .render(html)
+        .expect("render raster background");
+    assert!(!pdf.is_empty());
+}
