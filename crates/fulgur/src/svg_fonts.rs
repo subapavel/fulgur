@@ -125,20 +125,28 @@ impl SvgFonts {
                         style: style(font.style()),
                     })
                 };
-                // Owned names first: `fontdb::Family::Name` borrows.
-                let names: Vec<Option<String>> = font
+                // A CSS-wide keyword (`initial`, `unset`, …) reaches us as a name: it selects the initial value,
+                // the default family, and is not a family that matches nothing.
+                let families: Vec<&usvg::FontFamily> = font
                     .families()
+                    .iter()
+                    .filter(|family| !matches!(family, usvg::FontFamily::Named(name) if is_css_wide_keyword(name)))
+                    .collect();
+                if families.is_empty() {
+                    return query(&[fontdb::Family::Serif]);
+                }
+                // Owned names first: `fontdb::Family::Name` borrows.
+                let names: Vec<Option<String>> = families
                     .iter()
                     .map(|family| match family {
                         usvg::FontFamily::Named(name) => Some(fonts.named(built, name)),
                         _ => None,
                     })
                     .collect();
-                let list: Vec<fontdb::Family<'_>> = font
-                    .families()
+                let list: Vec<fontdb::Family<'_>> = families
                     .iter()
                     .zip(&names)
-                    .map(|(family, name)| match (family, name) {
+                    .map(|(family, name)| match (*family, name) {
                         (usvg::FontFamily::Serif, _) => fontdb::Family::Serif,
                         (usvg::FontFamily::SansSerif, _) => fontdb::Family::SansSerif,
                         (usvg::FontFamily::Cursive, _) => fontdb::Family::Cursive,
@@ -162,13 +170,19 @@ impl SvgFonts {
 
     /// The name a `Named` family is looked up under: a bundled family of that name (any ASCII case), else the
     /// family a generic keyword that usvg reads as a plain name (`system-ui`, `ui-monospace`, …) is mapped to, else
-    /// the name as written.
+    /// the name as written. svgtypes reads the five generics it knows (lowercase, unquoted) as keywords, so a
+    /// `Named` family spelled exactly like one of them was quoted: a family name, not the generic (CSS Fonts 4
+    /// §4.2), and not mapped.
     fn named(&self, built: &Built, name: &str) -> String {
         let folded = name.to_ascii_lowercase();
         if let Some(registered) = built.names.get(&folded) {
             return registered.clone();
         }
-        if let Some(mapped) = self.generics.get(&folded) {
+        let quoted_generic = matches!(
+            name,
+            "serif" | "sans-serif" | "cursive" | "fantasy" | "monospace"
+        );
+        if let Some(mapped) = self.generics.get(&folded).filter(|_| !quoted_generic) {
             return built
                 .names
                 .get(&mapped.to_ascii_lowercase())
@@ -179,13 +193,24 @@ impl SvgFonts {
     }
 }
 
-/// A family list as it reads in CSS: names that need it in quotes.
+/// Whether `name` is a CSS-wide keyword (CSS Cascade 5 §7.3), which usvg passes on as a family name.
+fn is_css_wide_keyword(name: &str) -> bool {
+    ["initial", "inherit", "unset", "revert", "revert-layer"]
+        .iter()
+        .any(|k| name.eq_ignore_ascii_case(k))
+}
+
+/// A family list as it reads in CSS: names that need it in quotes, and a name spelled like a generic keyword.
 pub(crate) fn family_list(families: &[usvg::FontFamily]) -> String {
     families
         .iter()
         .map(|family| match family {
             usvg::FontFamily::Named(name)
                 if name.is_empty()
+                    || matches!(
+                        name.as_str(),
+                        "serif" | "sans-serif" | "cursive" | "fantasy" | "monospace"
+                    )
                     || name
                         .chars()
                         .any(|c| !(c.is_alphanumeric() || c == '-' || c == '_')) =>
@@ -377,6 +402,27 @@ mod tests {
         ] {
             let (face, found) = pick(&fonts, attrs);
             assert_eq!(face.as_deref(), Some(want), "{attrs}");
+            assert!(found.is_empty(), "{attrs}: {found:?}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_generic_is_a_family_name_and_a_css_wide_keyword_is_the_default_family() {
+        let map = generics(&[("serif", "Noto Sans"), ("monospace", "Noto Sans Mono")]);
+        let fonts = SvgFonts::new(&bundle(), &map);
+        // Quoted: the family named "monospace", which is not bundled.
+        let (face, found) = pick(&fonts, "font-family=\"'monospace'\"");
+        assert_eq!(face.as_deref(), Some("NotoSans-Regular"));
+        assert_eq!(found, vec!["'monospace'".to_string()]);
+        // Unquoted, any ASCII case: the generic.
+        for attrs in ["font-family=\"monospace\"", "font-family=\"MONOSPACE\""] {
+            let (face, found) = pick(&fonts, attrs);
+            assert_eq!(face.as_deref(), Some("NotoSansMono-Regular"), "{attrs}");
+            assert!(found.is_empty(), "{attrs}: {found:?}");
+        }
+        for attrs in ["font-family=\"initial\"", "font-family=\"unset\""] {
+            let (face, found) = pick(&fonts, attrs);
+            assert_eq!(face.as_deref(), Some("NotoSans-Regular"), "{attrs}");
             assert!(found.is_empty(), "{attrs}: {found:?}");
         }
     }
