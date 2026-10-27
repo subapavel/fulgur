@@ -9,6 +9,40 @@ use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Drops `value` on one of rayon's workers instead of on the calling thread, when `parallel-construct` or `parallel-pdf`
+/// is on (the global pool exists then anyway); otherwise it is dropped here.
+///
+/// The Blitz document (a Stylo tree, a Parley layout per paragraph) and the drawables of a large document are millions of
+/// small allocations to free, and nothing waits for them: the caller needs the PDF, not the memory. This takes that
+/// off the critical path of `render`. `value` is plain owned data: dropping it neither touches the output nor can it
+/// fail the render. The process may end before the worker has finished; the operating system frees the rest.
+pub(crate) fn drop_off_thread<T: Send + 'static>(value: T) {
+    #[cfg(any(feature = "parallel-construct", feature = "parallel-pdf"))]
+    rayon::spawn(move || drop(value));
+    #[cfg(not(any(feature = "parallel-construct", feature = "parallel-pdf")))]
+    drop(value);
+}
+
+/// [`drop_off_thread`] for the Blitz document.
+///
+/// `HtmlDocument` is not `Send` only because three of its fields are trait objects without a `Send` bound: the shell
+/// provider, the HTML parser provider and Stylo's font-metrics provider. This crate never installs its own providers, so
+/// they are Blitz's `DummyShellProvider` and `HtmlProvider` (unit structs) and `BlitzFontMetricsProvider` (an
+/// `Arc<Mutex<FontContext>>`), all of which are `Send + Sync`. Everything else in the document is `Send` (the compiler
+/// checks that: only those three fields are reported), `Node` is `Send + Sync` by Blitz's own `unsafe impl`, and no
+/// `Drop` impl of the document, Stylo's tree or Parley's layouts reads a thread-local.
+fn drop_document_off_thread(doc: blitz_html::HtmlDocument) {
+    #[cfg(any(feature = "parallel-construct", feature = "parallel-pdf"))]
+    {
+        struct SendOnlyToDrop(#[allow(dead_code)] blitz_html::HtmlDocument);
+        // SAFETY: see the function's documentation; the value is only ever dropped, never used, on the other thread.
+        unsafe impl Send for SendOnlyToDrop {}
+        drop_off_thread(SendOnlyToDrop(doc));
+    }
+    #[cfg(not(any(feature = "parallel-construct", feature = "parallel-pdf")))]
+    drop(doc);
+}
+
 /// Most `log::warn!` lines for text without a font face per render; the rest is counted in one more line.
 const MAX_DROPPED_TEXT_WARNINGS: usize = 20;
 
@@ -732,6 +766,8 @@ impl Engine {
         // The inline SVGs were parsed when the layout was resolved, the SVG assets while converting; every raster
         // inside them has been checked by now. Pass 2 parses the same SVGs again; report them once.
         let svg_images = svg_checks.take(&doc);
+        // Nothing reads the document after this: free it while the caller goes on to the PDF.
+        drop_document_off_thread(doc);
         if anchor_map.is_none() {
             self.report_svg_images(svg_images)?;
         }
@@ -867,6 +903,8 @@ impl Engine {
             anchor_map,
             &implicit_href_map,
         )?;
+        // The PDF is built; nothing reads the drawables or the geometry again. Free them off this thread.
+        drop_off_thread((drawables, pagination_geometry));
         self.report_dropped_text(skipped)?;
         Ok(pdf)
     }
@@ -2173,5 +2211,45 @@ mod tests {
             .render(html)
             .unwrap();
         assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    /// Where a value is dropped: on a rayon worker with `parallel-construct` / `parallel-pdf`, else on the caller.
+    #[test]
+    fn drop_off_thread_drops_on_a_worker_only_with_the_parallel_features() {
+        struct ReportsThread(std::sync::mpsc::Sender<std::thread::ThreadId>);
+        impl Drop for ReportsThread {
+            fn drop(&mut self) {
+                let _ = self.0.send(std::thread::current().id());
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop_off_thread(ReportsThread(tx));
+        let dropped_on = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the value was dropped");
+        let here = std::thread::current().id();
+        if cfg!(any(
+            feature = "parallel-construct",
+            feature = "parallel-pdf"
+        )) {
+            assert_ne!(dropped_on, here, "dropped on the calling thread");
+        } else {
+            assert_eq!(dropped_on, here, "dropped on another thread");
+        }
+    }
+
+    /// The offloaded drops change nothing in the output: same bytes twice, with a table, a margin box and a page break.
+    #[test]
+    fn offloaded_drops_leave_the_pdf_unchanged() {
+        let html = r#"<!doctype html><html><head><style>
+          @page { size: A4; margin: 15mm; @bottom-right { content: "p " counter(page); } }
+          td { border: 1px solid #333; padding: 2px; }
+        </style></head><body><table>
+          <tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>
+          <p style="break-before: page">second page</p></body></html>"#;
+        let render = || Engine::builder().build().render(html).unwrap();
+        let first = render();
+        assert!(first.starts_with(b"%PDF"));
+        assert_eq!(first, render());
     }
 }
