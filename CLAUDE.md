@@ -63,20 +63,20 @@ HTML string → Blitz (parse/style/layout) → Drawables / PaginationGeometryTab
 - **Hybrid layout**: Taffy pre-computes sizes; geometry is recorded in `PaginationGeometryTable` once and reused during pagination — no re-layout after splitting
 - **Adapter isolation**: Blitz API surface is contained in `blitz_adapter.rs`
 
-**Font determinism caveat**: `blitz-dom` 0.2.4 hardcodes
-`fontdb::Database::load_system_fonts()` for inline `<svg>` parsing (see
-`blitz-dom-0.2.4/src/util.rs`), and fulgur currently inherits Parley's
-system font fallback for HTML text whenever no bundled fonts are supplied.
-This means the same HTML can produce different PDFs on two hosts if their
-installed `.ttf`/`.otf` set differs — the usual bite is `<text>` inside
-SVG picking a fallback that happens to ship on one machine but not the
-other. The regeneration scripts under `mise.toml` and
+**Font determinism caveat**: fulgur inherits Parley's system font fallback
+for HTML text whenever no bundled fonts are supplied, so the same HTML can
+produce different PDFs on two hosts if their installed `.ttf`/`.otf` set
+differs. The regeneration scripts under `mise.toml` and
 `.github/workflows/update-examples.yml` pin this via
 `FONTCONFIG_FILE=examples/.fontconfig/fonts.conf`, which redirects
-fontconfig to the bundled Noto Sans set in `examples/.fonts/`. When
-editing fonts, CLI defaults, or the SVG pipeline, remember that library
-callers don't get this guarantee by default — see the tracking issue
-`fulgur-a8s` and the README's *Determinism and fonts* section.
+fontconfig to the bundled Noto Sans set in `examples/.fonts/`. SVG `<text>`
+no longer reads host fonts on this fork (html-to-pdf F152): every drawing
+SVG parse gets a `fontdb` built from the bundled faces (`svg_fonts.rs`), and
+the Blitz fork receives the whole `usvg::Options` from fulgur instead of
+calling `load_system_fonts()`. When editing fonts, CLI defaults, or the SVG
+pipeline, remember that library callers don't get the HTML guarantee by
+default — see the tracking issue `fulgur-a8s` and the README's
+*Determinism and fonts* section.
 
 ### Gotchas
 
