@@ -339,38 +339,6 @@ pub fn render_v2(
                         canvas_source != Some(root_id),
                     );
                 }
-                // Body bg pre-pass: runs on ALL pages. body's
-                // `layout_size.height` is the full document height (page-0
-                // layout), which overshoots the content area whenever
-                // margin-bottom > 0. Painting here with `content_area_h`
-                // prevents that overshoot on every page (fulgur-ossm).
-                //
-                // Continuation pages (page_idx > 0) have no body fragment in
-                // the geometry table (fragmenter only records body on page 0),
-                // so the pre-pass is their sole source of body background.
-                //
-                // Page 0: body HAS a geometry fragment, so the main dispatch
-                // also visits it. `draw_v2_page` therefore skips body's block
-                // bg for body_id (only rendering inline content) to avoid
-                // double-painting (see the body_id check in `draw_v2_page`).
-                if let Some(body_id) = drawables.body_id
-                    && let Some(body_block) = drawables.block_styles.get(&body_id)
-                {
-                    let content_area_h = content_area.height.to_f32();
-                    let body_bg_y = if page_idx == 0 {
-                        resolved_margin.top + drawables.body_offset_pt.1.to_f32()
-                    } else {
-                        resolved_margin.top
-                    };
-                    paint_root_block_v2(
-                        &mut canvas,
-                        body_block,
-                        resolved_margin.left + drawables.body_offset_pt.0.to_f32(),
-                        body_bg_y,
-                        Some(content_area_h),
-                        canvas_source != Some(body_id),
-                    );
-                }
                 // `frag.x` is html-relative (fragmenter folds body's x
                 // offset in); `frag.y` is body-content-area-relative.
                 // On page 0 body_offset_pt.1 translates body-content-area
@@ -382,6 +350,28 @@ pub fn render_v2(
                 } else {
                     resolved_margin.top
                 };
+                // Body's own box (F37): background, border and shadow, painted as the slice of the box that is on this
+                // page (`PaginationGeometry::box_slices`), not as a box of one page's height on every page. Page 0's
+                // slice starts at `body_top_pt` (it has body's `margin-top` above it), the others at the page-area top.
+                // `draw_v2_page` skips body's block paint, so this is its only painter; when body is the canvas source
+                // (F184) its background is already painted and only the border and shadow are left.
+                if let Some(body_id) = drawables.body_id
+                    && let Some(body_block) = drawables.block_styles.get(&body_id)
+                {
+                    let slices = geometry
+                        .get(&body_id)
+                        .map_or(&[][..], |g| g.box_slices.as_slice());
+                    paint_body_box_v2(
+                        &mut canvas,
+                        body_block,
+                        slices,
+                        page_idx as u32,
+                        resolved_margin.left + drawables.body_offset_pt.0.to_f32(),
+                        body_top_pt,
+                        (page_size.width, page_size.height),
+                        canvas_source != Some(body_id),
+                    );
+                }
                 draw_v2_page(
                     &mut canvas,
                     page_idx as u32,
@@ -3680,6 +3670,104 @@ fn paint_root_block_v2(
     });
 }
 
+/// F37: the slice of `<body>`'s box (`PaginationGeometry::box_slices`) that is on `page`, with the height of the slices
+/// before it and of all of them, in px. `None` when body's box has no slice on this page.
+fn slice_on_page(
+    slices: &[crate::pagination_layout::Fragment],
+    page: u32,
+) -> Option<(
+    crate::units::Px,
+    crate::units::Px,
+    &crate::pagination_layout::Fragment,
+)> {
+    let slice = slices.iter().find(|f| f.page_index == page)?;
+    let before = slices
+        .iter()
+        .filter(|f| f.page_index < page)
+        .map(|f| f.height)
+        .sum();
+    let total = slices.iter().map(|f| f.height).sum();
+    Some((before, total, slice))
+}
+
+/// Whether the part of `<body>`'s box on one page is just a flat rectangle of its own height: no image or gradient layer
+/// (those are one image over the stitched box), no border, no shadow, and no radius under a colour. `paint_background`
+/// is false when the background is the canvas background (F184), which paints none on the box.
+fn is_flat_slice(style: &crate::draw_primitives::BlockStyle, paint_background: bool) -> bool {
+    let layers = paint_background && !style.background_layers.is_empty();
+    let rounded_colour = paint_background && style.background_color.is_some() && style.has_radius();
+    let border = style
+        .border_widths
+        .iter()
+        .zip(&style.border_styles)
+        .any(|(w, s)| {
+            *w > crate::units::Pt::ZERO && *s != crate::draw_primitives::BorderStyleValue::None
+        });
+    !layers && !rounded_colour && !border && style.box_shadows.is_empty()
+}
+
+/// F37: paint `<body>`'s own background, border and shadow for `page` (css-break-3 section 5.4, `slice`): the unbroken
+/// box is drawn at the position it has when its earlier slices are stacked above this page's, with the height of all
+/// slices, and cut to the y span of this slice, so that a background image or gradient is one image over the stitched
+/// box and the border, radius and padding appear only at the real start and end. Where the box really starts (the
+/// first slice) and ends (the last) the cut opens to the page edge, so a shadow is not clipped there.
+///
+/// A single slice, and a flat one ([`is_flat_slice`]: a plain colour is the same on every page), is drawn as the
+/// rectangle it is, without the cut: the common card-body case adds nothing to the page.
+///
+/// `top_pt` is where this page's slice begins (body's top on page 0, the page-area top after); `x_pt` is body's left.
+/// Nothing is drawn on a page without a slice.
+#[allow(clippy::too_many_arguments)]
+fn paint_body_box_v2(
+    canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
+    entry: &crate::drawables::BlockEntry,
+    slices: &[crate::pagination_layout::Fragment],
+    page: u32,
+    x_pt: f32,
+    top_pt: f32,
+    (page_width_pt, page_height_pt): (f32, f32),
+    paint_background: bool,
+) {
+    let Some((before, total, slice)) = slice_on_page(slices, page) else {
+        return;
+    };
+    let here_pt = slice.height.in_pt().to_f32();
+    if slices.len() == 1 || is_flat_slice(&entry.style, paint_background) {
+        paint_root_block_v2(canvas, entry, x_pt, top_pt, Some(here_pt), paint_background);
+        return;
+    }
+    let first = slices.first().is_some_and(|f| f.page_index == page);
+    let last = slices.last().is_some_and(|f| f.page_index == page);
+    let cut_top = if first { 0.0 } else { top_pt };
+    let cut_bottom = if last {
+        page_height_pt
+    } else {
+        top_pt + here_pt
+    };
+    let cut = krilla::geom::Rect::from_xywh(0.0, cut_top, page_width_pt, cut_bottom - cut_top)
+        .and_then(|rect| {
+            let mut builder = krilla::geom::PathBuilder::new();
+            builder.push_rect(rect);
+            builder.finish()
+        });
+    if let Some(path) = &cut {
+        canvas
+            .surface
+            .push_clip_path(path, &krilla::paint::FillRule::default());
+    }
+    paint_root_block_v2(
+        canvas,
+        entry,
+        x_pt,
+        top_pt - before.in_pt().to_f32(),
+        Some(total.in_pt().to_f32()),
+        paint_background,
+    );
+    if cut.is_some() {
+        canvas.surface.pop();
+    }
+}
+
 /// Whether a block paints a background of its own: a colour that is not fully transparent, or an image layer.
 fn has_background(style: &crate::draw_primitives::BlockStyle) -> bool {
     style.background_color.is_some_and(|c| c[3] > 0) || !style.background_layers.is_empty()
@@ -6854,6 +6942,73 @@ mod tests {
             words.len(),
             first_diff.map(|i| (&printed[i], &words[i]))
         );
+    }
+
+    // --- slice_on_page / is_flat_slice (F37) ---
+
+    fn body_slice(page: u32, height: f32) -> crate::pagination_layout::Fragment {
+        crate::pagination_layout::Fragment {
+            page_index: page,
+            x: 0.0_f32.as_px(),
+            y: 0.0_f32.as_px(),
+            width: 100.0_f32.as_px(),
+            height: height.as_px(),
+        }
+    }
+
+    #[test]
+    fn slice_on_page_gives_the_heights_before_and_in_total() {
+        let slices = [
+            body_slice(0, 900.0),
+            body_slice(1, 1000.0),
+            body_slice(2, 250.0),
+        ];
+        for (page, before, here) in [(0, 0.0, 900.0), (1, 900.0, 1000.0), (2, 1900.0, 250.0)] {
+            let (b, total, slice) = slice_on_page(&slices, page).expect("a slice on the page");
+            assert_eq!(b.to_f32(), before, "page {page}");
+            assert_eq!(total.to_f32(), 2150.0);
+            assert_eq!(slice.height.to_f32(), here);
+        }
+        assert!(slice_on_page(&slices, 3).is_none(), "no slice past the end");
+        assert!(slice_on_page(&[], 0).is_none(), "no slices at all");
+    }
+
+    #[test]
+    fn a_slice_is_flat_unless_it_has_layers_a_border_a_shadow_or_a_rounded_colour() {
+        use crate::draw_primitives::{BlockStyle, BorderStyleValue};
+        assert!(is_flat_slice(&BlockStyle::default(), true));
+        let coloured = BlockStyle {
+            background_color: Some([255, 0, 0, 255]),
+            ..Default::default()
+        };
+        assert!(is_flat_slice(&coloured, true), "a flat colour");
+        let rounded = BlockStyle {
+            background_color: Some([255, 0, 0, 255]),
+            border_radii: [[3.0_f32.as_pt(), 3.0_f32.as_pt()]; 4],
+            ..Default::default()
+        };
+        assert!(!is_flat_slice(&rounded, true), "a colour with a radius");
+        assert!(
+            is_flat_slice(&rounded, false),
+            "the canvas background is not the box's own"
+        );
+        let bordered = BlockStyle {
+            border_widths: [2.0_f32.as_pt(); 4],
+            border_styles: [BorderStyleValue::Solid; 4],
+            ..Default::default()
+        };
+        assert!(!is_flat_slice(&bordered, false));
+        let unseen_border = BlockStyle {
+            border_widths: [2.0_f32.as_pt(); 4],
+            border_styles: [BorderStyleValue::None; 4],
+            ..Default::default()
+        };
+        assert!(is_flat_slice(&unseen_border, true));
+        let shadowed = BlockStyle {
+            box_shadows: vec![Default::default()],
+            ..Default::default()
+        };
+        assert!(!is_flat_slice(&shadowed, false));
     }
 
     // --- canvas_background_source (F184) ---

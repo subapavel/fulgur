@@ -9403,3 +9403,42 @@ fn test_render_canvas_background_over_three_pages_smoke() {
         assert!(page_count(&pdf) >= 3, "{style}: {} pages", page_count(&pdf));
     }
 }
+
+/// html-to-pdf F37: `body`'s own box (a background image, border, radius and shadow) is drawn as the slices of one box
+/// over the pages it spans, in the block-child form and in the inline-root form (text and `<br>` only).
+#[test]
+fn test_render_bordered_body_with_image_over_three_pages_smoke() {
+    let png: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    let lines = "Line<br>".repeat(300);
+    for (content, expect_pages) in [
+        ("<div style=\"height:2500px\"></div>".to_string(), 3),
+        (lines, 4),
+    ] {
+        let mut bundle = AssetBundle::default();
+        bundle.add_image("dot.png", png.clone());
+        let html = format!(
+            "<!doctype html><html><head><style>\
+             html {{ background: #eee }} \
+             body {{ margin: 30px; padding: 10px; border: 4px solid #c00; border-radius: 16px; \
+             background: #fff url(dot.png) repeat; box-shadow: 0 4px 12px #888; line-height: 20px }}\
+             </style></head><body>{content}</body></html>"
+        );
+        let pdf = Engine::builder()
+            .assets(bundle)
+            .build()
+            .render(&html)
+            .expect("render a bordered body");
+        assert!(!pdf.is_empty());
+        assert!(
+            page_count(&pdf) >= expect_pages.min(3),
+            "{} pages",
+            page_count(&pdf)
+        );
+    }
+}
