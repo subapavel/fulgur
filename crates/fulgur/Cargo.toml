@@ -18,13 +18,12 @@ parallel = ["dep:rayon"]
 ## per-document snapshot of the document's font context, so the output does not depend on earlier documents or on the
 ## number of threads. Off by default: the pool needs threads (not wasm32-unknown-unknown), and the global pool is shared
 ## with the caller.
-parallel-construct = ["blitz-dom/parallel-construct", "dep:rayon"]
+parallel-construct = ["blitz-dom/parallel-construct"]
 ## Deflate the page streams (and decode the images) on rayon's global pool (Krilla `rayon`): `Page::drop` hands the
 ## content stream to an idle worker instead of compressing it on the thread that draws the next page. Pages are still
 ## committed in order and every chunk is waited for when the document is written, so the bytes do not depend on
 ## scheduling. Off by default for the same reasons as `parallel-construct`.
-## Both also move the drop of the Blitz document and of the drawables off the calling thread (`engine::drop_off_thread`).
-parallel-pdf = ["krilla/rayon", "dep:rayon"]
+parallel-pdf = ["krilla/rayon"]
 
 [dependencies]
 rayon = { version = "1", optional = true }
