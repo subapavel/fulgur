@@ -561,6 +561,64 @@ fn draw_background_color(
     }
 }
 
+/// Draw the canvas background (css-backgrounds-3 §2.11.1) of one page.
+///
+/// `source` is the style whose colour and layers are painted (the root's, or `<body>`'s when the root has none,
+/// §2.11.2); `root` is the root element's style, which supplies the border and padding that locate the `origin` box of
+/// each layer. The colour fills `painting`; every layer is sized and positioned against its origin box inside
+/// `positioning` (the root element's border box, which may start above `painting` on a continuation page) and
+/// clipped to `painting`. A layer's own `background-clip` and the radii of the root do not limit the canvas.
+pub fn draw_canvas_background(
+    canvas: &mut Canvas<'_, '_>,
+    source: &BlockStyle,
+    root: &BlockStyle,
+    positioning: crate::draw_primitives::Rect,
+    painting: crate::draw_primitives::Rect,
+) {
+    let (px, py, pw, ph) = (
+        positioning.x.to_f32(),
+        positioning.y.to_f32(),
+        positioning.width.to_f32(),
+        positioning.height.to_f32(),
+    );
+    let clip = (
+        painting.x.to_f32(),
+        painting.y.to_f32(),
+        painting.width.to_f32(),
+        painting.height.to_f32(),
+    );
+    if clip.2 <= 0.0 || clip.3 <= 0.0 {
+        return;
+    }
+    let Some(clip_path) = build_rect_path(clip.0, clip.1, clip.2, clip.3) else {
+        return;
+    };
+    if let Some(bg) = &source.background_color {
+        canvas.surface.set_fill(Some(krilla::paint::Fill {
+            paint: krilla::color::rgb::Color::new(bg[0], bg[1], bg[2]).into(),
+            opacity: krilla::num::NormalizedF32::new(bg[3] as f32 / 255.0)
+                .unwrap_or(krilla::num::NormalizedF32::ONE),
+            rule: Default::default(),
+        }));
+        canvas.surface.set_stroke(None);
+        canvas.surface.draw_path(&clip_path);
+    }
+    for layer in source.background_layers.iter().rev() {
+        let origin = canvas_layer_origin(root, layer, (px, py, pw, ph));
+        draw_background_layer_in(canvas, layer, origin, clip, &clip_path);
+    }
+}
+
+/// The positioning area of a canvas background layer: its `background-origin` box of the root element, whose border
+/// box is `root_box`. The border and padding are the root's even when the layer comes from `<body>` (§2.11.2).
+fn canvas_layer_origin(
+    root: &BlockStyle,
+    layer: &BackgroundLayer,
+    (x, y, w, h): (f32, f32, f32, f32),
+) -> (f32, f32, f32, f32) {
+    compute_origin_rect(root, &layer.origin, x, y, w, h)
+}
+
 /// Draw a single background image layer.
 fn draw_background_layer(
     canvas: &mut Canvas<'_, '_>,
@@ -590,9 +648,28 @@ fn draw_background_layer(
     let Some(clip_path) = clip_path else {
         return;
     };
+    draw_background_layer_in(
+        canvas,
+        layer,
+        (ox, oy, ow, oh),
+        (cx, cy, cw, ch),
+        &clip_path,
+    );
+}
+
+/// Draw one layer whose positioning area (`origin`) and painting area (`clip`, with its `clip_path`) are already
+/// resolved: `(x, y, w, h)` in pt. Shared by an element's own background and by the canvas background, which has a
+/// positioning area (the root element's box) that differs from its painting area (the page).
+fn draw_background_layer_in(
+    canvas: &mut Canvas<'_, '_>,
+    layer: &BackgroundLayer,
+    (ox, oy, ow, oh): (f32, f32, f32, f32),
+    (cx, cy, cw, ch): (f32, f32, f32, f32),
+    clip_path: &krilla::geom::Path,
+) {
     canvas
         .surface
-        .push_clip_path(&clip_path, &krilla::paint::FillRule::default());
+        .push_clip_path(clip_path, &krilla::paint::FillRule::default());
 
     let (img_w, img_h) = match &layer.content {
         BgImageContent::LinearGradient { .. }
@@ -2629,6 +2706,104 @@ mod tests {
             origin: BgBox::PaddingBox,
             clip: BgClip::BorderBox,
         }
+    }
+
+    /// A canvas layer is located by the origin box of the root element, whatever the layer's own `background-clip`
+    /// and the source's border and padding say (css-backgrounds-3 §2.11.1, §2.11.2).
+    #[test]
+    fn canvas_layer_origin_is_the_root_origin_box() {
+        let root = BlockStyle {
+            border_widths: [1.0, 2.0, 3.0, 4.0].map(F32Units::as_pt),
+            padding: [10.0, 20.0, 30.0, 40.0].map(F32Units::as_pt),
+            ..Default::default()
+        };
+        let mut layer = make_layer(10.0_f32.as_pt(), 10.0_f32.as_pt(), BgSize::Auto);
+        let root_box = (100.0, -500.0, 400.0, 2000.0);
+        layer.origin = BgBox::BorderBox;
+        assert_eq!(canvas_layer_origin(&root, &layer, root_box), root_box);
+        layer.origin = BgBox::PaddingBox;
+        assert_eq!(
+            canvas_layer_origin(&root, &layer, root_box),
+            (104.0, -499.0, 394.0, 1996.0)
+        );
+        layer.origin = BgBox::ContentBox;
+        assert_eq!(
+            canvas_layer_origin(&root, &layer, root_box),
+            (144.0, -489.0, 334.0, 1956.0)
+        );
+    }
+
+    fn with_scratch_canvas(f: impl FnOnce(&mut Canvas<'_, '_>)) {
+        let mut doc = krilla::Document::new();
+        let settings = krilla::page::PageSettings::from_wh(200.0, 200.0).expect("valid page size");
+        let mut page = doc.start_page_with(settings);
+        let mut surface = page.surface();
+        let mut canvas = Canvas {
+            surface: &mut surface,
+            bookmark_collector: None,
+            link_collector: None,
+            tag_collector: None,
+            link_run_node_id: None,
+            in_marked_content: false,
+            images: Default::default(),
+            fonts: &mut Default::default(),
+            paint_extent: Default::default(),
+        };
+        f(&mut canvas);
+    }
+
+    /// The canvas painter handles a colour, a gradient layer whose positioning box starts above the painting area,
+    /// and a degenerate painting area (nothing to do) without panicking.
+    #[test]
+    fn draw_canvas_background_smoke() {
+        use crate::draw_primitives::Rect;
+        let rect = |x: f32, y: f32, w: f32, h: f32| Rect {
+            x: x.as_pt(),
+            y: y.as_pt(),
+            width: w.as_pt(),
+            height: h.as_pt(),
+        };
+        let mut gradient = make_layer(0.0_f32.as_pt(), 0.0_f32.as_pt(), BgSize::Auto);
+        gradient.content = BgImageContent::LinearGradient {
+            direction: crate::draw_primitives::LinearGradientDirection::Angle(std::f32::consts::PI),
+            stops: vec![
+                crate::draw_primitives::GradientStop {
+                    position: crate::draw_primitives::GradientStopPosition::Fraction(0.0),
+                    rgba: [255, 0, 0, 255],
+                    is_hint: false,
+                },
+                crate::draw_primitives::GradientStop {
+                    position: crate::draw_primitives::GradientStopPosition::Fraction(1.0),
+                    rgba: [0, 0, 255, 255],
+                    is_hint: false,
+                },
+            ],
+            repeating: false,
+        };
+        gradient.repeat_x = BgRepeat::Repeat;
+        gradient.repeat_y = BgRepeat::Repeat;
+        let source = BlockStyle {
+            background_color: Some([255, 255, 221, 255]),
+            background_layers: vec![gradient],
+            ..Default::default()
+        };
+        let root = BlockStyle::default();
+        with_scratch_canvas(|canvas| {
+            draw_canvas_background(
+                canvas,
+                &source,
+                &root,
+                rect(10.0, -300.0, 180.0, 150.0),
+                rect(10.0, 10.0, 180.0, 180.0),
+            );
+            draw_canvas_background(
+                canvas,
+                &source,
+                &root,
+                rect(10.0, 10.0, 180.0, 150.0),
+                rect(10.0, 10.0, 0.0, 180.0),
+            );
+        });
     }
 
     #[test]

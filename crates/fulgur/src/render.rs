@@ -296,6 +296,41 @@ pub fn render_v2(
                 // the entry. The main dispatch loop skips both
                 // `root_id` and `body_id` to avoid double-painting on
                 // page 0.
+                //
+                // F184: the background of `<html>` (or of `<body>`, when `<html>` has none) is the background of the
+                // canvas, painted first and under everything: over the page area of every page, positioned against
+                // the root element's box as it sits on this page, and not again on the box itself.
+                let canvas_source = canvas_background_source(drawables);
+                if let Some(source_id) = canvas_source
+                    && let Some(source) = drawables.block_styles.get(&source_id)
+                    && let Some(root_id) = drawables.root_id
+                    && let Some(root_block) = drawables.block_styles.get(&root_id)
+                    && let Some(root_size) = root_block.layout_size
+                    && source.visible
+                {
+                    // The root is one box cut into strips of page 1's content height (F109): page k shows it from
+                    // k strips down.
+                    let strip_pt = page_one_box.1.max(0.0);
+                    let positioning = crate::draw_primitives::Rect {
+                        x: content_area.x,
+                        y: content_area.y - (page_idx as f32 * strip_pt).as_pt(),
+                        width: root_size.width,
+                        height: root_size.height,
+                    };
+                    crate::draw_primitives::draw_with_opacity(
+                        &mut canvas,
+                        root_block.opacity,
+                        |canvas| {
+                            crate::background::draw_canvas_background(
+                                canvas,
+                                &source.style,
+                                &root_block.style,
+                                positioning,
+                                content_area,
+                            );
+                        },
+                    );
+                }
                 if let Some(root_id) = drawables.root_id
                     && let Some(root_block) = drawables.block_styles.get(&root_id)
                 {
@@ -305,6 +340,7 @@ pub fn render_v2(
                         resolved_margin.left,
                         resolved_margin.top,
                         None,
+                        canvas_source != Some(root_id),
                     );
                 }
                 // Body bg pre-pass: runs on ALL pages. body's
@@ -336,6 +372,7 @@ pub fn render_v2(
                         resolved_margin.left + drawables.body_offset_pt.0.to_f32(),
                         body_bg_y,
                         Some(content_area_h),
+                        canvas_source != Some(body_id),
                     );
                 }
                 // `frag.x` is html-relative (fragmenter folds body's x
@@ -3596,12 +3633,16 @@ fn draw_block_v2(
 /// `body_offset_pt.y` adjustment that the main dispatch loop applies,
 /// because html's bg paints at the page's margin top, not at body's
 /// content origin.
+///
+/// `paint_background` is false when the box's background is the canvas background of the page
+/// ([`canvas_background_source`]); shadows and borders are still the box's own.
 fn paint_root_block_v2(
     canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
     entry: &crate::drawables::BlockEntry,
     margin_left_pt: f32,
     margin_top_pt: f32,
     height_override: Option<f32>,
+    paint_background: bool,
 ) {
     use crate::draw_primitives::draw_with_opacity;
     let Some(size) = entry.layout_size else {
@@ -3621,14 +3662,16 @@ fn paint_root_block_v2(
                 w,
                 h,
             );
-            crate::background::draw_background(
-                canvas,
-                &entry.style,
-                margin_left_pt,
-                margin_top_pt,
-                w,
-                h,
-            );
+            if paint_background {
+                crate::background::draw_background(
+                    canvas,
+                    &entry.style,
+                    margin_left_pt,
+                    margin_top_pt,
+                    w,
+                    h,
+                );
+            }
             crate::draw_primitives::draw_block_border(
                 canvas,
                 &entry.style,
@@ -3639,6 +3682,25 @@ fn paint_root_block_v2(
             );
         }
     });
+}
+
+/// Whether a block paints a background of its own: a colour that is not fully transparent, or an image layer.
+fn has_background(style: &crate::draw_primitives::BlockStyle) -> bool {
+    style.background_color.is_some_and(|c| c[3] > 0) || !style.background_layers.is_empty()
+}
+
+/// The element whose background is the canvas background (css-backgrounds-3 §2.11): the root element's if it has one,
+/// otherwise the first `<body>`'s (§2.11.2: the root has no image and a transparent colour). `None` when neither
+/// paints a background. The source paints no background of its own box.
+fn canvas_background_source(d: &Drawables) -> Option<crate::drawables::NodeId> {
+    let has = |id: Option<crate::drawables::NodeId>| {
+        id.filter(|id| {
+            d.block_styles
+                .get(id)
+                .is_some_and(|e| has_background(&e.style))
+        })
+    };
+    has(d.root_id).or_else(|| has(d.body_id))
 }
 
 /// Overflow smaller than this (pt) is rounding, not content: nothing is reported.
@@ -5213,6 +5275,7 @@ impl<'a> MarginBoxRenderer<'a> {
                             rect.x.to_f32(),
                             rect.y.to_f32(),
                             None,
+                            true,
                         );
                     }
                 }
@@ -6795,6 +6858,96 @@ mod tests {
             words.len(),
             first_diff.map(|i| (&printed[i], &words[i]))
         );
+    }
+
+    // --- canvas_background_source (F184) ---
+
+    fn entry_with_background(
+        colour: Option<[u8; 4]>,
+        layers: bool,
+    ) -> crate::drawables::BlockEntry {
+        let mut entry = block_entry_with_overflow_clip(vec![]);
+        entry.style = crate::draw_primitives::BlockStyle {
+            background_color: colour,
+            ..Default::default()
+        };
+        if layers {
+            entry
+                .style
+                .background_layers
+                .push(crate::draw_primitives::BackgroundLayer {
+                    content: crate::draw_primitives::BgImageContent::Raster {
+                        data: Arc::new(vec![]),
+                        format: crate::image::ImageFormat::Png,
+                    },
+                    intrinsic_width: crate::units::Pt::ZERO,
+                    intrinsic_height: crate::units::Pt::ZERO,
+                    size: crate::draw_primitives::BgSize::Auto,
+                    position_x: crate::draw_primitives::BgLengthPercentage::Percentage(0.0),
+                    position_y: crate::draw_primitives::BgLengthPercentage::Percentage(0.0),
+                    repeat_x: crate::draw_primitives::BgRepeat::Repeat,
+                    repeat_y: crate::draw_primitives::BgRepeat::Repeat,
+                    origin: crate::draw_primitives::BgBox::PaddingBox,
+                    clip: crate::draw_primitives::BgClip::BorderBox,
+                });
+        }
+        entry
+    }
+
+    /// `html` is node 1, `body` node 2.
+    fn root_and_body(
+        root: Option<crate::drawables::BlockEntry>,
+        body: Option<crate::drawables::BlockEntry>,
+    ) -> Drawables {
+        let mut d = Drawables::new();
+        d.root_id = Some(1);
+        d.body_id = Some(2);
+        if let Some(e) = root {
+            d.block_styles.insert(1, e);
+        }
+        if let Some(e) = body {
+            d.block_styles.insert(2, e);
+        }
+        d
+    }
+
+    #[test]
+    fn canvas_background_source_is_the_root_when_it_has_a_colour_or_an_image() {
+        let white = Some([255, 255, 255, 255]);
+        for root in [
+            entry_with_background(white, false),
+            entry_with_background(None, true),
+            entry_with_background(white, true),
+        ] {
+            let d = root_and_body(Some(root), Some(entry_with_background(white, true)));
+            assert_eq!(canvas_background_source(&d), Some(1));
+        }
+    }
+
+    #[test]
+    fn canvas_background_source_falls_back_to_body_when_root_is_transparent() {
+        let body = || Some(entry_with_background(Some([255, 255, 221, 255]), false));
+        for root in [
+            None,
+            Some(entry_with_background(None, false)),
+            // a colour with alpha 0 is transparent (css-backgrounds-3 §2.11.2)
+            Some(entry_with_background(Some([10, 20, 30, 0]), false)),
+        ] {
+            let d = root_and_body(root, body());
+            assert_eq!(canvas_background_source(&d), Some(2));
+        }
+        let d = root_and_body(None, Some(entry_with_background(None, true)));
+        assert_eq!(canvas_background_source(&d), Some(2));
+    }
+
+    #[test]
+    fn canvas_background_source_is_none_without_a_background() {
+        let d = root_and_body(
+            Some(entry_with_background(Some([1, 2, 3, 0]), false)),
+            Some(entry_with_background(None, false)),
+        );
+        assert_eq!(canvas_background_source(&d), None);
+        assert_eq!(canvas_background_source(&Drawables::new()), None);
     }
 
     // --- build_page_skip_sets ---

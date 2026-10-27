@@ -9370,3 +9370,36 @@ fn test_render_raster_background_natural_size_smoke() {
         .expect("render raster background");
     assert!(!pdf.is_empty());
 }
+
+/// html-to-pdf F184: a `body` background image and `html` / `body` colours are the canvas background; they are drawn on
+/// every page of a three-page document (the page count is the proof the document was paginated, not the pixels).
+#[test]
+fn test_render_canvas_background_over_three_pages_smoke() {
+    let png: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    for style in [
+        // the root has none: body's image is the canvas background
+        "body { margin: 20px; background: url(dot.png) repeat }",
+        "body { margin: 8px; background: url(dot.png) no-repeat 50% 50% }",
+        // the root has one: body keeps its own
+        "html { background: #fdd } body { margin: 40px; background: #dfd }",
+        "html { background: linear-gradient(#f00, #00f) } body { margin: 0 }",
+    ] {
+        let mut bundle = AssetBundle::default();
+        bundle.add_image("dot.png", png.clone());
+        let html = format!(
+            "<!doctype html><html><head><style>{style}</style></head><body><div style=\"height:2500px\"></div></body></html>"
+        );
+        let pdf = Engine::builder()
+            .assets(bundle)
+            .build()
+            .render(&html)
+            .expect("render canvas background");
+        assert!(page_count(&pdf) >= 3, "{style}: {} pages", page_count(&pdf));
+    }
+}
