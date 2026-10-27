@@ -11,18 +11,29 @@
 //! it decides what gets embedded. A file is accepted only if every face in it passes: Parley registers a blob with all
 //! of its faces, so a collection with one bad face is left out whole (OTS, Chrome's sanitiser, does the same).
 //!
+//! A face Krilla accepts can still fail later, when the PDF is written: `unitsPerEm` 0 panics in its font descriptor,
+//! and a malformed `hmtx`, `maxp`, `post` or `loca` fails the subsetter, which fails the whole document. So a face with
+//! outlines is also subset the way Krilla subsets it (`.notdef` plus a few mapped glyphs, `subsetter` with no
+//! variation coordinates) and the result must open again.
+//!
 //! The cost is reading table directories, `head`, `hhea`, `OS/2`, `name` and the outline table headers of each face
-//! (Krilla's `Font::new`), never glyph data: microseconds per face, a 17 MB collection included.
+//! (Krilla's `Font::new`), plus a subset of a few glyphs: well under a millisecond per face.
 
 use std::fmt;
 use std::sync::Arc;
 
+use skrifa::bitmap::{BitmapData, BitmapStrikes};
+use skrifa::instance::Size;
 use skrifa::string::StringId;
 use skrifa::{FontRef, MetadataProvider, Tag, raw::FileRef, raw::TableProvider};
 
-/// Tables that carry something to draw when a face has no outlines: colour glyphs (`COLR`, `SVG `) and bitmaps
-/// (`CBDT`, `sbix`). Krilla draws them as Type 3 glyphs.
-const PAINTED_TABLES: [&[u8; 4]; 4] = [b"COLR", b"SVG ", b"CBDT", b"sbix"];
+/// How many glyphs the `cmap` maps are sampled: for PNG bitmap data when a face has no outlines, and for the trial
+/// subset when it has.
+const GLYPH_SAMPLE: usize = 16;
+
+/// The `unitsPerEm` range OpenType allows (`head` table). Krilla divides by it; 0 panics, a tiny value puts the text
+/// thousands of points off the page.
+const UNITS_PER_EM: std::ops::RangeInclusive<u16> = 16..=16384;
 
 /// One face of a font file the PDF writer cannot embed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,19 +141,71 @@ fn check_face(data: &Arc<Vec<u8>>, index: u32) -> Result<(), RejectedFace> {
         };
         return Err(reject(name, reason));
     }
-
-    // Krilla accepts a face without outlines and embeds invisible Type 3 glyphs; that is no better than no face.
-    let has_outlines = font.outline_glyphs().format().is_some();
-    let paints = PAINTED_TABLES
-        .iter()
-        .any(|t| font.table_data(Tag::new(t)).is_some());
-    if !has_outlines && !paints {
-        return Err(reject(
+    if let Ok(head) = font.head()
+        && !UNITS_PER_EM.contains(&head.units_per_em())
+    {
+        return Err(RejectedFace {
+            index,
             name,
-            "no glyph outlines (no `glyf`, `CFF ` or `CFF2` table) and no colour or bitmap glyphs",
-        ));
+            reason: format!("unitsPerEm {} is outside 16..16384", head.units_per_em()),
+        });
     }
-    Ok(())
+
+    // Krilla accepts a face without outlines and embeds invisible Type 3 glyphs; that is no better than no face. Without
+    // outlines the only glyphs Krilla draws are PNG bitmaps (`CBDT` / `sbix`; `glyph/bitmap.rs`: "We only support
+    // PNG"): `COLR` layers are outline glyphs, and fulgur installs no SVG-glyph renderer, so a `COLR` or `SVG ` table
+    // alone paints nothing.
+    if font.outline_glyphs().format().is_some() {
+        return trial_subset(data, index, &font).map_err(|e| RejectedFace {
+            index,
+            name,
+            reason: format!("the PDF writer cannot subset it: {e}"),
+        });
+    }
+    if has_png_bitmaps(&font) {
+        return Ok(());
+    }
+    let has_table = |t: &[u8; 4]| font.table_data(Tag::new(t)).is_some();
+    let reason = if has_table(b"glyf") || has_table(b"CFF ") || has_table(b"CFF2") {
+        "its glyph outlines do not parse (`glyf` / `loca`, `CFF ` or `CFF2`) and it has no PNG bitmap glyphs"
+    } else {
+        "no glyph outlines (no `glyf`, `CFF ` or `CFF2` table) and no PNG bitmap glyphs"
+    };
+    Err(reject(name, reason))
+}
+
+/// Subsets `.notdef` and the first glyphs the `cmap` maps as Krilla does when it writes a CID font (`text/cid.rs`
+/// `subset_font`), and opens the result again.
+fn trial_subset(data: &Arc<Vec<u8>>, index: u32, font: &FontRef<'_>) -> Result<(), String> {
+    let mut glyphs: Vec<u16> = vec![0];
+    glyphs.extend(
+        font.charmap()
+            .mappings()
+            .take(GLYPH_SAMPLE)
+            .filter_map(|(_, g)| u16::try_from(g.to_u32()).ok()),
+    );
+    let mut remapper = subsetter::GlyphRemapper::new();
+    for g in glyphs {
+        remapper.remap(g);
+    }
+    let subset = subsetter::subset_with_variations(data, index, &[], &remapper)
+        .map_err(|e| e.to_string())?;
+    krilla::text::Font::new(Arc::new(subset).into(), 0)
+        .map(|_| ())
+        .ok_or_else(|| "the subset does not open".to_string())
+}
+
+/// Whether one of the first glyphs the `cmap` maps has PNG bitmap data, the bitmap kind Krilla draws.
+fn has_png_bitmaps(font: &FontRef<'_>) -> bool {
+    let strikes = BitmapStrikes::new(font);
+    if strikes.is_empty() {
+        return false;
+    }
+    font.charmap()
+        .mappings()
+        .take(GLYPH_SAMPLE)
+        .filter_map(|(_, glyph)| strikes.glyph_for_size(Size::unscaled(), glyph))
+        .any(|g| matches!(g.data, BitmapData::Png(_)))
 }
 
 /// Helpers that build broken fonts from good ones, shared with the tests of `asset`.
@@ -244,6 +307,64 @@ mod tests {
         let r = rejection(&bad);
         assert_eq!(r.faces.len(), 1);
         assert!(r.faces[0].reason.contains("no glyph outlines"), "{r}");
+    }
+
+    #[test]
+    fn a_colour_or_bitmap_table_without_outlines_or_png_glyphs_is_rejected() {
+        // The `glyf` table renamed to a tag Krilla could paint from: still nothing it can draw.
+        for tag in [b"COLR", b"SVG ", b"CBDT", b"sbix"] {
+            let bad = rename_table(NOTO_BOLD, b"glyf", tag);
+            let r = rejection(&bad);
+            assert_eq!(r.faces.len(), 1, "{tag:?}");
+            assert!(
+                r.faces[0].reason.contains("no glyph outlines"),
+                "{tag:?}: {r}"
+            );
+        }
+    }
+
+    /// `font` with the big-endian u16 at `table` offset `at` set to `value`.
+    fn set_u16(font: &[u8], table: &[u8; 4], at: usize, value: u16) -> Vec<u8> {
+        let n = u16::from_be_bytes([font[4], font[5]]) as usize;
+        let record = (0..n)
+            .map(|i| 12 + 16 * i)
+            .find(|r| &font[*r..*r + 4] == table)
+            .expect("no such table");
+        let off = u32::from_be_bytes(font[record + 8..record + 12].try_into().unwrap()) as usize;
+        let mut out = font.to_vec();
+        out[off + at..off + at + 2].copy_from_slice(&value.to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn units_per_em_outside_the_opentype_range_is_rejected() {
+        // `head.unitsPerEm` is at offset 18. Krilla's `Font::new` accepts 0 and then panics writing the descriptor.
+        for upm in [0u16, 1, 15, 16385] {
+            let bad = set_u16(NOTO_BOLD, b"head", 18, upm);
+            let r = rejection(&bad);
+            assert!(r.faces[0].reason.contains("unitsPerEm"), "{upm}: {r}");
+        }
+        assert_eq!(
+            check_font(&arc(&set_u16(NOTO_BOLD, b"head", 18, 2048))),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_face_the_subsetter_cannot_subset_is_rejected() {
+        // `hhea.numberOfHMetrics` (offset 34) 0: Krilla opens the face, the subsetter fails ("malformed font") and,
+        // before F178, failed the whole document.
+        let bad = set_u16(NOTO_BOLD, b"hhea", 34, 0);
+        assert!(krilla::text::Font::new(Arc::new(bad.clone()).into(), 0).is_some());
+        let r = rejection(&bad);
+        assert!(r.faces[0].reason.contains("cannot subset"), "{r}");
+    }
+
+    #[test]
+    fn outlines_that_do_not_parse_are_named() {
+        let bad = rename_table(NOTO_BOLD, b"loca", b"locx");
+        let r = rejection(&bad);
+        assert!(r.faces[0].reason.contains("do not parse"), "{r}");
     }
 
     #[test]
