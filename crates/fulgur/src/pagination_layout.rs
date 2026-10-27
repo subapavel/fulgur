@@ -3477,7 +3477,13 @@ fn leading_block_size(
                 // The gap is measured from the content edge: the node's own
                 // border and padding are not a gap, they belong to its box.
                 let content_top = node.final_layout.border.top + node.final_layout.padding.top;
-                if top - content_top > 0.5 {
+                // Not for the children of an inline root: they are inline-level boxes (an `<img>`, an `inline-block`)
+                // placed by line layout, and where the line puts one says nothing about a margin. A `border-collapse:
+                // collapse` cell with a 1 px border lays its first line 1 px below the `border + padding` its layout
+                // reports (the cell is 0 + 8 px at the top, the image at 9), and a box shorter than the strut's ascent
+                // sits below the top of its line: both were read as a gap and the box was entered to break in front of
+                // its first child at the bottom of a page, instead of moving whole (html-to-pdf F183, plan 7.4).
+                if !node.flags.is_inline_root() && top - content_top > 0.5 {
                     // Class C break point: the gap in front of the first child.
                     return top.min(own_h);
                 }
@@ -11791,6 +11797,47 @@ h2 { string-set: chapter-title content(text); }
             .unwrap_or_else(|| panic!("no #{id}"))
     }
 
+    /// html-to-pdf F183 (plan 7.4): the first line of a `border-collapse: collapse` cell with a 1 px border sits 1 px
+    /// below `border + padding`; that was read as a margin gap in front of the first child (a class C break point), so
+    /// a row that did not fit the bottom of the page was entered there: a 9 px stub of the cell stayed on page 0, the
+    /// image went to page 1 as a box of its own (60 px) in a cell fragment of 60 px, shorter than its 64 px line, and the
+    /// paragraph painter dropped the line. Chrome moves the row whole.
+    #[test]
+    fn a_collapsed_cell_with_an_inline_image_moves_to_the_next_page_whole() {
+        let font = Arc::new(
+            std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../examples/.fonts/NotoSans-Regular.ttf"
+            ))
+            .expect("the bundled Noto Sans"),
+        );
+        for table_style in ["border-collapse:collapse", ""] {
+            let html = format!(
+                r#"<style>body{{margin:0;font:16px 'Noto Sans'}}td{{padding:8px;border:1px solid #000}}</style><body>
+                <div style="height:1080px"></div><table style="{table_style}"><tr><td><img id="box" width="60" height="60"></td></tr></table></body>"#
+            );
+            let mut doc = blitz_adapter::parse(&html, 794.0, std::slice::from_ref(&font));
+            blitz_adapter::resolve(&mut doc);
+            let table = run_pass(&mut doc, 1122.52);
+            let td = find_by_id(doc.deref(), "box")
+                .and_then(|id| doc.get_node(id))
+                .and_then(|n| n.parent)
+                .expect("the cell");
+            let pages: Vec<u32> = table[&td].fragments.iter().map(|f| f.page_index).collect();
+            assert_eq!(pages, [1], "{table_style:?}: the cell is whole on page 1");
+            let img = find_by_id(doc.deref(), "box").unwrap();
+            assert_eq!(
+                table[&img]
+                    .fragments
+                    .iter()
+                    .map(|f| f.page_index)
+                    .collect::<Vec<_>>(),
+                [1],
+                "{table_style:?}"
+            );
+        }
+    }
+
     /// F32a: a paragraph of two or more lines took the line-splitting path, which recorded the
     /// paragraph but none of its inline boxes. `paragraph.rs` draws an `InlineBox` item only when
     /// the box has a fragment on the page, so an `<img>` or `inline-block` in such a paragraph was
@@ -12931,6 +12978,19 @@ h2 { string-set: chapter-title content(text); }
             (30.0..=32.0).contains(&leading),
             "first row plus the border, got {leading}"
         );
+    }
+
+    #[test]
+    fn leading_block_size_of_an_inline_root_is_not_cut_short_by_where_its_line_puts_a_box() {
+        // A 10 px image sits on the baseline, so it starts below the top of its line. That offset is not a margin: the
+        // first line box is one unit, and the box needs the line (html-to-pdf F183).
+        let html = r#"<html><body style="margin:0;font:16px sans-serif"><div id="o"><img width="10" height="10"></div></body></html>"#;
+        let doc = parse(html, 600.0);
+        let o = find_by_id(doc.deref(), "o").unwrap();
+        let own = doc.get_node(o).unwrap().final_layout.size.height;
+        let leading = leading_of(html, "o");
+        assert!(own > 10.0, "the line is taller than the image: {own}");
+        assert!(leading >= 10.0 + 0.5, "got {leading} of {own}");
     }
 
     #[test]
