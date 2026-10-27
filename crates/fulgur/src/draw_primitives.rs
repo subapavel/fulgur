@@ -841,8 +841,8 @@ pub struct BlockStyle {
     pub background_color: Option<[u8; 4]>,
     /// Background image layers (first = top-most, rendered in reverse order).
     pub background_layers: Vec<BackgroundLayer>,
-    /// Border color as RGBA
-    pub border_color: [u8; 4],
+    /// Border colours as RGBA: top, right, bottom, left (the order of `border_widths` / `border_styles`).
+    pub border_colors: [[u8; 4]; 4],
     /// Border widths: top, right, bottom, left
     pub border_widths: [crate::units::Pt; 4],
     /// Padding: top, right, bottom, left
@@ -1112,6 +1112,15 @@ pub struct BackgroundLayer {
 }
 
 impl BlockStyle {
+    /// The border colour when all four sides have the same one, `None` when they differ.
+    ///
+    /// Every border with a single colour takes the pre-F186 painter paths (rounded stroke, inset rectangle stroke,
+    /// per-side lines), so its output is unchanged.
+    pub fn uniform_border_color(&self) -> Option<[u8; 4]> {
+        let [top, right, bottom, left] = self.border_colors;
+        (top == right && right == bottom && bottom == left).then_some(top)
+    }
+
     /// Whether any border radius is non-zero.
     pub fn has_radius(&self) -> bool {
         self.border_radii
@@ -1670,11 +1679,19 @@ pub(crate) fn draw_block_border(
     if !(bt > 0.0 || br > 0.0 || bb > 0.0 || bl > 0.0) {
         return;
     }
-    let bc = &style.border_color;
+    // F186: each side has its own colour. A border whose four colours are equal takes exactly the paths it took when
+    // only the top colour was read; only a border with differing colours reaches the mixed-colour code below.
+    let uniform_colour = style.uniform_border_color();
+    let bc = &uniform_colour.unwrap_or(style.border_colors[0]);
 
     let uniform_width = bt == br && br == bb && bb == bl;
     let uniform_style = st == sr && sr == sb && sb == sl;
-    if style.has_radius() && uniform_width && uniform_style && st != BorderStyleValue::None {
+    if style.has_radius()
+        && uniform_width
+        && uniform_style
+        && st != BorderStyleValue::None
+        && uniform_colour.is_some()
+    {
         let inset = bt / 2.0;
         let inset_radii = style.border_radii.map(|[rx, ry]| {
             [
@@ -1706,6 +1723,7 @@ pub(crate) fn draw_block_border(
         && uniform_width
         && uniform_style
         && matches!(st, BorderStyleValue::Solid | BorderStyleValue::Double)
+        && uniform_colour.is_some()
     {
         let opacity = alpha_to_opacity(bc[3]);
         canvas.surface.set_fill(None);
@@ -1725,69 +1743,215 @@ pub(crate) fn draw_block_border(
             }
         }
         canvas.surface.set_stroke(None);
+    } else if uniform_colour.is_none() && style.has_radius() && ring_sides_are_solid(style) {
+        draw_border_ring(canvas, style, x, y, w, h);
     } else {
-        let opacity = alpha_to_opacity(bc[3]);
         canvas.surface.set_fill(None);
 
+        // Per side: (x1, y1, x2, y2, is_top_or_left, outward_sign) of the centre line of the side's band.
         // top: normal=(0,+half) points down=inward, so outward_sign=-1
-        draw_border_line(
-            canvas,
-            x,
-            y + bt / 2.0,
-            x + w,
-            y + bt / 2.0,
-            bt,
-            st,
-            bc,
-            opacity,
-            true,
-            -1.0,
-        );
-        // bottom (top_or_left = false)
-        draw_border_line(
-            canvas,
-            x,
-            y + h - bb / 2.0,
-            x + w,
-            y + h - bb / 2.0,
-            bb,
-            sb,
-            bc,
-            opacity,
-            false,
-            1.0, // bottom: normal=(0,+half) points down=outward
-        );
-        // left: normal=(-half,0) points left=outward, so outward_sign=+1
-        draw_border_line(
-            canvas,
-            x + bl / 2.0,
-            y,
-            x + bl / 2.0,
-            y + h,
-            bl,
-            sl,
-            bc,
-            opacity,
-            true,
-            1.0,
-        );
         // right: normal=(-half,0) points left=inward, so outward_sign=-1
-        draw_border_line(
-            canvas,
-            x + w - br / 2.0,
-            y,
-            x + w - br / 2.0,
-            y + h,
-            br,
-            sr,
-            bc,
-            opacity,
-            false,
-            -1.0, // right: outward_sign=-1
-        );
+        // bottom: normal=(0,+half) points down=outward, so outward_sign=+1
+        // left: normal=(-half,0) points left=outward, so outward_sign=+1
+        let lines = [
+            (x, y + bt / 2.0, x + w, y + bt / 2.0, true, -1.0),
+            (x + w - br / 2.0, y, x + w - br / 2.0, y + h, false, -1.0),
+            (x, y + h - bb / 2.0, x + w, y + h - bb / 2.0, false, 1.0),
+            (x + bl / 2.0, y, x + bl / 2.0, y + h, true, 1.0),
+        ];
+        let widths = [bt, br, bb, bl];
+        let styles = [st, sr, sb, sl];
+        // top, bottom, left, right: the order the sides have always been painted in.
+        for side in [0, 2, 3, 1] {
+            let colour = &style.border_colors[side];
+            let (x1, y1, x2, y2, is_top_or_left, outward_sign) = lines[side];
+            let (mitre_a, mitre_b) = (
+                mitred_join(style, side, (side + 3) % 4),
+                mitred_join(style, side, (side + 1) % 4),
+            );
+            if mitre_a || mitre_b {
+                // Where two solid sides of different colour meet, each is a trapezoid ending on the diagonal from
+                // the outer to the inner corner (css-backgrounds-3 section 5.2), not a line overlapping the other.
+                let points = border_side_polygon(
+                    side,
+                    (x, y, w, h),
+                    widths,
+                    (mitre_a, mitre_b),
+                    widths[side],
+                );
+                fill_polygon(canvas, &points, colour);
+            } else {
+                draw_border_line(
+                    canvas,
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    widths[side],
+                    styles[side],
+                    colour,
+                    alpha_to_opacity(colour[3]),
+                    is_top_or_left,
+                    outward_sign,
+                );
+            }
+        }
 
         canvas.surface.set_stroke(None);
     }
+}
+
+/// Whether side `side` and its neighbour `other` meet in a coloured mitre: both are drawn (non-zero width), both are
+/// solid, and their colours differ. Everything else keeps the overlapping lines (equal colours show no seam, a side
+/// of width 0 has no join).
+fn mitred_join(style: &BlockStyle, side: usize, other: usize) -> bool {
+    let widths = style.border_widths.map(crate::units::Pt::to_f32);
+    widths[side] > 0.0
+        && widths[other] > 0.0
+        && style.border_styles[side] == BorderStyleValue::Solid
+        && style.border_styles[other] == BorderStyleValue::Solid
+        && style.border_colors[side] != style.border_colors[other]
+}
+
+/// Whether every drawn side is solid, so the rounded mixed-colour painter ([`draw_border_ring`]) applies.
+fn ring_sides_are_solid(style: &BlockStyle) -> bool {
+    style
+        .border_widths
+        .iter()
+        .zip(style.border_styles)
+        .all(|(w, s)| w.to_f32() <= 0.0 || s == BorderStyleValue::Solid)
+}
+
+/// The four corners of border side `side` (0 top, 1 right, 2 bottom, 3 left) of the border box `(x, y, w, h)`, as the
+/// outer edge of the side plus the points `depth` inwards. A mitred end (`mitres.0` at the end shared with the
+/// previous side in the order top, right, bottom, left; `mitres.1` at the end shared with the next) runs along the
+/// line from the outer corner through the inner corner of the border (the neighbour's width along the edge for this
+/// side's width in depth); any other end is square.
+fn border_side_polygon(
+    side: usize,
+    (x, y, w, h): (f32, f32, f32, f32),
+    widths: [f32; 4],
+    mitres: (bool, bool),
+    depth: f32,
+) -> [(f32, f32); 4] {
+    // Start corner A, unit step u along the outer edge towards the end corner B, unit step n inwards.
+    let ((ox, oy), (ux, uy), (nx, ny), len) = match side {
+        0 => ((x, y), (1.0, 0.0), (0.0, 1.0), w),
+        1 => ((x + w, y), (0.0, 1.0), (-1.0, 0.0), h),
+        2 => ((x + w, y + h), (-1.0, 0.0), (0.0, -1.0), w),
+        _ => ((x, y + h), (0.0, -1.0), (1.0, 0.0), h),
+    };
+    let own = widths[side];
+    let (width_a, width_b) = (widths[(side + 3) % 4], widths[(side + 1) % 4]);
+    let mut depth = depth;
+    if mitres.0 && mitres.1 && width_a + width_b > 0.0 {
+        // The two mitre lines meet at this depth; going deeper would make the polygon cross itself.
+        depth = depth.min(len * own / (width_a + width_b));
+    }
+    let along_a = if mitres.0 { width_a * depth / own } else { 0.0 };
+    let along_b = if mitres.1 {
+        len - width_b * depth / own
+    } else {
+        len
+    };
+    let at = |a: f32, d: f32| (ox + ux * a + nx * d, oy + uy * a + ny * d);
+    [
+        at(0.0, 0.0),
+        at(len, 0.0),
+        at(along_b, depth),
+        at(along_a, depth),
+    ]
+}
+
+/// Fill the polygon `points` with `colour` (RGBA).
+fn fill_polygon(canvas: &mut Canvas<'_, '_>, points: &[(f32, f32); 4], colour: &[u8; 4]) {
+    let mut pb = krilla::geom::PathBuilder::new();
+    pb.move_to(points[0].0, points[0].1);
+    for p in &points[1..] {
+        pb.line_to(p.0, p.1);
+    }
+    pb.close();
+    if let Some(path) = pb.finish() {
+        canvas.surface.set_fill(Some(krilla::paint::Fill {
+            paint: krilla::color::rgb::Color::new(colour[0], colour[1], colour[2]).into(),
+            opacity: alpha_to_opacity(colour[3]),
+            rule: Default::default(),
+        }));
+        canvas.surface.set_stroke(None);
+        canvas.surface.draw_path(&path);
+        canvas.surface.set_fill(None);
+    }
+}
+
+/// Border radii reduced so that adjacent radii fit their edge (css-backgrounds-3 section 5.5), the same factor
+/// [`append_rounded_rect_subpath`] applies when it builds the path.
+fn fit_border_radii(radii: &[[f32; 2]; 4], w: f32, h: f32) -> [[f32; 2]; 4] {
+    let scale = |a: f32, b: f32, edge: f32| -> f32 {
+        let sum = a + b;
+        if sum > edge && sum > 0.0 {
+            edge / sum
+        } else {
+            1.0
+        }
+    };
+    let f = scale(radii[0][0], radii[1][0], w)
+        .min(scale(radii[1][1], radii[2][1], h))
+        .min(scale(radii[2][0], radii[3][0], w))
+        .min(scale(radii[3][1], radii[0][1], h));
+    radii.map(|[rx, ry]| [rx * f, ry * f])
+}
+
+/// Paints a rounded border whose sides have different colours: the four sides as wedges meeting on the diagonals from
+/// the outer to the inner corners of the border box, clipped to the ring between the outer rounded rectangle and the
+/// padding-box rounded rectangle, so the colour boundaries follow the curve (css-backgrounds-3 section 5.2). Every
+/// drawn side is solid (see [`ring_sides_are_solid`]); a width-0 side leaves its crescent to the neighbours' wedges.
+fn draw_border_ring(
+    canvas: &mut Canvas<'_, '_>,
+    style: &BlockStyle,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) {
+    let widths = style.border_widths.map(crate::units::Pt::to_f32);
+    let [bt, br, bb, bl] = widths;
+    let outer = style.border_radii.map(|p| p.map(crate::units::Pt::to_f32));
+    let fitted = fit_border_radii(&outer, w, h);
+    let inner = compute_padding_box_inner_radii(&fitted, &widths);
+
+    let mut pb = krilla::geom::PathBuilder::new();
+    append_rounded_rect_subpath(&mut pb, x, y, w, h, &fitted);
+    let (iw, ih) = (w - bl - br, h - bt - bb);
+    if iw > 0.0 && ih > 0.0 {
+        append_rounded_rect_subpath(&mut pb, x + bl, y + bt, iw, ih, &inner);
+    }
+    let Some(ring) = pb.finish() else {
+        return;
+    };
+    canvas
+        .surface
+        .push_clip_path(&ring, &krilla::paint::FillRule::EvenOdd);
+    for side in 0..4 {
+        if widths[side] <= 0.0 {
+            continue;
+        }
+        // The wedge reaches as deep as the ring does at the two corners it ends in: the border width plus the corner
+        // radius across the side (ry for top / bottom, rx for right / left), so no part of the ring is left unpainted.
+        let across = usize::from(side % 2 == 0);
+        let reach = fitted[side][across].max(fitted[(side + 1) % 4][across]);
+        let points = border_side_polygon(
+            side,
+            (x, y, w, h),
+            widths,
+            (
+                mitred_join(style, side, (side + 3) % 4),
+                mitred_join(style, side, (side + 1) % 4),
+            ),
+            widths[side] + reach,
+        );
+        fill_polygon(canvas, &points, &style.border_colors[side]);
+    }
+    canvas.surface.pop();
 }
 
 // ─── clamp_marker_size ───────────────────────────────────
@@ -3023,12 +3187,164 @@ mod dp_unit_tests {
         f(&mut canvas);
     }
 
+    // ── F186: a colour per side ─────────────────────────────────────
+
+    const C_RED: [u8; 4] = [204, 0, 0, 255];
+    const C_GREEN: [u8; 4] = [0, 170, 0, 255];
+    const C_BLUE: [u8; 4] = [0, 0, 204, 255];
+    const C_ORANGE: [u8; 4] = [255, 170, 0, 255];
+
+    fn mixed_style(widths: [f32; 4], radius: f32) -> BlockStyle {
+        BlockStyle {
+            border_colors: [C_RED, C_GREEN, C_BLUE, C_ORANGE],
+            border_widths: widths.map(|v| v.as_pt()),
+            border_styles: [BorderStyleValue::Solid; 4],
+            border_radii: [[radius, radius]; 4].map(|p| p.map(|v| v.as_pt())),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn uniform_border_color_is_some_only_when_all_four_sides_agree() {
+        let mut style = BlockStyle {
+            border_colors: [C_RED; 4],
+            ..Default::default()
+        };
+        assert_eq!(style.uniform_border_color(), Some(C_RED));
+        for side in 0..4 {
+            style.border_colors = [C_RED; 4];
+            style.border_colors[side] = C_BLUE;
+            assert_eq!(style.uniform_border_color(), None, "side {side}");
+        }
+        // A different alpha is a different colour.
+        style.border_colors = [C_RED; 4];
+        style.border_colors[2][3] = 128;
+        assert_eq!(style.uniform_border_color(), None);
+    }
+
+    #[test]
+    fn mitred_join_needs_two_drawn_solid_sides_of_different_colour() {
+        let style = mixed_style([4.0, 4.0, 4.0, 4.0], 0.0);
+        assert!(mitred_join(&style, 0, 3) && mitred_join(&style, 0, 1));
+        // Equal colours: lines overlap without a seam.
+        let same = BlockStyle {
+            border_colors: [C_RED; 4],
+            ..style.clone()
+        };
+        assert!(!mitred_join(&same, 0, 1));
+        // A neighbour of width 0 has no join.
+        let no_right = mixed_style([4.0, 0.0, 4.0, 4.0], 0.0);
+        assert!(!mitred_join(&no_right, 0, 1) && mitred_join(&no_right, 0, 3));
+        // A non-solid neighbour keeps overlapping lines.
+        let mut dashed = mixed_style([4.0; 4], 0.0);
+        dashed.border_styles[1] = BorderStyleValue::Dashed;
+        assert!(!mitred_join(&dashed, 0, 1) && !mitred_join(&dashed, 1, 0));
+    }
+
+    #[test]
+    fn side_polygon_ends_on_the_diagonal_from_outer_to_inner_corner() {
+        // Box (10, 20) 100 x 60, widths top 10, right 4, bottom 16, left 8.
+        let b = (10.0, 20.0, 100.0, 60.0);
+        let widths = [10.0, 4.0, 16.0, 8.0];
+        // Top, mitred at both ends: outer corners and the inner corners.
+        assert_eq!(
+            border_side_polygon(0, b, widths, (true, true), 10.0),
+            [(10.0, 20.0), (110.0, 20.0), (106.0, 30.0), (18.0, 30.0)]
+        );
+        // Right: start at the top-right corner, end at the bottom-right corner.
+        assert_eq!(
+            border_side_polygon(1, b, widths, (true, true), 4.0),
+            [(110.0, 20.0), (110.0, 80.0), (106.0, 64.0), (106.0, 30.0)]
+        );
+        // Bottom: start at the bottom-right corner, end at the bottom-left corner.
+        assert_eq!(
+            border_side_polygon(2, b, widths, (true, true), 16.0),
+            [(110.0, 80.0), (10.0, 80.0), (18.0, 64.0), (106.0, 64.0)]
+        );
+        // Left: start at the bottom-left corner, end at the top-left corner.
+        assert_eq!(
+            border_side_polygon(3, b, widths, (true, true), 8.0),
+            [(10.0, 80.0), (10.0, 20.0), (18.0, 30.0), (18.0, 64.0)]
+        );
+        // Square ends where the neighbour is not mitred.
+        assert_eq!(
+            border_side_polygon(0, b, widths, (false, true), 10.0),
+            [(10.0, 20.0), (110.0, 20.0), (106.0, 30.0), (10.0, 30.0)]
+        );
+        assert_eq!(
+            border_side_polygon(0, b, widths, (false, false), 10.0),
+            [(10.0, 20.0), (110.0, 20.0), (110.0, 30.0), (10.0, 30.0)]
+        );
+    }
+
+    #[test]
+    fn side_polygon_depth_is_capped_where_the_two_mitre_lines_meet() {
+        // 20 wide, 10 + 10 across: the lines meet at depth 20 * 4 / 20 = 4 even when asked for more.
+        let widths = [4.0, 10.0, 4.0, 10.0];
+        let p = border_side_polygon(0, (0.0, 0.0, 20.0, 40.0), widths, (true, true), 50.0);
+        assert_eq!(p[2], p[3], "a triangle: {p:?}");
+        assert_eq!(p[2], (10.0, 4.0));
+    }
+
+    #[test]
+    fn fit_border_radii_scales_all_radii_by_the_tightest_edge() {
+        // Pill: 9999 radii on an 80 x 20 box scale so that the left and right edges (20) fit: factor 20 / 19998.
+        let fitted = fit_border_radii(&[[9999.0; 2]; 4], 80.0, 20.0);
+        assert!((fitted[0][0] - 10.0).abs() < 0.01 && (fitted[0][1] - 10.0).abs() < 0.01);
+        // Radii that fit stay as they are.
+        let small = [[4.0, 2.0]; 4];
+        assert_eq!(fit_border_radii(&small, 80.0, 40.0), small);
+    }
+
+    #[test]
+    fn ring_painter_needs_every_drawn_side_to_be_solid() {
+        let mut style = mixed_style([4.0, 0.0, 4.0, 4.0], 8.0);
+        assert!(ring_sides_are_solid(&style));
+        // A side of width 0 may have any style; a drawn dashed side rules the ring painter out.
+        style.border_styles[1] = BorderStyleValue::Dashed;
+        assert!(ring_sides_are_solid(&style));
+        style.border_styles[0] = BorderStyleValue::Dashed;
+        assert!(!ring_sides_are_solid(&style));
+    }
+
+    #[test]
+    fn draw_block_border_mixed_colours_smoke() {
+        // Straight: trapezoids at the colour joins, a plain line for the lone side, dashed sides as overlapping
+        // lines, a translucent colour; rounded: the ring painter, a width-0 side, a pill and a box smaller than its
+        // borders.
+        let mut dashed = mixed_style([4.0; 4], 0.0);
+        dashed.border_styles = [BorderStyleValue::Dashed; 4];
+        let mut translucent = mixed_style([4.0, 8.0, 12.0, 16.0], 0.0);
+        translucent.border_colors[3][3] = 128;
+        let lone = BlockStyle {
+            border_colors: [[0, 0, 0, 255], [0, 0, 0, 255], C_RED, [0, 0, 0, 255]],
+            border_widths: [0.0, 0.0, 4.0, 0.0].map(|v| v.as_pt()),
+            border_styles: [BorderStyleValue::Solid; 4],
+            ..Default::default()
+        };
+        let cases = [
+            (mixed_style([4.0; 4], 0.0), 80.0, 80.0),
+            (mixed_style([4.0, 8.0, 12.0, 16.0], 0.0), 80.0, 80.0),
+            (translucent, 80.0, 80.0),
+            (dashed, 80.0, 80.0),
+            (lone, 80.0, 80.0),
+            (mixed_style([4.0; 4], 12.0), 80.0, 80.0),
+            (mixed_style([10.0, 4.0, 16.0, 8.0], 14.0), 80.0, 80.0),
+            (mixed_style([0.0, 0.0, 0.0, 4.0], 8.0), 80.0, 80.0),
+            (mixed_style([6.0; 4], 9999.0), 80.0, 20.0),
+            (mixed_style([10.0; 4], 6.0), 8.0, 8.0),
+        ];
+        for (style, w, h) in cases {
+            with_canvas_smoke(|canvas| draw_block_border(canvas, &style, 0.0, 0.0, w, h));
+        }
+    }
+
     #[test]
     fn draw_block_border_rounded_uniform_solid_smoke() {
         // has_radius && uniform_width && uniform_style && Solid
         // → rounded-rect stroke path (lines 1441-1458 in draw_block_border).
         let style = BlockStyle {
-            border_color: [0, 0, 0, 255],
+            border_colors: [[0, 0, 0, 255]; 4],
             border_widths: [2.0, 2.0, 2.0, 2.0].map(|v| v.as_pt()),
             border_styles: [BorderStyleValue::Solid; 4],
             border_radii: [[4.0, 4.0]; 4].map(|p| p.map(|v| v.as_pt())),
@@ -3045,7 +3361,7 @@ mod dp_unit_tests {
         // → two stroke_inset_rect calls (lines 1473-1476), covering
         //   stroke_inset_rect (1307-1308) and colored_stroke (1323-1324).
         let style = BlockStyle {
-            border_color: [0, 0, 100, 255],
+            border_colors: [[0, 0, 100, 255]; 4],
             border_widths: [6.0, 6.0, 6.0, 6.0].map(|v| v.as_pt()),
             border_styles: [BorderStyleValue::Double; 4],
             ..Default::default()
@@ -3061,7 +3377,7 @@ mod dp_unit_tests {
         // Each draw_border_line call hits the `_` arm → colored_stroke +
         // apply_border_style(Solid) + stroke_line.
         let style = BlockStyle {
-            border_color: [200, 100, 0, 255],
+            border_colors: [[200, 100, 0, 255]; 4],
             border_widths: [2.0, 4.0, 2.0, 4.0].map(|v| v.as_pt()),
             border_styles: [BorderStyleValue::Solid; 4],
             ..Default::default()
@@ -3077,7 +3393,7 @@ mod dp_unit_tests {
         // to the per-side fallback even with uniform widths.
         // draw_border_line Groove arm (lines 1369-1397).
         let style = BlockStyle {
-            border_color: [128, 128, 128, 255],
+            border_colors: [[128, 128, 128, 255]; 4],
             border_widths: [4.0, 4.0, 4.0, 4.0].map(|v| v.as_pt()),
             border_styles: [BorderStyleValue::Groove; 4],
             ..Default::default()
@@ -3090,7 +3406,7 @@ mod dp_unit_tests {
     #[test]
     fn draw_block_border_ridge_per_side_smoke() {
         let style = BlockStyle {
-            border_color: [128, 128, 128, 255],
+            border_colors: [[128, 128, 128, 255]; 4],
             border_widths: [4.0, 4.0, 4.0, 4.0].map(|v| v.as_pt()),
             border_styles: [BorderStyleValue::Ridge; 4],
             ..Default::default()
@@ -3104,7 +3420,7 @@ mod dp_unit_tests {
     fn draw_block_border_inset_per_side_smoke() {
         // draw_border_line Inset arm (lines 1399-1408).
         let style = BlockStyle {
-            border_color: [128, 128, 128, 255],
+            border_colors: [[128, 128, 128, 255]; 4],
             border_widths: [4.0, 4.0, 4.0, 4.0].map(|v| v.as_pt()),
             border_styles: [BorderStyleValue::Inset; 4],
             ..Default::default()
@@ -3117,7 +3433,7 @@ mod dp_unit_tests {
     #[test]
     fn draw_block_border_outset_per_side_smoke() {
         let style = BlockStyle {
-            border_color: [128, 128, 128, 255],
+            border_colors: [[128, 128, 128, 255]; 4],
             border_widths: [4.0, 4.0, 4.0, 4.0].map(|v| v.as_pt()),
             border_styles: [BorderStyleValue::Outset; 4],
             ..Default::default()
@@ -3132,7 +3448,7 @@ mod dp_unit_tests {
         // Non-uniform widths force per-side; top uses Double ≥ 3pt →
         // draw_border_line Double arm (lines 1354-1367).
         let style = BlockStyle {
-            border_color: [0, 0, 0, 255],
+            border_colors: [[0, 0, 0, 255]; 4],
             border_widths: [6.0, 2.0, 2.0, 2.0].map(|v| v.as_pt()),
             border_styles: [
                 BorderStyleValue::Double,

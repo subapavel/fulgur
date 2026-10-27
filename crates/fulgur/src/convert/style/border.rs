@@ -8,9 +8,13 @@ use crate::draw_primitives::{BlockStyle, BorderStyleValue};
 use crate::units::F32Units;
 
 pub(super) fn apply_to(style: &mut BlockStyle, ctx: &StyleContext<'_>) {
-    // Border color (use top border color for all sides for simplicity)
-    let bc = ctx.styles.clone_border_top_color();
-    style.border_color = absolute_to_rgba(bc.resolve_to_absolute(ctx.current_color));
+    // Border colours: each side has its own (css-backgrounds-3 section 4.1); `currentColor` resolves per side.
+    style.border_colors = [
+        side_color(&ctx.styles.clone_border_top_color(), ctx),
+        side_color(&ctx.styles.clone_border_right_color(), ctx),
+        side_color(&ctx.styles.clone_border_bottom_color(), ctx),
+        side_color(&ctx.styles.clone_border_left_color(), ctx),
+    ];
 
     // Border radii. Stylo evaluates length-percentage values in CSS px
     // space, so we feed it the CSS-px border-box basis and convert the
@@ -51,6 +55,11 @@ pub(super) fn apply_to(style: &mut BlockStyle, ctx: &StyleContext<'_>) {
     ];
 }
 
+/// One side's computed border colour as RGBA, `currentColor` resolved against the element's `color`.
+fn side_color(c: &style::values::computed::Color, ctx: &StyleContext<'_>) -> [u8; 4] {
+    absolute_to_rgba(c.resolve_to_absolute(ctx.current_color))
+}
+
 /// Resolve one border-radius corner component to PDF pt. Stylo resolves the
 /// length-percentage in CSS px (`Length::px()` -> f32 CSS px); `F32Units`
 /// (`f32 -> Px`) then `.in_pt()` converts to `Pt`. Byte-neutral.
@@ -84,6 +93,75 @@ pub(in crate::convert) fn map_border_style(
 #[cfg(test)]
 mod tests {
     use super::{map_border_style, resolve_radius};
+    use crate::units::F32Units;
+
+    /// `extract_block_style` of the `<div>` in `<body>` with `style` as its inline style.
+    fn div_style(style: &str) -> crate::draw_primitives::BlockStyle {
+        let doc = crate::blitz_adapter::parse_and_layout(
+            &format!(
+                "<!doctype html><html><body style=\"margin:0\"><div style=\"{style}\"></div></body></html>"
+            ),
+            595.0_f32.as_px(),
+            842.0_f32.as_px(),
+            &[],
+            false,
+        );
+        let body = doc.get_node(doc.root_element().children[1]).unwrap();
+        let div = doc.get_node(body.children[0]).unwrap();
+        super::super::extract_block_style(div, None, None)
+    }
+
+    const RED: [u8; 4] = [204, 0, 0, 255];
+    const GREEN: [u8; 4] = [0, 170, 0, 255];
+    const BLUE: [u8; 4] = [0, 0, 204, 255];
+    const ORANGE: [u8; 4] = [255, 170, 0, 255];
+    const BLACK: [u8; 4] = [0, 0, 0, 255];
+
+    #[test]
+    fn four_colours_are_read_per_side_in_trbl_order() {
+        let s = div_style("border: 4px solid; border-color: #c00 #0a0 #00c #fa0");
+        assert_eq!(s.border_colors, [RED, GREEN, BLUE, ORANGE]);
+        assert_eq!(s.uniform_border_color(), None);
+    }
+
+    #[test]
+    fn border_color_shorthand_expands_one_two_and_three_values() {
+        let one = div_style("border: 4px solid; border-color: #c00");
+        assert_eq!(one.border_colors, [RED; 4]);
+        assert_eq!(one.uniform_border_color(), Some(RED));
+        let two = div_style("border: 4px solid; border-color: #c00 #0a0");
+        assert_eq!(two.border_colors, [RED, GREEN, RED, GREEN]);
+        let three = div_style("border: 4px solid; border-color: #c00 #0a0 #00c");
+        assert_eq!(three.border_colors, [RED, GREEN, BLUE, GREEN]);
+    }
+
+    #[test]
+    fn a_side_shorthand_sets_only_its_own_colour_and_the_rest_stay_current_color() {
+        // The unset sides keep the initial `currentColor`, here the (black) `color` of the element.
+        let s = div_style("border-bottom: 4px solid #c00");
+        assert_eq!(s.border_colors, [BLACK, BLACK, RED, BLACK]);
+        let s = div_style("color: #00c; border-left: 4px solid #fa0");
+        assert_eq!(s.border_colors, [BLUE, BLUE, BLUE, ORANGE]);
+    }
+
+    #[test]
+    fn current_color_resolves_per_side_against_the_element_color() {
+        let s = div_style(
+            "color: #0a0; border: 2px solid; border-top-color: #c00; border-right-color: currentColor",
+        );
+        assert_eq!(s.border_colors, [RED, GREEN, GREEN, GREEN]);
+        assert_eq!(s.uniform_border_color(), None);
+        let all = div_style("color: #0a0; border: 2px solid");
+        assert_eq!(all.uniform_border_color(), Some(GREEN));
+    }
+
+    #[test]
+    fn a_translucent_side_keeps_its_alpha() {
+        let s = div_style("border: 2px solid #c00; border-left-color: rgba(255, 170, 0, 0.5)");
+        assert_eq!(s.border_colors[3], [255, 170, 0, 128]);
+        assert_eq!(s.border_colors[0], RED);
+    }
+
     use crate::draw_primitives::BorderStyleValue;
     use style::values::computed::{Length, LengthPercentage, Percentage};
     use style::values::generics::NonNegative;

@@ -9442,3 +9442,47 @@ fn test_render_bordered_body_with_image_over_three_pages_smoke() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// F186: every border side is painted in its own colour.
+// ---------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn render_smoke_border_sides_with_their_own_colours() {
+    // Four colours, one lone side, a colour join with unequal widths, and an accent: the mitred trapezoids and the
+    // single-side line path of `draw_block_border`.
+    let html = r#"<!DOCTYPE html><html><body>
+        <div style="width:80px;height:40px;border:8px solid;border-color:#c00 #0a0 #00c #fa0"></div>
+        <div style="width:80px;height:40px;border-bottom:4px solid #c00"></div>
+        <div style="width:80px;height:40px;border-style:solid;border-width:10px 4px 16px 8px;
+                    border-color:#c00 #0a0 #00c rgba(255,170,0,0.5)"></div>
+        <div style="width:80px;height:40px;border-left:4px solid #2563eb"></div>
+        <div style="width:80px;height:40px;border:6px dashed;border-color:#c00 #0a0 #00c #fa0"></div>
+        <div style="width:80px;height:40px;border:1px solid #ccc;border-top:0;color:#c00"></div>
+    </body></html>"#;
+    let pdf = Engine::builder()
+        .build()
+        .render(html)
+        .expect("render borders with a colour per side");
+    assert!(pdf.starts_with(b"%PDF"));
+}
+
+#[test]
+fn render_smoke_border_sides_with_their_own_colours_and_a_radius() {
+    // The rounded mixed-colour painter: wedges clipped to the ring between the outer and the padding-box rounded
+    // rectangles; with equal widths, unequal widths, a single side, a pill and a box smaller than its borders.
+    let html = r#"<!DOCTYPE html><html><body>
+        <div style="width:80px;height:40px;border:8px solid;border-color:#c00 #0a0 #00c #fa0;border-radius:12px"></div>
+        <div style="width:80px;height:40px;border-style:solid;border-width:10px 4px 16px 8px;
+                    border-color:#c00 #0a0 #00c #fa0;border-radius:14px 6px 20px 0"></div>
+        <div style="width:80px;height:40px;border-left:4px solid #2563eb;border-radius:8px"></div>
+        <div style="width:80px;height:20px;border:6px solid;border-color:#c00 #0a0 #00c #fa0;border-radius:9999px"></div>
+        <div style="width:4px;height:4px;border:10px solid;border-color:#c00 #0a0 #00c #fa0;border-radius:6px"></div>
+        <div style="width:80px;height:40px;border:6px dashed;border-color:#c00 #0a0 #00c #fa0;border-radius:12px"></div>
+    </body></html>"#;
+    let pdf = Engine::builder()
+        .build()
+        .render(html)
+        .expect("render rounded borders with a colour per side");
+    assert!(pdf.starts_with(b"%PDF"));
+}
