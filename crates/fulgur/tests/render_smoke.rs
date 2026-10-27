@@ -722,6 +722,25 @@ fn test_render_html_small_svg_background_is_one_tiling_pattern() {
 }
 
 #[test]
+fn test_render_html_svg_background_below_the_tile_cap_stays_per_tile() {
+    // SVG cells are a pattern only past MAX_TILES (poppler draws seams between
+    // SVG pattern cells): 51 x 51 tiles of 6 px stay per tile.
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="6" height="6"><rect width="3" height="3" fill="red"/></svg>"#;
+    let mut bundle = AssetBundle::default();
+    bundle.add_image("dot.svg", svg.to_vec());
+    let html = r#"<!DOCTYPE html><html><body style="margin:0">
+        <div style="width:300px;height:300px;background:url(dot.svg);"></div>
+    </body></html>"#;
+    let pdf = Engine::builder()
+        .assets(bundle)
+        .build()
+        .render(html)
+        .expect("render svg background below the cap");
+    assert!(pdf.starts_with(b"%PDF"));
+    assert_eq!(tiling_pattern_count(&pdf), 0, "per-tile below MAX_TILES");
+}
+
+#[test]
 fn test_render_html_few_tile_raster_background_stays_per_tile() {
     // Below IMAGE_PATTERN_MIN_TILES the per-tile draws are kept.
     let png_data: Vec<u8> = vec![

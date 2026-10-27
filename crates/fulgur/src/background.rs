@@ -621,7 +621,17 @@ fn draw_background_layer(
             img_h,
             (cx, cy, cw, ch),
         )
-        .filter(|g| g.grid.count.0.saturating_mul(g.grid.count.1) >= IMAGE_PATTERN_MIN_TILES),
+        .filter(|g| {
+            let n = g.grid.count.0.saturating_mul(g.grid.count.1);
+            match &layer.content {
+                // An SVG cell drawn through krilla-svg shows hairline seams between
+                // cells in poppler at DPIs where the step is not a whole number of
+                // device pixels (raster cells do not): keep SVG tiles per tile
+                // unless the per-tile path would be cut at `MAX_TILES`.
+                BgImageContent::Svg { .. } => n > MAX_TILES,
+                _ => n >= IMAGE_PATTERN_MIN_TILES,
+            }
+        }),
         _ => None,
     };
     let tiles = if dense_image_grid.is_some() {
@@ -1799,7 +1809,11 @@ fn draw_gradient_tiling_pattern(
     canvas.surface.set_fill(None);
 }
 
-/// Tile counts at or above which a raster / SVG layer is painted as one tiling
+/// Cap on the tiles the per-tile path enumerates (memory / CPU with tiny images on
+/// large containers). A raster or SVG grid larger than this is a tiling pattern.
+const MAX_TILES: usize = 10_000;
+
+/// Tile counts at or above which a raster layer is painted as one tiling
 /// pattern instead of one draw per tile. Below it the per-tile path is kept
 /// byte-for-byte: a handful of tiles costs a few operators, and viewers
 /// rasterise those exactly, whereas a pattern cell may be resampled.
@@ -2279,9 +2293,6 @@ fn compute_tile_positions_slow(
     if tile_w <= 0.0 || tile_h <= 0.0 {
         return tiles;
     }
-
-    // Cap tile count to prevent memory/CPU explosion with tiny images on large containers.
-    const MAX_TILES: usize = 10_000;
 
     let mut ty = start_y;
     while ty < end_y + 0.01 {
