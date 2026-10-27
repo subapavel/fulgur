@@ -70,13 +70,18 @@ impl AssetBundle {
         self.add_font_bytes(data)
     }
 
-    /// バイト列からフォントを登録する。
+    /// Registers a font from bytes, detecting the format by its magic bytes.
     ///
-    /// マジックバイトで形式を自動判定する:
-    /// - TTF / OTF / TTC: そのまま登録
-    /// - WOFF2: `woff2_patched` で TTF にデコードしてから登録
-    /// - WOFF1: `Error::UnsupportedFontFormat` を返す（未対応）
-    /// - その他: 警告ログを出してそのまま登録（caller が正しい形式を渡している可能性）
+    /// - TTF / OTF / TTC: registered as they are.
+    /// - WOFF2: decoded to TTF / OTF with `woff2_patched`, and the decoded bytes are registered.
+    /// - WOFF1: `Error::UnsupportedFontFormat` (not supported).
+    ///
+    /// What is registered is then checked with [`crate::font_check::check_font`], because Parley and the PDF writer
+    /// (Krilla) parse a font separately and disagree about which ones are usable: a face the writer cannot embed was
+    /// shaped with and then left out of the PDF without a word, or embedded as a Type 3 font with empty glyphs. A
+    /// font with any such face (and bytes that are not a font at all, which used to pass through with a warning) is
+    /// not registered: `Error::FontRejected` names each face and why. Every consumer of `fonts` (Parley for the
+    /// document and the margin boxes, the SVG font database, the PDF writer) therefore sees only fonts that work.
     pub fn add_font_bytes(&mut self, data: Vec<u8>) -> Result<()> {
         let decoded = match detect_font_format(&data) {
             FontFormat::Woff2 => decode_woff2(&data)?,
@@ -85,13 +90,11 @@ impl AssetBundle {
                     "WOFF1 is not supported; convert to WOFF2 or TTF/OTF".into(),
                 ));
             }
-            FontFormat::Unknown => {
-                log::warn!("add_font_bytes: unknown font magic bytes; passing through as-is");
-                data
-            }
-            FontFormat::Ttf | FontFormat::Otf | FontFormat::Ttc => data,
+            FontFormat::Unknown | FontFormat::Ttf | FontFormat::Otf | FontFormat::Ttc => data,
         };
-        self.fonts.push(Arc::new(decoded));
+        let decoded = Arc::new(decoded);
+        crate::font_check::check_font(&decoded).map_err(Error::FontRejected)?;
+        self.fonts.push(decoded);
         Ok(())
     }
 
@@ -318,27 +321,54 @@ mod tests {
         assert_eq!(detect_font_format(b"typ1\x00\x00"), FontFormat::Ttf);
     }
 
+    const NOTO_SANS: &[u8] = include_bytes!("../../../examples/.fonts/NotoSans-Regular.ttf");
+
     #[test]
     fn test_add_font_bytes_ttf_passthrough() {
         let mut bundle = AssetBundle::new();
-        let mut data = vec![0x00, 0x01, 0x00, 0x00];
-        data.extend_from_slice(&[0xAA; 100]);
         bundle
-            .add_font_bytes(data.clone())
+            .add_font_bytes(NOTO_SANS.to_vec())
             .expect("should accept TTF");
         assert_eq!(bundle.fonts.len(), 1);
-        assert_eq!(&bundle.fonts[0][..], &data[..]);
+        assert_eq!(&bundle.fonts[0][..], NOTO_SANS);
     }
 
     #[test]
-    fn test_add_font_bytes_unknown_passthrough() {
+    fn test_add_font_bytes_unknown_is_rejected() {
+        // Bytes that are not a font used to pass through with a warning and draw nothing (html-to-pdf F178).
         let mut bundle = AssetBundle::new();
-        let data = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00];
-        bundle
-            .add_font_bytes(data.clone())
-            .expect("unknown format should pass through");
-        assert_eq!(bundle.fonts.len(), 1);
-        assert_eq!(&bundle.fonts[0][..], &data[..]);
+        let err = bundle
+            .add_font_bytes(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00])
+            .expect_err("bytes that are not a font must be rejected");
+        match err {
+            Error::FontRejected(r) => {
+                assert_eq!(r.faces.len(), 1);
+                assert!(r.faces[0].reason.starts_with("not an OpenType font"), "{r}");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        assert_eq!(bundle.fonts.len(), 0);
+    }
+
+    #[test]
+    fn test_add_font_bytes_rejects_a_face_the_pdf_writer_cannot_embed() {
+        use crate::font_check::test_support::{rename_table, ttc_of};
+        let bold = include_bytes!("../../../examples/.fonts/NotoSans-Bold.ttf");
+        let mut bundle = AssetBundle::new();
+        bundle.add_font_bytes(NOTO_SANS.to_vec()).unwrap();
+        for (what, bad) in [
+            ("no head", rename_table(bold, b"head", b"hexd")),
+            ("no glyf", rename_table(bold, b"glyf", b"glyx")),
+            (
+                "collection with one bad face",
+                ttc_of(&[NOTO_SANS, &rename_table(bold, b"head", b"hexd")]),
+            ),
+        ] {
+            let err = bundle.add_font_bytes(bad).expect_err(what);
+            assert!(matches!(err, Error::FontRejected(_)), "{what}: {err:?}");
+            assert!(err.to_string().contains("Noto Sans Bold"), "{what}: {err}");
+        }
+        assert_eq!(bundle.fonts.len(), 1, "a rejected font is not kept");
     }
 
     #[test]
@@ -536,12 +566,10 @@ mod tests {
 
     #[test]
     fn add_font_file_accepts_valid_ttf_on_disk() {
-        // Write a file whose first 4 bytes are TTF magic (0x00010000);
-        // add_font_file reads it and passes it to add_font_bytes unchanged.
+        // Write a real TTF; add_font_file reads it and passes it to add_font_bytes unchanged.
         let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
         use std::io::Write as _;
-        let mut data = vec![0x00u8, 0x01, 0x00, 0x00];
-        data.extend_from_slice(&[0xAB; 32]);
+        let data = NOTO_SANS.to_vec();
         tmp.write_all(&data).expect("write");
         let mut bundle = AssetBundle::new();
         bundle

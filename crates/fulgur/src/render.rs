@@ -20,6 +20,9 @@ use std::sync::Arc;
 /// to per-type draw functions sourced from `drawables`. Page settings
 /// (size, margins, landscape, GCPM `@page` overrides) resolve once per
 /// page.
+///
+/// Returns the PDF and the glyph runs that were left out because the PDF writer could not read their face
+/// (`KrillaFonts::skip_run`; the caller reports them).
 #[allow(clippy::too_many_arguments)]
 pub fn render_v2(
     config: &Config,
@@ -36,7 +39,7 @@ pub fn render_v2(
     serialize_settings: SerializeSettings,
     anchor_map: Option<&AnchorMap>,
     implicit_href_by_page: &BTreeMap<usize, String>,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Vec<crate::convert::DroppedText>)> {
     let mut document = if config.effective_tagging() {
         let configuration = if config.pdf_ua {
             Configuration::new_with_validator(Validator::UA1)
@@ -477,9 +480,10 @@ pub fn render_v2(
     }
 
     document.set_metadata(build_metadata(config, html_title.as_deref()));
-    document
+    let pdf = document
         .finish()
-        .map_err(|e| Error::PdfGeneration(format!("{e:?}")))
+        .map_err(|e| Error::PdfGeneration(format!("{e:?}")))?;
+    Ok((pdf, krilla_fonts.into_skipped()))
 }
 
 /// Phase 4 v2 per-page draw dispatcher. Walks every `(node_id,

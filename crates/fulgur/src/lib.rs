@@ -548,6 +548,7 @@ pub mod draw_primitives;
 pub mod drawables;
 pub mod engine;
 pub mod error;
+pub mod font_check;
 pub mod gcpm;
 pub mod image;
 pub mod inspect;

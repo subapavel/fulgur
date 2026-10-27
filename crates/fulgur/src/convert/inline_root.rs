@@ -704,7 +704,7 @@ const EXCERPT_CHARS: usize = 60;
 /// Whitespace (collapsed or not), control characters and default-ignorable code points (zero-width space
 /// and joiners, soft hyphen, variation selectors, …) have no glyphs to lose and are not reported; gaps are
 /// separated by one space in the excerpt.
-fn uncovered_text(text: &str, covered: &[Range<usize>]) -> Option<String> {
+pub(crate) fn uncovered_text(text: &str, covered: &[Range<usize>]) -> Option<String> {
     let sorted;
     let covered = if covered.windows(2).all(|w| w[0].start <= w[1].start) {
         covered

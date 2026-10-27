@@ -28,6 +28,7 @@ use crate::MAX_DOM_DEPTH;
 
 mod block;
 mod inline_root;
+pub(crate) use inline_root::uncovered_text;
 mod list_item;
 mod list_marker;
 mod positioned;
@@ -116,7 +117,7 @@ pub struct DroppedTexts {
 }
 
 impl DroppedTexts {
-    fn push(&mut self, d: DroppedText) {
+    pub(crate) fn push(&mut self, d: DroppedText) {
         if self.seen.insert((d.element.clone(), d.excerpt.clone())) {
             self.list.push(d);
         }

@@ -661,6 +661,8 @@ pub struct KrillaFonts {
     fonts: std::collections::HashMap<(usize, u32), KrillaFontEntry>,
     /// How many faces were parsed (cache misses); a test hook.
     pub(crate) misses: usize,
+    /// Glyph runs left out because their face does not parse (see [`KrillaFonts::skip_run`]).
+    skipped: crate::convert::DroppedTexts,
 }
 
 /// The buffer a cached font was made from (kept alive so its address stays the key) and the font, `None` when it does
@@ -678,6 +680,26 @@ impl KrillaFonts {
         let font = krilla::text::Font::new(Arc::clone(data).into(), index);
         self.fonts.insert(key, (Arc::clone(data), font.clone()));
         font
+    }
+
+    /// Records that the glyph run of `text` is left out of the PDF because [`KrillaFonts::get`] had no font for its
+    /// face. Safety net: `AssetBundle::add_font_bytes` refuses such a face, so this is only reachable when
+    /// `AssetBundle::fonts` is filled directly, or with system fonts. Each distinct text is kept once.
+    pub fn skip_run(&mut self, text: &str) {
+        let excerpt = crate::convert::uncovered_text(text, &[]).unwrap_or_default();
+        if excerpt.is_empty() {
+            // Only whitespace and invisible characters: nothing is lost.
+            return;
+        }
+        self.skipped.push(crate::convert::DroppedText {
+            element: "glyph run in a face the PDF writer cannot read".into(),
+            excerpt,
+        });
+    }
+
+    /// The runs recorded by [`KrillaFonts::skip_run`], in the order they were drawn.
+    pub fn into_skipped(self) -> Vec<crate::convert::DroppedText> {
+        self.skipped.into_vec()
     }
 }
 

@@ -117,6 +117,12 @@ default — see the tracking issue `fulgur-a8s` and the README's
   - Short version: **touch fd 1 only from a crate that can guarantee
     single-threaded semantics**. That's CLI today; bindings are
     multi-threaded by design and must leave fd 1 alone.
+- **Fonts are checked when they are registered** (html-to-pdf F178): `AssetBundle::add_font_bytes` runs
+  `font_check::check_font` (Krilla's own parser plus an outline check) and returns `Error::FontRejected` for a file with
+  any face the PDF writer cannot embed, or bytes that are not a font. Parley and Krilla disagree otherwise: a face
+  without `head` was shaped with and then skipped at draw time, one without `glyf` was embedded as invisible Type 3.
+  Filling the public `AssetBundle::fonts` directly bypasses the check; the draw-time safety net (`KrillaFonts::skip_run`)
+  then reports the dropped run like text without a face (`Error::TextWithoutFont` under `strict_text`).
 - **Worktree sparse-checkout**: `git worktree add` inherits a `/.beads/`-only
   sparse-checkout pattern, which makes `git add` refuse modifications to
   source files (`paths ... outside of your sparse-checkout definition`).

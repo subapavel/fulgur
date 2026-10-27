@@ -24,6 +24,11 @@ pub enum Error {
     #[error("Unsupported font format: {0}")]
     UnsupportedFontFormat(String),
 
+    /// A font file with a face the PDF writer cannot embed, or bytes that are not a font (`AssetBundle::add_font_bytes`).
+    /// The file is not registered; the message names each face (index, full name) and why.
+    #[error("font rejected: {0}")]
+    FontRejected(crate::font_check::FontRejection),
+
     /// Text for which no glyph run was produced (`EngineBuilder::strict_text`): `<element> "excerpt"` each,
     /// at most 20 in the message. A character the chosen font has no glyph for (`.notdef`) still gets a run
     /// and is not reported; nor is text in `@page` margin boxes.

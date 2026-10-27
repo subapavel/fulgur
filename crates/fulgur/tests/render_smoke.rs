@@ -8531,7 +8531,7 @@ mod svg_images {
         fn flush(&self) {}
     }
 
-    fn warnings_with(needle: &str) -> Vec<String> {
+    pub(super) fn warnings_with(needle: &str) -> Vec<String> {
         static INIT: OnceLock<()> = OnceLock::new();
         INIT.get_or_init(|| {
             let _ = log::set_logger(&Collect);
@@ -9139,4 +9139,84 @@ fn test_render_svg_text_with_an_unbundled_family_is_drawn_or_refused_when_strict
     // A list with a bundled entry is fine in strict mode.
     let ok = html.replace("Georgia, Palatino", "Georgia, Noto Sans");
     strict.render(&ok).expect("a bundled entry resolves");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// html-to-pdf F178: a glyph run in a face the PDF writer cannot read is reported, not dropped silently.
+// ---------------------------------------------------------------------------------------------------------------
+
+mod rejected_fonts {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Noto Sans Bold with its `head` table renamed `hexd` (the directory stays sorted): Parley registers and shapes
+    /// with it, Krilla's `Font::new` returns `None`.
+    fn bold_without_head() -> Vec<u8> {
+        let font = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../examples/.fonts/NotoSans-Bold.ttf"),
+        )
+        .unwrap();
+        let n = u16::from_be_bytes([font[4], font[5]]) as usize;
+        let mut records: Vec<[u8; 16]> = (0..n)
+            .map(|i| font[12 + 16 * i..28 + 16 * i].try_into().unwrap())
+            .collect();
+        for r in records.iter_mut().filter(|r| &r[..4] == b"head") {
+            r[..4].copy_from_slice(b"hexd");
+        }
+        records.sort_by(|a, b| a[..4].cmp(&b[..4]));
+        let mut out = font;
+        for (i, r) in records.iter().enumerate() {
+            out[12 + 16 * i..28 + 16 * i].copy_from_slice(r);
+        }
+        out
+    }
+
+    /// The bad font goes straight into `AssetBundle::fonts`, which is public and bypasses the check of
+    /// `add_font_bytes`; this is the only way left for such a face to reach the writer.
+    fn bundle() -> AssetBundle {
+        let mut assets = noto_bundle();
+        assets.fonts.push(Arc::new(bold_without_head()));
+        assets
+    }
+
+    fn html(word: &str) -> String {
+        format!(
+            "<!DOCTYPE html><html><body><p>Normal text</p>\
+             <p style=\"font-weight:700\">{word}</p></body></html>"
+        )
+    }
+
+    #[test]
+    fn render_smoke_a_run_in_a_face_krilla_cannot_read_is_an_error_in_strict_text_mode() {
+        let result = Engine::builder()
+            .system_fonts(false)
+            .strict_text(true)
+            .assets(bundle())
+            .build()
+            .render(&html("ZXQSTRICT"));
+        match result {
+            Err(fulgur::Error::TextWithoutFont(found)) => {
+                assert_eq!(found.len(), 1, "{found:?}");
+                assert_eq!(found[0].excerpt, "ZXQSTRICT");
+                assert!(found[0].element.contains("glyph run"), "{found:?}");
+            }
+            other => panic!("expected TextWithoutFont, got {:?}", other.map(|p| p.len())),
+        }
+    }
+
+    #[test]
+    fn render_smoke_a_run_in_a_face_krilla_cannot_read_is_one_warning_otherwise() {
+        super::svg_images::warnings_with("");
+        let pdf = Engine::builder()
+            .system_fonts(false)
+            .assets(bundle())
+            .build()
+            .render(&html("ZXQLENIENT"))
+            .expect("not strict: a PDF without the run");
+        assert!(pdf.starts_with(b"%PDF-"));
+        let warned = super::svg_images::warnings_with("ZXQLENIENT");
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(warned[0].contains("left out of the PDF"), "{warned:?}");
+    }
 }

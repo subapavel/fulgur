@@ -736,19 +736,8 @@ impl Engine {
             self.report_svg_images(svg_images)?;
         }
         // Pass 2 (`anchor_map` is `Some`) lays out the same text again; report it once.
-        if anchor_map.is_none() && !dropped_text.is_empty() {
-            if self.strict_text {
-                return Err(crate::error::Error::TextWithoutFont(dropped_text));
-            }
-            for d in dropped_text.iter().take(MAX_DROPPED_TEXT_WARNINGS) {
-                log::warn!("text has no font face and is left out of the PDF: {d}");
-            }
-            if dropped_text.len() > MAX_DROPPED_TEXT_WARNINGS {
-                log::warn!(
-                    "... and {} more pieces of text without a font face",
-                    dropped_text.len() - MAX_DROPPED_TEXT_WARNINGS
-                );
-            }
+        if anchor_map.is_none() {
+            self.report_dropped_text(dropped_text)?;
         }
         Ok(LayoutArtifacts {
             drawables,
@@ -762,6 +751,28 @@ impl Engine {
             collected_anchor_map,
             needs_pass_two: needs_anchor_map_for_pass_two,
         })
+    }
+
+    /// Text that is left out of the PDF: an error with `strict_text`, otherwise a `log::warn!` each (at most
+    /// `MAX_DROPPED_TEXT_WARNINGS`, the rest counted in one more line). Text with no matching face is found while
+    /// converting; glyph runs in a face the PDF writer cannot read are found while drawing.
+    fn report_dropped_text(&self, dropped_text: Vec<crate::convert::DroppedText>) -> Result<()> {
+        if dropped_text.is_empty() {
+            return Ok(());
+        }
+        if self.strict_text {
+            return Err(crate::error::Error::TextWithoutFont(dropped_text));
+        }
+        for d in dropped_text.iter().take(MAX_DROPPED_TEXT_WARNINGS) {
+            log::warn!("text has no font face and is left out of the PDF: {d}");
+        }
+        if dropped_text.len() > MAX_DROPPED_TEXT_WARNINGS {
+            log::warn!(
+                "... and {} more pieces of text without a font face",
+                dropped_text.len() - MAX_DROPPED_TEXT_WARNINGS
+            );
+        }
+        Ok(())
     }
 
     /// The raster images inside SVGs that were left out (an error with `strict_images`, otherwise a `log::warn!`
@@ -840,7 +851,7 @@ impl Engine {
         // value `layout_to_drawables` used for parsing.
         let fonts = self.fonts();
 
-        crate::render::render_v2(
+        let (pdf, skipped) = crate::render::render_v2(
             &self.config,
             &pagination_geometry,
             &drawables,
@@ -855,7 +866,9 @@ impl Engine {
             self.serialize_settings.clone(),
             anchor_map,
             &implicit_href_map,
-        )
+        )?;
+        self.report_dropped_text(skipped)?;
+        Ok(pdf)
     }
 
     /// Render an HTML string to a PDF file.

@@ -840,6 +840,8 @@ pub fn draw_shaped_lines(
                     }
                     // The Krilla font of this face, parsed once per render
                     let Some(font) = canvas.fonts.get(&run.font_data, run.font_index) else {
+                        // The PDF writer cannot read this face: say so instead of dropping the run silently.
+                        canvas.fonts.skip_run(&run.text);
                         continue;
                     };
 
