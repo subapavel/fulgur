@@ -1539,6 +1539,12 @@ pub struct PaginationGeometry {
     /// table (its frame is as tall as the fragment), not a slice of one table box, and the header group repeats
     /// at the top of the pieces that continue it. `false` for everything else.
     pub table_pieces: bool,
+    /// F37: for `<body>` only, its border box on each page it spans, in strip coordinates (y 0 is the top of the
+    /// page's body area; on page 0 that is body's own top). Page 0 runs to `bottom(0)`, a middle page to
+    /// `fresh()`, the last page to where the box ends ([`body_box_slices`]). The renderer paints body's own
+    /// background, border and shadow from these instead of at a page-high box on every page. Empty for everything else
+    /// (and for a body that was not fragmented, which has no body fragment).
+    pub box_slices: Vec<Fragment>,
 }
 
 impl PaginationGeometry {
@@ -1616,6 +1622,41 @@ impl PageStrips {
     pub(crate) fn fresh(self) -> f32 {
         self.page_h
     }
+}
+
+/// F37: the border box of `<body>` on each page it spans (css-break-3 section 5.4, `box-decoration-break: slice`): a
+/// box that breaks fills the fragmentainer on every page but its last, so page 0 runs to `bottom(0)` and a middle page
+/// to `fresh()`; the last page runs to `end.1`, the y where the box ends on it (its last in-flow child plus what body
+/// has below it: padding, border, an inner margin), and never past the page area.
+///
+/// `end` is `(page, y)` of that end. A body that ends on page 0 has one slice of `body_h`, clamped to the page area
+/// (a body taller than its content's pages is not extended with pages of its own, F37c). `x` and `w` are body's, copied
+/// into every slice. Pure.
+pub(crate) fn body_box_slices(
+    strips: PageStrips,
+    x: f32,
+    w: f32,
+    body_h: f32,
+    end: (u32, f32),
+) -> Vec<Fragment> {
+    let (last, end_y) = end;
+    let slice = |page: u32, height: f32| Fragment {
+        page_index: page,
+        x: x.as_px(),
+        y: 0.0_f32.as_px(),
+        width: w.as_px(),
+        height: height.max(0.0).as_px(),
+    };
+    if last == 0 {
+        return vec![slice(0, body_h.min(strips.bottom(0)))];
+    }
+    let mut slices = Vec::with_capacity(last as usize + 1);
+    slices.push(slice(0, strips.bottom(0)));
+    for page in 1..last {
+        slices.push(slice(page, strips.fresh()));
+    }
+    slices.push(slice(last, end_y.min(strips.bottom(last))));
+    slices
 }
 
 /// Taffy tree wrapper that intercepts the pagination root through
@@ -1942,7 +1983,7 @@ impl<'a> PaginationLayoutTree<'a> {
         body_w: f32,
         split: &LineSplit,
     ) -> usize {
-        fragment_nested_inline_root(
+        let end = fragment_nested_inline_root(
             &mut self.geometry,
             self.doc,
             body_id,
@@ -1956,6 +1997,13 @@ impl<'a> PaginationLayoutTree<'a> {
             split,
             0,
         );
+        // F37: body's own box ends where its last line (and its padding and border below) ends.
+        let body_h = self
+            .doc
+            .get_node(body_id)
+            .map_or(0.0, |n| n.final_layout.size.height);
+        let slices = body_box_slices(self.strips, body_x, body_w, body_h, end);
+        self.geometry.entry(body_id).or_default().box_slices = slices;
         let mut emitted = self.geometry.get(&body_id).map_or(0, |g| g.fragments.len());
         if let Some(store) = self.running_store {
             let children = self
@@ -2144,6 +2192,9 @@ impl<'a> PaginationLayoutTree<'a> {
         // must neither move the cursor on again nor be counted as a row of
         // its own.
         let mut prev_plain: Option<(f32, u32, f32, f32)> = None;
+        // F37: the page and the y (page-local) below the last child that was placed, for the end of body's box. Not
+        // `page_index`: a trailing `break-after: page` moves that on without placing anything.
+        let mut last_end: Option<(u32, f32)> = None;
         // fulgur-uebl: tracks the used page-name of the previously
         // placed in-flow sibling (`Some(Some(name))` named, `Some(None)`
         // auto/unnamed, `None` no previous). When the next sibling's
@@ -2440,6 +2491,7 @@ impl<'a> PaginationLayoutTree<'a> {
                             }
                             prev_bottom_y_in_body = prev_bottom_y_in_body.max(row_bottom);
                         }
+                        last_end = Some((page_index, cursor_y));
                         if !is_float {
                             prev_used_page = Some(used_end.clone());
                         }
@@ -2540,6 +2592,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     }
                     prev_bottom_y_in_body = prev_bottom_y_in_body.max(row_bottom);
                 }
+                last_end = Some((page_index, cursor_y));
                 if !is_float {
                     prev_used_page = Some(used_end.clone());
                 }
@@ -2764,6 +2817,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     }
                     prev_bottom_y_in_body = prev_bottom_y_in_body.max(row_bottom);
                 }
+                last_end = Some((page_index, cursor_y));
                 if !is_float {
                     prev_used_page = Some(used_end.clone());
                 }
@@ -2957,6 +3011,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     }
                     prev_bottom_y_in_body = prev_bottom_y_in_body.max(row_bottom);
                 }
+                last_end = Some((page_index, cursor_y));
                 if !is_float {
                     prev_used_page = Some(used_end.clone());
                 }
@@ -3016,6 +3071,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 }
                 prev_bottom_y_in_body = prev_bottom_y_in_body.max(row_bottom);
             }
+            last_end = Some((page_index, cursor_y));
             prev_plain = Some((this_top_in_body, page_index, placed_y, cursor_y));
             if !is_float {
                 prev_used_page = Some(used_end.clone());
@@ -3035,6 +3091,19 @@ impl<'a> PaginationLayoutTree<'a> {
                 cursor_y = 0.0;
             }
         }
+
+        // F37: body's own box on each page. It ends below its last child by what body has under it (padding,
+        // border, an inner margin: `body_h - prev_bottom_y_in_body`, as the cursor includes the gaps between
+        // children); a body without placed children is its own height.
+        let end = match last_end {
+            Some((page, y)) => (
+                page,
+                y + (body_layout.size.height - prev_bottom_y_in_body).max(0.0),
+            ),
+            None => (0, body_layout.size.height),
+        };
+        let slices = body_box_slices(self.strips, body_x, body_w, body_layout.size.height, end);
+        self.geometry.entry(body_id).or_default().box_slices = slices;
 
         emitted
     }
@@ -8823,6 +8892,144 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(body.fragments[0].height.to_f32(), height);
         assert!(body.line_slices.is_empty());
         assert_eq!(implied_page_count(&table), 1);
+        let heights: Vec<f32> = body.box_slices.iter().map(|f| f.height.to_f32()).collect();
+        assert_eq!(heights, [height], "F37: one slice of body's own height");
+    }
+
+    fn slice_heights(geom: &PaginationGeometry) -> Vec<(u32, f32)> {
+        geom.box_slices
+            .iter()
+            .map(|f| (f.page_index, f.height.to_f32()))
+            .collect()
+    }
+
+    /// F37: an inline-root body's box fills every page but the last and ends at its last line plus the padding and
+    /// border below it.
+    #[test]
+    fn body_inline_root_box_slices_end_at_the_last_line() {
+        let mut doc = parse(&body_lines_html(200, "", None), 600.0);
+        let body_id = body_node(&doc);
+        let table = run_pass(&mut doc, 800.0);
+        // 40 lines per page: five full pages.
+        let want: Vec<(u32, f32)> = (0..5).map(|p| (p, 800.0)).collect();
+        assert_eq!(slice_heights(&table[&body_id]), want);
+
+        let mut doc = parse(&body_lines_html(200, "padding:20px", None), 600.0);
+        let body_id = body_node(&doc);
+        let table = run_pass(&mut doc, 800.0);
+        // 39 lines per page below the top inset (780); the last page holds 5 lines (100) and both insets.
+        let mut want: Vec<(u32, f32)> = (0..5).map(|p| (p, 800.0)).collect();
+        want.push((5, 140.0));
+        assert_eq!(slice_heights(&table[&body_id]), want);
+    }
+
+    /// F37: the walk over body's children records where body's box ends on each page: page 0 runs to `bottom(0)`
+    /// (the page strip less body's offset), a middle page to the strip, the last to the last child plus body's
+    /// padding and border; a trailing `break-after: page` adds no slice.
+    #[test]
+    fn body_box_slices_follow_the_children_of_the_walk() {
+        let divs = |n: usize, last_style: &str| {
+            let mut s = "<div style=\"height:100px\"></div>".repeat(n - 1);
+            s.push_str(&format!("<div style=\"height:100px;{last_style}\"></div>"));
+            s
+        };
+        let html = |content: String| {
+            format!(
+                "<!DOCTYPE html><html><body style=\"margin:40px 0 0;padding-bottom:20px;border-bottom:5px solid\">\
+                 {content}</body></html>"
+            )
+        };
+        for (last_style, label) in [("", "plain"), ("break-after:page", "trailing break")] {
+            let mut doc = parse(&html(divs(25, last_style)), 600.0);
+            let body_id = body_node(&doc);
+            let table = crate::blitz_adapter::extract_column_style_table(&doc);
+            let geom = run_pass_with_break_styles(doc.deref_mut(), 1000.0_f32.as_px(), &table);
+            // Strips: page 0 is 960 (the 40px offset), the others 1000. Nine divs fit page 0, ten page 1, six page 2
+            // (600) with the 20px padding and the 5px border below them.
+            assert_eq!(
+                slice_heights(&geom[&body_id]),
+                [(0, 960.0), (1, 1000.0), (2, 625.0)],
+                "{label}"
+            );
+            for f in &geom[&body_id].box_slices {
+                assert_eq!(f.y.to_f32(), 0.0);
+            }
+            // `fragments` is untouched: body keeps its one fragment on page 0.
+            assert_eq!(geom[&body_id].fragments.len(), 1);
+        }
+    }
+
+    /// F37: a body that fits one page has one slice of its own height; one taller than the page area is clamped to it.
+    #[test]
+    fn body_box_slices_of_a_short_and_of_a_tall_body() {
+        let mut doc = parse(
+            "<!DOCTYPE html><html><body style=\"margin:40px 0;padding:10px\">\
+             <div style=\"height:300px\"></div></body></html>",
+            600.0,
+        );
+        let body_id = body_node(&doc);
+        let table = run_pass(&mut doc, 1000.0);
+        assert_eq!(slice_heights(&table[&body_id]), [(0, 320.0)]);
+
+        // Content on one page, but a `height` far beyond it (F37c): the box stops at the page area (1000 - 40).
+        let mut doc = parse(
+            "<!DOCTYPE html><html><body style=\"margin:40px 0;height:5000px\">\
+             <div style=\"height:300px\"></div></body></html>",
+            600.0,
+        );
+        let body_id = body_node(&doc);
+        let table = run_pass(&mut doc, 1000.0);
+        assert_eq!(slice_heights(&table[&body_id]), [(0, 960.0)]);
+    }
+
+    fn strips_1000_offset_40() -> PageStrips {
+        PageStrips::new(1000.0, 40.0)
+    }
+
+    /// F37: pure slice arithmetic of `body_box_slices`.
+    #[test]
+    fn body_box_slices_arithmetic() {
+        let strips = strips_1000_offset_40();
+        let heights = |s: Vec<Fragment>| -> Vec<(u32, f32)> {
+            s.iter()
+                .map(|f| (f.page_index, f.height.to_f32()))
+                .collect()
+        };
+        // one page: the body's height
+        assert_eq!(
+            heights(body_box_slices(strips, 7.0, 500.0, 340.0, (0, 340.0))),
+            [(0, 340.0)]
+        );
+        // one page: clamped to the page area
+        assert_eq!(
+            heights(body_box_slices(strips, 7.0, 500.0, 4000.0, (0, 340.0))),
+            [(0, 960.0)]
+        );
+        // three pages: bottom(0), fresh, the end
+        assert_eq!(
+            heights(body_box_slices(strips, 0.0, 500.0, 2500.0, (2, 620.0))),
+            [(0, 960.0), (1, 1000.0), (2, 620.0)]
+        );
+        // the end past the page area is clamped; before it, trailing padding is in `end` already
+        assert_eq!(
+            heights(body_box_slices(strips, 0.0, 500.0, 2500.0, (1, 1500.0))),
+            [(0, 960.0), (1, 1000.0)]
+        );
+        // x and w are copied into every slice; y is the top of the slice
+        let s = body_box_slices(strips, 7.0, 500.0, 2500.0, (2, 620.0));
+        assert!(
+            s.iter()
+                .all(|f| f.x.to_f32() == 7.0 && f.width.to_f32() == 500.0 && f.y.to_f32() == 0.0)
+        );
+        // a negative or NaN end is no height
+        assert_eq!(
+            heights(body_box_slices(strips, 0.0, 1.0, 1.0, (1, f32::NAN))),
+            [(0, 960.0), (1, 1000.0)]
+        );
+        assert_eq!(
+            heights(body_box_slices(strips, 0.0, 1.0, 1.0, (1, -5.0))),
+            [(0, 960.0), (1, 0.0)]
+        );
     }
 
     /// F111: a body with a line taller than a page (a box alone on its line) is left to the walk over its children,
