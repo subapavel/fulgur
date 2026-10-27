@@ -494,8 +494,11 @@ pub struct LinkSpanEntry;
 pub struct Drawables {
     /// `body_layout.location.x/y` in pt. Captures the html → body
     /// offset that CSS margin collapsing folds onto the body element.
-    /// `render_v2` adds this to every per-fragment `(x, y)` so v2 paint
+    /// `render_v2` adds the y part to every page-0 fragment's `y` (and to
+    /// no other page's; fragment x already holds body's x) so v2 paint
     /// matches v1's `html → body @ pc=(body.x, body.y)` chain exactly.
+    /// Geometry for boxes placed in the initial containing block is stored
+    /// in the same frame (`pagination_layout::icb_to_fragment`).
     /// Pre-Phase-4 the fragmenter intentionally records body's own
     /// fragment at `y=0` in body-content-area-relative coordinates and
     /// downstream slicing logic depends on that — keeping it relative

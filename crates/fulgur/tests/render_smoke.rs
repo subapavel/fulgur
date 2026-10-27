@@ -9486,3 +9486,33 @@ fn render_smoke_border_sides_with_their_own_colours_and_a_radius() {
         .expect("render rounded borders with a colour per side");
     assert!(pdf.starts_with(b"%PDF"));
 }
+
+#[test]
+fn render_smoke_body_direct_boxes_in_a_margined_body() {
+    // html-to-pdf F187 / F40: absolutely positioned and fixed children of a margined, bordered body are stored in
+    // the fragmenter's frame (x without body's offset, y without it after page 0), static and positioned body.
+    let lines = (0..120)
+        .map(|i| format!("<div style=\"height:20px\">line {i}</div>"))
+        .collect::<String>();
+    for body_position in ["static", "relative"] {
+        let html = format!(
+            "<!DOCTYPE html><html><head><style>@page {{ size: A4; margin: 0 }}\
+             body {{ margin: 30px; border: 4px solid #c00; position: {body_position} }}</style></head><body>{lines}\
+             <div style=\"position:absolute;top:50px;left:50px;width:100px;height:100px;background:#0a0\"></div>\
+             <div style=\"position:absolute;right:50px;bottom:50px;width:100px;height:100px;background:#0a0\"></div>\
+             <div style=\"position:absolute;top:1300px;left:10%;width:100px;height:100px;background:#0a0\"></div>\
+             <div style=\"position:absolute;left:50px;width:100px;height:100px;background:#0a0\"></div>\
+             <div style=\"position:fixed;top:50px;left:50px;width:100px;height:100px;background:#00c\"></div>\
+             </body></html>"
+        );
+        let pdf = Engine::builder()
+            .build()
+            .render(&html)
+            .expect("render body-direct boxes in a margined body");
+        assert!(pdf.starts_with(b"%PDF"));
+        assert!(
+            page_count(&pdf) >= 2,
+            "{body_position}: the rows span pages"
+        );
+    }
+}

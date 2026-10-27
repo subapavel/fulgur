@@ -6796,16 +6796,18 @@ pub fn append_position_fixed_fragments(
         let (resolved_x, resolved_y) =
             resolve_viewport_cb_location(node, w, h, viewport_w_px, viewport_h_px)
                 .unwrap_or((layout.location.x, layout.location.y));
-        // Render adds `body_offset_pt.y` to every fragment's y to
-        // account for the html→body offset (collapsed margins from
-        // in-flow body-direct children, etc.). Fixed elements are
-        // viewport-anchored, not body-anchored, so subtract that
-        // offset here so the dispatch path produces a viewport-
-        // relative y in PDF coordinates. Without this compensation,
-        // documents that mix in-flow content with `position: fixed`
-        // (WPT fixedpos-008) shift the fixed text by the in-flow
-        // div's margin-top.
-        let (x, y) = (resolved_x - body_offset_xy.0, resolved_y - body_offset_xy.1);
+        // Render adds `body_offset_pt.y` to every fragment's y on page 0
+        // (and only there) to account for the html→body offset (collapsed
+        // margins from in-flow body-direct children, etc.). Fixed elements
+        // are viewport-anchored, not body-anchored, so each page's fragment
+        // goes through `icb_to_fragment`, which takes that offset off on
+        // page 0 and leaves x alone (in-flow fragments already hold body's
+        // x). Without this compensation, documents that mix in-flow content
+        // with `position: fixed` (WPT fixedpos-008) shift the fixed text by
+        // the in-flow div's margin-top; subtracting it on every page and
+        // from x (html-to-pdf F40 / F187) moved the box on pages 2+ and
+        // left of where its insets put it.
+        let (x, y) = (resolved_x, resolved_y);
 
         let entry = geometry.entry(id).or_default();
         // Replace any prior placements (e.g. if the fixed element was
@@ -6819,10 +6821,11 @@ pub fn append_position_fixed_fragments(
             if emitted >= crate::MAX_SUBTREE_PAGE_FRAGMENTS {
                 break;
             }
+            let (frag_x, frag_y) = icb_to_fragment(page_index, x, y, body_offset_xy.1);
             entry.fragments.push(Fragment {
                 page_index,
-                x: x.as_px(),
-                y: y.as_px(),
+                x: frag_x.as_px(),
+                y: frag_y.as_px(),
                 width: w.as_px(),
                 height: h.as_px(),
             });
@@ -6844,7 +6847,15 @@ pub fn append_position_fixed_fragments(
         // fixed pass runs a second time after the absolute pass and must not
         // leave stale fragments from the first pass behind (Codex review). The
         // per-node push is itself bounded by the `emitted` budget.
-        record_fixed_subtree_descendants(geometry, doc, id, (x, y), pages, &mut emitted);
+        record_fixed_subtree_descendants(
+            geometry,
+            doc,
+            id,
+            (x, y),
+            body_offset_xy.1,
+            pages,
+            &mut emitted,
+        );
     }
 
     // Don't allocate empty entries for nodes without fragments.
@@ -6860,11 +6871,12 @@ pub fn append_position_fixed_fragments(
 /// `append_position_absolute_body_direct_fragments`) except:
 ///   - fragments repeat on every page instead of landing on a single
 ///     y-derived page,
-///   - the caller passes the root's body-relative stored (x, y) so we
-///     don't re-resolve viewport-CB here (the root's `final_layout`
-///     can lack end-side inset resolution — see fulgur-a8m5),
-///   - body-offset compensation already happened on the caller's `(x, y)`,
-///     so descendants just add their subtree offset on top.
+///   - the caller passes the root's resolved (x, y) in the initial
+///     containing block so we don't re-resolve viewport-CB here (the
+///     root's `final_layout` can lack end-side inset resolution — see
+///     fulgur-a8m5),
+///   - each page's fragment goes through [`icb_to_fragment`] with body's
+///     y offset (taken off on page 0 only), as the root's own does.
 ///
 /// Skips out-of-flow descendants (handled by their own pass) and
 /// whitespace-only text nodes (matches fragmenter behavior).
@@ -6873,6 +6885,7 @@ fn record_fixed_subtree_descendants(
     doc: &BaseDocument,
     fixed_root_id: usize,
     root_stored_xy: (f32, f32),
+    body_offset_y: f32,
     pages: u32,
     emitted: &mut usize,
 ) {
@@ -6885,6 +6898,7 @@ fn record_fixed_subtree_descendants(
         node_id: usize,
         offset_in_subtree: (f32, f32),
         root_stored_xy: (f32, f32),
+        body_offset_y: f32,
         pages: u32,
         depth: usize,
         emitted: &mut usize,
@@ -6916,10 +6930,11 @@ fn record_fixed_subtree_descendants(
             if *emitted >= crate::MAX_SUBTREE_PAGE_FRAGMENTS {
                 break;
             }
+            let (frag_x, frag_y) = icb_to_fragment(page_index, stored_x, stored_y, body_offset_y);
             entry.fragments.push(Fragment {
                 page_index,
-                x: stored_x.as_px(),
-                y: stored_y.as_px(),
+                x: frag_x.as_px(),
+                y: frag_y.as_px(),
                 width: w.as_px(),
                 height: h.as_px(),
             });
@@ -6961,6 +6976,7 @@ fn record_fixed_subtree_descendants(
                 child_id,
                 child_offset,
                 root_stored_xy,
+                body_offset_y,
                 pages,
                 depth + 1,
                 emitted,
@@ -7003,6 +7019,7 @@ fn record_fixed_subtree_descendants(
             child_id,
             child_offset,
             root_stored_xy,
+            body_offset_y,
             pages,
             1,
             emitted,
@@ -7084,11 +7101,8 @@ pub fn append_position_absolute_body_direct_fragments(
         if !is_abs_only {
             continue;
         }
-        let layout = child.final_layout;
-        let (w, h) = (layout.size.width, layout.size.height);
         let (resolved_x, resolved_y) =
-            resolve_viewport_cb_location(child, w, h, viewport_w_px, viewport_h_px)
-                .unwrap_or((layout.location.x, layout.location.y));
+            body_direct_root_icb(child, body, viewport_w_px, viewport_h_px);
         let page_stride_px = if uses_bottom_without_top(child) {
             viewport_h_px.round()
         } else {
@@ -7101,17 +7115,17 @@ pub fn append_position_absolute_body_direct_fragments(
         // is not the root abs id (anonymous block wrappers around mixed
         // text/element content — fixedpos-002 / fixedpos-008 ref-side
         // pattern). Out-of-flow descendants are skipped because they
-        // are handled by their own pass. The render path adds
-        // `body_offset_pt` to every emitted fragment's y, so we pass
-        // the body offset down and let the walker subtract it from the
-        // stored y while keeping page assignment based on the un-
-        // compensated viewport-anchored y.
+        // are handled by their own pass. `(resolved_x, resolved_y)` is
+        // the box in the initial containing block; the walker stores it
+        // in the fragmenter's frame ([`icb_to_fragment`]: the render path
+        // adds body's y offset on page 0 only) while keeping page
+        // assignment based on the ICB y.
         record_subtree_fragments_at_offset(
             geometry,
             doc,
             child_id,
             (resolved_x, resolved_y),
-            body_offset_xy,
+            body_offset_xy.1,
             viewport_h_px,
             page_stride_px,
             pages,
@@ -7138,7 +7152,7 @@ fn record_subtree_fragments_at_offset(
     doc: &BaseDocument,
     subtree_root_id: usize,
     root_xy_for_paging: (f32, f32),
-    body_offset: (f32, f32),
+    body_offset_y: f32,
     page_h_px: f32,
     page_stride_px: f32,
     total_pages: u32,
@@ -7152,7 +7166,7 @@ fn record_subtree_fragments_at_offset(
         node_id: usize,
         offset_in_subtree: (f32, f32),
         root_xy_for_paging: (f32, f32),
-        body_offset: (f32, f32),
+        body_offset_y: f32,
         page_h_px: f32,
         page_stride_px: f32,
         total_pages: u32,
@@ -7224,12 +7238,13 @@ fn record_subtree_fragments_at_offset(
         } else {
             (cb_anchor, cb_size)
         };
-        // Page assignment is based on the un-compensated viewport-CB
-        // resolved position (the actual paint location). Storage is
-        // body-relative because the dispatch path adds `body_offset_pt`
-        // back at draw time.
+        // Page assignment is based on the viewport-CB resolved position in
+        // the initial containing block (the actual paint location). Storage
+        // is in the fragmenter's frame ([`icb_to_fragment`]): x is
+        // page-area-relative as is, y has body's offset taken off on page 0
+        // because the dispatch path adds `body_offset_pt` back there only.
         let final_y_for_paging = root_xy_for_paging.1 + offset_in_subtree.1;
-        let stored_x = root_xy_for_paging.0 + offset_in_subtree.0 - body_offset.0;
+        let stored_x = root_xy_for_paging.0 + offset_in_subtree.0;
         let w = node.final_layout.size.width;
         let h = node.final_layout.size.height;
         let is_size_contained = has_contain_size(node);
@@ -7376,11 +7391,13 @@ fn record_subtree_fragments_at_offset(
                     }
                     let is_monolithic_continuation =
                         monolithic_adjust > 0.0 && page_index > first_page;
-                    let stored_y = if is_monolithic_continuation {
-                        -body_offset.1
+                    let y_on_page = if is_monolithic_continuation {
+                        0.0
                     } else {
-                        paging_origin_y - (page_index as f32) * page_stride_px - body_offset.1
+                        paging_origin_y - (page_index as f32) * page_stride_px
                     };
+                    let (_, stored_y) =
+                        icb_to_fragment(page_index, stored_x, y_on_page, body_offset_y);
                     let stored_h = if is_monolithic_continuation {
                         let consumed = (page_index - first_page) as f32 * page_h_px;
                         (h_for_paging - consumed).clamp(0.0, page_h_px)
@@ -7468,7 +7485,7 @@ fn record_subtree_fragments_at_offset(
                             child_id,
                             nested_offset,
                             root_xy_for_paging,
-                            body_offset,
+                            body_offset_y,
                             page_h_px,
                             page_stride_px,
                             descendant_total_pages,
@@ -7501,7 +7518,7 @@ fn record_subtree_fragments_at_offset(
                 child_id,
                 child_offset,
                 root_xy_for_paging,
-                body_offset,
+                body_offset_y,
                 page_h_px,
                 page_stride_px,
                 descendant_total_pages,
@@ -7524,7 +7541,7 @@ fn record_subtree_fragments_at_offset(
         subtree_root_id,
         (0.0, 0.0),
         root_xy_for_paging,
-        body_offset,
+        body_offset_y,
         page_h_px,
         page_stride_px,
         total_pages,
@@ -7610,9 +7627,10 @@ fn clips_overflow(node: &blitz_dom::Node) -> bool {
 /// CSS-px (x, y) of `<body>`'s top-left in its containing block (html).
 /// Mirrors `convert::extract_body_offset_pt` but stays in CSS px so
 /// pagination_layout doesn't need to round-trip through pt. The render
-/// path adds `drawables.body_offset_pt` to every fragment's y when
-/// dispatching, so viewport-anchored fragments must subtract this
-/// offset to keep the dispatched y page-relative.
+/// path adds `drawables.body_offset_pt.1` to a page-0 fragment's y (only
+/// there) and nothing to x when dispatching, so viewport-anchored
+/// fragments go through [`icb_to_fragment`] with this offset to keep the
+/// dispatched position page-area-relative.
 fn body_origin_in_px(doc: &BaseDocument) -> (f32, f32) {
     let Some(body_id) = find_body_id(doc) else {
         return (0.0, 0.0);
@@ -7621,6 +7639,68 @@ fn body_origin_in_px(doc: &BaseDocument) -> (f32, f32) {
         return (0.0, 0.0);
     };
     (body.final_layout.location.x, body.final_layout.location.y)
+}
+
+/// The frame the in-flow fragmenter writes and `render_v2` reads (html-to-pdf F187, the F29 rule), for a point that lies
+/// `x_icb` px right of the page area's left edge and `y_on_page` px below its top on page `page_index`: `x` is
+/// page-area-relative (in-flow fragments already hold body's x offset), `y` is page-area-relative less body's y offset
+/// on page 0 only, because `render_v2` adds `body_offset` there and nowhere else. Every pass that writes geometry for a
+/// box placed in the initial containing block (the body-direct absolute pass, the fixed pass) goes through this one
+/// function. CSS px in, CSS px out.
+pub(crate) fn icb_to_fragment(
+    page_index: u32,
+    x_icb: f32,
+    y_on_page: f32,
+    body_offset_y: f32,
+) -> (f32, f32) {
+    (
+        x_icb,
+        y_on_page - if page_index == 0 { body_offset_y } else { 0.0 },
+    )
+}
+
+/// Whether `body`'s `position` is not `static`: it is then the containing block of its absolutely positioned children
+/// (CSS 2.1 section 10.1 (4)) instead of the initial containing block.
+fn is_positioned_body(body: &blitz_dom::Node) -> bool {
+    use ::style::properties::longhands::position::computed_value::T as Pos;
+    body.primary_styles()
+        .is_some_and(|s| !matches!(s.get_box().clone_position(), Pos::Static))
+}
+
+/// The top-left of the border box of the absolutely positioned child `child` of `body` in the initial containing
+/// block (page-area-relative CSS px; the page-0 stitched frame). CSS 2.1 section 10.3.7 / 10.6.4:
+///
+/// - static body: the containing block is the initial containing block of `viewport_w_px` x `viewport_h_px`; an axis
+///   with an inset is resolved against it ([`resolve_viewport_cb_location`]); an axis with both insets `auto` keeps the
+///   static position, which Taffy reports relative to body's border box, so body's own origin is added;
+/// - positioned body: Taffy has already resolved both axes against body's padding box (insets and `%` included), so the
+///   box is at body's origin plus `final_layout.location` on both axes.
+fn body_direct_root_icb(
+    child: &blitz_dom::Node,
+    body: &blitz_dom::Node,
+    viewport_w_px: f32,
+    viewport_h_px: f32,
+) -> (f32, f32) {
+    let layout = child.final_layout;
+    let origin = (body.final_layout.location.x, body.final_layout.location.y);
+    let static_xy = (origin.0 + layout.location.x, origin.1 + layout.location.y);
+    if is_positioned_body(body) {
+        return static_xy;
+    }
+    let Some((x, y)) = resolve_viewport_cb_location(
+        child,
+        layout.size.width,
+        layout.size.height,
+        viewport_w_px,
+        viewport_h_px,
+    ) else {
+        return static_xy;
+    };
+    let (explicit_x, explicit_y) = explicit_inset_axes(child);
+    (
+        if explicit_x { x } else { static_xy.0 },
+        if explicit_y { y } else { static_xy.1 },
+    )
 }
 
 /// Resolve a viewport-CB-anchored absolute/fixed element's CSS px
@@ -9448,6 +9528,172 @@ h2 { string-set: chapter-title content(text); }
         );
     }
 
+    /// html-to-pdf F40 / F187: on pages 2+ `render_v2` adds no body offset, so a fixed box's fragment holds the
+    /// resolved y there, and x is never reduced by body's x offset (in-flow fragments already hold it).
+    #[test]
+    fn position_fixed_keeps_its_page_position_on_pages_after_the_first() {
+        let html = r#"
+            <html><body style="margin:30px 20px">
+              <div style="height:100px">x</div>
+              <div style="position: fixed; top: 50px; left: 70px; width: 40px; height: 30px"></div>
+            </body></html>
+        "#;
+        let mut doc = parse(html, 600.0);
+        crate::blitz_adapter::relayout_position_fixed(&mut doc, 600.0, 800.0);
+        let (body_x, body_y) = super::body_origin_in_px(doc.deref_mut());
+        assert!(body_x > 0.5 && body_y > 0.5, "test needs a body offset");
+        let mut geom = PaginationGeometryTable::new();
+        super::append_position_fixed_fragments(&mut geom, doc.deref_mut(), 2, 600.0, 800.0);
+        let g = geom
+            .values()
+            .find(|g| {
+                g.fragments
+                    .iter()
+                    .any(|f| (f.height.to_f32() - 30.0).abs() < 0.5)
+            })
+            .expect("the fixed box");
+        assert_eq!(g.fragments.len(), 2);
+        let (p0, p1) = (&g.fragments[0], &g.fragments[1]);
+        assert_eq!((p0.page_index, p1.page_index), (0, 1));
+        assert_eq!(p0.x.to_f32(), 70.0, "x is the ICB x on page 0");
+        assert_eq!(p1.x.to_f32(), 70.0, "and on page 1");
+        assert_eq!(
+            p0.y.to_f32(),
+            50.0 - body_y,
+            "page 0: the body offset is added back by the renderer"
+        );
+        assert_eq!(
+            p1.y.to_f32(),
+            50.0,
+            "page 1: no body offset is added, none is taken off"
+        );
+    }
+
+    /// html-to-pdf F187: the frame rule of the geometry passes: x as is, body's y offset off page 0 only.
+    #[test]
+    fn icb_to_fragment_takes_the_body_offset_off_page_zero_only() {
+        assert_eq!(super::icb_to_fragment(0, 50.0, 100.0, 40.0), (50.0, 60.0));
+        assert_eq!(super::icb_to_fragment(2, 50.0, 100.0, 40.0), (50.0, 100.0));
+        assert_eq!(super::icb_to_fragment(0, 7.0, -5.0, 40.0), (7.0, -45.0));
+        assert_eq!(super::icb_to_fragment(1, 7.0, -5.0, 40.0), (7.0, -5.0));
+        assert_eq!(super::icb_to_fragment(0, 3.0, 10.0, 0.0), (3.0, 10.0));
+    }
+
+    /// `body_direct_root_icb` of the box `#a` in `html` (viewport 600 x 800), against `<body>`.
+    fn root_icb(html: &str) -> (f32, f32) {
+        let mut doc = parse(html, 600.0);
+        let a = find_by_id(doc.deref_mut(), "a").expect("#a");
+        let body_id = super::find_body_id(doc.deref_mut()).expect("body");
+        let (a, body) = (doc.get_node(a).unwrap(), doc.get_node(body_id).unwrap());
+        super::body_direct_root_icb(a, body, 600.0, 800.0)
+    }
+
+    fn assert_near(got: (f32, f32), want: (f32, f32)) {
+        assert!(
+            (got.0 - want.0).abs() < 0.5 && (got.1 - want.1).abs() < 0.5,
+            "got {got:?}, want {want:?}"
+        );
+    }
+
+    const ROOT_BODY: &str = "margin:30px;border:4px solid #c00";
+    const ROOT_BOX: &str = "position:absolute;width:100px;height:100px";
+
+    /// html-to-pdf F187: explicit insets are resolved against the initial containing block, whatever body's box is.
+    #[test]
+    fn body_direct_root_with_explicit_insets_is_placed_in_the_icb() {
+        let html = format!(
+            "<html><body style=\"{ROOT_BODY}\"><div id=\"a\" style=\"{ROOT_BOX};top:50px;left:50px\"></div></body></html>"
+        );
+        assert_near(root_icb(&html), (50.0, 50.0));
+        let html = format!(
+            "<html><body style=\"{ROOT_BODY}\"><div id=\"a\" style=\"{ROOT_BOX};right:50px;bottom:50px\"></div></body></html>"
+        );
+        assert_near(root_icb(&html), (450.0, 650.0));
+    }
+
+    /// An axis with both insets `auto` keeps the static position, which includes body's origin (margin 30 + border 4
+    /// to the content, below the 100 px block).
+    #[test]
+    fn body_direct_root_with_auto_insets_keeps_the_static_position() {
+        let html = format!(
+            "<html><body style=\"{ROOT_BODY}\"><div style=\"height:100px\"></div>\
+             <div id=\"a\" style=\"{ROOT_BOX}\"></div></body></html>"
+        );
+        assert_near(root_icb(&html), (34.0, 134.0));
+    }
+
+    /// Mixed axes: `left` is explicit (ICB), `top` is `auto` (static position, body's origin included).
+    #[test]
+    fn body_direct_root_with_mixed_axes_resolves_each_axis_on_its_own() {
+        let html = format!(
+            "<html><body style=\"{ROOT_BODY}\"><div style=\"height:100px\"></div>\
+             <div id=\"a\" style=\"{ROOT_BOX};left:50px\"></div></body></html>"
+        );
+        assert_near(root_icb(&html), (50.0, 134.0));
+        let html = format!(
+            "<html><body style=\"{ROOT_BODY}\"><div style=\"height:100px\"></div>\
+             <div id=\"a\" style=\"{ROOT_BOX};top:50px\"></div></body></html>"
+        );
+        assert_near(root_icb(&html), (34.0, 50.0));
+    }
+
+    /// A positioned body is the containing block: Taffy has resolved both axes against its padding box.
+    #[test]
+    fn body_direct_root_in_a_positioned_body_is_placed_in_its_padding_box() {
+        let body = format!("{ROOT_BODY};position:relative");
+        let html = format!(
+            "<html><body style=\"{body}\"><div style=\"height:300px\"></div>\
+             <div id=\"a\" style=\"{ROOT_BOX};top:50px;left:50px\"></div></body></html>"
+        );
+        assert_near(root_icb(&html), (84.0, 84.0));
+        // Body's border box is 540 x 308 at (30, 30): its padding box ends at x 566, y 334.
+        let html = format!(
+            "<html><body style=\"{body}\"><div style=\"height:300px\"></div>\
+             <div id=\"a\" style=\"{ROOT_BOX};right:50px;bottom:50px\"></div></body></html>"
+        );
+        assert_near(root_icb(&html), (416.0, 184.0));
+    }
+
+    /// html-to-pdf F187: the body-direct pass stores the box in the fragmenter's frame: x is the ICB x, y has body's
+    /// offset taken off on page 0 only (the renderer adds it there and nowhere else).
+    #[test]
+    fn body_direct_boxes_are_stored_in_the_fragmenter_frame() {
+        let html = r#"
+            <html><body style="margin:30px;border:4px solid #c00">
+              <div id="p0" style="position:absolute;top:50px;left:50px;width:100px;height:100px"></div>
+              <div id="p2" style="position:absolute;top:2150px;left:50px;width:100px;height:100px"></div>
+            </body></html>
+        "#;
+        let mut doc = parse(html, 600.0);
+        let (body_x, body_y) = super::body_origin_in_px(doc.deref_mut());
+        assert_eq!((body_x, body_y), (30.0, 30.0));
+        let p0 = find_by_id(doc.deref_mut(), "p0").unwrap();
+        let p2 = find_by_id(doc.deref_mut(), "p2").unwrap();
+        let mut geom = PaginationGeometryTable::new();
+        super::append_position_absolute_body_direct_fragments(
+            &mut geom,
+            doc.deref_mut(),
+            1,
+            600.0,
+            1000.0,
+            None,
+        );
+        let f0 = &geom[&p0].fragments;
+        assert_eq!(f0.len(), 1);
+        assert_eq!(
+            (f0[0].page_index, f0[0].x.to_f32(), f0[0].y.to_f32()),
+            (0, 50.0, 20.0),
+            "page 0: x as is, y 50 less body's 30"
+        );
+        let f2 = &geom[&p2].fragments;
+        assert_eq!(f2.len(), 1);
+        assert_eq!(
+            (f2[0].page_index, f2[0].x.to_f32(), f2[0].y.to_f32()),
+            (2, 50.0, 150.0),
+            "page 2: no body offset at all"
+        );
+    }
+
     /// fulgur-4m16: when a `position: fixed` root has a sized
     /// block-element child, the child must also receive per-page
     /// repeated fragments. v2 dispatch reads
@@ -9907,7 +10153,7 @@ h2 { string-set: chapter-title content(text); }
             doc.deref_mut(),
             abs_id,
             (0.0, f32::MAX),
-            (0.0, 0.0),
+            0.0,
             f32::MAX,
             f32::MAX,
             3,
@@ -12191,7 +12437,7 @@ h2 { string-set: chapter-title content(text); }
             doc.deref_mut(),
             abs_id,
             (0.0, 0.0),
-            (0.0, 0.0),
+            0.0,
             800.0,
             800.0,
             1,
@@ -12228,7 +12474,7 @@ h2 { string-set: chapter-title content(text); }
             doc.deref_mut(),
             abs_id,
             (0.0, 0.0),
-            (0.0, 0.0),
+            0.0,
             800.0,
             800.0,
             1,

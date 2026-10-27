@@ -135,14 +135,22 @@ fn abspos_boxes_in_tree_order(
 }
 
 /// The containing block of the absolutely positioned box `id` (CSS 2.1 §10.1): the nearest positioned ancestor below
-/// `<body>`, or `None` for the initial containing block. The second value is whether a clipping, transformed or
+/// `<body>`, `<body>` itself when it is positioned (html-to-pdf F187: its padding box, as for any other positioned
+/// ancestor; a clip on it still clips nothing on the page and is no guard), or `None` for the initial containing block.
+/// The second value is whether a clipping, transformed or
 /// multicol box lies between the box and its containing block, the containing block included.
 fn containing_block(doc: &BaseDocument, id: usize, body_id: usize) -> (Option<usize>, bool) {
     let mut guarded = false;
     let mut cur = doc.get_node(id).and_then(|n| n.parent);
     let mut depth = 0;
     while let Some(pid) = cur {
-        if pid == body_id || depth >= crate::MAX_DOM_DEPTH {
+        if pid == body_id {
+            if doc.get_node(pid).is_some_and(is_positioned_body) {
+                return (Some(pid), guarded);
+            }
+            break;
+        }
+        if depth >= crate::MAX_DOM_DEPTH {
             break;
         }
         let Some(p) = doc.get_node(pid) else {
@@ -1031,18 +1039,11 @@ pub fn fragment_abspos_flows(
             keep(&mut kept_roots);
             continue;
         };
-        let root_y_icb = if body_direct {
-            let l = node.final_layout;
-            resolve_viewport_cb_location(
-                node,
-                l.size.width,
-                l.size.height,
-                viewport_w_px,
-                page_height_px,
-            )
-            .map_or(l.location.y, |(_, y)| y)
-        } else {
-            0.0
+        let root_y_icb = match doc.get_node(body_id) {
+            Some(body) if body_direct => {
+                body_direct_root_icb(node, body, viewport_w_px, page_height_px).1
+            }
+            _ => 0.0,
         };
         let facts = Facts {
             guarded: false,
@@ -1585,6 +1586,39 @@ mod tests {
         assert!(line_slices_tile(&geom[&a].line_slices, 25));
         let page0_lines = geom[&a].line_slices[0].end;
         assert_eq!(page0_lines, 10, "the 200 px of page 0 hold 10 lines");
+    }
+
+    /// F187: a positioned body is the containing block of its body-direct boxes, so a long paragraph F30g flows starts
+    /// at the top of body's padding box (ICB y 40, not 0) and its first page holds the 160 px below it.
+    #[test]
+    fn an_abspos_paragraph_in_a_relative_body_flows_from_its_padding_box() {
+        let body = format!(
+            "<div style=\"height:60px\"></div>\
+             <p class=\"a\" style=\"position:absolute;top:0;left:0\">{}</p>",
+            lines_20px(25)
+        );
+        let (doc, geom) = fragments(&body, true, "margin:40px;position:relative");
+        let a = by_class(&doc, "a");
+        let s = shape(&geom, a);
+        // Page 0 is shorter by the margin: the box starts 40 px below the page-area top, in body coordinates y 0.
+        assert_eq!(s[0].0, 0, "{s:?}");
+        assert_eq!(s[0].1, 0, "body coordinates: the top of body's padding box");
+        assert!(s.iter().skip(1).all(|&(_, y, _)| y == 0), "{s:?}");
+        assert!(
+            line_slices_tile(&geom[&a].line_slices, 25),
+            "{:?}",
+            slices(&geom, a)
+        );
+        assert_eq!(
+            slices(&geom, a),
+            vec![(0, 8), (8, 18), (18, 25)],
+            "page 0 holds the 8 lines (160 px) between body's top and the page bottom"
+        );
+        let x = geom[&a].fragments[0].x.to_f32();
+        assert!(
+            (x - 40.0).abs() < 0.5,
+            "html-relative x of body's padding box: {x}"
+        );
     }
 
     // ── units ───────────────────────────────────────────────────────────────────────────────────────────────────

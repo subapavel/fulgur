@@ -107,10 +107,13 @@ pub fn render_v2(
                     config,
                     drawables.root_dir_rtl,
                 );
-            // `frag.x` is html-relative (already includes body's x
-            // offset from the fragmenter); only y needs `body_offset_pt`
-            // applied, and only on page 0 (continuation pages are already
-            // page-content-area-relative after the fragmenter resets cursor_y).
+            // `frag.x` is page-area-relative (already includes body's x
+            // offset from the fragmenter; geometry for boxes placed in the
+            // initial containing block is stored in the same frame, see
+            // `pagination_layout::icb_to_fragment`); only y needs
+            // `body_offset_pt` applied, and only on page 0 (continuation pages
+            // are already page-content-area-relative after the fragmenter
+            // resets cursor_y).
             let body_y_off = if page_idx == 0 {
                 drawables.body_offset_pt.1
             } else {
@@ -339,12 +342,15 @@ pub fn render_v2(
                         canvas_source != Some(root_id),
                     );
                 }
-                // `frag.x` is html-relative (fragmenter folds body's x
-                // offset in); `frag.y` is body-content-area-relative.
-                // On page 0 body_offset_pt.1 translates body-content-area
-                // to html-content-area; on continuation pages the fragmenter
-                // resets cursor_y=0 per page so fragments are already
+                // `frag.x` is page-area-relative (fragmenter folds body's x
+                // offset in); `frag.y` is page-area-relative less body's y
+                // offset on page 0 only. On page 0 body_offset_pt.1 translates
+                // that back to the page area; on continuation pages the
+                // fragmenter resets cursor_y=0 per page so fragments are already
                 // page-content-area-relative and the offset must not apply.
+                // Boxes placed in the initial containing block (absolute
+                // children of body, fixed boxes) are stored in this frame by
+                // `pagination_layout::icb_to_fragment` (html-to-pdf F187).
                 let body_top_pt = if page_idx == 0 {
                     resolved_margin.top + drawables.body_offset_pt.1.to_f32()
                 } else {
