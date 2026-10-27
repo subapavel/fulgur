@@ -608,19 +608,39 @@ fn draw_background_layer(
     let pos_x = ox + resolve_position(&layer.position_x, ow, img_w);
     let pos_y = oy + resolve_position(&layer.position_y, oh, img_h);
 
-    let tiles = compute_tile_positions(
-        layer.repeat_x,
-        layer.repeat_y,
-        pos_x,
-        pos_y,
-        img_w,
-        img_h,
-        cx,
-        cy,
-        cw,
-        ch,
-    );
-    if tiles.is_empty() {
+    // Raster / SVG layers with a dense uniform grid are painted as ONE tiling
+    // pattern, computed analytically from the repeat axes. Enumerating the
+    // tiles first would hit `MAX_TILES` and cut the background short.
+    let dense_image_grid = match &layer.content {
+        BgImageContent::Raster { .. } | BgImageContent::Svg { .. } => uniform_image_grid(
+            layer.repeat_x,
+            layer.repeat_y,
+            pos_x,
+            pos_y,
+            img_w,
+            img_h,
+            (cx, cy, cw, ch),
+        )
+        .filter(|g| g.grid.count.0.saturating_mul(g.grid.count.1) >= IMAGE_PATTERN_MIN_TILES),
+        _ => None,
+    };
+    let tiles = if dense_image_grid.is_some() {
+        Vec::new()
+    } else {
+        compute_tile_positions(
+            layer.repeat_x,
+            layer.repeat_y,
+            pos_x,
+            pos_y,
+            img_w,
+            img_h,
+            cx,
+            cy,
+            cw,
+            ch,
+        )
+    };
+    if tiles.is_empty() && dense_image_grid.is_none() {
         canvas.surface.pop();
         return;
     }
@@ -821,32 +841,54 @@ fn draw_background_layer(
                 canvas.surface.pop();
                 return;
             };
-            for (tx, ty, tw, th) in &tiles {
-                let Some(size) = krilla::geom::Size::from_wh(*tw, *th) else {
-                    continue;
-                };
-                let transform = krilla::geom::Transform::from_translate(*tx, *ty);
-                canvas.surface.push_transform(&transform);
-                canvas.surface.draw_image(image.clone(), size);
-                canvas.surface.pop();
+            if let Some(grid) = dense_image_grid {
+                draw_image_tiling_pattern(canvas, grid, |surface, tw, th| {
+                    if let Some(size) = krilla::geom::Size::from_wh(tw, th) {
+                        surface.draw_image(image.clone(), size);
+                    }
+                });
+            } else {
+                for (tx, ty, tw, th) in &tiles {
+                    let Some(size) = krilla::geom::Size::from_wh(*tw, *th) else {
+                        continue;
+                    };
+                    let transform = krilla::geom::Transform::from_translate(*tx, *ty);
+                    canvas.surface.push_transform(&transform);
+                    canvas.surface.draw_image(image.clone(), size);
+                    canvas.surface.pop();
+                }
             }
         }
         BgImageContent::Svg { tree } => {
             use krilla_svg::{SurfaceExt, SvgSettings};
-            for (tx, ty, tw, th) in &tiles {
-                let Some(size) = krilla::geom::Size::from_wh(*tw, *th) else {
-                    continue;
-                };
-                let transform = krilla::geom::Transform::from_translate(*tx, *ty);
-                canvas.surface.push_transform(&transform);
-                if canvas
-                    .surface
-                    .draw_svg(tree, size, SvgSettings::default())
-                    .is_none()
-                {
-                    log::warn!("failed to draw SVG background tile");
+            if let Some(grid) = dense_image_grid {
+                draw_image_tiling_pattern(canvas, grid, |surface, tw, th| {
+                    let Some(size) = krilla::geom::Size::from_wh(tw, th) else {
+                        return;
+                    };
+                    if surface
+                        .draw_svg(tree, size, SvgSettings::default())
+                        .is_none()
+                    {
+                        log::warn!("failed to draw SVG background tile");
+                    }
+                });
+            } else {
+                for (tx, ty, tw, th) in &tiles {
+                    let Some(size) = krilla::geom::Size::from_wh(*tw, *th) else {
+                        continue;
+                    };
+                    let transform = krilla::geom::Transform::from_translate(*tx, *ty);
+                    canvas.surface.push_transform(&transform);
+                    if canvas
+                        .surface
+                        .draw_svg(tree, size, SvgSettings::default())
+                        .is_none()
+                    {
+                        log::warn!("failed to draw SVG background tile");
+                    }
+                    canvas.surface.pop();
                 }
-                canvas.surface.pop();
             }
         }
     }
@@ -1757,6 +1799,132 @@ fn draw_gradient_tiling_pattern(
     canvas.surface.set_fill(None);
 }
 
+/// Tile counts at or above which a raster / SVG layer is painted as one tiling
+/// pattern instead of one draw per tile. Below it the per-tile path is kept
+/// byte-for-byte: a handful of tiles costs a few operators, and viewers
+/// rasterise those exactly, whereas a pattern cell may be resampled.
+const IMAGE_PATTERN_MIN_TILES: usize = 64;
+
+/// A uniform raster / SVG tile grid, emitted as a single tiling pattern.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ImagePatternGrid {
+    /// Origin, tile size, step (tile + `space` gap) and tile count per axis.
+    grid: UniformGrid,
+    /// Area `(x, y, w, h)` the pattern is painted into: the clip box on a
+    /// repeating axis, the single tile's extent on a non-repeating one.
+    fill: (f32, f32, f32, f32),
+}
+
+/// Describe the tile grid of a raster / SVG layer without enumerating tiles.
+///
+/// The grid of CSS `background-repeat` is separable: each axis is either one
+/// tile (`no-repeat`, or `space` that cannot fit two) or evenly spaced tiles
+/// (`repeat`, `round`, `space`, step = tile + gap), so it is uniform by
+/// construction and its geometry comes from [`resolve_repeat_axis`], the same
+/// helper the per-tile path uses. Returns `None` when there is nothing to
+/// tile (fewer than two tiles) or a pitch is below [`crate::MIN_GRADIENT_TILE_PT`].
+fn uniform_image_grid(
+    repeat_x: BgRepeat,
+    repeat_y: BgRepeat,
+    pos_x: f32,
+    pos_y: f32,
+    img_w: f32,
+    img_h: f32,
+    clip: (f32, f32, f32, f32),
+) -> Option<ImagePatternGrid> {
+    let (clip_x, clip_y, clip_w, clip_h) = clip;
+    let (tile_w, space_x, start_x, end_x) =
+        resolve_repeat_axis(repeat_x, pos_x, img_w, clip_x, clip_w);
+    let (tile_h, space_y, start_y, end_y) =
+        resolve_repeat_axis(repeat_y, pos_y, img_h, clip_y, clip_h);
+    let (pitch_x, pitch_y) = (tile_w + space_x, tile_h + space_y);
+    let finite = [tile_w, tile_h, pitch_x, pitch_y, start_x, start_y]
+        .iter()
+        .all(|v| v.is_finite());
+    if !finite
+        || tile_w < crate::MIN_GRADIENT_TILE_PT
+        || tile_h < crate::MIN_GRADIENT_TILE_PT
+        || pitch_x < crate::MIN_GRADIENT_TILE_PT
+        || pitch_y < crate::MIN_GRADIENT_TILE_PT
+    {
+        return None;
+    }
+    // Same loop condition as `compute_tile_positions_slow`: tiles start at
+    // `start + k * pitch` while `< end + 0.01`.
+    let axis_count = |repeat: BgRepeat, start: f32, end: f32, pitch: f32| -> usize {
+        if repeat == BgRepeat::NoRepeat || end <= start {
+            1
+        } else {
+            (((end + 0.01 - start) / pitch).ceil().max(1.0)) as usize
+        }
+    };
+    let nx = axis_count(repeat_x, start_x, end_x, pitch_x);
+    let ny = axis_count(repeat_y, start_y, end_y, pitch_y);
+    if nx * ny < 2 {
+        return None;
+    }
+    let (fx, fw) = if nx > 1 {
+        (clip_x, clip_w)
+    } else {
+        (start_x, tile_w)
+    };
+    let (fy, fh) = if ny > 1 {
+        (clip_y, clip_h)
+    } else {
+        (start_y, tile_h)
+    };
+    Some(ImagePatternGrid {
+        grid: UniformGrid {
+            origin: (start_x, start_y),
+            cell: (tile_w, tile_h),
+            step: (pitch_x, pitch_y),
+            count: (nx, ny),
+        },
+        fill: (fx, fy, fw, fh),
+    })
+}
+
+/// Paint a raster / SVG tile grid as ONE tiling pattern.
+///
+/// `paint_in_cell(surface, tile_w, tile_h)` draws a single tile at the cell's
+/// origin. The pattern repeats it every `step` from `grid.origin`, so the
+/// phase follows `background-position`; the pattern is filled into
+/// `ImagePatternGrid::fill` (clipped by the layer's clip path), so the number
+/// of tiles does not matter.
+fn draw_image_tiling_pattern(
+    canvas: &mut Canvas<'_, '_>,
+    pattern_grid: ImagePatternGrid,
+    paint_in_cell: impl FnOnce(&mut krilla::surface::Surface<'_>, f32, f32),
+) {
+    let grid = pattern_grid.grid;
+    let mut sb = canvas.surface.stream_builder();
+    {
+        let mut ps = sb.surface();
+        paint_in_cell(&mut ps, grid.cell.0, grid.cell.1);
+        ps.finish();
+    }
+    let stream = sb.finish();
+
+    let pattern = krilla::paint::Pattern {
+        stream,
+        transform: krilla::geom::Transform::from_translate(grid.origin.0, grid.origin.1),
+        width: grid.step.0,
+        height: grid.step.1,
+    };
+    let (fx, fy, fw, fh) = pattern_grid.fill;
+    let Some(rect_path) = build_rect_path(fx, fy, fw, fh) else {
+        return;
+    };
+    canvas.surface.set_fill(Some(krilla::paint::Fill {
+        paint: pattern.into(),
+        rule: Default::default(),
+        opacity: krilla::num::NormalizedF32::ONE,
+    }));
+    canvas.surface.set_stroke(None);
+    canvas.surface.draw_path(&rect_path);
+    canvas.surface.set_fill(None);
+}
+
 /// `BgLengthPercentage` を origin rect 内の点座標に変換 (radial 中心位置用)。
 /// CSS では radial-gradient の position percentage は container の幅/高さに対する単純な割合。
 fn resolve_point(lp: &BgLengthPercentage, container: f32) -> f32 {
@@ -2120,10 +2288,19 @@ fn compute_tile_positions_slow(
         let mut tx = start_x;
         while tx < end_x + 0.01 {
             tiles.push((tx, ty, tile_w, tile_h));
+            tx += tile_w + space_x;
             if tiles.len() >= MAX_TILES {
+                let more_in_row = repeat_x != BgRepeat::NoRepeat && tx < end_x + 0.01;
+                let more_rows =
+                    repeat_y != BgRepeat::NoRepeat && ty + tile_h + space_y < end_y + 0.01;
+                if more_in_row || more_rows {
+                    log::warn!(
+                        "background tiling stopped at {MAX_TILES} tiles; the rest of the \
+                         background area is left unpainted"
+                    );
+                }
                 return tiles;
             }
-            tx += tile_w + space_x;
             if repeat_x == BgRepeat::NoRepeat {
                 break;
             }
@@ -3569,6 +3746,185 @@ mod tests {
         assert!((g.cell.0 - 10.0).abs() < 1e-3);
         assert!((g.step.0 - 15.0).abs() < 1e-3);
         assert!((g.step.1 - 20.0).abs() < 1e-3);
+    }
+
+    const CLIP: (f32, f32, f32, f32) = (0.0, 0.0, 100.0, 100.0);
+
+    #[test]
+    fn image_grid_repeat_both_axes_covers_the_clip() {
+        let g = uniform_image_grid(BgRepeat::Repeat, BgRepeat::Repeat, 0.0, 0.0, 8.0, 8.0, CLIP)
+            .expect("repeat is a grid");
+        assert_eq!(g.grid.origin, (0.0, 0.0));
+        assert_eq!(g.grid.cell, (8.0, 8.0));
+        assert_eq!(g.grid.step, (8.0, 8.0));
+        assert_eq!(g.grid.count, (13, 13));
+        assert_eq!(g.fill, CLIP);
+    }
+
+    #[test]
+    fn image_grid_is_not_capped_like_the_per_tile_path() {
+        // A4 page of 1 px (0.75 pt) tiles: 794 x 1123 tiles, far beyond MAX_TILES.
+        let clip = (0.0, 0.0, 595.28, 841.89);
+        let g = uniform_image_grid(
+            BgRepeat::Repeat,
+            BgRepeat::Repeat,
+            0.0,
+            0.0,
+            0.75,
+            0.75,
+            clip,
+        )
+        .unwrap();
+        assert!(g.grid.count.0 * g.grid.count.1 > 10_000);
+        assert_eq!(g.fill, clip);
+    }
+
+    #[test]
+    fn image_grid_origin_follows_the_position_phase() {
+        // position 3 with an 8 pt tile: a tile starts at 3 - 8 = -5 and at 3 + 8k.
+        let g = uniform_image_grid(
+            BgRepeat::Repeat,
+            BgRepeat::Repeat,
+            3.0,
+            -2.0,
+            8.0,
+            8.0,
+            CLIP,
+        )
+        .unwrap();
+        assert!((g.grid.origin.0 - -5.0).abs() < 1e-4);
+        assert!((g.grid.origin.1 - -2.0).abs() < 1e-4);
+        // the grid origin is the first tile at or before the clip, not the position itself
+        assert!(g.grid.origin.0 <= CLIP.0 && g.grid.origin.1 <= CLIP.1);
+    }
+
+    #[test]
+    fn image_grid_single_axis_repeat_is_limited_to_the_tile_row() {
+        // repeat-x only: one row, painted over the tile's own y extent, not the whole clip
+        let g = uniform_image_grid(
+            BgRepeat::Repeat,
+            BgRepeat::NoRepeat,
+            0.0,
+            20.0,
+            10.0,
+            6.0,
+            CLIP,
+        )
+        .unwrap();
+        // 10 tiles fit; like the per-tile loop the count includes the one starting on the clip edge
+        assert_eq!(g.grid.count, (11, 1));
+        assert_eq!(g.fill, (0.0, 20.0, 100.0, 6.0));
+        let g = uniform_image_grid(
+            BgRepeat::NoRepeat,
+            BgRepeat::Repeat,
+            30.0,
+            0.0,
+            6.0,
+            10.0,
+            CLIP,
+        )
+        .unwrap();
+        assert_eq!(g.grid.count, (1, 11));
+        assert_eq!(g.fill, (30.0, 0.0, 6.0, 100.0));
+    }
+
+    #[test]
+    fn image_grid_no_repeat_or_one_tile_is_not_a_grid() {
+        assert!(
+            uniform_image_grid(
+                BgRepeat::NoRepeat,
+                BgRepeat::NoRepeat,
+                0.0,
+                0.0,
+                8.0,
+                8.0,
+                CLIP
+            )
+            .is_none()
+        );
+        // `space` with a tile wider than the clip: a single tile, no gap
+        assert!(
+            uniform_image_grid(
+                BgRepeat::Space,
+                BgRepeat::NoRepeat,
+                0.0,
+                0.0,
+                150.0,
+                8.0,
+                CLIP
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn image_grid_space_steps_by_tile_plus_gap() {
+        // 9 tiles of 10 in 95: gap (95 - 90) / 8 = 0.625
+        let clip = (0.0, 0.0, 95.0, 20.0);
+        let g = uniform_image_grid(
+            BgRepeat::Space,
+            BgRepeat::NoRepeat,
+            0.0,
+            0.0,
+            10.0,
+            20.0,
+            clip,
+        )
+        .unwrap();
+        assert_eq!(g.grid.count, (9, 1));
+        assert_eq!(g.grid.cell, (10.0, 20.0));
+        assert!((g.grid.step.0 - 10.625).abs() < 1e-4);
+    }
+
+    #[test]
+    fn image_grid_round_resizes_the_tile_to_an_integer_count() {
+        // 100 / 30 rounds to 3 tiles of 33.33 (count 4: the per-tile loop's edge tile, outside the clip)
+        let g = uniform_image_grid(BgRepeat::Round, BgRepeat::Round, 0.0, 0.0, 30.0, 30.0, CLIP)
+            .unwrap();
+        assert_eq!(g.grid.count, (4, 4));
+        assert!((g.grid.cell.0 - 100.0 / 3.0).abs() < 1e-3);
+        assert_eq!(g.grid.cell, g.grid.step);
+    }
+
+    #[test]
+    fn image_grid_matches_the_per_tile_enumeration() {
+        // Wherever the per-tile path is below its cap, the analytic grid is the same set of tiles.
+        let cases = [
+            (BgRepeat::Repeat, BgRepeat::Repeat, 3.0, 7.0, 8.0, 6.0),
+            (BgRepeat::Space, BgRepeat::Repeat, 0.0, 0.0, 12.0, 9.0),
+            (BgRepeat::Round, BgRepeat::Space, 0.0, 0.0, 17.0, 11.0),
+            (BgRepeat::Repeat, BgRepeat::NoRepeat, -4.0, 10.0, 9.0, 5.0),
+        ];
+        for (rx, ry, px, py, w, h) in cases {
+            let tiles = compute_tile_positions_slow(rx, ry, px, py, w, h, 0.0, 0.0, 100.0, 100.0);
+            let g = uniform_image_grid(rx, ry, px, py, w, h, CLIP).unwrap();
+            assert_eq!(
+                g.grid.count.0 * g.grid.count.1,
+                tiles.len(),
+                "{rx:?} {ry:?}"
+            );
+            let first = tiles[0];
+            assert!((g.grid.origin.0 - first.0).abs() < 1e-3);
+            assert!((g.grid.origin.1 - first.1).abs() < 1e-3);
+            assert!((g.grid.cell.0 - first.2).abs() < 1e-3);
+            assert!((g.grid.cell.1 - first.3).abs() < 1e-3);
+            // and the per-tile set is a uniform grid with the same step
+            if let Some(u) = try_uniform_grid(&tiles) {
+                assert!((u.step.0 - g.grid.step.0).abs() < 1e-3 || u.count.0 == 1);
+                assert!((u.step.1 - g.grid.step.1).abs() < 1e-3 || u.count.1 == 1);
+            }
+        }
+    }
+
+    #[test]
+    fn image_grid_degenerate_sizes_fall_back() {
+        for (w, h) in [(0.0, 8.0), (8.0, 0.0), (0.001, 8.0), (f32::NAN, 8.0)] {
+            assert!(
+                uniform_image_grid(BgRepeat::Repeat, BgRepeat::Repeat, 0.0, 0.0, w, h, CLIP)
+                    .is_none(),
+                "{w} x {h}"
+            );
+        }
     }
 
     #[test]

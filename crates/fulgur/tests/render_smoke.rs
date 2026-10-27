@@ -659,6 +659,91 @@ fn test_render_html_bg_repeat_origin_clip_variants() {
     assert!(!pdf.is_empty());
 }
 
+/// Count of tiling patterns (`/PatternType 1`) in the raw PDF.
+fn tiling_pattern_count(pdf: &[u8]) -> usize {
+    let needle = b"/PatternType 1";
+    pdf.windows(needle.len()).filter(|w| *w == needle).count()
+}
+
+#[test]
+fn test_render_html_small_raster_background_is_one_tiling_pattern() {
+    // A 1x1 PNG repeated over a large box is 640 000 tiles at its natural size: one
+    // tiling pattern, not a per-tile draw cut off at MAX_TILES.
+    let png_data: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    let mut bundle = AssetBundle::default();
+    bundle.add_image("dot.png", png_data);
+    let html = r#"<!DOCTYPE html><html><body style="margin:0">
+        <div style="width:800px;height:800px;background:url(dot.png);"></div>
+        <div style="width:300px;height:100px;background:url(dot.png) repeat-x;"></div>
+        <div style="width:300px;height:100px;background:url(dot.png) space round;"></div>
+    </body></html>"#;
+    let pdf = Engine::builder()
+        .assets(bundle)
+        .build()
+        .render(html)
+        .expect("render small raster background");
+    assert!(pdf.starts_with(b"%PDF"));
+    assert!(
+        tiling_pattern_count(&pdf) >= 1,
+        "a dense raster grid is a tiling pattern"
+    );
+    assert!(
+        pdf.len() < 100_000,
+        "the PDF does not grow with the tile count: {} bytes",
+        pdf.len()
+    );
+}
+
+#[test]
+fn test_render_html_small_svg_background_is_one_tiling_pattern() {
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="6" height="6"><rect width="3" height="3" fill="red"/></svg>"#;
+    let mut bundle = AssetBundle::default();
+    bundle.add_image("dot.svg", svg.to_vec());
+    let html = r#"<!DOCTYPE html><html><body style="margin:0">
+        <div style="width:600px;height:600px;background:url(dot.svg);"></div>
+        <div style="width:30px;height:30px;background:url(dot.svg);"></div>
+    </body></html>"#;
+    let pdf = Engine::builder()
+        .assets(bundle)
+        .build()
+        .render(html)
+        .expect("render small svg background");
+    assert!(pdf.starts_with(b"%PDF"));
+    assert!(
+        tiling_pattern_count(&pdf) >= 1,
+        "a dense SVG grid is a tiling pattern"
+    );
+}
+
+#[test]
+fn test_render_html_few_tile_raster_background_stays_per_tile() {
+    // Below IMAGE_PATTERN_MIN_TILES the per-tile draws are kept.
+    let png_data: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    let mut bundle = AssetBundle::default();
+    bundle.add_image("dot.png", png_data);
+    let html = r#"<!DOCTYPE html><html><body style="margin:0">
+        <div style="width:6px;height:6px;background:url(dot.png);"></div>
+    </body></html>"#;
+    let pdf = Engine::builder()
+        .assets(bundle)
+        .build()
+        .render(html)
+        .expect("render few-tile raster background");
+    assert_eq!(tiling_pattern_count(&pdf), 0);
+}
+
 #[test]
 fn linear_gradient_with_interpolation_hint_renders_via_engine() {
     // CSS Images 3 §3.5.3 hint expansion を `Engine::render_html` 経由で叩く
