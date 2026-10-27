@@ -3739,7 +3739,8 @@ fn paint_body_box_v2(
         .layout_size
         .map_or(total_pt, |size| size.height.to_f32().max(total_pt));
     let continues = box_pt > total_pt + 0.75;
-    if !continues && (slices.len() == 1 || is_flat_slice(&entry.style, paint_background)) {
+    // A flat slice is the same rectangle whether or not the box goes on (and a body that paints nothing is flat).
+    if is_flat_slice(&entry.style, paint_background) || (slices.len() == 1 && !continues) {
         paint_root_block_v2(canvas, entry, x_pt, top_pt, Some(here_pt), paint_background);
         return;
     }
