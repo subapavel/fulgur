@@ -1802,15 +1802,17 @@ pub(crate) fn draw_block_border(
 }
 
 /// Whether side `side` and its neighbour `other` meet in a coloured mitre: both are drawn (non-zero width), both are
-/// solid, and their colours differ. Everything else keeps the overlapping lines (equal colours show no seam, a side
-/// of width 0 has no join).
+/// solid, and their colours differ — or they are equal but not opaque, where two overlapping lines would paint the
+/// corner square twice and darken it (F186 vrt-validator). Everything else keeps the overlapping lines (equal opaque
+/// colours show no seam, a side of width 0 has no join).
 fn mitred_join(style: &BlockStyle, side: usize, other: usize) -> bool {
     let widths = style.border_widths.map(crate::units::Pt::to_f32);
+    let colours = style.border_colors;
     widths[side] > 0.0
         && widths[other] > 0.0
         && style.border_styles[side] == BorderStyleValue::Solid
         && style.border_styles[other] == BorderStyleValue::Solid
-        && style.border_colors[side] != style.border_colors[other]
+        && (colours[side] != colours[other] || colours[side][3] < 255)
 }
 
 /// Whether every drawn side is solid, so the rounded mixed-colour painter ([`draw_border_ring`]) applies.
@@ -3232,6 +3234,10 @@ mod dp_unit_tests {
             ..style.clone()
         };
         assert!(!mitred_join(&same, 0, 1));
+        // The same translucent colour on both sides is mitred too: overlapping lines would darken the corner.
+        let mut translucent = same.clone();
+        translucent.border_colors = [[255, 0, 0, 128]; 4];
+        assert!(mitred_join(&translucent, 0, 1));
         // A neighbour of width 0 has no join.
         let no_right = mixed_style([4.0, 0.0, 4.0, 4.0], 0.0);
         assert!(!mitred_join(&no_right, 0, 1) && mitred_join(&no_right, 0, 3));
