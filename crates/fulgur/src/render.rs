@@ -1723,8 +1723,20 @@ pub(crate) fn dispatch_fragment(
     // lines as the fragment height; its frame (border + padding) is
     // `line_split_insets` bigger. The paragraph slicing below still reads
     // `geom.fragments`, so only the frame sees the adjusted fragment.
-    let frame_frag = frame_fragment(geom, frag);
+    let (frame_frag, edges) = frame_fragment(geom, frag);
     let frag = &frame_frag;
+    // F30f-d: a box sliced at its breaks paints its open edges without border, padding or radius.
+    let sliced_block;
+    let sliced_block_ref = match drawables.block_styles.get(&node_id) {
+        Some(block) if edges.any() => {
+            sliced_block = crate::drawables::BlockEntry {
+                style: crate::draw_primitives::sliced_style(&block.style, edges).into_owned(),
+                ..block.clone()
+            };
+            Some(&sliced_block)
+        }
+        other => other,
+    };
     // True when this block / list-item / paragraph spans multiple
     // pages (the fragmenter recorded one fragment per page slice).
     // Passed down so `draw_block_inner_paint` can use the per-page
@@ -1736,7 +1748,7 @@ pub(crate) fn dispatch_fragment(
     // share a single opacity group. See `draw_list_item_with_block`
     // for the v1 mirror.
     if let Some(li) = drawables.list_items.get(&node_id) {
-        let block_for_li = drawables.block_styles.get(&node_id);
+        let block_for_li = sliced_block_ref;
         let para_for_li = drawables.paragraphs.get(&node_id);
         draw_list_item_with_block(
             canvas,
@@ -1770,7 +1782,7 @@ pub(crate) fn dispatch_fragment(
     // Block + inner content (paragraph / image / svg) sharing the
     // same node_id: combine into one `draw_with_opacity` group. See
     // `draw_block_with_inner_content` for the v1 mirror.
-    if let Some(block) = drawables.block_styles.get(&node_id) {
+    if let Some(block) = sliced_block_ref {
         // Suppress the inline-paragraph branch of
         // `draw_block_with_inner_content` when paragraph_slices owns
         // this NodeId (Case A: container is itself the inline root, so
@@ -2573,7 +2585,11 @@ fn draw_under_clip(
     // covers content that should be cut off.
     // (PR #313 follow-up Devin Review — completes the PR #316 fix.)
     let is_split = geom.is_split();
-    let frame_frag = frame_fragment(geom, frag);
+    let (frame_frag, edges) = frame_fragment(geom, frag);
+    // F30f-d: the edges of a box sliced at its breaks are open on this page: no border, padding or radius there, and
+    // the clip is the padding box of this fragment.
+    let sliced = crate::draw_primitives::sliced_style(&block.style, edges);
+    let style: &crate::draw_primitives::BlockStyle = &sliced;
     let total_height = block
         .layout_size
         .map(|s| {
@@ -2588,7 +2604,7 @@ fn draw_under_clip(
     let para_for_block = drawables.paragraphs.get(&node_id);
     let img_for_block = drawables.images.get(&node_id);
     let svg_for_block = drawables.svgs.get(&node_id);
-    let inner_inset = block.style.content_inset();
+    let inner_inset = style.content_inset();
 
     // When this node is a list-item with overflow clip, honour the
     // list-item painting order: outer opacity uses `list_item.opacity`
@@ -2617,10 +2633,10 @@ fn draw_under_clip(
         // `draw_block_inner_paint` but inlined so the opacity wrap
         // covers the entire clipped region too.
         if block.visible {
-            note_painted_box(canvas, &block.style, x_pt, total_width);
+            note_painted_box(canvas, style, x_pt, total_width);
             crate::background::draw_box_shadows(
                 canvas,
-                &block.style,
+                style,
                 x_pt,
                 y_pt,
                 total_width,
@@ -2628,7 +2644,7 @@ fn draw_under_clip(
             );
             crate::background::draw_background(
                 canvas,
-                &block.style,
+                style,
                 x_pt,
                 y_pt,
                 total_width,
@@ -2636,7 +2652,7 @@ fn draw_under_clip(
             );
             crate::draw_primitives::draw_block_border(
                 canvas,
-                &block.style,
+                style,
                 x_pt,
                 y_pt,
                 total_width,
@@ -2649,7 +2665,7 @@ fn draw_under_clip(
         // changed since extract decided this block clips).
         let clip_pushed = if let Some(clip_path) =
             crate::draw_primitives::compute_overflow_clip_path(
-                &block.style,
+                style,
                 x_pt,
                 y_pt,
                 total_width,
@@ -2669,12 +2685,12 @@ fn draw_under_clip(
         let outer_clip_band = canvas.clip_band;
         // A box whose block size the author does not constrain hides nothing: it gets no band.
         if clip_pushed
-            && block.style.overflow_y == crate::draw_primitives::Overflow::Clip
-            && block.style.block_size_constrained
+            && style.overflow_y == crate::draw_primitives::Overflow::Clip
+            && style.block_size_constrained
         {
             let (top_border, bottom_border) = (
-                block.style.border_widths[0].to_f32(),
-                block.style.border_widths[2].to_f32(),
+                style.border_widths[0].to_f32(),
+                style.border_widths[2].to_f32(),
             );
             canvas.clip_band = outer_clip_band.intersect(
                 (y_pt + top_border).as_pt(),
@@ -3050,7 +3066,10 @@ fn draw_under_opacity(
             // `draw_block_inner_paint` fix addresses for non-opacity
             // blocks (PR #316). (PR #314 follow-up Devin Review)
             let is_split = geom.is_split();
-            let frame_frag = frame_fragment(geom, frag);
+            let (frame_frag, edges) = frame_fragment(geom, frag);
+            // F30f-d: open edges of a box sliced at its breaks (see `draw_under_clip`).
+            let sliced = crate::draw_primitives::sliced_style(&block.style, edges);
+            let style: &crate::draw_primitives::BlockStyle = &sliced;
             let total_height = block
                 .layout_size
                 .map(|s| {
@@ -3064,7 +3083,7 @@ fn draw_under_opacity(
             if block.visible {
                 crate::background::draw_box_shadows(
                     canvas,
-                    &block.style,
+                    style,
                     x_pt,
                     y_pt,
                     total_width,
@@ -3072,7 +3091,7 @@ fn draw_under_opacity(
                 );
                 crate::background::draw_background(
                     canvas,
-                    &block.style,
+                    style,
                     x_pt,
                     y_pt,
                     total_width,
@@ -3080,14 +3099,14 @@ fn draw_under_opacity(
                 );
                 crate::draw_primitives::draw_block_border(
                     canvas,
-                    &block.style,
+                    style,
                     x_pt,
                     y_pt,
                     total_width,
                     total_height,
                 );
             }
-            let inner_inset = block.style.content_inset();
+            let inner_inset = style.content_inset();
             let inner_x = x_pt + inner_inset.0;
             let inner_y = y_pt + inner_inset.1;
             if let Some(p) = para_for_block {
@@ -3595,11 +3614,22 @@ fn draw_svg_inner_paint(
 /// covers the border and padding above them (reserved on every page, because the
 /// lines are painted at `y + inset_top`) and, on the last page, below them.
 /// Everything else gets `frag` back unchanged.
+///
+/// html-to-pdf F30f-d: a box that is sliced at its breaks (`geom.line_split_slice`, css-break-3 §5.4) has the top
+/// inset on its first fragment only and the bottom one on its last; a fragment that is not the last was extended to
+/// the page bottom by the fragmenter. The second value says which edges of the frame are open (no border, padding or
+/// radius there: [`crate::draw_primitives::sliced_style`], which also takes the top inset off the lines of a continuation
+/// page).
 pub(crate) fn frame_fragment(
     geom: &crate::pagination_layout::PaginationGeometry,
     frag: &crate::pagination_layout::Fragment,
-) -> crate::pagination_layout::Fragment {
+) -> (
+    crate::pagination_layout::Fragment,
+    crate::draw_primitives::FrameEdges,
+) {
+    use crate::draw_primitives::FrameEdges;
     let mut frame = frag.clone();
+    let mut edges = FrameEdges::default();
     if let Some((top, bottom)) = geom.line_split_insets
         && geom.is_split()
     {
@@ -3607,6 +3637,24 @@ pub(crate) fn frame_fragment(
             .fragments
             .last()
             .is_some_and(|last| last.page_index == frag.page_index);
+        let is_first = geom
+            .fragments
+            .first()
+            .is_some_and(|first| first.page_index == frag.page_index);
+        // A sliced box has the top inset on its first fragment only (the bottom one is on the last either way).
+        let top = if geom.line_split_slice {
+            edges = FrameEdges {
+                top_open: !is_first,
+                bottom_open: !is_last,
+            };
+            if is_first {
+                top
+            } else {
+                crate::units::Px::ZERO
+            }
+        } else {
+            top
+        };
         frame.height = top
             + frag.height
             + if is_last {
@@ -3615,7 +3663,7 @@ pub(crate) fn frame_fragment(
                 crate::units::Px::ZERO
             };
     }
-    frame
+    (frame, edges)
 }
 
 /// Block draw: emits background / border / box-shadow for the
@@ -4015,7 +4063,7 @@ fn paint_table_row_backgrounds(
                 // A cell whose direct text was split between lines (F30b) holds the
                 // span of its lines in the raw fragment; its frame also covers the
                 // padding and border above and below them.
-                let frag = frame_fragment(cell_geom, frag);
+                let (frag, _) = frame_fragment(cell_geom, frag);
                 if let Some(piece) = piece {
                     // The middle of the cell is in the piece.
                     let cx = frag.x.to_f32() + frag.width.to_f32() / 2.0;
@@ -6499,9 +6547,78 @@ mod tests {
         let heights: Vec<f32> = geom
             .fragments
             .iter()
-            .map(|f| frame_fragment(&geom, f).height.to_f32())
+            .map(|f| frame_fragment(&geom, f).0.height.to_f32())
             .collect();
         assert_eq!(heights, vec![117.0, 117.0, 62.0]);
+        // A closed frame has no open edge.
+        for f in &geom.fragments {
+            assert!(!frame_fragment(&geom, f).1.any());
+        }
+    }
+
+    #[test]
+    fn frame_fragment_of_a_sliced_paragraph_opens_the_broken_edges() {
+        // html-to-pdf F30f-d: three fragments of a box with 17px above and 5px below its lines, sliced at its breaks.
+        // The fragmenter extended the first two to the page bottom (100px frames: 83 + 17 and 100). The first has the top
+        // inset and an open bottom, the middle one is open on both sides, the last has the bottom inset and an open top.
+        let mut geom = geometry_of(&[83.0, 100.0, 40.0], Some((17.0, 5.0)));
+        geom.line_split_slice = true;
+        let got: Vec<(f32, bool, bool)> = geom
+            .fragments
+            .iter()
+            .map(|f| {
+                let (frame, edges) = frame_fragment(&geom, f);
+                (frame.height.to_f32(), edges.top_open, edges.bottom_open)
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (100.0, false, true),
+                (100.0, true, true),
+                (45.0, true, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn sliced_style_zeroes_the_open_edges_only() {
+        use crate::draw_primitives::{BlockStyle, FrameEdges, sliced_style};
+        use crate::units::{F32Units, Pt};
+        let style = BlockStyle {
+            border_widths: [1.0_f32.as_pt(); 4],
+            padding: [12.0_f32.as_pt(); 4],
+            border_radii: [[6.0_f32.as_pt(); 2]; 4],
+            ..Default::default()
+        };
+        let closed = sliced_style(&style, FrameEdges::default());
+        assert!(matches!(closed, std::borrow::Cow::Borrowed(_)));
+        let open = sliced_style(
+            &style,
+            FrameEdges {
+                top_open: true,
+                bottom_open: false,
+            },
+        );
+        assert_eq!(open.border_widths[0], Pt::ZERO);
+        assert_eq!(open.padding[0], Pt::ZERO);
+        assert_eq!(open.content_inset(), (13.0, 0.0));
+        assert_eq!(open.border_radii[0], [Pt::ZERO; 2]);
+        assert_eq!(open.border_radii[1], [Pt::ZERO; 2]);
+        assert_eq!(open.border_radii[2], style.border_radii[2]);
+        assert_eq!(open.border_widths[2], style.border_widths[2]);
+        assert_eq!(open.border_widths[1], style.border_widths[1]);
+        let both = sliced_style(
+            &style,
+            FrameEdges {
+                top_open: true,
+                bottom_open: true,
+            },
+        );
+        assert_eq!(both.border_widths[2], Pt::ZERO);
+        assert_eq!(both.padding[2], Pt::ZERO);
+        assert_eq!(both.border_radii[3], [Pt::ZERO; 2]);
+        assert_eq!(both.border_widths[3], style.border_widths[3]);
     }
 
     #[test]
@@ -6509,11 +6626,14 @@ mod tests {
         // No insets recorded: a block split by the block fragmenter.
         let geom = geometry_of(&[100.0, 40.0], None);
         for f in &geom.fragments {
-            assert_eq!(frame_fragment(&geom, f), *f);
+            assert_eq!(frame_fragment(&geom, f).0, *f);
         }
         // Insets but a single fragment (nothing was split): the box's own layout height is used.
         let geom = geometry_of(&[100.0], Some((17.0, 5.0)));
-        assert_eq!(frame_fragment(&geom, &geom.fragments[0]), geom.fragments[0]);
+        assert_eq!(
+            frame_fragment(&geom, &geom.fragments[0]).0,
+            geom.fragments[0]
+        );
     }
 
     #[test]

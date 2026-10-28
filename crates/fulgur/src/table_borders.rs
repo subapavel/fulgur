@@ -401,7 +401,7 @@ fn page_rows(
         let later = geom.fragments.iter().any(|f| f.page_index > page_index);
         for frag in geom.fragments.iter().filter(|f| f.page_index == page_index) {
             let place = piece_of(pieces, frag).map_or(0, |p| slot_key(p.x));
-            let frag = crate::render::frame_fragment(geom, frag);
+            let (frag, _) = crate::render::frame_fragment(geom, frag);
             let (x, y) = (frag.x.to_f32() + dx_px, frag.y.to_f32() + dy_px);
             let (w, h) = (frag.width.to_f32(), frag.height.to_f32());
             if w <= 0.0 || h <= 0.0 {
@@ -1073,7 +1073,7 @@ mod tests {
             let earlier = geom.fragments.iter().any(|f| f.page_index < page_index);
             let later = geom.fragments.iter().any(|f| f.page_index > page_index);
             for frag in geom.fragments.iter().filter(|f| f.page_index == page_index) {
-                let frag = crate::render::frame_fragment(geom, frag);
+                let (frag, _) = crate::render::frame_fragment(geom, frag);
                 let (x, y) = (frag.x.to_f32() + dx_px, frag.y.to_f32() + dy_px);
                 let (w, h) = (frag.width.to_f32(), frag.height.to_f32());
                 if w <= 0.0 || h <= 0.0 {

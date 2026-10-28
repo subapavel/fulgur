@@ -1153,6 +1153,53 @@ pub struct BackgroundLayer {
     pub clip: BgClip,
 }
 
+/// html-to-pdf F30f-d: the edges of a box's frame that are open on one page because the box is sliced at its breaks
+/// (`box-decoration-break: slice`, css-break-3 §5.4): there is no border, padding or radius at a break edge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FrameEdges {
+    /// The top edge is a break (a continuation page of the box).
+    pub top_open: bool,
+    /// The bottom edge is a break (the box goes on on the next page).
+    pub bottom_open: bool,
+}
+
+impl FrameEdges {
+    /// Whether any edge is open.
+    pub(crate) fn any(self) -> bool {
+        self.top_open || self.bottom_open
+    }
+}
+
+/// The style a sliced box is painted with on one page: the border width, the padding and the two radii of an open edge
+/// are zero (css-break-3 §5.4: "as though the element were rendered with no breaks present, and then sliced by the
+/// breaks afterward"; `border-radius` applies at unbroken corners only). The result is what
+/// [`BlockStyle::content_inset`], `draw_background`, `draw_block_border` and `compute_overflow_clip_path` read, so they
+/// need no knowledge of slicing. A box with no open edge is borrowed unchanged.
+pub(crate) fn sliced_style(
+    style: &BlockStyle,
+    edges: FrameEdges,
+) -> std::borrow::Cow<'_, BlockStyle> {
+    if !edges.any() {
+        return std::borrow::Cow::Borrowed(style);
+    }
+    let mut s = style.clone();
+    let zero = crate::units::Pt::ZERO;
+    if edges.top_open {
+        s.border_widths[0] = zero;
+        s.padding[0] = zero;
+        // [top-left, top-right, bottom-right, bottom-left]
+        s.border_radii[0] = [zero; 2];
+        s.border_radii[1] = [zero; 2];
+    }
+    if edges.bottom_open {
+        s.border_widths[2] = zero;
+        s.padding[2] = zero;
+        s.border_radii[2] = [zero; 2];
+        s.border_radii[3] = [zero; 2];
+    }
+    std::borrow::Cow::Owned(s)
+}
+
 impl BlockStyle {
     /// The border colour when all four sides have the same one, `None` when they differ.
     ///

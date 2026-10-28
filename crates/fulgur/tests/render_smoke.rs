@@ -9593,3 +9593,21 @@ fn render_smoke_max_height_clip_box_spans_pages() {
     // The lines the clip hides are not written, on either page.
     assert!(text_items_of(&clipped, "c.pdf") < text_items_of(&free, "f.pdf") / 2 + 4);
 }
+
+#[test]
+fn render_smoke_padded_body_level_paragraph_is_sliced_at_its_page_breaks() {
+    // html-to-pdf F30f-d: a bordered, padded box with direct text taller than a page is cut between line boxes and
+    // sliced at the breaks (`box-decoration-break: slice`): three A4 pages of 20px lines with nothing lost, the frame
+    // open at each break, and the paragraph after the box below its last line.
+    let lines: String = (0..120).map(|i| format!("line{i}<br>")).collect();
+    let html = format!(
+        "<!DOCTYPE html><html><head><style>@page {{ margin: 0 }} body {{ margin: 0 }}</style></head><body>\
+         <div style=\"border:2px solid #000;padding:12px;border-radius:8px;line-height:20px\">{lines}</div>\
+         <p style=\"margin:0\">AFTER</p></body></html>"
+    );
+    let pdf = noto_engine().render(&html).expect("render");
+    // 2400px of lines + 28px of insets over 1122px pages: 3 pages, the last one holding the end and AFTER.
+    assert_eq!(page_count(&pdf), 3);
+    // 120 lines and AFTER, each written once (a `<br>` ends a text item).
+    assert!(text_items_of(&pdf, "s.pdf") >= 121);
+}

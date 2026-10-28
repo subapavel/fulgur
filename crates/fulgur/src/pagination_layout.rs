@@ -2581,18 +2581,21 @@ impl<'a> PaginationLayoutTree<'a> {
             // under the clip of an `overflow` box), and the frame closed `inset_top + inset_bottom` too early on the last
             // page. A box without insets, a clip box (above), `break-inside: avoid`, a float and a box that is not in
             // block flow keep the path they had (F30c for the unpadded ones).
-            let has_insets = layout.border.top
+            let insets = layout.border.top
                 + layout.padding.top
                 + layout.border.bottom
-                + layout.padding.bottom
-                > 0.0;
+                + layout.padding.bottom;
+            // The lines and their insets do not fit the room. A box whose `height`, `max-height` or `min-height` makes it
+            // taller than that keeps the path it had (F83c: its frame continues over the pages, its lines stay on the
+            // page that has room for them: a 120px box with four lines at the page bottom).
             let inset_split_here = clip_limit_here.is_none()
-                && has_insets
+                && insets > 0.0
                 && body_block_flow
                 && !is_float
                 && !avoid_inside
                 && !crate::blitz_adapter::is_multicol_container(child)
-                && cursor_y + child_h > self.strips.bottom(page_index) + 0.5;
+                && !block_size_constrained(child)
+                && cursor_y + insets + lines_extent > self.strips.bottom(page_index) + 0.5;
             if line_metrics.len() > 1
                 && (clip_limit_here.is_some() && !clip_whole_now || inset_split_here)
                 && let Some(body_node) = self.doc.get_node(body_id)
@@ -15362,6 +15365,24 @@ h2 { string-set: chapter-title content(text); }
             &[(3, 50.0, 20.0)],
             "after the box",
         );
+    }
+
+    #[test]
+    fn a_padded_box_with_a_height_whose_lines_fit_keeps_its_path() {
+        // html-to-pdf F30f-d: the box is taller than the page only through `height` (300px on 200px pages), its four lines
+        // and their insets fit: it is not cut between its lines (F83c), whatever the room below the cursor.
+        for style in ["height:300px", "min-height:300px"] {
+            let (doc, table) = nested_geometry(
+                &format!(
+                    "<div style=\"height:60px\"></div><div id=\"b\" style=\"border:1px solid #000;padding:9px;{style}\">{}</div>",
+                    br_lines(4)
+                ),
+                200.0,
+            );
+            let geom = geometry_of(&doc, &table, "b").expect("geometry");
+            assert!(!geom.line_split_slice, "{style}");
+            assert_eq!(geom.line_split_insets, None, "{style}");
+        }
     }
 
     #[test]
