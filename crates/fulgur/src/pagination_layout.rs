@@ -2601,7 +2601,8 @@ impl<'a> PaginationLayoutTree<'a> {
                 && let Some(body_node) = self.doc.get_node(body_id)
                 && let Some(mut split) = line_split_candidate(self.doc, body_node, child)
             {
-                split.slice = inset_split_here;
+                // The clip box that is fragmented in place is sliced like the paragraph with insets (F30f-d, step 4).
+                split.slice = split.inset_top + split.inset_bottom > 0.0;
                 // A paragraph that is itself the clip box: the lines at or below the clip are dropped.
                 let leading = split.leading();
                 if cursor_y > 0.0
@@ -4755,7 +4756,7 @@ fn fragment_block_subtree(
         let mut line_split = if row_whole || clip_whole_at(page_index, child_page_y) {
             None
         } else {
-            nested_line_split(
+            block_walk_line_split(
                 doc,
                 parent,
                 child,
@@ -4817,8 +4818,10 @@ fn fragment_block_subtree(
             && mc_split.is_none()
             && !forced_break_below(facts, doc, column_styles, child_id)
             && !page_name_change_below(facts, doc, used_page_names, child_id)
-            && let Some(split) = line_split_candidate(doc, parent, child)
+            && let Some(mut split) = line_split_candidate(doc, parent, child)
         {
+            split.slice =
+                split.inset_top + split.inset_bottom > 0.0 && slices_at_breaks(doc, parent, child);
             line_split = Some(split);
             needs_recursion = false;
         }
@@ -4967,7 +4970,7 @@ fn fragment_block_subtree(
                 line_split = if clip_whole_at(page_index, child_page_y) {
                     None
                 } else {
-                    nested_line_split(
+                    block_walk_line_split(
                         doc,
                         parent,
                         child,
@@ -6709,6 +6712,40 @@ fn inline_root_lines(child: &blitz_dom::Node) -> Option<LineSplit> {
         own_box_height: None,
         slice: false,
     })
+}
+
+/// html-to-pdf F30f-d: whether a paragraph `child` split between its lines is sliced at its breaks (`box-decoration-break:
+/// slice`, css-break-3 5.4: no border, padding or radius at a break edge, the lines of a continuation page start at the top
+/// of the page). The paragraphs the renderer paints as a frame of their own in block flow: the child of a block, flow-root
+/// or list item. Table cells are painted by the table (F96), a flex or grid item or an atomic inline by its container.
+fn slices_at_breaks(doc: &BaseDocument, parent: &blitz_dom::Node, child: &blitz_dom::Node) -> bool {
+    use ::style::values::specified::box_::DisplayInside;
+    let inside = |n: &blitz_dom::Node| n.primary_styles().map(|s| s.clone_display().inside());
+    is_block_flow_container(doc, parent)
+        && matches!(
+            inside(parent),
+            Some(DisplayInside::Flow | DisplayInside::FlowRoot)
+        )
+        && !matches!(inside(child), Some(DisplayInside::TableCell))
+        && !is_cell_of_table(parent, child)
+}
+
+/// [`nested_line_split`] for a child of the block walk (`fragment_block_subtree`): the paragraph is sliced at its breaks
+/// where [`slices_at_breaks`] says so and it has a border or padding to open (F30f-d). The body (F37 slices it itself)
+/// and the multicol column-span caller use [`nested_line_split`] and keep the closed frame.
+fn block_walk_line_split(
+    doc: &BaseDocument,
+    parent: &blitz_dom::Node,
+    child: &blitz_dom::Node,
+    child_page_y: f32,
+    strip_top: f32,
+    strips: PageStrips,
+    page: u32,
+) -> Option<LineSplit> {
+    let mut split = nested_line_split(doc, parent, child, child_page_y, strip_top, strips, page)?;
+    split.slice =
+        split.inset_top + split.inset_bottom > 0.0 && slices_at_breaks(doc, parent, child);
+    Some(split)
 }
 
 /// F30: the split to apply to `child` when it is placed at `child_page_y` on
@@ -14761,8 +14798,11 @@ h2 { string-set: chapter-title content(text); }
     }
 
     #[test]
-    fn padding_and_border_are_reserved_on_every_page_of_a_split_box() {
-        // The box is its own paragraph: border 1 + padding 9 = 10px above the lines.
+    fn a_padded_paragraph_in_a_block_is_sliced_at_its_page_breaks() {
+        // html-to-pdf F30f-d, step 4 (was `padding_and_border_are_reserved_on_every_page_of_a_split_box`: F30 reserved the
+        // 10px of border and padding above the lines on every page). The box is its own paragraph, in a block: it is
+        // sliced at its breaks (css-break-3 5.4): the top inset is on the first fragment only, a continuation page starts
+        // its lines at the top, and a fragment that is not the last fills the page.
         let (doc, table) = nested_geometry(
             &format!(
                 "<section><div id=\"b\" style=\"border:1px solid #000;padding:9px\">{}</div></section>",
@@ -14773,18 +14813,28 @@ h2 { string-set: chapter-title content(text); }
         let node = find_by_id(doc.deref(), "b").unwrap();
         let geom = &table[&node];
         let frags = &geom.fragments;
-        assert!(frags.len() >= 4, "{frags:?}");
+        assert!(geom.line_split_slice);
+        assert!(frags.len() >= 3, "{frags:?}");
         let (top, bottom) = geom.line_split_insets.expect("insets recorded");
         assert_eq!((top.to_f32(), bottom.to_f32()), (10.0, 10.0));
-        for f in frags {
+        for (k, f) in frags.iter().enumerate() {
+            let inset = if k == 0 { 10.0 } else { 0.0 };
             assert!(
-                f.y.to_f32() + 10.0 + f.height.to_f32() <= 200.5,
+                f.y.to_f32() + inset + f.height.to_f32() <= 200.5,
                 "lines must end inside the page: {f:?}"
             );
+            if k > 0 {
+                assert_eq!(f.y.to_f32(), 0.0, "{frags:?}");
+            }
+            if k + 1 < frags.len() {
+                assert!(
+                    (f.y.to_f32() + inset + f.height.to_f32() - 200.0).abs() < 0.5,
+                    "a fragment that is not the last fills the page: {f:?}"
+                );
+            }
         }
-        // 600px of lines in 180px strips: 9 lines each (widows pull the last strip up).
-        let total: f32 = frags.iter().map(|f| f.height.to_f32()).sum();
-        assert!((total - 600.0).abs() < 0.5, "{total}");
+        let lines: u32 = geom.line_slices.iter().map(|l| l.end - l.first).sum();
+        assert_eq!(lines, 30, "{:?}", geom.line_slices);
     }
 
     #[test]
