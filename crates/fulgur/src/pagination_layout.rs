@@ -3485,7 +3485,7 @@ fn leading_block_size(
                 // leading`), not the bottom of the first box, which may sit on a later line (a text line, then the
                 // image) or on a line shorter than its strut. It was `top + the box`: a cell of `text<br><img>` near
                 // the bottom of a page asked for the text and the image, did not fit, and moved whole where Chrome
-                // keeps its first two lines (html-to-pdf F183, plan 7.8).
+                // keeps its first two lines (html-to-pdf F183, plan 7.7).
                 if node.flags.is_inline_root()
                     && let Some(split) = abspos_line_split(node)
                 {
@@ -4607,7 +4607,7 @@ fn fragment_block_subtree(
                 keeps_whole,
                 tail_over_at(page_index, child_page_y, content_above_child),
             );
-        // html-to-pdf F183 (plan 7.8): the gate enters an inline root because one of its inline boxes (an `<img>`, the
+        // html-to-pdf F183 (plan 7.7): the gate enters an inline root because one of its inline boxes (an `<img>`, the
         // second line's) overflows the strip. The children of an inline root are not block children: the lines put
         // them where they are, and the block walk cut the root between two boxes, in fragments as tall as the boxes,
         // without line ranges (a 64 px line of a 60 px image no longer fitted its fragment and was dropped, with the
@@ -11993,7 +11993,7 @@ h2 { string-set: chapter-title content(text); }
     /// Two lines (an image each) at the bottom of page 0: a cell on two pages has a line range for each fragment, and
     /// the images are where the last column says. The cell of a table with a frame is not flush with the top of the strip, so the cut
     /// that keeps the first two lines (orphans) together moves it to page 1 whole, as Chrome does; so does the plain
-    /// table at the top of its strip since plan 7.8 (`leading_block_size` of an inline root counts its first two
+    /// table at the top of its strip since plan 7.7 (`leading_block_size` of an inline root counts its first two
     /// lines, not the bottom of its first image: it used to split 1 | 1).
     #[test]
     fn a_cell_of_a_bordered_table_is_split_between_its_lines() {
@@ -12046,7 +12046,7 @@ h2 { string-set: chapter-title content(text); }
         }
     }
 
-    /// html-to-pdf F183 (plan 7.8): an inline root that holds inline boxes (an `<img>` on each of its lines) and that
+    /// html-to-pdf F183 (plan 7.7): an inline root that holds inline boxes (an `<img>` on each of its lines) and that
     /// the strip cannot hold is cut between its lines, never between its boxes. The block walk used to enter it because
     /// one of its children (an image on a later line) overflowed the strip, and cut it between the images in fragments
     /// as tall as the images: with no line ranges the renderer measured the lines from those heights, and a line taller
@@ -12164,7 +12164,7 @@ h2 { string-set: chapter-title content(text); }
         );
     }
 
-    /// html-to-pdf F183 (plan 7.8): the first thing an inline root with a box in it needs below its top is its first
+    /// html-to-pdf F183 (plan 7.7): the first thing an inline root with a box in it needs below its top is its first
     /// two lines (orphans), as for a cut paragraph, not the bottom of its first box. A cell of `text<br><img><br>text`
     /// whose two text lines fit the room but not the image under them is entered and cut after the text, as Chrome
     /// does; it used to ask for the text and the image, did not fit, and moved to the next page whole.
