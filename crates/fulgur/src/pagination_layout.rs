@@ -5905,6 +5905,16 @@ fn split_barrier(
     None
 }
 
+/// Whether `child` is a cell of the table box `parent`, or an anonymous cell Blitz made for what is not a table part
+/// (CSS 2.1 section 17.2.1).
+fn is_cell_of_table(parent: &blitz_dom::Node, child: &blitz_dom::Node) -> bool {
+    use ::style::values::specified::box_::DisplayInside;
+    let inside_of = |n: &blitz_dom::Node| n.primary_styles().map(|s| s.clone_display().inside());
+    inside_of(parent) == Some(DisplayInside::Table)
+        && (inside_of(child) == Some(DisplayInside::TableCell)
+            || crate::blitz_adapter::is_anonymous_table_cell(parent, child))
+}
+
 /// F30: whether a child of `parent` is an inline root that the fragmenter may
 /// split between its line boxes, and if so its lines — whatever its height.
 ///
@@ -5979,8 +5989,18 @@ fn nested_line_split(
     let split = line_split_candidate(doc, parent, child)?;
     let total = split.inset_top + split.span();
     let taller_than_a_page = total > strips.fresh() + 1.0;
-    let first_and_overflowing =
-        child_page_y <= strip_top + 0.5 && child_page_y + total > strips.bottom(page) + 1.0;
+    // The first thing in the box: nothing precedes it but the box's own border and padding. A cell of a table with a
+    // border is placed below the table's border (a collapsed table holds half of its outer borders, Blitz rounds that
+    // to the pixel above the cell), which is no content above the cell, and measuring from the border edge left such
+    // a cell "not first": it was not split between its lines, the block path cut it between its boxes instead
+    // (html-to-pdf F183, plan 7.5). Only table cells: a block child of a padded box keeps moving whole (F30c).
+    let frame_above = if is_cell_of_table(parent, child) {
+        parent.final_layout.border.top + parent.final_layout.padding.top
+    } else {
+        0.0
+    };
+    let first_and_overflowing = child_page_y <= strip_top + frame_above + 0.5
+        && child_page_y + total > strips.bottom(page) + 1.0;
     (taller_than_a_page || first_and_overflowing).then_some(split)
 }
 
@@ -11835,6 +11855,69 @@ h2 { string-set: chapter-title content(text); }
                 [1],
                 "{table_style:?}"
             );
+        }
+    }
+
+    /// html-to-pdf F183 (plan 7.5): a table cell is a paragraph that may be split between its line boxes (F30b) whatever
+    /// the border of its table is. The test "the paragraph is flush with the top of its box" (`nested_line_split`)
+    /// measured from the border edge, so a cell of a table with a border (separated borders with `border: 3px`) or of a
+    /// `border-collapse: collapse` table (the table holds half of its outer borders, Blitz puts the cells 1 px or more
+    /// below its top) was never "first": it was not split between its lines but cut between its boxes by the block
+    /// path, the second line landed in a fragment as tall as the image, and the paragraph painter dropped the 64 px
+    /// line that did not fit it (the later lines vanished from page 2).
+    ///
+    /// Two lines (an image each) at the bottom of page 0: a cell on two pages has a line range for each fragment, and
+    /// the images are where the last column says. The cell of a table with a frame is not flush with the top of the strip, so the cut
+    /// that keeps the first two lines (orphans) together moves it to page 1 whole, as Chrome does; the plain table
+    /// at the top of its strip splits 1 | 1 (F30c).
+    #[test]
+    fn a_cell_of_a_bordered_table_is_split_between_its_lines() {
+        let font = Arc::new(
+            std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../examples/.fonts/NotoSans-Regular.ttf"
+            ))
+            .expect("the bundled Noto Sans"),
+        );
+        // (table style, td style, page of each image)
+        let variants = [
+            ("", "border:1px solid #000", [0, 1]),
+            ("border-collapse:collapse", "border:1px solid #000", [1, 1]),
+            ("border-collapse:collapse", "border:2px solid #000", [1, 1]),
+            ("border-collapse:collapse", "border:3px solid #000", [1, 1]),
+            (
+                "border-collapse:collapse;border:4px solid red",
+                "border:1px solid #000",
+                [1, 1],
+            ),
+            ("border:3px solid red", "border:1px solid #000", [1, 1]),
+            ("padding:4px", "border:1px solid #000", [1, 1]),
+        ];
+        for (table_style, td_style, image_pages) in variants {
+            let html = format!(
+                r#"<style>body{{margin:0;font:16px 'Noto Sans'}}td{{padding:5px;{td_style}}}</style><body>
+                <div style="height:1000px"></div><table style="{table_style}"><tr><td id="td"><img id="a" width="60" height="60"><br><img id="b" width="60" height="60"></td></tr></table></body>"#
+            );
+            let mut doc = blitz_adapter::parse(&html, 794.0, std::slice::from_ref(&font));
+            blitz_adapter::resolve(&mut doc);
+            let table = run_pass(&mut doc, 1122.52);
+            let label = format!("{table_style:?} / {td_style:?}");
+            let td = &table[&find_by_id(doc.deref(), "td").unwrap()];
+            assert!(
+                td.fragments.len() < 2 || line_slices_tile(&td.line_slices, 2),
+                "{label}: the cell is cut but not by line ranges: {td:?}"
+            );
+            for (id, page) in ["a", "b"].into_iter().zip(image_pages) {
+                let img = &table[&find_by_id(doc.deref(), id).unwrap()];
+                assert_eq!(
+                    img.fragments
+                        .iter()
+                        .map(|f| f.page_index)
+                        .collect::<Vec<_>>(),
+                    [page],
+                    "{label}: image {id}"
+                );
+            }
         }
     }
 
