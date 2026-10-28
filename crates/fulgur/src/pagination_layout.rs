@@ -15710,9 +15710,10 @@ h2 { string-set: chapter-title content(text); }
     }
 
     #[test]
-    fn content_below_the_clip_gets_no_page() {
-        // The second paragraph starts at 200px, below the clip of the 100px box that straddles the page bottom. It is
-        // not placed: its fragment is below the content box of the page the box ends on, and no page is added for it.
+    fn a_clip_box_with_two_paragraphs_is_not_fragmented_by_its_block_size() {
+        // F30f-f (plan 7, "Supported shapes"): the second paragraph starts at 200px, below the clip of the 100px box that
+        // straddles the page bottom. Content below the clip getting no page needs the fragmenter to place more than the
+        // first thing on a strip (F30c); until then a box with two paragraphs has no limit and is laid out as on main.
         let (doc, table) = nested_geometry(
             &format!(
                 "<div style=\"height:150px\"></div><div id=\"w\" style=\"overflow:hidden;height:100px\">\
@@ -15722,17 +15723,11 @@ h2 { string-set: chapter-title content(text); }
             ),
             200.0,
         );
-        assert_frames(frames_of(&doc, &table, "a"), &[(1, 50.0, 20.0)], "after");
-        let y = frames_of(&doc, &table, "y");
-        assert_eq!(y.len(), 1, "{y:?}");
-        assert_eq!(y[0].0, 1, "on the page the box ends on: {y:?}");
-        assert!(y[0].1 >= 200.0, "below the content box: {y:?}");
-        let pages = table
-            .values()
-            .flat_map(|g| g.fragments.iter())
-            .map(|f| f.page_index)
-            .max();
-        assert_eq!(pages, Some(1));
+        // As on main: the first paragraph on the page the box starts on, the second on the next one, AFTER after it.
+        assert_frames(frames_of(&doc, &table, "x"), &[(1, 0.0, 200.0)], "x");
+        assert_frames(frames_of(&doc, &table, "y"), &[(2, 0.0, 200.0)], "y");
+        assert_frames(frames_of(&doc, &table, "a"), &[(3, 0.0, 20.0)], "after");
+        assert_eq!(clip_block_limit(doc.deref(), node_of(&doc, "w")), None);
     }
 
     #[test]
