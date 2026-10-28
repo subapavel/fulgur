@@ -504,6 +504,7 @@ impl Engine {
         // consumed first by the multicol layout hook (for column-fill) and
         // then by the convert pass (for column-rule wrapping).
         let column_styles = crate::blitz_adapter::extract_column_style_table(&doc);
+        let _avoid_scope = crate::pagination_layout::BreakAvoidScope::enter(&column_styles);
         // Blitz treats multicol containers as plain blocks; route them
         // through fulgur's Taffy hook so columns balance and siblings
         // shift in lockstep. The returned geometry table captures per-
@@ -1020,6 +1021,7 @@ impl Engine {
             self.config.content_height().as_pt().in_px().to_f32(),
         );
         let column_styles = crate::blitz_adapter::extract_column_style_table(&doc);
+        let _avoid_scope = crate::pagination_layout::BreakAvoidScope::enter(&column_styles);
         let multicol_geometry = crate::multicol_layout::run_pass(doc.deref_mut(), &column_styles);
         let pagination_geometry = crate::pagination_layout::run_pass_with_multicol(
             doc.deref_mut(),
@@ -1099,6 +1101,7 @@ impl Engine {
             self.config.content_height().as_pt().in_px().to_f32(),
         );
         let column_styles = crate::blitz_adapter::extract_column_style_table(&doc);
+        let _avoid_scope = crate::pagination_layout::BreakAvoidScope::enter(&column_styles);
         let multicol_geometry = crate::multicol_layout::run_pass(doc.deref_mut(), &column_styles);
         let mut pagination_geometry = crate::pagination_layout::run_pass_with_multicol(
             doc.deref_mut(),

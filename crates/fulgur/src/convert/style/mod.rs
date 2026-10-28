@@ -56,7 +56,7 @@ pub(super) fn extract_block_style(
         // PDF has no scroll concept: hidden/clip/scroll/auto all collapse to Clip.
         overflow::apply_to(&mut style, &ctx);
         if style.overflow_y == crate::draw_primitives::Overflow::Clip {
-            style.block_size_constrained = crate::pagination_layout::block_size_constrained(node);
+            style.block_size_constrained = crate::pagination_layout::clip_semantics_apply(node);
         }
 
         // Background color + background-image layers — kept last to preserve

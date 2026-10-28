@@ -6157,13 +6157,156 @@ fn percentage_basis_is_definite(node: &blitz_dom::Node) -> bool {
     false
 }
 
+thread_local! {
+    /// html-to-pdf F30f-b: the nodes with `break-inside: avoid` (or `page-break-inside: avoid`) of the document being
+    /// rendered, for [`clip_shape_supported`]. The declaration is read from the stylesheets by `column_css` (Stylo
+    /// does not compute it here), so the free functions of the fragmenter and the style extraction of the converter,
+    /// which see only the DOM, learn it from the scope the engine opens ([`BreakAvoidScope`]). Without a scope (unit
+    /// tests that call the fragmenter directly) no node avoids.
+    static AVOID_NODES: std::cell::RefCell<std::rc::Rc<BTreeSet<usize>>> =
+        std::cell::RefCell::new(std::rc::Rc::new(BTreeSet::new()));
+}
+
+/// html-to-pdf F30f-b: the engine opens this once per render, after the side table of `column_css` is built and before
+/// the fragmenter and the converter run, so that both ask [`clip_shape_supported`] with the same answer. Dropping it
+/// restores the previous set.
+pub(crate) struct BreakAvoidScope {
+    previous: std::rc::Rc<BTreeSet<usize>>,
+}
+
+impl BreakAvoidScope {
+    pub(crate) fn enter(column_styles: &crate::column_css::ColumnStyleTable) -> Self {
+        let avoiding: BTreeSet<usize> = column_styles
+            .iter()
+            .filter(|(_, p)| {
+                matches!(
+                    p.break_inside,
+                    Some(crate::draw_primitives::BreakInside::Avoid)
+                )
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        let previous = AVOID_NODES.with(|a| a.replace(std::rc::Rc::new(avoiding)));
+        Self { previous }
+    }
+}
+
+impl Drop for BreakAvoidScope {
+    fn drop(&mut self) {
+        AVOID_NODES.with(|a| {
+            a.replace(std::rc::Rc::clone(&self.previous));
+        });
+    }
+}
+
+fn avoids_break_inside(node_id: usize) -> bool {
+    AVOID_NODES.with(|a| a.borrow().contains(&node_id))
+}
+
+/// F30f-b: whether the clip semantics of this change (a clip box is fragmented by its own block size, its lines are cut
+/// at the clip, the writer drops what lies below it) apply to `node`: its block size is constrained
+/// ([`block_size_constrained`]) and what is in it is a shape the fragmenter handles ([`clip_shape_supported`]).
+/// Everything else is laid out, fragmented and drawn as it was before F30f-b, as if the box had no `height`.
+pub(crate) fn clip_semantics_apply(node: &blitz_dom::Node) -> bool {
+    block_size_constrained(node) && clip_shape_supported(node)
+}
+
+/// F30f-b (plan 7, "Supported shapes"): whether the content of the clip box `node` is a shape whose lines the fragmenter
+/// can place where Chrome does: direct text (the box is itself the inline root), or exactly one in-flow child that
+/// starts at the content top of the box and is such a shape in turn: a paragraph, or a block-level wrapper around one.
+///
+/// The fragmenter splits only the first thing on a strip (F30c). With anything above the paragraph (a heading, a
+/// margin, a float, an image, an earlier paragraph) the paragraph moved whole to the next page and was clipped there,
+/// and lines Chrome shows on the page the box starts on were not written; a second paragraph is not placed at all. Such
+/// a box keeps main's output until F30c (finding F30f-f).
+///
+/// Positions are the layout's: a child is "at the top" when its offset equals the resolved border and padding of its
+/// parent (so margins count), not what the style says. A percentage `padding-top` or `padding-bottom` is the exception
+/// the layout cannot answer: Taffy's block layout resolves it against the parent's height, which is not definite, so
+/// the box is reported with no vertical padding and a height without it, while its content is placed below the padding
+/// (plan 7). Such a box is not a supported shape. A node with `break-inside: avoid` is not either: the line splitter
+/// does not honour it for the paragraph that is first in a clip box.
+pub(crate) fn clip_shape_supported(node: &blitz_dom::Node) -> bool {
+    shape_supported(node, 0)
+}
+
+fn shape_supported(node: &blitz_dom::Node, depth: usize) -> bool {
+    use ::style::values::specified::box_::{DisplayInside, DisplayOutside};
+    if depth >= crate::MAX_DOM_DEPTH
+        || avoids_break_inside(node.id)
+        || has_percentage_vertical_padding(node)
+    {
+        return false;
+    }
+    if node.flags.is_inline_root() {
+        return true;
+    }
+    // A wrapper (not the clip box itself) is a block container of normal flow: a flex, grid or table box, a multicol
+    // container or a float lays its child out by rules of its own.
+    if depth > 0 {
+        let Some(styles) = node.primary_styles() else {
+            return false;
+        };
+        let display = styles.clone_display();
+        if display.outside() != DisplayOutside::Block
+            || !matches!(
+                display.inside(),
+                DisplayInside::Flow | DisplayInside::FlowRoot
+            )
+            || crate::blitz_adapter::is_multicol_container(node)
+            || crate::blitz_adapter::node_is_floating(node)
+        {
+            return false;
+        }
+    }
+    let layout_children = node.layout_children.borrow();
+    let children: &[usize] = layout_children
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .unwrap_or(&node.children);
+    let mut only: Option<&blitz_dom::Node> = None;
+    for &id in children {
+        let child = node.with(id);
+        if let Some(text) = child.text_data() {
+            if text.content.chars().all(char::is_whitespace) {
+                continue;
+            }
+        } else if child.element_data().is_none() {
+            continue;
+        }
+        // The second child that takes part in the layout: more than one thing in the box.
+        if only.replace(child).is_some() {
+            return false;
+        }
+    }
+    let Some(child) = only else {
+        return false;
+    };
+    let layout = &node.final_layout;
+    child.element_data().is_some()
+        && !crate::blitz_adapter::node_is_floating(child)
+        && !child.primary_styles().is_some_and(|s| {
+            use ::style::properties::longhands::position::computed_value::T as Pos;
+            matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed)
+        })
+        && (child.final_layout.location.y - (layout.border.top + layout.padding.top)).abs() <= 0.5
+        && shape_supported(child, depth + 1)
+}
+
+/// F30f-b: whether `padding-top` or `padding-bottom` of `node` is a percentage (or a `calc()` with one).
+fn has_percentage_vertical_padding(node: &blitz_dom::Node) -> bool {
+    node.primary_styles().is_some_and(|s| {
+        s.clone_padding_top().0.has_percentage() || s.clone_padding_bottom().0.has_percentage()
+    })
+}
+
 /// F30f-b: where the clip of `node` ends, when it hides some of its content: the bottom of its padding box, in px from
 /// the top of its border box. `None` for a box that does not clip its block axis, for one whose block size the author
 /// does not constrain ([`block_size_constrained`]: a content-sized box hides nothing, however tall its line boxes are),
 /// and for one whose content ends within its padding box ([`clip_hides_nothing`]): content-sized clip boxes are
 /// fragmented like any other (F30f).
 fn clip_block_limit(doc: &BaseDocument, node: &blitz_dom::Node) -> Option<f32> {
-    if !clips_block_axis(node) || !block_size_constrained(node) || clip_hides_nothing(doc, node) {
+    if !clips_block_axis(node) || !clip_semantics_apply(node) || clip_hides_nothing(doc, node) {
         return None;
     }
     let layout = &node.final_layout;
@@ -6296,8 +6439,9 @@ fn box_barrier(
         return None;
     }
     // A box whose block size the author does not constrain keeps its paragraph whole as it always did: whatever its line
-    // boxes measure, it hides nothing the fragmenter should cut ([`block_size_constrained`]).
-    if !block_size_constrained(node) {
+    // boxes measure, it hides nothing the fragmenter should cut ([`block_size_constrained`]). The same goes for one
+    // whose content is not a shape the fragmenter handles ([`clip_shape_supported`]).
+    if !clip_semantics_apply(node) {
         return Some(LineBarrier::ClipsItsContent);
     }
     (!through_clips && clips_block_axis(node)).then_some(LineBarrier::ClipsItsContent)
@@ -15342,6 +15486,225 @@ h2 { string-set: chapter-title content(text); }
                 frames_of(&doc, &table, "a"),
                 vec![(1, 52.0, 20.0)],
                 "{what}: AFTER follows the box"
+            );
+        }
+    }
+
+    #[test]
+    fn clip_shape_supported_is_direct_text_or_one_paragraph_at_the_content_top() {
+        // html-to-pdf F30f-b, plan 7 ("Supported shapes"): the third validator pass. Anything above the paragraph (a
+        // heading, a margin, a float, an image), a second paragraph, a percentage vertical padding, a flex wrapper:
+        // not supported; the box keeps main's behaviour.
+        let l = br_lines(30);
+        let big = "overflow:hidden;height:100px";
+        let cases: Vec<(&str, String, bool)> = vec![
+            (
+                "direct text",
+                format!("<div id=\"x\" style=\"{big}\">{l}</div>"),
+                true,
+            ),
+            (
+                "paragraph",
+                format!("<div id=\"x\" style=\"{big}\"><p>{l}</p></div>"),
+                true,
+            ),
+            (
+                "padded, paragraph",
+                format!("<div id=\"x\" style=\"{big};padding:16px\"><p>{l}</p></div>"),
+                true,
+            ),
+            (
+                "bordered, paragraph",
+                format!("<div id=\"x\" style=\"{big};border:4px solid\"><p>{l}</p></div>"),
+                true,
+            ),
+            (
+                "content-sized wrapper around a paragraph",
+                format!(
+                    "<div id=\"x\" style=\"{big};padding:20px\"><div style=\"overflow:hidden;padding:10px\"><p>{l}</p></div></div>"
+                ),
+                true,
+            ),
+            (
+                "two wrappers",
+                format!("<div id=\"x\" style=\"{big}\"><div><div><p>{l}</p></div></div></div>"),
+                true,
+            ),
+            (
+                "heading above",
+                format!(
+                    "<div id=\"x\" style=\"{big}\"><h2 style=\"margin:0\">H</h2><p>{l}</p></div>"
+                ),
+                false,
+            ),
+            (
+                "second paragraph",
+                format!("<div id=\"x\" style=\"{big}\"><p>{l}</p><p>{l}</p></div>"),
+                false,
+            ),
+            (
+                "margin above the paragraph",
+                format!("<div id=\"x\" style=\"{big}\"><p style=\"margin-top:14px\">{l}</p></div>"),
+                false,
+            ),
+            (
+                "margin above the paragraph of a wrapper",
+                format!(
+                    "<div id=\"x\" style=\"{big}\"><div><p style=\"margin-top:14px\">{l}</p></div></div>"
+                ),
+                false,
+            ),
+            (
+                "float above",
+                format!(
+                    "<div id=\"x\" style=\"{big}\"><div style=\"float:left;width:10px;height:10px\"></div><p>{l}</p></div>"
+                ),
+                false,
+            ),
+            (
+                "image above",
+                format!(
+                    "<div id=\"x\" style=\"{big}\"><img style=\"display:block\" width=\"10\" height=\"10\"><p>{l}</p></div>"
+                ),
+                false,
+            ),
+            (
+                "heading and direct text",
+                format!("<div id=\"x\" style=\"{big}\"><h2 style=\"margin:0\">H</h2>{l}</div>"),
+                false,
+            ),
+            (
+                "absolutely positioned sibling",
+                format!(
+                    "<div id=\"x\" style=\"{big};position:relative\"><p>{l}</p><div style=\"position:absolute;top:0\">B</div></div>"
+                ),
+                false,
+            ),
+            (
+                "flex wrapper",
+                format!(
+                    "<div id=\"x\" style=\"{big}\"><div style=\"display:flex\"><p>{l}</p></div></div>"
+                ),
+                false,
+            ),
+            (
+                "percentage padding",
+                format!("<div id=\"x\" style=\"{big};padding:5%\"><p>{l}</p></div>"),
+                false,
+            ),
+            (
+                "percentage padding-bottom of the paragraph",
+                format!(
+                    "<div id=\"x\" style=\"{big}\"><p style=\"padding-bottom:5%\">{l}</p></div>"
+                ),
+                false,
+            ),
+            (
+                "empty",
+                format!("<div id=\"x\" style=\"{big}\"></div>"),
+                false,
+            ),
+            (
+                "flex clip box with a paragraph",
+                format!("<div id=\"x\" style=\"{big};display:flex\"><p>{l}</p></div>"),
+                true,
+            ),
+        ];
+        for (what, markup, supported) in cases {
+            let doc = laid_out(&markup);
+            assert_eq!(
+                clip_shape_supported(node_of(&doc, "x")),
+                supported,
+                "{what}"
+            );
+            assert_eq!(
+                clip_semantics_apply(node_of(&doc, "x")),
+                supported,
+                "{what}: constrained"
+            );
+        }
+    }
+
+    #[test]
+    fn a_percentage_padding_is_reported_without_its_vertical_part_by_the_layout() {
+        // Why `padding: 5%` is not a supported shape: Taffy resolves the vertical part against the (indefinite)
+        // height, so the box has no top padding and a height without it, while its content sits below the padding.
+        let doc = laid_out(&format!(
+            "<div id=\"x\" style=\"overflow:hidden;height:100px;padding:5%\"><p id=\"p\">{}</p></div>",
+            br_lines(30)
+        ));
+        let (x, p) = (node_of(&doc, "x"), node_of(&doc, "p"));
+        assert_eq!(x.final_layout.padding.left, 30.0);
+        assert_eq!(x.final_layout.padding.top, 0.0, "the layout drops it");
+        assert_eq!(x.final_layout.size.height, 100.0);
+        assert_eq!(p.final_layout.location.y, 30.0, "the content is below it");
+        assert!(!clip_shape_supported(x));
+    }
+
+    #[test]
+    fn a_clip_box_of_an_unsupported_shape_has_no_limit_and_keeps_the_barrier_of_main() {
+        let l = br_lines(30);
+        for (what, inner) in [
+            (
+                "heading",
+                format!("<h2 style=\"margin:0\">H</h2><p id=\"p\">{l}</p>"),
+            ),
+            ("second paragraph", format!("<p id=\"p\">{l}</p><p>{l}</p>")),
+        ] {
+            let doc = laid_out(&format!(
+                "<div id=\"x\" style=\"overflow:hidden;height:100px;padding:16px\">{inner}</div>"
+            ));
+            let (x, p) = (node_of(&doc, "x"), node_of(&doc, "p"));
+            assert!(block_size_constrained(x), "{what}");
+            assert_eq!(clip_block_limit(doc.deref(), x), None, "{what}");
+            assert_eq!(tightest_clip_limit(doc.deref(), p), None, "{what}");
+            assert_eq!(
+                box_barrier(doc.deref(), x, true),
+                Some(LineBarrier::ClipsItsContent),
+                "{what}: kept whole as on main, whatever through_clips says"
+            );
+        }
+        // The supported neighbour has both.
+        let doc = laid_out(&format!(
+            "<div id=\"x\" style=\"overflow:hidden;height:100px;padding:16px\"><p id=\"p\">{l}</p></div>"
+        ));
+        assert_eq!(
+            clip_block_limit(doc.deref(), node_of(&doc, "x")),
+            Some(132.0)
+        );
+        assert_eq!(box_barrier(doc.deref(), node_of(&doc, "x"), true), None);
+    }
+
+    #[test]
+    fn a_paragraph_that_avoids_a_break_inside_makes_the_box_an_unsupported_shape() {
+        // `break-inside: avoid` is read from the stylesheet by `column_css`; the engine opens the scope that tells
+        // the predicate. The line splitter would split the paragraph that is first in a padded clip box regardless.
+        let l = br_lines(30);
+        for style in ["break-inside:avoid", "page-break-inside:avoid"] {
+            let doc = laid_out(&format!(
+                "<div id=\"x\" style=\"overflow:hidden;height:100px;padding:16px\"><p id=\"p\" style=\"{style}\">{l}</p></div>\
+                 <div id=\"y\" style=\"overflow:hidden;height:100px;padding:16px;{style}\"><p>{l}</p></div>"
+            ));
+            let table = crate::blitz_adapter::extract_column_style_table(&doc);
+            assert!(
+                clip_shape_supported(node_of(&doc, "x")),
+                "{style}: no scope, no avoid"
+            );
+            {
+                let _scope = BreakAvoidScope::enter(&table);
+                assert!(
+                    !clip_shape_supported(node_of(&doc, "x")),
+                    "{style}: the paragraph avoids"
+                );
+                assert!(
+                    !clip_shape_supported(node_of(&doc, "y")),
+                    "{style}: the box avoids"
+                );
+                assert_eq!(clip_block_limit(doc.deref(), node_of(&doc, "x")), None);
+            }
+            assert!(
+                clip_shape_supported(node_of(&doc, "x")),
+                "{style}: the scope is closed"
             );
         }
     }
