@@ -6227,7 +6227,27 @@ pub(crate) fn clip_semantics_apply(node: &blitz_dom::Node) -> bool {
 /// (plan 7). Such a box is not a supported shape. A node with `break-inside: avoid` is not either: the line splitter
 /// does not honour it for the paragraph that is first in a clip box.
 pub(crate) fn clip_shape_supported(node: &blitz_dom::Node) -> bool {
-    shape_supported(node, 0)
+    in_block_flow(node) && shape_supported(node, 0)
+}
+
+/// F30f-b: whether the box `node` is placed by block flow: its parent is not a flex, grid, multicol, table or atomic
+/// inline box, which place their children by rules of their own. The fragmenter lifts the clip only where the parent is
+/// a block container (`line_split_candidate`: `through_clips`), so for a flex or grid item the clip semantics would be
+/// half on (the limit, `frame_above` and the writer's band) and half off, and a grid row with one such item and one
+/// unsupported item came out worse than main (3 pages and twice the ink, where main and Chrome have 2: the validator's
+/// `tw_clip_grid_card.s880`). Such an item keeps main's output.
+fn in_block_flow(node: &blitz_dom::Node) -> bool {
+    use ::style::values::specified::box_::DisplayInside;
+    let Some(parent) = node.layout_parent.get().or(node.parent) else {
+        return false;
+    };
+    let parent = node.with(parent);
+    !crate::blitz_adapter::is_flex_or_grid_container_node(parent)
+        && !crate::blitz_adapter::is_atomic_inline_container_node(parent)
+        && !crate::blitz_adapter::is_multicol_container(parent)
+        && !parent
+            .primary_styles()
+            .is_some_and(|s| s.clone_display().inside() == DisplayInside::Table)
 }
 
 fn shape_supported(node: &blitz_dom::Node, depth: usize) -> bool {
@@ -15622,6 +15642,48 @@ h2 { string-set: chapter-title content(text); }
                 supported,
                 "{what}: constrained"
             );
+        }
+    }
+
+    #[test]
+    fn a_clip_box_is_supported_only_in_block_flow() {
+        // The validator's `tw_clip_grid_card.s880`: two grid items with `overflow:hidden;height`, one holding a heading
+        // and a paragraph, one a paragraph. The second was a supported shape with its clip semantics half on (the fragmenter
+        // lifts the clip only below a block container) and the pair came out worse than main. A flex, grid, table,
+        // multicol or inline-block parent keeps main's output.
+        let l = br_lines(30);
+        let item = format!("<div id=\"x\" style=\"overflow:hidden;height:100px\"><p>{l}</p></div>");
+        for (what, markup, supported) in [
+            ("block parent", format!("<section>{item}</section>"), true),
+            (
+                "grid item",
+                format!("<section style=\"display:grid\">{item}</section>"),
+                false,
+            ),
+            (
+                "flex item",
+                format!("<section style=\"display:flex\">{item}</section>"),
+                false,
+            ),
+            (
+                "multicol child",
+                format!("<section style=\"columns:2\">{item}</section>"),
+                false,
+            ),
+            (
+                "inline-block child",
+                format!("<section style=\"display:inline-block\">{item}</section>"),
+                false,
+            ),
+            (
+                "table cell child",
+                format!("<table><tr><td>{item}</td></tr></table>"),
+                false,
+            ),
+        ] {
+            let doc = laid_out(&markup);
+            let node = node_of(&doc, "x");
+            assert_eq!(clip_shape_supported(node), supported, "{what}");
         }
     }
 
