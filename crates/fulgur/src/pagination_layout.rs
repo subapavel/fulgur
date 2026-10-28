@@ -6095,15 +6095,30 @@ fn clips_block_axis(node: &blitz_dom::Node) -> bool {
 /// The line boxes cannot decide this: Blitz makes them as tall as the font's ascent and descent when the line height is
 /// below that (16 px Inter in 12 px lines: 20 px boxes 12 px apart), so the last one ends further below the box than
 /// [`LINE_BOX_SLACK`] and a content-sized box looked like one with hidden content. `<html>` and `<body>` are never
-/// constrained: their overflow is the viewport's.
+/// constrained: their overflow is the viewport's. Neither is a table box, a row, a row group or a cell: their `height`
+/// is a minimum (CSS 2.1 §17.5.3).
 pub(crate) fn block_size_constrained(node: &blitz_dom::Node) -> bool {
     use ::style::values::generics::length::{GenericMaxSize, GenericSize};
+    use ::style::values::specified::box_::DisplayInside;
     if is_root_or_body(node) {
         return false;
     }
     let Some(styles) = node.primary_styles() else {
         return false;
     };
+    // CSS 2.1 §17.5.3: `height` on a table, a row, a row group or a cell is a minimum; the box grows with its content,
+    // so it is not a box the author constrains (Chrome grows a `td{height:300px;overflow:hidden}` to its content).
+    if matches!(
+        styles.clone_display().inside(),
+        DisplayInside::Table
+            | DisplayInside::TableRowGroup
+            | DisplayInside::TableHeaderGroup
+            | DisplayInside::TableFooterGroup
+            | DisplayInside::TableRow
+            | DisplayInside::TableCell
+    ) {
+        return false;
+    }
     let definite = |percentage: bool| !percentage || percentage_basis_is_definite(node);
     match styles.clone_height() {
         GenericSize::LengthPercentage(lp) if definite(lp.0.has_percentage()) => return true,
@@ -6522,8 +6537,13 @@ fn nested_line_split(
     // border is placed below the table's border (a collapsed table holds half of its outer borders, Blitz rounds that
     // to the pixel above the cell), which is no content above the cell, and measuring from the border edge left such
     // a cell "not first": it was not split between its lines, the block path cut it between its boxes instead
-    // (html-to-pdf F183, plan 7.5). Only table cells: a block child of a padded box keeps moving whole (F30c).
-    let frame_above = if is_cell_of_table(parent, child) {
+    // (html-to-pdf F183, plan 7.5). Only table cells and clip boxes that hide content: a block child of another padded
+    // box keeps moving whole (F30c). A clip box with a block size is fragmented where it is (F30f-b), so the lines of
+    // its first child stay on the page the box starts on, below the box's padding and border, as the lines of a clip box
+    // with direct text do; the paragraph, cut by the clip, would otherwise fit a page and move whole, and leave its box's
+    // frame empty (plan 7, "Padded and bordered clip boxes").
+    let frame_above = if is_cell_of_table(parent, child) || clip_block_limit(doc, parent).is_some()
+    {
         parent.final_layout.border.top + parent.final_layout.padding.top
     } else {
         0.0
@@ -15201,6 +15221,89 @@ h2 { string-set: chapter-title content(text); }
             let shown: Vec<(u32, u32)> = x.line_slices.iter().map(|s| (s.first, s.end)).collect();
             assert_eq!(shown, vec![(0, 2), (2, 5), (5, 30)], "{what}");
         }
+    }
+
+    #[test]
+    fn a_padded_clip_box_with_a_paragraph_is_fragmented_in_place_like_one_with_direct_text() {
+        // html-to-pdf F30f-b, plan 7 (padded boxes): the paragraph sits `padding-top` below the box's top, so it was not
+        // "the first thing in the strip" and, cut by the clip to 6 lines (120px, a page is 200px), it fitted a page and
+        // moved whole to the next one: the box's frame on page 0 was its padding alone and its first lines were gone
+        // from the page (Chrome: 3 lines on the first page, 3 on the second, like the same box with the words directly
+        // in it). 100px of height, 16px of padding or a border of 2px, the box starts 120px down the page.
+        for (what, style) in [
+            ("padding", "padding:16px;height:100px"),
+            ("border", "border:2px solid;height:100px"),
+            ("padding-top", "padding-top:16px;height:100px"),
+        ] {
+            let lines = br_lines(30);
+            let (pdoc, ptable) = nested_geometry(
+                &format!(
+                    "<div style=\"height:120px\"></div><div id=\"w\" style=\"overflow:hidden;{style}\">\
+                     <p id=\"x\">{lines}</p></div><p id=\"a\">AFTER</p>"
+                ),
+                200.0,
+            );
+            let (ddoc, dtable) = nested_geometry(
+                &format!(
+                    "<div style=\"height:120px\"></div><div id=\"x\" style=\"overflow:hidden;{style}\">{lines}</div>\
+                     <p id=\"a\">AFTER</p>"
+                ),
+                200.0,
+            );
+            let slices = |doc: &blitz_html::HtmlDocument, table: &PaginationGeometryTable| {
+                geometry_of(doc, table, "x")
+                    .unwrap()
+                    .line_slices
+                    .iter()
+                    .map(|s| (s.first, s.end))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                slices(&pdoc, &ptable),
+                slices(&ddoc, &dtable),
+                "{what}: the paragraph is cut where the direct text is"
+            );
+            let on_first_page = frames_of(&pdoc, &ptable, "x");
+            assert_eq!(on_first_page.first().map(|f| f.0), Some(0), "{what}");
+            let w = frames_of(&pdoc, &ptable, "w");
+            assert_eq!(
+                w.len(),
+                2,
+                "{what}: the box has a frame on each page: {w:?}"
+            );
+            assert_eq!(
+                frames_of(&pdoc, &ptable, "a"),
+                frames_of(&ddoc, &dtable, "a"),
+                "{what}: what follows is where it follows the box with direct text"
+            );
+        }
+    }
+
+    #[test]
+    fn a_table_box_has_no_constrained_block_size() {
+        // CSS 2.1 §17.5.3: `height` on a table, a row group, a row or a cell is a minimum. The box grows with its content
+        // (Chrome shows all of a `td{height:300px;overflow:hidden}`), so no limit, no band, no fragmentation by it.
+        let doc = laid_out(
+            "<table id=\"t\" style=\"height:100px\"><tbody id=\"g\" style=\"height:100px\">\
+             <tr id=\"r\" style=\"height:100px\"><td id=\"c\" style=\"height:100px;overflow:hidden\"><p>L</p></td></tr>\
+             </tbody></table>\
+             <div id=\"d\" style=\"display:table-cell;height:100px;overflow:hidden\">L</div>\
+             <div id=\"x\" style=\"height:100px;overflow:hidden\">L</div>",
+        );
+        for id in ["t", "g", "r", "c", "d"] {
+            assert!(
+                !block_size_constrained(node_of(&doc, id)),
+                "{id}: a table box is as tall as its content at least"
+            );
+        }
+        assert!(block_size_constrained(node_of(&doc, "x")));
+        // A cell with 30 lines in 100px: not a clip box of that height, so no limit.
+        let doc = laid_out(&format!(
+            "<table><tr><td id=\"c\" style=\"height:100px;overflow:hidden\">{}</td></tr></table>",
+            br_lines(30)
+        ));
+        assert_eq!(clip_block_limit(doc.deref(), node_of(&doc, "c")), None);
+        assert_eq!(tightest_clip_limit(doc.deref(), node_of(&doc, "c")), None);
     }
 
     #[test]
