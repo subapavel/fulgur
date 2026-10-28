@@ -6537,17 +6537,18 @@ fn nested_line_split(
     // border is placed below the table's border (a collapsed table holds half of its outer borders, Blitz rounds that
     // to the pixel above the cell), which is no content above the cell, and measuring from the border edge left such
     // a cell "not first": it was not split between its lines, the block path cut it between its boxes instead
-    // (html-to-pdf F183, plan 7.5). Only table cells and clip boxes that hide content: a block child of another padded
-    // box keeps moving whole (F30c). A clip box with a block size is fragmented where it is (F30f-b), so the lines of
-    // its first child stay on the page the box starts on, below the box's padding and border, as the lines of a clip box
-    // with direct text do; the paragraph, cut by the clip, would otherwise fit a page and move whole, and leave its box's
-    // frame empty (plan 7, "Padded and bordered clip boxes").
-    let frame_above = if is_cell_of_table(parent, child) || clip_block_limit(doc, parent).is_some()
-    {
-        parent.final_layout.border.top + parent.final_layout.padding.top
-    } else {
-        0.0
-    };
+    // (html-to-pdf F183, plan 7.5). Only table cells and boxes inside a clip box that hides content (the box itself or an
+    // ancestor, `tightest_clip_limit`): a block child of another padded box keeps moving whole (F30c). A clip box with a
+    // block size is fragmented where it is (F30f-b), so the lines of its first descendant paragraph stay on the page the
+    // box starts on, below the padding and border of the boxes above them, as the lines of a clip box with direct text
+    // do; the paragraph, cut by the clip, would otherwise fit a page and move whole, and leave its box's frame empty
+    // (plan 7, "Padded and bordered clip boxes").
+    let frame_above =
+        if is_cell_of_table(parent, child) || tightest_clip_limit(doc, parent).is_some() {
+            parent.final_layout.border.top + parent.final_layout.padding.top
+        } else {
+            0.0
+        };
     let first_and_overflowing = child_page_y <= strip_top + frame_above + 0.5
         && child_page_y + total > strips.bottom(page) + 1.0;
     // F30f-b: a paragraph that is itself a clip box taller than the room is fragmented where it is, by its own block
@@ -15304,6 +15305,45 @@ h2 { string-set: chapter-title content(text); }
         ));
         assert_eq!(clip_block_limit(doc.deref(), node_of(&doc, "c")), None);
         assert_eq!(tightest_clip_limit(doc.deref(), node_of(&doc, "c")), None);
+    }
+
+    #[test]
+    fn a_paragraph_in_a_padded_box_inside_a_clip_box_is_split_where_the_box_starts() {
+        // html-to-pdf F30f-b, plan 7 (padded boxes), the validator's `a_in_c_pad`: `overflow:hidden;height;padding` >
+        // `padding` (with or without `overflow:hidden`; the inner box is content-sized, the outer one clips it) > `<p>`.
+        // The inner box's padding sits above the paragraph, so the paragraph was not first in its strip and moved whole
+        // to the next page, uncut: 636px of frame on page 0 and no line of the paragraph there (page 1 was empty in the
+        // PDF where main showed the lines and Chrome shows 15).
+        let lines = br_lines(30);
+        for (what, inner) in [
+            ("hidden", "overflow:hidden;padding:10px"),
+            ("visible", "padding:10px"),
+            ("border", "border:3px solid"),
+        ] {
+            let (doc, table) = nested_geometry(
+                &format!(
+                    "<div style=\"height:120px\"></div><div id=\"w\" style=\"overflow:hidden;height:100px;padding:16px\">\
+                     <div id=\"i\" style=\"{inner}\"><p id=\"x\">{lines}</p></div></div><p id=\"a\">AFTER</p>"
+                ),
+                200.0,
+            );
+            let x = frames_of(&doc, &table, "x");
+            assert_eq!(
+                x.iter().map(|f| f.0).collect::<Vec<_>>(),
+                vec![0, 1],
+                "{what}: the paragraph starts on the page of the box: {x:?}"
+            );
+            let w = frames_of(&doc, &table, "w");
+            assert!(
+                w.iter().all(|f| f.2 <= 200.0 - f.1 + 0.5),
+                "{what}: the frames of the clip box stay inside the page: {w:?}"
+            );
+            assert_eq!(
+                frames_of(&doc, &table, "a"),
+                vec![(1, 52.0, 20.0)],
+                "{what}: AFTER follows the box"
+            );
+        }
     }
 
     #[test]
