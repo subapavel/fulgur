@@ -15678,7 +15678,7 @@ h2 { string-set: chapter-title content(text); }
             (
                 "table cell child",
                 format!("<table><tr><td>{item}</td></tr></table>"),
-                false,
+                true,
             ),
         ] {
             let doc = laid_out(&markup);
