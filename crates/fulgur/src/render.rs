@@ -2667,7 +2667,11 @@ fn draw_under_clip(
         // is written (ADR-0009 of html-to-pdf). The band is in page coordinates; it is intersected with the one of the
         // clip boxes around this one and restored below.
         let outer_clip_band = canvas.clip_band;
-        if clip_pushed && block.style.overflow_y == crate::draw_primitives::Overflow::Clip {
+        // A box whose block size the author does not constrain hides nothing: it gets no band.
+        if clip_pushed
+            && block.style.overflow_y == crate::draw_primitives::Overflow::Clip
+            && block.style.block_size_constrained
+        {
             let (top_border, bottom_border) = (
                 block.style.border_widths[0].to_f32(),
                 block.style.border_widths[2].to_f32(),

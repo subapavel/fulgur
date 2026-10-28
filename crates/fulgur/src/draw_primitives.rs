@@ -893,6 +893,10 @@ pub struct BlockStyle {
     pub overflow_x: Overflow,
     /// `overflow-y` value
     pub overflow_y: Overflow,
+    /// F30f-b: the author constrains the block size of the box (a `height` or a `max-height`;
+    /// `pagination_layout::block_size_constrained`). Only such a box can hide lines of its content: the writer sets a
+    /// [`ClipBand`] for a clipping box that has this flag and for no other (a content-sized box is as tall as its lines).
+    pub block_size_constrained: bool,
     /// Box shadows in CSS declaration order (first = top-most in paint stack).
     pub box_shadows: Vec<BoxShadow>,
 }

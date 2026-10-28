@@ -6086,11 +6086,69 @@ fn clips_block_axis(node: &blitz_dom::Node) -> bool {
             .is_some_and(|s| s.clone_overflow_y() != Ov::Visible)
 }
 
+/// F30f-b: whether the author constrains the block size of `node`: its computed `height` is a length (or a percentage
+/// of a basis that is definite) or its `max-height` is not `none` (a length, or a percentage of a definite basis). Only
+/// such a box can be shorter than its content, and only for such a box is a line that lies below the clip "hidden": an
+/// auto-height box (no `height`, no `max-height`; `min-height`, `fit-content` and `stretch` do not count) is as tall as
+/// its content, whatever the line boxes measure, and is fragmented like any other box (F30f, css-break-3 §4.1).
+///
+/// The line boxes cannot decide this: Blitz makes them as tall as the font's ascent and descent when the line height is
+/// below that (16 px Inter in 12 px lines: 20 px boxes 12 px apart), so the last one ends further below the box than
+/// [`LINE_BOX_SLACK`] and a content-sized box looked like one with hidden content. `<html>` and `<body>` are never
+/// constrained: their overflow is the viewport's.
+pub(crate) fn block_size_constrained(node: &blitz_dom::Node) -> bool {
+    use ::style::values::generics::length::{GenericMaxSize, GenericSize};
+    if is_root_or_body(node) {
+        return false;
+    }
+    let Some(styles) = node.primary_styles() else {
+        return false;
+    };
+    let definite = |percentage: bool| !percentage || percentage_basis_is_definite(node);
+    match styles.clone_height() {
+        GenericSize::LengthPercentage(lp) if definite(lp.0.has_percentage()) => return true,
+        _ => {}
+    }
+    matches!(
+        styles.clone_max_height(),
+        GenericMaxSize::LengthPercentage(lp) if definite(lp.0.has_percentage())
+    )
+}
+
+/// F30f-b: whether a percentage block size of `node` has a definite basis (css-sizing-3 §5.2.1: it computes to `auto`
+/// when the containing block's height depends on its content): the nearest ancestor with a non-percentage `height`
+/// is reached before one with an `auto` (or keyword) `height`. The root's containing block is the viewport.
+fn percentage_basis_is_definite(node: &blitz_dom::Node) -> bool {
+    use ::style::values::generics::length::GenericSize;
+    let mut current = node;
+    for _ in 0..crate::MAX_DOM_DEPTH {
+        let Some(parent_id) = current.layout_parent.get().or(current.parent) else {
+            return true;
+        };
+        let parent = current.with(parent_id);
+        if parent.element_data().is_none() {
+            return true;
+        }
+        let Some(styles) = parent.primary_styles() else {
+            return false;
+        };
+        match styles.clone_height() {
+            GenericSize::LengthPercentage(lp) if !lp.0.has_percentage() => return true,
+            GenericSize::LengthPercentage(_) => {}
+            _ => return false,
+        }
+        current = parent;
+    }
+    false
+}
+
 /// F30f-b: where the clip of `node` ends, when it hides some of its content: the bottom of its padding box, in px from
-/// the top of its border box. `None` for a box that does not clip its block axis, and for one whose content ends within
-/// its padding box ([`clip_hides_nothing`]): content-sized clip boxes are fragmented like any other (F30f).
+/// the top of its border box. `None` for a box that does not clip its block axis, for one whose block size the author
+/// does not constrain ([`block_size_constrained`]: a content-sized box hides nothing, however tall its line boxes are),
+/// and for one whose content ends within its padding box ([`clip_hides_nothing`]): content-sized clip boxes are
+/// fragmented like any other (F30f).
 fn clip_block_limit(doc: &BaseDocument, node: &blitz_dom::Node) -> Option<f32> {
-    if !clips_block_axis(node) || clip_hides_nothing(doc, node) {
+    if !clips_block_axis(node) || !block_size_constrained(node) || clip_hides_nothing(doc, node) {
         return None;
     }
     let layout = &node.final_layout;
@@ -6219,8 +6277,15 @@ fn box_barrier(
     // F30f-b: a box that clips its block axis and hides content keeps its paragraph whole, unless the caller cuts the
     // paragraph's lines at the clip (`through_clips`: the box is fragmented by its own block size). An
     // `overflow-x: clip` box hides nothing in the block axis.
-    (!through_clips && clips_block_axis(node) && !clip_hides_nothing(doc, node))
-        .then_some(LineBarrier::ClipsItsContent)
+    if !clips_overflow(node) || clip_hides_nothing(doc, node) {
+        return None;
+    }
+    // A box whose block size the author does not constrain keeps its paragraph whole as it always did: whatever its line
+    // boxes measure, it hides nothing the fragmenter should cut ([`block_size_constrained`]).
+    if !block_size_constrained(node) {
+        return Some(LineBarrier::ClipsItsContent);
+    }
+    (!through_clips && clips_block_axis(node)).then_some(LineBarrier::ClipsItsContent)
 }
 
 /// F30f: why the line splitter does not look through `parent` and `child` to split the paragraph `child`, or `None`
@@ -14839,6 +14904,122 @@ h2 { string-set: chapter-title content(text); }
                 "{what}"
             );
         }
+    }
+
+    #[test]
+    fn block_size_constrained_reads_height_and_max_height() {
+        let cases: [(&str, &str, bool); 14] = [
+            ("auto", "", false),
+            ("height", "height:300px", true),
+            ("max-height", "max-height:300px", true),
+            ("max-height none", "max-height:none", false),
+            ("min-height only", "min-height:300px", false),
+            ("height keyword", "height:fit-content", false),
+            ("height min-content", "height:min-content", false),
+            ("max-height keyword", "max-height:max-content", false),
+            (
+                "height calc without percentage",
+                "height:calc(100px + 2em)",
+                true,
+            ),
+            // The parent is auto-height: a percentage block size computes to `auto` (css-sizing-3 §5.2.1).
+            ("percentage of an auto parent", "height:50%", false),
+            (
+                "max-height percentage of an auto parent",
+                "max-height:50%",
+                false,
+            ),
+            (
+                "box-sizing does not matter",
+                "box-sizing:border-box;height:300px",
+                true,
+            ),
+            (
+                "overflow does not matter",
+                "overflow:hidden;height:300px",
+                true,
+            ),
+            ("overflow alone", "overflow:hidden", false),
+        ];
+        for (what, style, expected) in cases {
+            let doc = laid_out(&format!(
+                "<div><div id=\"x\" style=\"{style}\"><p>L</p></div></div>"
+            ));
+            assert_eq!(
+                block_size_constrained(node_of(&doc, "x")),
+                expected,
+                "{what}"
+            );
+        }
+        // A percentage of a parent with a definite height is definite; of a parent whose own height is a percentage
+        // of an auto grandparent it is not.
+        let doc = laid_out(
+            "<div style=\"height:400px\"><div id=\"x\" style=\"height:50%\"><p>L</p></div></div>",
+        );
+        assert!(block_size_constrained(node_of(&doc, "x")));
+        let doc = laid_out(
+            "<div><div style=\"height:50%\"><div id=\"x\" style=\"height:50%\"><p>L</p></div></div></div>",
+        );
+        assert!(!block_size_constrained(node_of(&doc, "x")));
+        // <html> and <body> clip the viewport, not themselves.
+        let doc = laid_out("<p>L</p>");
+        let body = doc
+            .deref()
+            .get_node(find_body_id(doc.deref()).unwrap())
+            .unwrap();
+        assert!(!block_size_constrained(body));
+    }
+
+    #[test]
+    fn a_content_sized_clip_box_has_no_limit_however_tall_its_line_boxes_are() {
+        // 16 px text in 6 px lines: Blitz's line boxes are as tall as the font (about 19 px) and 6 px apart, so the last
+        // one ends 13 px below the content-sized box: `clip_hides_nothing` is false, and the first version of F30f-b
+        // cut the box at its own height (words lost). With no `height` and no `max-height` the box hides nothing.
+        let lines = br_lines(30);
+        let doc = laid_out(&format!(
+            "<div id=\"x\" style=\"overflow:hidden;font-size:16px;line-height:6px\">{lines}</div>"
+        ));
+        let node = node_of(&doc, "x");
+        assert!(
+            !clip_hides_nothing(doc.deref(), node),
+            "the premise: the line boxes reach past the box"
+        );
+        assert_eq!(clip_block_limit(doc.deref(), node), None);
+        assert_eq!(tightest_clip_limit(doc.deref(), node), None);
+        // The same box with a `height` equal to its content is a clip box that hides its last lines' boxes: limit set.
+        let doc = laid_out(&format!(
+            "<div id=\"x\" style=\"overflow:hidden;font-size:16px;line-height:6px;height:180px\">{lines}</div>"
+        ));
+        assert_eq!(
+            clip_block_limit(doc.deref(), node_of(&doc, "x")),
+            Some(180.0)
+        );
+        // Descendants of the content-sized box are not clipped by it either.
+        let doc = laid_out(&format!(
+            "<div style=\"overflow:hidden;font-size:16px;line-height:6px\"><p id=\"x\">{lines}</p></div>"
+        ));
+        assert_eq!(ancestor_clip_limit(doc.deref(), node_of(&doc, "x")), None);
+    }
+
+    #[test]
+    fn a_content_sized_clip_box_keeps_the_barrier_it_had_and_a_sized_one_loses_it_in_block_flow() {
+        let lines = br_lines(30);
+        let doc = laid_out(&format!(
+            "<div id=\"x\" style=\"overflow:hidden;font-size:16px;line-height:6px\">{lines}</div>\
+             <div id=\"y\" style=\"overflow:hidden;font-size:16px;line-height:6px;height:100px\">{lines}</div>"
+        ));
+        for through in [false, true] {
+            assert_eq!(
+                box_barrier(doc.deref(), node_of(&doc, "x"), through),
+                Some(LineBarrier::ClipsItsContent),
+                "content-sized, through_clips {through}: as before F30f-b"
+            );
+        }
+        assert_eq!(
+            box_barrier(doc.deref(), node_of(&doc, "y"), false),
+            Some(LineBarrier::ClipsItsContent)
+        );
+        assert_eq!(box_barrier(doc.deref(), node_of(&doc, "y"), true), None);
     }
 
     #[test]
