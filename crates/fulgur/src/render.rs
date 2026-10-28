@@ -4706,8 +4706,9 @@ fn paragraph_lines_for_page(
         return Some(all_lines.to_vec());
     }
 
-    // The slices describe these lines: one per fragment, ending at the last line.
-    if line_slices.len() == fragments.len()
+    // The slices describe these lines: one per fragment, ending at the last line. F30f-b: a clip box that hides the
+    // last lines of a paragraph has one more slice, for the hidden lines, which no fragment paints.
+    if (line_slices.len() == fragments.len() || line_slices.len() == fragments.len() + 1)
         && line_slices
             .last()
             .is_some_and(|last| last.end as usize == all_lines.len())

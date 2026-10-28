@@ -9556,3 +9556,40 @@ fn render_smoke_clip_box_hides_lines_from_the_text_layer() {
     let clip_x = text_items_of(&engine.render(&html("overflow-x:clip")).unwrap(), "x.pdf");
     assert_eq!(clip_x, visible);
 }
+
+#[test]
+fn render_smoke_max_height_clip_box_spans_pages() {
+    // A `max-height` clip box taller than a page is fragmented by its own block size (css-break-3 §2: a UA may treat
+    // `overflow: hidden` with a definite height as monolithic, but not with a `max-height`): 1500px over A4 pages is two
+    // pages, the lines below the clip get none, and what follows the box is placed under it on the second page.
+    // Without the clip the 200 lines of 20px take four pages.
+    let lines: String = (0..200).map(|i| format!("line{i}<br>")).collect();
+    let html = |style: &str| {
+        format!(
+            "<!DOCTYPE html><html><head><style>@page {{ margin: 0 }} body {{ margin: 0 }}</style></head><body>\
+             <div style=\"{style};line-height:20px\"><p style=\"margin:0\">{lines}</p></div>\
+             <p style=\"margin:0\">AFTER</p></body></html>"
+        )
+    };
+    let engine = noto_engine();
+    let free = engine.render(&html("overflow:visible")).expect("render");
+    let clipped = engine
+        .render(&html("overflow:hidden;max-height:1500px"))
+        .expect("render");
+    assert_eq!(page_count(&free), 4, "the control: 4000px of lines");
+    assert_eq!(page_count(&clipped), 2, "1500px of box over A4 pages");
+    let direct = engine
+        .render(&format!(
+            "<!DOCTYPE html><html><head><style>@page {{ margin: 0 }} body {{ margin: 0 }}</style></head><body>\
+             <div style=\"overflow:hidden;max-height:1500px;line-height:20px\">{lines}</div>\
+             <p style=\"margin:0\">AFTER</p></body></html>"
+        ))
+        .expect("render");
+    assert_eq!(
+        page_count(&direct),
+        2,
+        "direct text in the box: the body-level line path"
+    );
+    // The lines the clip hides are not written, on either page.
+    assert!(text_items_of(&clipped, "c.pdf") < text_items_of(&free, "f.pdf") / 2 + 4);
+}

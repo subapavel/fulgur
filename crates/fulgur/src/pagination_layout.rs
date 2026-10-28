@@ -1622,6 +1622,14 @@ impl PageStrips {
     pub(crate) fn fresh(self) -> f32 {
         self.page_h
     }
+
+    /// html-to-pdf F30f-b: [`bottom`](Self::bottom) as Chrome has it, rounded up to a whole px. Chrome's fragmentainer
+    /// for an A4 page with 15 mm margins is 1010 px, not 1009.13: a 20 px line fits under a 990 px spacer and
+    /// not under a 990.5 px one (measured, m141). The clip boxes that are fragmented by their own block size count the
+    /// room on a page that way, so the box ends where Chrome's does and the content after it follows.
+    pub(crate) fn chrome_bottom(self, page: u32) -> f32 {
+        self.bottom(page).ceil()
+    }
 }
 
 /// F37: the border box of `<body>` on each page it spans (css-break-3 section 5.4, `box-decoration-break: slice`): a
@@ -2201,6 +2209,10 @@ impl<'a> PaginationLayoutTree<'a> {
         // used page-name differs, we induce a forced break before it
         // (CSS Page 3 §5.3, "Using Named Pages").
         let mut prev_used_page: Option<Option<String>> = None;
+        // html-to-pdf F30f-b: a clip box that was fragmented by its own block size ended where Chrome's does, in a
+        // fragmentainer that is a whole px taller than ours (`PageStrips::chrome_bottom`): the child that follows it
+        // may reach that px below the content box without moving to the next page.
+        let mut after_clip_box = false;
 
         for child_id in children {
             let Some(child) = self.doc.get_node(child_id) else {
@@ -2360,6 +2372,11 @@ impl<'a> PaginationLayoutTree<'a> {
                 continue;
             }
 
+            let clip_end_slack = if std::mem::take(&mut after_clip_box) {
+                1.0
+            } else {
+                0.0
+            };
             // Pick up the inter-child gap in body coordinates (collapsed
             // top/bottom margins, body padding before the first child)
             // before any break / overflow logic so the cursor reflects
@@ -2540,7 +2557,73 @@ impl<'a> PaginationLayoutTree<'a> {
                 } else {
                     all_line_metrics
                 };
-            if line_metrics.len() > 1 {
+            // html-to-pdf F30f-b: a clip box that hides some of its content (`overflow-y` not `visible`, a block size
+            // below its content) is placed whole while it fits the room below the cursor: the lines it hides are not
+            // written, and the box is as tall as its block size. When it does not fit, it is fragmented by its own
+            // block size, in place: its content is cut at the clip, its frames add up to its height, nothing at or
+            // below the clip gets a page.
+            let clip_limit_here = (body_block_flow
+                && !is_float
+                && !avoid_inside
+                && !crate::blitz_adapter::is_multicol_container(child))
+            .then(|| clip_block_limit(self.doc, child))
+            .flatten();
+            let clip_whole_now = clip_limit_here.is_some()
+                && cursor_y + child_h <= self.strips.bottom(page_index) + 0.5;
+            if line_metrics.len() > 1
+                && clip_limit_here.is_some()
+                && !clip_whole_now
+                && let Some(body_node) = self.doc.get_node(body_id)
+                && let Some(split) = line_split_candidate(self.doc, body_node, child)
+            {
+                // A paragraph that is itself the clip box: the lines at or below the clip are dropped.
+                let leading = split.leading();
+                if cursor_y > 0.0
+                    && leading > self.strips.bottom(page_index) - cursor_y
+                    && leading <= self.strips.fresh()
+                {
+                    page_index += 1;
+                    cursor_y = 0.0;
+                }
+                let (new_page_index, new_cursor_y) = fragment_nested_inline_root(
+                    &mut self.geometry,
+                    self.doc,
+                    child_id,
+                    body_x + layout.location.x,
+                    child_w,
+                    cursor_y,
+                    page_index,
+                    self.strips,
+                    0.0,
+                    0.0,
+                    &split,
+                    0,
+                );
+                page_index = new_page_index;
+                cursor_y = new_cursor_y;
+                emitted += 1;
+                after_clip_box = true;
+                prev_bottom_y_in_body = this_top_in_body + child_h;
+                if let Some((row_page, row_end, row_bottom)) = parallel_row {
+                    if page_index == row_page {
+                        cursor_y = cursor_y.max(row_end);
+                    }
+                    prev_bottom_y_in_body = prev_bottom_y_in_body.max(row_bottom);
+                }
+                last_end = Some((page_index, cursor_y));
+                if !is_float {
+                    prev_used_page = Some(used_end.clone());
+                }
+                if matches!(
+                    break_props.break_after,
+                    Some(crate::draw_primitives::BreakAfter::Page)
+                ) {
+                    page_index += 1;
+                    cursor_y = 0.0;
+                }
+                continue;
+            }
+            if line_metrics.len() > 1 && !clip_whole_now {
                 // fulgur-s67g Phase 2.2: if the paragraph cannot fit
                 // the remaining space on the current page strip but
                 // would fit (or at least start fresh) on a new page,
@@ -2553,7 +2636,9 @@ impl<'a> PaginationLayoutTree<'a> {
                     .last()
                     .map(|l| l.1 - line_metrics[0].0)
                     .unwrap_or(child_h);
-                if cursor_y > 0.0 && cursor_y + para_total_h > self.strips.bottom(page_index) {
+                if cursor_y > 0.0
+                    && cursor_y + para_total_h > self.strips.bottom(page_index) + clip_end_slack
+                {
                     page_index += 1;
                     cursor_y = 0.0;
                 }
@@ -2643,6 +2728,7 @@ impl<'a> PaginationLayoutTree<'a> {
             // children only never passes the gate (text nodes have no height).
             let child_node = self.doc.get_node(child_id);
             let has_splittable_children = child_node.is_some_and(|n| !n.children.is_empty());
+            let is_inline_root = child_node.is_some_and(|n| n.flags.is_inline_root());
             // fulgur-7hf5: multicol containers (`column-count > 1` /
             // `column-width: <len>`) distribute children across
             // columns; their DOM children's flow does not match the
@@ -2742,11 +2828,21 @@ impl<'a> PaginationLayoutTree<'a> {
                             )))
             };
             let mut keeps_whole = keeps_whole_at(page_index, cursor_y, content_above);
-            let mut needs_recursion = gate(
-                self.doc,
-                (strips.bottom(page_index) - cursor_y).max(0.0),
-                keeps_whole,
-            );
+            // F30f-b: a clip box that fits the room is not entered (its content past the clip is hidden); one that does
+            // not fit is entered, wherever its children are.
+            let clip_enters = |page: u32, cursor: f32| -> Option<bool> {
+                clip_limit_here?;
+                let whole = cursor + child_h <= strips.bottom(page) + 0.5;
+                Some(!whole && has_splittable_children && !is_multicol && !is_inline_root)
+            };
+            let mut needs_recursion = match clip_enters(page_index, cursor_y) {
+                Some(enter) => enter,
+                None => gate(
+                    self.doc,
+                    (strips.bottom(page_index) - cursor_y).max(0.0),
+                    keeps_whole,
+                ),
+            };
             // F28: entering a box means placing its first row at the current
             // cursor. When even that row does not fit below the cursor, the
             // only break point before it is the class A point in front of the
@@ -2784,7 +2880,10 @@ impl<'a> PaginationLayoutTree<'a> {
                     cursor_y = 0.0;
                     content_above = false;
                     keeps_whole = keeps_whole_at(page_index, cursor_y, content_above);
-                    needs_recursion = gate(self.doc, strips.bottom(page_index), keeps_whole);
+                    needs_recursion = match clip_enters(page_index, cursor_y) {
+                        Some(enter) => enter,
+                        None => gate(self.doc, strips.bottom(page_index), keeps_whole),
+                    };
                 }
             }
             if needs_recursion {
@@ -2810,6 +2909,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 page_index = new_page;
                 cursor_y = new_cursor;
                 emitted += 1;
+                after_clip_box = clip_limit_here.is_some();
                 prev_bottom_y_in_body = this_top_in_body + child_h;
                 if let Some((row_page, row_end, row_bottom)) = parallel_row {
                     if page_index == row_page {
@@ -2841,7 +2941,7 @@ impl<'a> PaginationLayoutTree<'a> {
             // this path too, because the gate no longer enters it. A taller
             // inline root has gone through the line path above (F83); a
             // taller box without lines is cut into strips below.
-            if cursor_y > 0.0 && cursor_y + child_h > strips.bottom(page_index) {
+            if cursor_y > 0.0 && cursor_y + child_h > strips.bottom(page_index) + clip_end_slack {
                 page_index += 1;
                 cursor_y = 0.0;
             }
@@ -3513,8 +3613,13 @@ fn leading_block_size(
         }
         // F30: a paragraph taller than a page is split between its line boxes,
         // so only its inset and ORPHANS lines have to fit, not all of it.
+        // F30f-b: so is a paragraph that a clip box cuts (`hidden_tail`): the lines it hides are not placed, and the
+        // clip box that holds it is fragmented in place.
         let child_leading = match line_split_candidate(doc, node, child) {
-            Some(split) if split.inset_top + split.span() > page_height_px + 1.0 => {
+            Some(split)
+                if split.inset_top + split.span() > page_height_px + 1.0
+                    || split.hidden_tail > 0 =>
+            {
                 split.leading().min(layout.size.height)
             }
             _ if kept_rows.contains_key(&row_key(top))
@@ -4065,6 +4170,18 @@ fn fragment_block_subtree(
     let suppress_page_check = allow_same_row_rebase
         || crate::blitz_adapter::is_atomic_inline_container_node(parent)
         || parent_is_orthogonal;
+    // html-to-pdf F30f-b: in block flow a clip box (this one or an ancestor) hides what lies below its padding box, and
+    // that gets no place on any page. `clip_limit` is the tightest such clip in this box's coordinates; `own_clip_height`
+    // is this box's block size when this box is the clip box that is fragmented by it.
+    let clip_flow =
+        !suppress_page_check && !parent_is_table && is_block_flow_container(doc, parent);
+    let clip_limit = clip_flow
+        .then(|| tightest_clip_limit(doc, parent))
+        .flatten();
+    let own_clip_height = clip_flow
+        .then(|| clip_block_limit(doc, parent))
+        .flatten()
+        .map(|_| parent.final_layout.size.height);
 
     // fulgur-yb27: prefer `layout_children` over raw `children` —
     // same rationale as `record_subtree_descendants` and
@@ -4287,6 +4404,41 @@ fn fragment_block_subtree(
                 target_y += (this_top_in_parent - prev_bottom).max(0.0);
             }
             page_taffy_origin = this_top_in_parent - (target_y - page_start_y);
+        }
+
+        // F30f-b: a child that starts at or below the clip is hidden. It gets no place and no page: its geometry sits
+        // below the page's content box (outside every clip band), on the page the box has reached, so that the counters,
+        // string-set and bookmarks in it keep their page.
+        if let Some(limit) = clip_limit
+            && child.element_data().is_some()
+            && this_top_in_parent >= limit - CLIP_LINE_SLACK
+        {
+            let hidden_y = strips.bottom(page_index) + (this_top_in_parent - limit).max(0.0);
+            let hidden_x = parent_x_in_body + layout.location.x;
+            geometry
+                .entry(child_id)
+                .or_default()
+                .fragments
+                .push(Fragment {
+                    page_index,
+                    x: hidden_x.as_px(),
+                    y: hidden_y.as_px(),
+                    width: child_w.as_px(),
+                    height: child_h.as_px(),
+                });
+            record_subtree_descendants(
+                geometry,
+                doc,
+                child_id,
+                page_index,
+                hidden_y,
+                hidden_x,
+                depth + 1,
+            );
+            if !is_float {
+                prev_used_page = Some(used_end.clone());
+            }
+            continue;
         }
 
         if child_h <= 0.0 {
@@ -4555,7 +4707,26 @@ fn fragment_block_subtree(
                     && !forced_break_below(facts, doc, column_styles, child_id)
                     && !page_name_change_below(facts, doc, used_page_names, child_id)
             });
-        let mut line_split = if row_whole {
+        // F30f-b: a child that is a clip box hiding some of its content (`overflow-y` not `visible`, a block size below
+        // its content) is placed whole while it fits the room below it (the lines it hides are not written, the box is
+        // as tall as its block size); when it does not, it is fragmented by its own block size: its content is cut at
+        // the clip, the frames add up to its height, nothing at or below the clip gets a page.
+        let child_clips = clip_flow
+            && !is_float
+            && !is_multicol
+            && !avoid_inside_child
+            && clip_block_limit(doc, child).is_some();
+        let clip_whole_at =
+            |page: u32, y: f32| child_clips && y + child_h <= strips.bottom(page) + 0.5;
+        // A clip box with block children that does not fit is entered even though the gate sees no overflowing child
+        // (its content overflows its box, not the strip below the cursor).
+        let clip_enter = |page: u32, y: f32| {
+            child_clips
+                && !clip_whole_at(page, y)
+                && !child.flags.is_inline_root()
+                && !child.children.is_empty()
+        };
+        let mut line_split = if row_whole || clip_whole_at(page_index, child_page_y) {
             None
         } else {
             nested_line_split(
@@ -4602,11 +4773,13 @@ fn fragment_block_subtree(
         let mut keeps_whole = keeps_whole_at(page_index, child_page_y, movable);
         let mut needs_recursion = line_split.is_none()
             && !row_whole
-            && gate(
-                (strips.bottom(page_index) - cursor_y).max(0.0),
-                keeps_whole,
-                tail_over_at(page_index, child_page_y, content_above_child),
-            );
+            && !clip_whole_at(page_index, child_page_y)
+            && (clip_enter(page_index, child_page_y)
+                || gate(
+                    (strips.bottom(page_index) - cursor_y).max(0.0),
+                    keeps_whole,
+                    tail_over_at(page_index, child_page_y, content_above_child),
+                ));
         // html-to-pdf F183 (plan 7.7): the gate enters an inline root because one of its inline boxes (an `<img>`, the
         // second line's) overflows the strip. The children of an inline root are not block children: the lines put
         // them where they are, and the block walk cut the root between two boxes, in fragments as tall as the boxes,
@@ -4765,23 +4938,29 @@ fn fragment_block_subtree(
             }
             if line_split.is_some() {
                 // On a fresh page the paragraph may fit whole after all.
-                line_split = nested_line_split(
-                    doc,
-                    parent,
-                    child,
-                    child_page_y,
-                    page_start_y + band,
-                    strips,
-                    page_index,
-                );
+                line_split = if clip_whole_at(page_index, child_page_y) {
+                    None
+                } else {
+                    nested_line_split(
+                        doc,
+                        parent,
+                        child,
+                        child_page_y,
+                        page_start_y + band,
+                        strips,
+                        page_index,
+                    )
+                };
             } else if needs_recursion {
                 // The child may fit the new page whole.
                 keeps_whole = keeps_whole_at(page_index, child_page_y, false);
-                needs_recursion = gate(
-                    (strips.bottom(page_index) - cursor_y).max(0.0),
-                    keeps_whole,
-                    tail_over_at(page_index, child_page_y, false),
-                );
+                needs_recursion = !clip_whole_at(page_index, child_page_y)
+                    && (clip_enter(page_index, child_page_y)
+                        || gate(
+                            (strips.bottom(page_index) - cursor_y).max(0.0),
+                            keeps_whole,
+                            tail_over_at(page_index, child_page_y, false),
+                        ));
             }
             content_above_child = false;
             if was_entered {
@@ -5240,6 +5419,25 @@ fn fragment_block_subtree(
         0.0
     };
 
+    // F30f-b: a clip box that is fragmented by its own block size is as tall as that over the pages: the frames before
+    // the last one ran to the page bottom, and the last one is what is left of the box's height. What follows the box
+    // starts at its bottom, not below its last visible line.
+    let clip_frame = own_clip_height.map(|box_height| {
+        // Every frame so far ended at the bottom of its page.
+        let used: f32 = geometry.get(&parent_id).map_or(0.0, |g| {
+            g.fragments
+                .iter()
+                .map(|f| (strips.chrome_bottom(f.page_index) - f.y.to_f32()).max(0.0))
+                .sum()
+        });
+        (box_height - used)
+            .max(0.0)
+            .min((strips.chrome_bottom(page_index) - page_start_y).max(0.0))
+    });
+    if let Some(frame) = clip_frame {
+        cursor_y = page_start_y + frame;
+    }
+
     // Close the parent's fragment for the final page span. Always
     // emit at least one fragment so the parent is represented in
     // geometry — `collect_counter_states` and friends look up nodes
@@ -5259,8 +5457,13 @@ fn fragment_block_subtree(
             width: parent_w.as_px(),
             // A frame never extends below the content box: padding taller
             // than the room left overflows (the next sibling moves on).
-            height: (cursor_y - page_start_y
-                + closing.min((strips.bottom(page_index) - cursor_y).max(0.0)))
+            height: match clip_frame {
+                Some(frame) => frame,
+                None => {
+                    cursor_y - page_start_y
+                        + closing.min((strips.bottom(page_index) - cursor_y).max(0.0))
+                }
+            }
             .as_px(),
         });
 
@@ -5278,6 +5481,9 @@ fn fragment_block_subtree(
         - (parent.final_layout.border.bottom + parent.final_layout.padding.bottom)
         - trailing)
         .max(0.0);
+    if clip_frame.is_some() {
+        return (page_index, cursor_y, lines_split_below, 0.0);
+    }
     (page_index, cursor_y + closing, lines_split_below, stretch)
 }
 
@@ -5713,9 +5919,33 @@ struct LineSplit {
     inset_top: f32,
     /// Border + padding below the last line.
     inset_bottom: f32,
+    /// html-to-pdf F30f-b: how many lines after `lines` a clip box hides ([`LineSplit::clip_to`]); they take no place
+    /// on any page. The fragments get a slice for them (`LineSlice` after the last fragment's) so that the slices
+    /// still tile all the lines of the paragraph.
+    hidden_tail: usize,
+    /// F30f-b: the border-box height of the paragraph when the paragraph is itself the clip box that hid the lines:
+    /// its frames add up to this height over the pages, however far its last visible line reaches.
+    own_box_height: Option<f32>,
 }
 
+/// F30f-b: a line whose top is less than this far (px) inside the clip does not show. The writer's slack is 0.5 pt
+/// (`paragraph::CLIP_BAND_SLACK_PT`) of the line's height: a hair of difference that only decides whether a sliver of a
+/// line is written.
+const CLIP_LINE_SLACK: f32 = 0.5;
+
 impl LineSplit {
+    /// F30f-b: the lines that show above `limit` px below the top of the paragraph's border box (the bottom of the
+    /// padding box of the clip box, in the paragraph's own coordinates); the rest is hidden by the clip and gets no
+    /// place on any page. The first line is always kept (a split has at least one line); a line that starts within
+    /// [`CLIP_LINE_SLACK`] of the limit is hidden.
+    fn clip_to(mut self, limit: f32) -> LineSplit {
+        let shows = |line: &(f32, f32)| self.inset_top + line.0 < limit - CLIP_LINE_SLACK;
+        let keep = self.lines.iter().take_while(|l| shows(l)).count().max(1);
+        self.hidden_tail += self.lines.len() - keep;
+        self.lines.truncate(keep);
+        self
+    }
+
     /// Block-size of the lines alone.
     fn span(&self) -> f32 {
         match (self.lines.first(), self.lines.last()) {
@@ -5837,6 +6067,78 @@ fn clip_hides_nothing(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
         <= height - layout.border.bottom - layout.padding.bottom + 0.5
 }
 
+/// html-to-pdf F30f-b: whether `node` is `<html>` or `<body>`, whose `overflow` is the viewport's (CSS Overflow 3 §3.5),
+/// not a clip of the box.
+fn is_root_or_body(node: &blitz_dom::Node) -> bool {
+    node.element_data()
+        .is_some_and(|e| matches!(e.name.local.as_ref(), "html" | "body"))
+}
+
+/// F30f-b: whether `node` clips its block axis: its computed `overflow-y` is not `visible` (css-overflow-3 §3: a
+/// `visible` axis next to a `hidden`, `auto` or `scroll` one computes to `auto`, so `overflow-x: hidden` alone clips
+/// the block axis too, and `overflow-x: clip` alone does not). Not a root or body box.
+fn clips_block_axis(node: &blitz_dom::Node) -> bool {
+    use ::style::values::computed::Overflow as Ov;
+    !is_root_or_body(node)
+        && clips_overflow(node)
+        && node
+            .primary_styles()
+            .is_some_and(|s| s.clone_overflow_y() != Ov::Visible)
+}
+
+/// F30f-b: where the clip of `node` ends, when it hides some of its content: the bottom of its padding box, in px from
+/// the top of its border box. `None` for a box that does not clip its block axis, and for one whose content ends within
+/// its padding box ([`clip_hides_nothing`]): content-sized clip boxes are fragmented like any other (F30f).
+fn clip_block_limit(doc: &BaseDocument, node: &blitz_dom::Node) -> Option<f32> {
+    if !clips_block_axis(node) || clip_hides_nothing(doc, node) {
+        return None;
+    }
+    let layout = &node.final_layout;
+    layout
+        .size
+        .height
+        .is_finite()
+        .then_some(layout.size.height - layout.border.bottom)
+}
+
+/// F30f-b: the tightest clip that an ancestor of `node` puts on its block axis, as px below the top of `node`'s border
+/// box: the smallest [`clip_block_limit`] of the clipping boxes above it (the `layout_parent` chain, below `<body>`),
+/// moved by the offsets of the boxes between. `None` when no ancestor hides anything.
+fn ancestor_clip_limit(doc: &BaseDocument, node: &blitz_dom::Node) -> Option<f32> {
+    let mut best: Option<f32> = None;
+    let mut offset = 0.0_f32;
+    let mut current = node;
+    for _ in 0..crate::MAX_DOM_DEPTH {
+        offset += current.final_layout.location.y;
+        let Some(parent) = current
+            .layout_parent
+            .get()
+            .or(current.parent)
+            .and_then(|id| doc.get_node(id))
+        else {
+            break;
+        };
+        if is_root_or_body(parent) {
+            break;
+        }
+        if let Some(limit) = clip_block_limit(doc, parent) {
+            let here = limit - offset;
+            best = Some(best.map_or(here, |b| b.min(here)));
+        }
+        current = parent;
+    }
+    best
+}
+
+/// F30f-b: the smaller of the clip `node` puts on itself and the one its ancestors put on it, in px below the top of its
+/// border box.
+fn tightest_clip_limit(doc: &BaseDocument, node: &blitz_dom::Node) -> Option<f32> {
+    match (clip_block_limit(doc, node), ancestor_clip_limit(doc, node)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// F30e: whether `node` is an `inline-block` or an `inline-table`: an atomic inline whose inside is a block formatting
 /// context (a flow-root, or a table box whose cells are block containers) that [`alone_on_its_line`] may split.
 fn is_inline_block_or_table(node: &blitz_dom::Node) -> bool {
@@ -5901,7 +6203,11 @@ fn alone_on_its_line(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
 /// F30f: the barrier a box puts up on its own, whether it is the parent or the child of the paragraph: an atomic
 /// inline that is not an `inline-block` alone on its line ([`alone_on_its_line`]), or a clipping box that hides
 /// content ([`clip_hides_nothing`]).
-fn box_barrier(doc: &BaseDocument, node: &blitz_dom::Node) -> Option<LineBarrier> {
+fn box_barrier(
+    doc: &BaseDocument,
+    node: &blitz_dom::Node,
+    through_clips: bool,
+) -> Option<LineBarrier> {
     if crate::blitz_adapter::is_atomic_inline_container_node(node) && !alone_on_its_line(doc, node)
     {
         return Some(if is_inline_block_or_table(node) {
@@ -5910,7 +6216,11 @@ fn box_barrier(doc: &BaseDocument, node: &blitz_dom::Node) -> Option<LineBarrier
             LineBarrier::AtomicNotFlowRoot
         });
     }
-    (clips_overflow(node) && !clip_hides_nothing(doc, node)).then_some(LineBarrier::ClipsItsContent)
+    // F30f-b: a box that clips its block axis and hides content keeps its paragraph whole, unless the caller cuts the
+    // paragraph's lines at the clip (`through_clips`: the box is fragmented by its own block size). An
+    // `overflow-x: clip` box hides nothing in the block axis.
+    (!through_clips && clips_block_axis(node) && !clip_hides_nothing(doc, node))
+        .then_some(LineBarrier::ClipsItsContent)
 }
 
 /// F30f: why the line splitter does not look through `parent` and `child` to split the paragraph `child`, or `None`
@@ -5925,6 +6235,16 @@ fn split_barrier(
     parent: &blitz_dom::Node,
     child: &blitz_dom::Node,
 ) -> Option<LineBarrier> {
+    split_barrier_with(doc, parent, child, false)
+}
+
+/// [`split_barrier`], optionally looking through the clip boxes that hide content (F30f-b: `through_clips`).
+fn split_barrier_with(
+    doc: &BaseDocument,
+    parent: &blitz_dom::Node,
+    child: &blitz_dom::Node,
+    through_clips: bool,
+) -> Option<LineBarrier> {
     use ::style::values::specified::box_::DisplayInside;
     let parent_orthogonal = parent
         .parent
@@ -5938,7 +6258,7 @@ fn split_barrier(
     let cell_of_table = table_parent
         && (inside_of(child) == Some(DisplayInside::TableCell)
             || crate::blitz_adapter::is_anonymous_table_cell(parent, child));
-    if let Some(barrier) = box_barrier(doc, parent) {
+    if let Some(barrier) = box_barrier(doc, parent, through_clips) {
         return Some(barrier);
     }
     if crate::blitz_adapter::is_multicol_container(parent) {
@@ -5950,7 +6270,7 @@ fn split_barrier(
     if table_parent && !cell_of_table {
         return Some(LineBarrier::TablePart);
     }
-    if let Some(barrier) = box_barrier(doc, child) {
+    if let Some(barrier) = box_barrier(doc, child, through_clips) {
         return Some(barrier);
     }
     if crate::blitz_adapter::is_multicol_container(child) {
@@ -6057,7 +6377,25 @@ fn line_split_candidate(
 ) -> Option<LineSplit> {
     // Cheap exit first: a paragraph of one line has nothing to split.
     let split = inline_root_lines(child)?;
-    split_barrier(doc, parent, child).is_none().then_some(split)
+    // F30f-b: in block flow a clip box that hides content is fragmented by its own block size, and the lines it hides
+    // get no place on any page: the barrier of the clip boxes is lifted and the lines are cut at the tightest clip.
+    let through_clips = is_block_flow_container(doc, parent);
+    if split_barrier_with(doc, parent, child, through_clips).is_some() {
+        return None;
+    }
+    let own = clip_block_limit(doc, child);
+    let limit = match (own, ancestor_clip_limit(doc, child)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    Some(match limit {
+        Some(limit) => {
+            let mut split = split.clip_to(limit);
+            split.own_box_height = own.map(|_| child.final_layout.size.height);
+            split
+        }
+        None => split,
+    })
 }
 
 /// F30g: the child-side part of [`line_split_candidate`] for an absolutely positioned box: whether `child` is an inline
@@ -6091,6 +6429,8 @@ fn inline_root_lines(child: &blitz_dom::Node) -> Option<LineSplit> {
         lines,
         inset_top: layout.border.top + layout.padding.top,
         inset_bottom: layout.border.bottom + layout.padding.bottom,
+        hidden_tail: 0,
+        own_box_height: None,
     })
 }
 
@@ -6125,7 +6465,13 @@ fn nested_line_split(
     };
     let first_and_overflowing = child_page_y <= strip_top + frame_above + 0.5
         && child_page_y + total > strips.bottom(page) + 1.0;
-    (taller_than_a_page || first_and_overflowing).then_some(split)
+    // F30f-b: a paragraph that is itself a clip box taller than the room is fragmented where it is, by its own block
+    // size, like Chrome does (css-break-3 §2: `overflow: hidden` with a `max-height` must fragment, and with a `height`
+    // it may); one that fits the room is placed whole.
+    let clip_box_overflows = split
+        .own_box_height
+        .is_some_and(|h| child_page_y + h > strips.bottom(page) + 1.0);
+    (taller_than_a_page || first_and_overflowing || clip_box_overflows).then_some(split)
 }
 
 /// F111: the split to apply to `<body>` when it is the inline root of the document: its text and inline elements are
@@ -6277,6 +6623,35 @@ fn fragment_nested_inline_root(
         split.lines.len(),
         entry.line_slices
     );
+    // F30f-b: the lines a clip box hides are the slice after the last fragment's.
+    if split.hidden_tail > 0 {
+        entry.line_slices.push(LineSlice {
+            first: split.lines.len() as u32,
+            end: (split.lines.len() + split.hidden_tail) as u32,
+            offset: 0.0_f32.as_px(),
+        });
+    }
+    // F30f-b: a paragraph that is itself the clip box that hid lines is as tall as its box over the pages: every frame
+    // but the last runs to the page bottom (the break between two line boxes leaves the room under the last line to
+    // the box, like Chrome's), and the last one is what is left of the box's height.
+    if let Some(box_height) = split.own_box_height {
+        let first = entry.fragments.len() - ranges.len();
+        let mut used = 0.0_f32;
+        for fragment in &mut entry.fragments[first..first + ranges.len() - 1] {
+            let room = strips.chrome_bottom(fragment.page_index) - fragment.y.to_f32();
+            used += room;
+            fragment.height = (room - split.inset_top)
+                .max(fragment.height.to_f32())
+                .as_px();
+        }
+        let last = &mut entry.fragments[first + ranges.len() - 1];
+        let room = strips.chrome_bottom(last.page_index) - last.y.to_f32();
+        let frame = (box_height - used).clamp(0.0, room.max(0.0));
+        last.height = (frame - split.inset_top - split.inset_bottom)
+            .max(0.0)
+            .as_px();
+        cursor_y = last.y.to_f32() + frame;
+    }
     record_split_inline_root_descendants(
         geometry,
         doc,
@@ -14325,21 +14700,366 @@ h2 { string-set: chapter-title content(text); }
         assert_lines_once(fragments_of(&doc, &table, "x"), 30, "overflow:hidden text");
     }
 
+    /// The (page, y, height) of the fragments of `id`, in px.
+    fn frames_of(
+        doc: &blitz_html::HtmlDocument,
+        table: &PaginationGeometryTable,
+        id: &str,
+    ) -> Vec<(u32, f32, f32)> {
+        fragments_of(doc, table, id)
+            .iter()
+            .map(|f| (f.page_index, f.y.to_f32(), f.height.to_f32()))
+            .collect()
+    }
+
+    fn assert_frames(got: Vec<(u32, f32, f32)>, expected: &[(u32, f32, f32)], what: &str) {
+        assert_eq!(got.len(), expected.len(), "{what}: {got:?} vs {expected:?}");
+        for (g, e) in got.iter().zip(expected) {
+            assert!(
+                g.0 == e.0 && (g.1 - e.1).abs() < 0.6 && (g.2 - e.2).abs() < 0.6,
+                "{what}: {got:?} vs {expected:?}"
+            );
+        }
+    }
+
     #[test]
-    fn a_clip_box_shorter_than_its_paragraph_keeps_it_whole() {
-        // The clip hides 300px of the paragraph: fragmenting the box would show them on the next pages. One unit,
-        // as before (Chrome: a box clipped at its height, F30f-b).
+    fn a_clip_box_shorter_than_its_paragraph_is_fragmented_at_its_block_size() {
+        // F30f-b (this was `..._keeps_it_whole` before): the clip hides 300px of the 600px paragraph, and Chrome
+        // fragments a `height` / `max-height` box taller than the page, clipping each fragment. The box is 300px over
+        // 200px pages: 15 of the 30 lines show, 10 on the first page and 5 on the second, the frames are 200px and 100px.
         for style in ["height:300px", "max-height:300px"] {
             let (doc, table) = nested_geometry(
                 &format!(
-                    "<div style=\"overflow:hidden;{style}\"><p id=\"x\">{}</p></div>",
+                    "<div id=\"w\" style=\"overflow:hidden;{style}\"><p id=\"x\">{}</p></div><p id=\"a\">AFTER</p>",
                     br_lines(30)
                 ),
                 200.0,
             );
-            let n = geometry_of(&doc, &table, "x").map_or(0, |g| g.fragments.len());
-            assert!(n <= 1, "{style}: {n} fragments");
+            assert_frames(
+                frames_of(&doc, &table, "x"),
+                &[(0, 0.0, 200.0), (1, 0.0, 100.0)],
+                style,
+            );
+            assert_frames(
+                frames_of(&doc, &table, "w"),
+                &[(0, 0.0, 200.0), (1, 0.0, 100.0)],
+                style,
+            );
+            // What follows the box starts at the box's bottom.
+            assert_frames(frames_of(&doc, &table, "a"), &[(1, 100.0, 20.0)], style);
         }
+    }
+
+    #[test]
+    fn clips_block_axis_reads_overflow_y() {
+        // css-overflow-3 §3: the block axis is clipped when the computed `overflow-y` is not `visible`; a `visible`
+        // axis next to a clipping one computes to `auto`, but `clip` next to `visible` stays as it is.
+        let cases = [
+            ("overflow:hidden", true),
+            ("overflow:clip", true),
+            ("overflow:auto", true),
+            ("overflow:scroll", true),
+            ("overflow-y:hidden", true),
+            ("overflow-y:clip", true),
+            ("overflow-x:hidden", true),
+            ("overflow-x:auto", true),
+            ("overflow-x:clip", false),
+            ("overflow:visible", false),
+            ("", false),
+        ];
+        for (style, expected) in cases {
+            let doc = laid_out(&format!("<div id=\"x\" style=\"{style}\"><p>L</p></div>"));
+            assert_eq!(clips_block_axis(node_of(&doc, "x")), expected, "`{style}`");
+        }
+        // The viewport's overflow, not a clip of the box.
+        let doc = laid_out("<p>L</p>");
+        let body = doc
+            .deref()
+            .get_node(find_body_id(doc.deref()).unwrap())
+            .unwrap();
+        assert!(!clips_block_axis(body));
+    }
+
+    #[test]
+    fn clip_block_limit_is_the_bottom_of_the_padding_box_when_content_reaches_past_it() {
+        let lines = br_lines(30);
+        let cases: [(&str, String, Option<f32>); 7] = [
+            (
+                "auto height",
+                format!("<div id=\"x\" style=\"overflow:hidden\"><p>{lines}</p></div>"),
+                None,
+            ),
+            (
+                "height",
+                format!(
+                    "<div id=\"x\" style=\"overflow:hidden;height:300px\"><p>{lines}</p></div>"
+                ),
+                Some(300.0),
+            ),
+            (
+                "max-height",
+                format!(
+                    "<div id=\"x\" style=\"overflow:hidden;max-height:250px\"><p>{lines}</p></div>"
+                ),
+                Some(250.0),
+            ),
+            (
+                "border below the padding box",
+                format!(
+                    "<div id=\"x\" style=\"overflow:hidden;height:300px;border-bottom:7px solid\"><p>{lines}</p></div>"
+                ),
+                Some(300.0),
+            ),
+            (
+                "padding is inside the padding box",
+                format!(
+                    "<div id=\"x\" style=\"overflow:hidden;box-sizing:border-box;height:300px;padding:10px\"><p>{lines}</p></div>"
+                ),
+                Some(300.0),
+            ),
+            (
+                "overflow-x: clip hides nothing in the block axis",
+                format!(
+                    "<div id=\"x\" style=\"overflow-x:clip;height:300px\"><p>{lines}</p></div>"
+                ),
+                None,
+            ),
+            (
+                "content within the box",
+                "<div id=\"x\" style=\"overflow:hidden;height:300px\"><p>L1<br>L2</p></div>"
+                    .to_string(),
+                None,
+            ),
+        ];
+        for (what, markup, expected) in cases {
+            let doc = laid_out(&markup);
+            assert_eq!(
+                clip_block_limit(doc.deref(), node_of(&doc, "x")),
+                expected,
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn ancestor_clip_limit_is_in_the_coordinates_of_the_node() {
+        // A clip box 300px high holds a div (20px of padding above) that holds the paragraph: the clip is 280px below
+        // the top of the div's content... the paragraph's top, 20px down in the box.
+        let doc = laid_out(&format!(
+            "<div style=\"overflow:hidden;height:300px\"><div style=\"padding-top:20px\"><p id=\"x\">{}</p></div></div>",
+            br_lines(30)
+        ));
+        let limit = ancestor_clip_limit(doc.deref(), node_of(&doc, "x"));
+        assert!(limit.is_some_and(|l| (l - 280.0).abs() < 0.5), "{limit:?}");
+        // Two clip boxes: the tighter wins.
+        let doc = laid_out(&format!(
+            "<div style=\"overflow:hidden;height:300px\"><div style=\"overflow:hidden;height:100px\"><p id=\"x\">{}</p></div></div>",
+            br_lines(30)
+        ));
+        let limit = ancestor_clip_limit(doc.deref(), node_of(&doc, "x"));
+        assert!(limit.is_some_and(|l| (l - 100.0).abs() < 0.5), "{limit:?}");
+        // Nothing clips above it.
+        let doc = laid_out(&format!("<div><p id=\"x\">{}</p></div>", br_lines(30)));
+        assert_eq!(ancestor_clip_limit(doc.deref(), node_of(&doc, "x")), None);
+    }
+
+    #[test]
+    fn clip_to_drops_the_lines_that_start_at_or_below_the_limit() {
+        let lines: Vec<(f32, f32)> = (0..10)
+            .map(|k| (20.0 * k as f32, 20.0 * (k + 1) as f32))
+            .collect();
+        let split = |inset_top: f32| LineSplit {
+            lines: lines.clone(),
+            inset_top,
+            inset_bottom: 0.0,
+            hidden_tail: 0,
+            own_box_height: None,
+        };
+        // 100px: lines at 0..80 show, the one at 100 does not.
+        let clipped = split(0.0).clip_to(100.0);
+        assert_eq!((clipped.lines.len(), clipped.hidden_tail), (5, 5));
+        // 110px: the sixth line shows 10px.
+        let clipped = split(0.0).clip_to(110.0);
+        assert_eq!((clipped.lines.len(), clipped.hidden_tail), (6, 4));
+        // The inset above the first line counts.
+        let clipped = split(17.0).clip_to(100.0);
+        assert_eq!((clipped.lines.len(), clipped.hidden_tail), (5, 5));
+        // A hair of a line (0.3px) does not show.
+        let clipped = split(0.0).clip_to(100.3);
+        assert_eq!(clipped.lines.len(), 5);
+        // The first line is always kept.
+        let clipped = split(0.0).clip_to(0.0);
+        assert_eq!((clipped.lines.len(), clipped.hidden_tail), (1, 9));
+    }
+
+    #[test]
+    fn a_body_level_clip_box_that_fits_is_placed_whole() {
+        // 30 lines of direct text in a box of 60px, and the same in a paragraph: the box fits the room, so it is one
+        // fragment of 60px (the lines it hides are the writer's to leave out), and what follows starts at 60px, on page 0.
+        for (what, markup) in [
+            (
+                "direct text",
+                format!(
+                    "<div id=\"w\" style=\"overflow:hidden;height:60px\">{}</div><p id=\"a\">AFTER</p>",
+                    br_lines(30)
+                ),
+            ),
+            (
+                "paragraph",
+                format!(
+                    "<div id=\"w\" style=\"overflow:hidden;height:60px\"><p id=\"x\">{}</p></div><p id=\"a\">AFTER</p>",
+                    br_lines(30)
+                ),
+            ),
+            (
+                "nested paragraph",
+                format!(
+                    "<div id=\"w\" style=\"overflow:hidden;height:60px\"><div><p id=\"x\">{}</p></div></div><p id=\"a\">AFTER</p>",
+                    br_lines(30)
+                ),
+            ),
+        ] {
+            let (doc, table) = nested_geometry(&markup, 200.0);
+            assert_frames(frames_of(&doc, &table, "w"), &[(0, 0.0, 60.0)], what);
+            assert_frames(frames_of(&doc, &table, "a"), &[(0, 60.0, 20.0)], what);
+        }
+    }
+
+    #[test]
+    fn a_clip_box_taller_than_the_room_is_fragmented_at_its_block_size() {
+        // 500px box over 200px pages: 25 of the 60 lines show (10 + 10 + 5); the frames are 200, 200 and 100px, the
+        // paragraph after the box starts at 100px on page 2, and nothing is placed on a fourth page.
+        for (what, markup) in [
+            (
+                "paragraph",
+                format!(
+                    "<div id=\"w\" style=\"overflow:hidden;height:500px\"><p id=\"x\">{}</p></div><p id=\"a\">AFTER</p>",
+                    br_lines(60)
+                ),
+            ),
+            (
+                "nested paragraph",
+                format!(
+                    "<div id=\"w\" style=\"overflow:hidden;height:500px\"><div><p id=\"x\">{}</p></div></div><p id=\"a\">AFTER</p>",
+                    br_lines(60)
+                ),
+            ),
+            (
+                "direct text",
+                format!(
+                    "<div id=\"x\" style=\"overflow:hidden;height:500px\">{}</div><p id=\"a\">AFTER</p>",
+                    br_lines(60)
+                ),
+            ),
+        ] {
+            let (doc, table) = nested_geometry(&markup, 200.0);
+            let frames = [(0, 0.0, 200.0), (1, 0.0, 200.0), (2, 0.0, 100.0)];
+            assert_frames(frames_of(&doc, &table, "x"), &frames, what);
+            if what != "direct text" {
+                assert_frames(frames_of(&doc, &table, "w"), &frames, what);
+            }
+            assert_frames(frames_of(&doc, &table, "a"), &[(2, 100.0, 20.0)], what);
+            // The slices tile all 60 lines: 25 shown, the hidden 35 after them.
+            let x = geometry_of(&doc, &table, "x").unwrap();
+            assert!(
+                line_slices_tile(&x.line_slices, 60),
+                "{what}: {:?}",
+                x.line_slices
+            );
+            let shown: Vec<(u32, u32)> = x.line_slices.iter().map(|s| (s.first, s.end)).collect();
+            assert_eq!(shown, vec![(0, 10), (10, 20), (20, 25), (25, 60)], "{what}");
+            assert_eq!(x.fragments.len(), 3, "{what}");
+        }
+    }
+
+    #[test]
+    fn a_clip_box_that_straddles_the_page_bottom_is_fragmented_in_place() {
+        // The box starts 150px down a 200px page: 50px of room, two lines. The box is 100px: 5 lines show, 2 on the
+        // first page, 3 on the second; the frames are 50 and 50px and the paragraph after starts at 50px on page 1.
+        for (what, body) in [
+            (
+                "direct text",
+                format!(
+                    "<div id=\"x\" style=\"overflow:hidden;height:100px\">{}</div>",
+                    br_lines(30)
+                ),
+            ),
+            (
+                "paragraph",
+                format!(
+                    "<div id=\"w\" style=\"overflow:hidden;height:100px\"><p id=\"x\">{}</p></div>",
+                    br_lines(30)
+                ),
+            ),
+        ] {
+            let (doc, table) = nested_geometry(
+                &format!("<div style=\"height:150px\"></div>{body}<p id=\"a\">AFTER</p>"),
+                200.0,
+            );
+            if what == "paragraph" {
+                // The paragraph's own fragments are its lines (2 and 3 of them); the box's frames are 50px each.
+                assert_frames(
+                    frames_of(&doc, &table, "x"),
+                    &[(0, 150.0, 40.0), (1, 0.0, 60.0)],
+                    what,
+                );
+                assert_frames(
+                    frames_of(&doc, &table, "w"),
+                    &[(0, 150.0, 50.0), (1, 0.0, 50.0)],
+                    what,
+                );
+            } else {
+                assert_frames(
+                    frames_of(&doc, &table, "x"),
+                    &[(0, 150.0, 50.0), (1, 0.0, 50.0)],
+                    what,
+                );
+            }
+            assert_frames(frames_of(&doc, &table, "a"), &[(1, 50.0, 20.0)], what);
+            let x = geometry_of(&doc, &table, "x").unwrap();
+            let shown: Vec<(u32, u32)> = x.line_slices.iter().map(|s| (s.first, s.end)).collect();
+            assert_eq!(shown, vec![(0, 2), (2, 5), (5, 30)], "{what}");
+        }
+    }
+
+    #[test]
+    fn content_below_the_clip_gets_no_page() {
+        // The second paragraph starts at 200px, below the clip of the 100px box that straddles the page bottom. It is
+        // not placed: its fragment is below the content box of the page the box ends on, and no page is added for it.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:150px\"></div><div id=\"w\" style=\"overflow:hidden;height:100px\">\
+                 <p id=\"x\">{}</p><p id=\"y\">{}</p></div><p id=\"a\">AFTER</p>",
+                br_lines(10),
+                br_lines(10)
+            ),
+            200.0,
+        );
+        assert_frames(frames_of(&doc, &table, "a"), &[(1, 50.0, 20.0)], "after");
+        let y = frames_of(&doc, &table, "y");
+        assert_eq!(y.len(), 1, "{y:?}");
+        assert_eq!(y[0].0, 1, "on the page the box ends on: {y:?}");
+        assert!(y[0].1 >= 200.0, "below the content box: {y:?}");
+        let pages = table
+            .values()
+            .flat_map(|g| g.fragments.iter())
+            .map(|f| f.page_index)
+            .max();
+        assert_eq!(pages, Some(1));
+    }
+
+    #[test]
+    fn a_clip_box_with_direct_text_that_fits_is_not_split_by_the_body_line_path() {
+        // R1 of the plan: the body-level line path split every multi-line child at the page bottom, and the box's
+        // per-fragment clip then showed what it hides.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:150px\"></div><div id=\"x\" style=\"overflow:hidden;height:40px\">{}</div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        assert_frames(frames_of(&doc, &table, "x"), &[(0, 150.0, 40.0)], "fits");
     }
 
     #[test]
