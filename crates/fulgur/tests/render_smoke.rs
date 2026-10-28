@@ -9516,3 +9516,43 @@ fn render_smoke_body_direct_boxes_in_a_margined_body() {
         );
     }
 }
+
+// ── html-to-pdf F30f-b: clip boxes ────────────────────────────────────────
+
+/// The text items `inspect` finds in `pdf`, one per glyph run (a line of one font is one run).
+fn text_items_of(pdf: &[u8], name: &str) -> usize {
+    use fulgur::inspect::inspect;
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join(name);
+    std::fs::write(&path, pdf).expect("write pdf");
+    inspect(&path).expect("inspect pdf").text_items.len()
+}
+
+#[test]
+fn render_smoke_clip_box_hides_lines_from_the_text_layer() {
+    // 20 lines of 20 px in a box of 100 px: the lines wholly below the box are not written (ADR-0009 of
+    // html-to-pdf): a partly visible line is. `draw_under_clip` sets the block-axis band, `draw_shaped_lines` tests it.
+    let lines: String = (0..20).map(|i| format!("line{i}<br>")).collect();
+    let html = |style: &str| {
+        format!(
+            "<!DOCTYPE html><html><body style=\"margin:0\"><div style=\"{style};height:100px;line-height:20px\">\
+             <p style=\"margin:0\">{lines}</p></div></body></html>"
+        )
+    };
+    let engine = noto_engine();
+    let visible = text_items_of(&engine.render(&html("overflow:visible")).unwrap(), "v.pdf");
+    let clipped = text_items_of(&engine.render(&html("overflow:hidden")).unwrap(), "c.pdf");
+    let clip_y = text_items_of(&engine.render(&html("overflow-y:clip")).unwrap(), "y.pdf");
+    assert!(visible >= 20, "the control writes every line: {visible}");
+    assert!(
+        (5..=6).contains(&clipped),
+        "5 lines show (a 6th only if it is partly visible): {clipped} of {visible}"
+    );
+    assert_eq!(
+        clip_y, clipped,
+        "`overflow-y: clip` clips the block axis too"
+    );
+    // `overflow-x: clip` leaves the block axis alone.
+    let clip_x = text_items_of(&engine.render(&html("overflow-x:clip")).unwrap(), "x.pdf");
+    assert_eq!(clip_x, visible);
+}

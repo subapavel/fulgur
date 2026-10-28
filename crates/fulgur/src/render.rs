@@ -287,6 +287,7 @@ pub fn render_v2(
                     images: images.clone(),
                     fonts: &mut krilla_fonts,
                     paint_extent: Default::default(),
+                    clip_band: Default::default(),
                 };
                 // Root `<html>` + `<body>` background pre-pass. Root
                 // `<html>` / `<body>` backgrounds repeat per page
@@ -438,6 +439,7 @@ pub fn render_v2(
                 images: images.clone(),
                 fonts: &mut krilla_fonts,
                 paint_extent: Default::default(),
+                clip_band: Default::default(),
             };
             let page_content_width = content_area.width.to_f32();
             let any_margin_box_painted = margin_box_renderer.render_page(
@@ -797,6 +799,7 @@ fn paint_repeated_table_headers(
                 images: canvas.images.clone(),
                 fonts: &mut *canvas.fonts,
                 paint_extent: Default::default(),
+                clip_band: Default::default(),
             };
             if tagging {
                 copy_canvas
@@ -1471,6 +1474,9 @@ fn paint_inline_box_continuation(
             }
             canvas.surface.push_transform(&transform);
             canvas.paint_extent.enter_local();
+            // F30f-b: shifted by the body offset, so not page coordinates: no block-axis clip band here.
+            let saved_clip_band =
+                std::mem::replace(&mut canvas.clip_band, crate::draw_primitives::ClipBand::Off);
             dispatch_inline_box_content(
                 canvas,
                 ib_id,
@@ -1485,6 +1491,7 @@ fn paint_inline_box_continuation(
                 page_index,
                 &drawables.inline_box_subtree_descendants,
             );
+            canvas.clip_band = saved_clip_band;
             canvas.paint_extent.leave_local();
             canvas.surface.pop();
             if let Some(lc) = canvas.link_collector.as_deref_mut() {
@@ -2213,6 +2220,9 @@ fn draw_under_transform(
     }
     canvas.surface.push_transform(&full.to_krilla());
     canvas.paint_extent.enter_local();
+    // F30f-b: under the matrix the coordinates are not page coordinates: no block-axis clip band here.
+    let saved_clip_band =
+        std::mem::replace(&mut canvas.clip_band, crate::draw_primitives::ClipBand::Off);
 
     // Dispatch the wrapper's own payload first (the same NodeId
     // carries both the transform and its inner content), before
@@ -2498,6 +2508,7 @@ fn draw_under_transform(
         );
     }
 
+    canvas.clip_band = saved_clip_band;
     canvas.paint_extent.leave_local();
     canvas.surface.pop();
     if let Some(lc) = canvas.link_collector.as_deref_mut() {
@@ -2652,6 +2663,20 @@ fn draw_under_clip(
         } else {
             false
         };
+        // F30f-b: a box that clips its block axis leaves only its padding box visible: no line box wholly outside it
+        // is written (ADR-0009 of html-to-pdf). The band is in page coordinates; it is intersected with the one of the
+        // clip boxes around this one and restored below.
+        let outer_clip_band = canvas.clip_band;
+        if clip_pushed && block.style.overflow_y == crate::draw_primitives::Overflow::Clip {
+            let (top_border, bottom_border) = (
+                block.style.border_widths[0].to_f32(),
+                block.style.border_widths[2].to_f32(),
+            );
+            canvas.clip_band = outer_clip_band.intersect(
+                (y_pt + top_border).as_pt(),
+                (y_pt + total_height - bottom_border).as_pt(),
+            );
+        }
 
         // Inner content sharing `node_id` (inline-root paragraph,
         // replaced image / svg) paints at the content-box top-left,
@@ -2909,6 +2934,7 @@ fn draw_under_clip(
             drawables,
         );
 
+        canvas.clip_band = outer_clip_band;
         if clip_pushed {
             canvas.paint_extent.leave_local();
             canvas.surface.pop();
@@ -6756,6 +6782,7 @@ mod tests {
             images: Default::default(),
             fonts: &mut Default::default(),
             paint_extent: Default::default(),
+            clip_band: Default::default(),
         };
         f(&mut canvas)
     }

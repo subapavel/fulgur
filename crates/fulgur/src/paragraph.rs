@@ -790,6 +790,29 @@ fn item_is_ink(item: &LineItem) -> bool {
     }
 }
 
+/// F30f-b: how much of a line box's height may stick out of the clip band without the line counting as visible, in pt.
+/// A line shows through the band when more than this is inside it. Line boxes are quantised to the pixel (F78) and the
+/// tops here are the sum of the heights above, so a line that ends exactly at the band's edge can be off by a hair.
+const CLIP_BAND_SLACK_PT: f32 = 0.5;
+
+/// F30f-b: whether the line box that starts at `top` (page pt) lies wholly outside the block-axis `band`
+/// `(top, bottom)` that the enclosing clip boxes leave visible. A line is written when at least [`CLIP_BAND_SLACK_PT`]
+/// of its height is inside the band (a partly visible line is written and clipped, as Chrome does). A line of no height
+/// is kept.
+fn line_is_clipped_out(
+    line: &ShapedLine,
+    top: crate::units::Pt,
+    band: (crate::units::Pt, crate::units::Pt),
+) -> bool {
+    let (band_top, band_bottom) = (band.0.to_f32(), band.1.to_f32());
+    let height = line.height.to_f32();
+    if height <= 0.0 {
+        return false;
+    }
+    let (top, bottom) = (top.to_f32(), top.to_f32() + height);
+    bottom <= band_top + CLIP_BAND_SLACK_PT || top >= band_bottom - CLIP_BAND_SLACK_PT
+}
+
 /// Draw pre-shaped text lines at the given position.
 pub fn draw_shaped_lines(
     canvas: &mut Canvas<'_, '_>,
@@ -831,6 +854,15 @@ pub fn draw_shaped_lines(
     for line in lines {
         let line_top_abs = y + line_top;
         let baseline_y = y + line.baseline;
+
+        // F30f-b: a line box wholly outside the block-axis clip of the boxes around it is not written (no glyphs, link
+        // rect, inline box or tag). The line still takes its height below.
+        if let Some(band) = canvas.clip_band.band()
+            && line_is_clipped_out(line, line_top_abs, band)
+        {
+            line_top += line.height;
+            continue;
+        }
 
         for item in &line.items {
             match item {
@@ -1026,6 +1058,11 @@ pub fn draw_shaped_lines(
                             }
                             canvas.surface.push_transform(&transform);
                             canvas.paint_extent.enter_local();
+                            // Not page coordinates under the translate: no band (F30f-b).
+                            let saved_band = std::mem::replace(
+                                &mut canvas.clip_band,
+                                crate::draw_primitives::ClipBand::Off,
+                            );
                             crate::render::dispatch_inline_box_content(
                                 canvas,
                                 content_id,
@@ -1040,6 +1077,7 @@ pub fn draw_shaped_lines(
                                 ctx.page_index,
                                 &ctx.drawables.inline_box_subtree_descendants,
                             );
+                            canvas.clip_band = saved_band;
                             canvas.paint_extent.leave_local();
                             canvas.surface.pop();
                             if let Some(lc) = canvas.link_collector.as_deref_mut() {
@@ -1269,6 +1307,7 @@ mod tests {
                 images: Default::default(),
                 fonts: &mut Default::default(),
                 paint_extent: Default::default(),
+                clip_band: Default::default(),
             };
             // Draw origin (5, 7) pt; rect must land at (5+2, 7+3, 20, 10).
             draw_shaped_lines(&mut canvas, &[line], 5.0_f32.as_pt(), 7.0_f32.as_pt(), None);
@@ -1282,6 +1321,102 @@ mod tests {
         // (x + x_offset, y + computed_y, width, height) = (7, 10, 20, 10).
         let pts = occ[0].quads[0].points;
         assert_eq!(pts, [[7.0, 20.0], [27.0, 20.0], [27.0, 10.0], [7.0, 10.0]]);
+    }
+
+    /// Link rects that `draw_shaped_lines` records for three lines of 16 pt at the origin y = 0 (tops 0, 16 and 32),
+    /// each holding a linked image, drawn under `band`: one per line that is written, as the tops in pt.
+    fn written_lines_under(band: crate::draw_primitives::ClipBand) -> Vec<f32> {
+        let link = Arc::new(LinkSpan {
+            target: LinkTarget::External(Arc::new("https://example.com".into())),
+            alt_text: None,
+        });
+        let lines: Vec<ShapedLine> = (0..3)
+            .map(|k| {
+                let mut img = make_inline_image(20.0, 10.0, VerticalAlign::Baseline);
+                img.link = Some(Arc::clone(&link));
+                // `computed_y` is measured from the paragraph's top, so the rect says which line it belongs to.
+                img.computed_y = (16.0 * k as f32).as_pt();
+                let mut line = text_line(16.0, 12.0);
+                line.items.push(LineItem::Image(img));
+                line
+            })
+            .collect();
+        let mut lc = crate::draw_primitives::LinkCollector::new();
+        {
+            let mut doc = krilla::Document::new();
+            let settings =
+                krilla::page::PageSettings::from_wh(200.0, 200.0).expect("valid page size");
+            let mut page = doc.start_page_with(settings);
+            let mut surface = page.surface();
+            let mut canvas = Canvas {
+                surface: &mut surface,
+                bookmark_collector: None,
+                link_collector: Some(&mut lc),
+                tag_collector: None,
+                link_run_node_id: None,
+                in_marked_content: false,
+                images: Default::default(),
+                fonts: &mut Default::default(),
+                paint_extent: Default::default(),
+                clip_band: band,
+            };
+            draw_shaped_lines(&mut canvas, &lines, 0.0_f32.as_pt(), 0.0_f32.as_pt(), None);
+        }
+        // The rect top is the line's top. Quad order bl, br, tr, tl.
+        lc.take_page(0)
+            .iter()
+            .flat_map(|o| o.quads.iter().map(|q| q.points[3][1]))
+            .collect()
+    }
+
+    fn band(top: f32, bottom: f32) -> crate::draw_primitives::ClipBand {
+        crate::draw_primitives::ClipBand::Band(top.as_pt(), bottom.as_pt())
+    }
+
+    #[test]
+    fn a_line_outside_the_clip_band_is_not_drawn() {
+        // F30f-b: lines at 0..16, 16..32 and 32..48; the clip leaves 16..32 visible. The first ends where the band
+        // starts and the last starts where it ends: neither is written, nor is its link.
+        assert_eq!(written_lines_under(band(16.0, 32.0)), vec![16.0]);
+        // Without a band all three are written.
+        assert_eq!(
+            written_lines_under(crate::draw_primitives::ClipBand::Open),
+            vec![0.0, 16.0, 32.0]
+        );
+    }
+
+    #[test]
+    fn a_partly_visible_line_is_drawn() {
+        // The band 16..20 shows 4 pt of the second line (and nothing of the others).
+        assert_eq!(written_lines_under(band(16.0, 20.0)), vec![16.0]);
+        // 0.2 pt of the third line inside the band is noise, not a visible line (the slack).
+        assert_eq!(written_lines_under(band(0.0, 32.2)), vec![0.0, 16.0]);
+        // A band that shows the lower half of the first line and the upper half of the third keeps all three.
+        assert_eq!(written_lines_under(band(8.0, 40.0)), vec![0.0, 16.0, 32.0]);
+    }
+
+    #[test]
+    fn no_band_under_a_transform() {
+        // Inside a transform the coordinates are not page coordinates: every line is written, and a clip box there
+        // sets no band either.
+        use crate::draw_primitives::ClipBand;
+        assert_eq!(written_lines_under(ClipBand::Off), vec![0.0, 16.0, 32.0]);
+        assert_eq!(
+            ClipBand::Off.intersect(1.0_f32.as_pt(), 2.0_f32.as_pt()),
+            ClipBand::Off
+        );
+        assert_eq!(ClipBand::Off.band(), None);
+    }
+
+    #[test]
+    fn clip_boxes_inside_each_other_intersect_their_bands() {
+        use crate::draw_primitives::ClipBand;
+        let outer = ClipBand::Open.intersect(10.0_f32.as_pt(), 100.0_f32.as_pt());
+        assert_eq!(outer, band(10.0, 100.0));
+        let inner = outer.intersect(20.0_f32.as_pt(), 200.0_f32.as_pt());
+        assert_eq!(inner, band(20.0, 100.0));
+        assert_eq!(inner.band(), Some((20.0_f32.as_pt(), 100.0_f32.as_pt())));
+        assert_eq!(ClipBand::Open.band(), None);
     }
 
     #[test]

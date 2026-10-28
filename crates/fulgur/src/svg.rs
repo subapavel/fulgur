@@ -106,6 +106,7 @@ mod tests {
                     images: Default::default(),
                     fonts: &mut Default::default(),
                     paint_extent: Default::default(),
+                    clip_band: Default::default(),
                 };
                 svg.draw(
                     &mut canvas,

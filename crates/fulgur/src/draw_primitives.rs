@@ -732,6 +732,44 @@ pub struct Canvas<'a, 'b> {
     pub fonts: &'a mut KrillaFonts,
     /// How far to the right of the page's left edge this canvas has painted (see [`PaintExtent`]).
     pub paint_extent: PaintExtent,
+    /// html-to-pdf F30f-b: the block-axis band that the clip boxes around what is being drawn leave visible, see
+    /// [`ClipBand`].
+    pub clip_band: ClipBand,
+}
+
+/// F30f-b: the block-axis clip of the boxes around the content being drawn, in pt from the page's top edge: the
+/// intersection of the padding boxes of the enclosing boxes whose `overflow-y` clips. `draw_shaped_lines` writes no line
+/// box that lies wholly outside it (ADR-0009 of html-to-pdf): the reader sees none of it, and the text layer would still
+/// hold it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ClipBand {
+    /// No clip box around, and the coordinates are page coordinates.
+    #[default]
+    Open,
+    /// The padding boxes of the clip boxes around leave this `(top, bottom)` visible.
+    Band(crate::units::Pt, crate::units::Pt),
+    /// Inside a transform (or a translate that is not the page's): the coordinates are not page coordinates, so no band
+    /// is known, and none is set. Output there stays as it was.
+    Off,
+}
+
+impl ClipBand {
+    /// The band left by a further clip box whose padding box spans these page y values.
+    pub fn intersect(self, top: crate::units::Pt, bottom: crate::units::Pt) -> ClipBand {
+        match self {
+            ClipBand::Open => ClipBand::Band(top, bottom),
+            ClipBand::Band(t, b) => ClipBand::Band(t.max(top), b.min(bottom)),
+            ClipBand::Off => ClipBand::Off,
+        }
+    }
+
+    /// The `(top, bottom)` to test lines against, if there is a band.
+    pub fn band(self) -> Option<(crate::units::Pt, crate::units::Pt)> {
+        match self {
+            ClipBand::Band(t, b) => Some((t, b)),
+            ClipBand::Open | ClipBand::Off => None,
+        }
+    }
 }
 
 /// The rightmost x, in pt from the page's left edge, that text, inline images and boxes with a visible background or
@@ -3185,6 +3223,7 @@ mod dp_unit_tests {
             images: Default::default(),
             fonts: &mut Default::default(),
             paint_extent: Default::default(),
+            clip_band: Default::default(),
         };
         f(&mut canvas);
     }
