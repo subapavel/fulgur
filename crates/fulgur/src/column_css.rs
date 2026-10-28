@@ -463,12 +463,17 @@ fn parse_column_fill_value<'i>(
 /// (`avoid`, `avoid-page`, `avoid-column`) as `BreakInside::Avoid`, and
 /// `auto` as `BreakInside::Auto`. Other idents (`avoid-region`,
 /// `left`, `right`, typos …) drop the declaration so siblings still apply.
+///
+/// `legacy` is the value side of `page-break-inside` (css-break-3 section 3.4, an alias of `break-inside`), which takes
+/// only `auto` and `avoid`: `avoid-page` and `avoid-column` are not valid there.
 fn parse_break_inside_value<'i>(
     input: &mut Parser<'i, '_>,
+    legacy: bool,
 ) -> Result<BreakInside, ParseError<'i, ()>> {
     let ident = input.expect_ident()?.clone();
     match ident.as_ref().to_ascii_lowercase().as_str() {
-        "avoid" | "avoid-page" | "avoid-column" => Ok(BreakInside::Avoid),
+        "avoid" => Ok(BreakInside::Avoid),
+        "avoid-page" | "avoid-column" if !legacy => Ok(BreakInside::Avoid),
         "auto" => Ok(BreakInside::Auto),
         _ => Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid)),
     }
@@ -709,7 +714,10 @@ fn parse_value_into(props: &mut ColumnStyleProps, name: &str, input: &mut Parser
         if let Ok(fill) = input.parse_entirely(parse_column_fill_value) {
             props.fill = Some(fill);
         }
-    } else if name.eq_ignore_ascii_case("break-inside") {
+    } else if name.eq_ignore_ascii_case("break-inside")
+        || name.eq_ignore_ascii_case("page-break-inside")
+    {
+        let legacy = name.eq_ignore_ascii_case("page-break-inside");
         // `break-inside` (CSS Fragmentation Level 3) maps
         // `avoid-page` / `avoid-column` / `avoid` all onto
         // [`BreakInside::Avoid`]: fulgur's fragmentation model only
@@ -717,7 +725,7 @@ fn parse_value_into(props: &mut ColumnStyleProps, name: &str, input: &mut Parser
         // flavours collapse into a single lattice point. `auto` is the
         // initial value; unknown idents drop the declaration silently
         // so siblings keep applying.
-        if let Ok(bi) = input.parse_entirely(parse_break_inside_value) {
+        if let Ok(bi) = input.parse_entirely(|i| parse_break_inside_value(i, legacy)) {
             props.break_inside = Some(bi);
         }
     } else if name.eq_ignore_ascii_case("break-after")
@@ -1406,6 +1414,20 @@ mod tests {
     fn parse_break_inside_invalid_value_is_silently_dropped() {
         let props = parse_declaration_block("break-inside: banana;");
         assert_eq!(props.break_inside, None);
+    }
+
+    /// html-to-pdf F83a/F83d: `page-break-inside` is the legacy name of `break-inside` (css-break-3 section 3.4); it takes
+    /// `auto` and `avoid` only.
+    #[test]
+    fn parse_page_break_inside_is_an_alias_for_auto_and_avoid() {
+        let avoid = parse_declaration_block("page-break-inside: avoid;");
+        assert_eq!(avoid.break_inside, Some(BreakInside::Avoid));
+        let auto = parse_declaration_block("page-break-inside: auto;");
+        assert_eq!(auto.break_inside, Some(BreakInside::Auto));
+        for invalid in ["avoid-page", "avoid-column", "always", "banana"] {
+            let p = parse_declaration_block(&format!("page-break-inside: {invalid};"));
+            assert_eq!(p.break_inside, None, "{invalid}");
+        }
     }
 
     #[test]

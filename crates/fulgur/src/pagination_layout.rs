@@ -3447,6 +3447,12 @@ fn leading_block_size(
         .filter(|v| !v.is_empty())
         .unwrap_or(&node.children);
     let avoid_applies = column_styles.is_some() && is_block_flow_container(doc, node);
+    // F83d: a row of a table that `avoid` keeps together counts whole, like an avoid box in block flow.
+    let kept_rows = if column_styles.is_some() && is_table_box(node) {
+        avoid_rows(doc, node, walk_children, column_styles, page_height_px)
+    } else {
+        BTreeMap::new()
+    };
     let mut first_row_top: Option<f32> = None;
     let mut leading: f32 = 0.0;
     for &child_id in walk_children {
@@ -3499,6 +3505,11 @@ fn leading_block_size(
         let child_leading = match line_split_candidate(doc, node, child) {
             Some(split) if split.inset_top + split.span() > page_height_px + 1.0 => {
                 split.leading().min(layout.size.height)
+            }
+            _ if kept_rows.contains_key(&row_key(top))
+                && above + top + layout.size.height <= page_height_px + 1.0 =>
+            {
+                layout.size.height
             }
             _ if avoid_applies
                 && has_avoid(column_styles, child_id)
@@ -4069,6 +4080,12 @@ fn fragment_block_subtree(
         .map(|v| v.to_vec())
         .unwrap_or_else(|| parent.children.clone());
     drop(layout_children_borrow);
+    // F83d: the rows of this table that `break-inside: avoid` keeps on one page.
+    let kept_rows = if parent_is_table {
+        avoid_rows(doc, parent, &walk_children, column_styles, strips.fresh())
+    } else {
+        BTreeMap::new()
+    };
     // F30: the last in-flow child with a height: what is below it in this box
     // (padding, border) is `tail` for a paragraph in it.
     let last_flow_child = walk_children
@@ -4513,15 +4530,33 @@ fn fragment_block_subtree(
         // F30: a paragraph that does not fit any page whole is split between
         // its line boxes instead of being placed as one oversized leaf (the
         // gate sees no overflowing child in it: its children are text).
-        let mut line_split = nested_line_split(
-            doc,
-            parent,
-            child,
-            child_page_y,
-            page_start_y + band,
-            strips,
-            page_index,
-        );
+        //
+        // F83d: not a cell of a row that `avoid` keeps together (`td` or `tr`), which fits a page: the row is the unit,
+        // it is not entered, and the cut below moves it to the next page when it does not fit the room. A row that sits
+        // at the top of its strip and does not fit the room has nowhere to move to and is split as before. A forced
+        // break inside the cell wins over `avoid` (css-break-3 section 4.3) and enters it as before.
+        let row_whole = kept_rows
+            .get(&row_key(this_top_in_parent))
+            .is_some_and(|&row_h| {
+                is_cell_of_table(parent, child)
+                    && (child_page_y > page_start_y + band
+                        || child_page_y + row_h <= strips.bottom(page_index) + 1.0)
+                    && !forced_break_below(facts, doc, column_styles, child_id)
+                    && !page_name_change_below(facts, doc, used_page_names, child_id)
+            });
+        let mut line_split = if row_whole {
+            None
+        } else {
+            nested_line_split(
+                doc,
+                parent,
+                child,
+                child_page_y,
+                page_start_y + band,
+                strips,
+                page_index,
+            )
+        };
         // F30d: a multi-column container that does not fit the room below it is distributed over the
         // pages (plain block flow only: in a flex / grid box, a table or an atomic inline it stays one
         // box, F30d-b).
@@ -4555,6 +4590,7 @@ fn fragment_block_subtree(
         let movable = content_above_child && child_page_y > page_start_y + band;
         let mut keeps_whole = keeps_whole_at(page_index, child_page_y, movable);
         let mut needs_recursion = line_split.is_none()
+            && !row_whole
             && gate(
                 (strips.bottom(page_index) - cursor_y).max(0.0),
                 keeps_whole,
@@ -5913,6 +5949,67 @@ fn is_cell_of_table(parent: &blitz_dom::Node, child: &blitz_dom::Node) -> bool {
     inside_of(parent) == Some(DisplayInside::Table)
         && (inside_of(child) == Some(DisplayInside::TableCell)
             || crate::blitz_adapter::is_anonymous_table_cell(parent, child))
+}
+
+/// Whether `node` is a table box (`display: table`, also the box an `inline-table` makes).
+fn is_table_box(node: &blitz_dom::Node) -> bool {
+    use ::style::values::specified::box_::DisplayInside;
+    node.primary_styles()
+        .is_some_and(|s| s.clone_display().inside() == DisplayInside::Table)
+}
+
+/// F83d: the key of a table row in [`avoid_rows`]: the row's top, in quarter pixels. The cells of a row share their top
+/// (Taffy places them at the row's `y`); the key survives f32 noise between them.
+fn row_key(top: f32) -> i64 {
+    (top * 4.0).round() as i64
+}
+
+/// F83d: the rows of the table box `table` that `break-inside: avoid` keeps on one page, keyed by [`row_key`], with the
+/// block-size of the row. A row is kept when one of its cells has `avoid`, or the `tr` that holds the cell does (`tr` has
+/// no box of its own in the fragmenter, Blitz gives `tbody` and `tr` no size, so the rule is read from the cell's
+/// parent), and when the row fits a fresh page: css-break-3 section 4.4 relaxes `avoid` only when the content cannot be
+/// kept from overflowing the fragmentainer, and then the row breaks like an `auto` one. `children` are the table's
+/// `layout_children`, the cells in visual order. Empty when `column_styles` is `None` (the caller has no use for the rule)
+/// or no row asks for it, which is the common case and costs one pass over the cells.
+fn avoid_rows(
+    doc: &BaseDocument,
+    table: &blitz_dom::Node,
+    children: &[usize],
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    fresh: f32,
+) -> BTreeMap<i64, f32> {
+    use ::style::values::specified::box_::DisplayInside;
+    let mut rows: BTreeMap<i64, (bool, f32)> = BTreeMap::new();
+    if column_styles.is_none() {
+        return BTreeMap::new();
+    }
+    for &id in children {
+        let Some(cell) = doc.get_node(id) else {
+            continue;
+        };
+        if !is_cell_of_table(table, cell) || !is_flow_child_with_height(cell) {
+            continue;
+        }
+        let in_tr = cell
+            .parent
+            .filter(|&p| p != table.id)
+            .and_then(|p| doc.get_node(p))
+            .filter(|tr| {
+                tr.primary_styles()
+                    .is_some_and(|s| s.clone_display().inside() == DisplayInside::TableRow)
+            });
+        let avoid =
+            has_avoid(column_styles, id) || in_tr.is_some_and(|tr| has_avoid(column_styles, tr.id));
+        let row = rows
+            .entry(row_key(cell.final_layout.location.y))
+            .or_insert((false, 0.0));
+        row.0 |= avoid;
+        row.1 = row.1.max(cell.final_layout.size.height);
+    }
+    rows.into_iter()
+        .filter(|(_, (avoid, h))| *avoid && *h <= fresh + 1.0)
+        .map(|(k, (_, h))| (k, h))
+        .collect()
 }
 
 /// F30: whether a child of `parent` is an inline root that the fragmenter may
@@ -11918,6 +12015,166 @@ h2 { string-set: chapter-title content(text); }
                     "{label}: image {id}"
                 );
             }
+        }
+    }
+
+    /// Cell content for the `avoid` tests: an image, then `n` words that a 60 px cell wraps one per line (20 px lines). The
+    /// fragmenter counts a cell made of text alone as a leaf and moves its table whole; it enters the row at its first
+    /// line only when an inline box is the first thing in the cell (the shape of an invoice cell with a logo or an icon).
+    fn avoid_cell_lines(n: usize) -> String {
+        format!(
+            "<img width=\"20\" height=\"20\">{}",
+            vec!["line"; n].join(" ")
+        )
+    }
+
+    /// Pages of the fragments of the element `id`, and the top (page-local y) of the first one.
+    fn pages_and_top(
+        doc: &blitz_dom::BaseDocument,
+        table: &PaginationGeometryTable,
+        id: &str,
+    ) -> (Vec<u32>, f32) {
+        let g = &table[&find_by_id(doc, id).unwrap()];
+        (
+            g.fragments.iter().map(|f| f.page_index).collect(),
+            g.fragments[0].y.to_f32(),
+        )
+    }
+
+    /// html-to-pdf F83d (table rows and cells): `break-inside: avoid` on a `td`, or on its `tr` (which has no box of its own
+    /// in the fragmenter: Blitz gives `tbody` / `tr` no size), keeps the row on one page when it fits one (css-break-3
+    /// section 3.3: a class A break point between rows is preferred to one inside the row; section 4.4 relaxes `avoid`
+    /// only when the row is taller than the fragmentainer). The cell used to be split between its lines whenever it was the
+    /// first thing in its table, which is every cell of a table without a border and, since F183, every cell of a
+    /// bordered table too. Chrome moves the row whole. Page 1000 px, 20 px lines.
+    #[test]
+    fn avoid_on_a_row_or_a_cell_moves_a_row_that_fits_a_page_whole() {
+        let font = Arc::new(
+            std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../examples/.fonts/NotoSans-Regular.ttf"
+            ))
+            .expect("the bundled Noto Sans"),
+        );
+        // (table style, rule, what the rule is for)
+        let rules = [
+            ("tr{break-inside:avoid}", "tr"),
+            ("td{break-inside:avoid}", "td"),
+            ("tr{page-break-inside:avoid}", "page-break-inside on tr"),
+            ("td{page-break-inside:avoid}", "page-break-inside on td"),
+        ];
+        for table_style in ["border-collapse:collapse", "border-collapse:separate", ""] {
+            for (rule, what) in rules {
+                // 900 px of filler, eight lines of 20 px: the row does not fit the 100 px left, fits a page.
+                let html = format!(
+                    r#"<style>body{{margin:0;font:16px 'Noto Sans';line-height:20px}}td{{width:60px;padding:4px;border:1px solid #000}}{rule}</style><body>
+                    <div style="height:900px"></div><table style="{table_style}"><tr><td id="a">{}</td><td id="b"><img width="20" height="20">short</td></tr></table></body>"#,
+                    avoid_cell_lines(8)
+                );
+                let mut doc = blitz_adapter::parse(&html, 794.0, std::slice::from_ref(&font));
+                blitz_adapter::resolve(&mut doc);
+                let styles = blitz_adapter::extract_column_style_table(&doc);
+                let table =
+                    run_pass_with_break_styles(doc.deref_mut(), 1000.0_f32.as_px(), &styles);
+                let label = format!("{table_style:?} / {what}");
+                let (a_pages, a_top) = pages_and_top(&doc, &table, "a");
+                let (b_pages, b_top) = pages_and_top(&doc, &table, "b");
+                assert_eq!(a_pages, [1], "{label}: the cell is whole on page 1");
+                assert_eq!(b_pages, [1], "{label}: its row mate follows it");
+                assert!(
+                    (a_top - b_top).abs() < 0.5 && a_top < 5.0,
+                    "{label}: the row starts the page: {a_top} / {b_top}"
+                );
+                assert!(
+                    table[&find_by_id(doc.deref(), "a").unwrap()]
+                        .line_slices
+                        .len()
+                        < 2,
+                    "{label}: not cut between lines"
+                );
+            }
+        }
+    }
+
+    /// F83d: only the row that straddles the page moves; the rows before it stay, the row after it follows it. And a
+    /// row that does not fit a page whole is split as before (`avoid` cannot be honoured, css-break-3 section 4.4).
+    #[test]
+    fn avoid_row_moves_alone_and_a_row_taller_than_a_page_still_splits() {
+        let font = Arc::new(
+            std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../examples/.fonts/NotoSans-Regular.ttf"
+            ))
+            .expect("the bundled Noto Sans"),
+        );
+        for table_style in ["border-collapse:collapse", ""] {
+            let html = format!(
+                r#"<style>body{{margin:0;font:16px 'Noto Sans';line-height:20px}}td{{width:60px;padding:4px;border:1px solid #000}}tr{{break-inside:avoid}}</style><body>
+                <div style="height:760px"></div><table style="{table_style}">
+                <tr><td id="r1">{}</td></tr><tr><td id="r2">{}</td></tr><tr><td id="r3">{}</td></tr>
+                <tr><td id="r4">{}</td></tr></table></body>"#,
+                avoid_cell_lines(6),
+                avoid_cell_lines(16),
+                avoid_cell_lines(6),
+                avoid_cell_lines(120),
+            );
+            let mut doc = blitz_adapter::parse(&html, 794.0, std::slice::from_ref(&font));
+            blitz_adapter::resolve(&mut doc);
+            let styles = blitz_adapter::extract_column_style_table(&doc);
+            let table = run_pass_with_break_styles(doc.deref_mut(), 1000.0_f32.as_px(), &styles);
+            let pages = |id: &str| pages_and_top(&doc, &table, id).0;
+            assert_eq!(pages("r1"), [0], "{table_style:?}: r1 fits");
+            assert_eq!(
+                pages("r2"),
+                [1],
+                "{table_style:?}: r2 straddles, moves whole"
+            );
+            assert_eq!(pages("r3"), [1], "{table_style:?}: r3 follows r2");
+            // 1200 px of lines cannot be kept together: split as an `auto` row, from page 1 on.
+            let r4 = pages("r4");
+            assert!(
+                r4.len() >= 2 && r4[0] >= 1,
+                "{table_style:?}: r4 is taller than a page and splits: {r4:?}"
+            );
+        }
+    }
+
+    /// F83d: the row that moves goes below the repeated header of the next page (F12), and the table is not left with a
+    /// stub on the page it came from.
+    #[test]
+    fn avoid_row_moved_to_the_next_page_sits_below_the_repeated_header() {
+        let font = Arc::new(
+            std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../examples/.fonts/NotoSans-Regular.ttf"
+            ))
+            .expect("the bundled Noto Sans"),
+        );
+        for table_style in ["border-collapse:collapse", ""] {
+            let html = format!(
+                r#"<style>body{{margin:0;font:16px 'Noto Sans';line-height:20px}}td,th{{width:60px;padding:4px;border:1px solid #000}}tr.k{{break-inside:avoid}}</style><body>
+                <div style="height:830px"></div><table style="{table_style}"><thead id="h"><tr><th>head</th></tr></thead>
+                <tbody><tr class="k"><td id="r1">{}</td></tr><tr class="k"><td id="r2">{}</td></tr></tbody></table></body>"#,
+                avoid_cell_lines(6),
+                avoid_cell_lines(16),
+            );
+            let mut doc = blitz_adapter::parse(&html, 794.0, std::slice::from_ref(&font));
+            blitz_adapter::resolve(&mut doc);
+            let styles = blitz_adapter::extract_column_style_table(&doc);
+            let table = run_pass_with_break_styles(doc.deref_mut(), 1000.0_f32.as_px(), &styles);
+            let (r1_pages, _) = pages_and_top(&doc, &table, "r1");
+            let (r2_pages, r2_top) = pages_and_top(&doc, &table, "r2");
+            assert_eq!(r1_pages, [0], "{table_style:?}: r1 fits below the header");
+            assert_eq!(r2_pages, [1], "{table_style:?}: r2 moves whole");
+            let h = &table[&find_by_id(doc.deref(), "h").unwrap()];
+            assert!(
+                h.fragments.iter().any(|f| f.page_index == 1),
+                "{table_style:?}: the header is repeated on page 1: {h:?}"
+            );
+            assert!(
+                r2_top >= 20.0,
+                "{table_style:?}: r2 sits below the repeated header: {r2_top}"
+            );
         }
     }
 
