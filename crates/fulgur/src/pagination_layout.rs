@@ -3480,6 +3480,17 @@ fn leading_block_size(
         let top = layout.location.y;
         match first_row_top {
             None => {
+                // An inline root that holds a box (an `<img>`) and has two lines or more: the first thing the
+                // fragmenter can keep apart from the rest is its first lines, as for a cut paragraph (`LineSplit::
+                // leading`), not the bottom of the first box, which may sit on a later line (a text line, then the
+                // image) or on a line shorter than its strut. It was `top + the box`: a cell of `text<br><img>` near
+                // the bottom of a page asked for the text and the image, did not fit, and moved whole where Chrome
+                // keeps its first two lines (html-to-pdf F183, plan 7.8).
+                if node.flags.is_inline_root()
+                    && let Some(split) = abspos_line_split(node)
+                {
+                    return split.leading().min(own_h);
+                }
                 // The gap is measured from the content edge: the node's own
                 // border and padding are not a gap, they belong to its box.
                 let content_top = node.final_layout.border.top + node.final_layout.padding.top;
@@ -11981,8 +11992,9 @@ h2 { string-set: chapter-title content(text); }
     ///
     /// Two lines (an image each) at the bottom of page 0: a cell on two pages has a line range for each fragment, and
     /// the images are where the last column says. The cell of a table with a frame is not flush with the top of the strip, so the cut
-    /// that keeps the first two lines (orphans) together moves it to page 1 whole, as Chrome does; the plain table
-    /// at the top of its strip splits 1 | 1 (F30c).
+    /// that keeps the first two lines (orphans) together moves it to page 1 whole, as Chrome does; so does the plain
+    /// table at the top of its strip since plan 7.8 (`leading_block_size` of an inline root counts its first two
+    /// lines, not the bottom of its first image: it used to split 1 | 1).
     #[test]
     fn a_cell_of_a_bordered_table_is_split_between_its_lines() {
         let font = Arc::new(
@@ -11994,7 +12006,7 @@ h2 { string-set: chapter-title content(text); }
         );
         // (table style, td style, page of each image)
         let variants = [
-            ("", "border:1px solid #000", [0, 1]),
+            ("", "border:1px solid #000", [1, 1]),
             ("border-collapse:collapse", "border:1px solid #000", [1, 1]),
             ("border-collapse:collapse", "border:2px solid #000", [1, 1]),
             ("border-collapse:collapse", "border:3px solid #000", [1, 1]),
@@ -12058,14 +12070,23 @@ h2 { string-set: chapter-title content(text); }
         };
         let img = |id: &str, k: usize| format!(r#"<img id="{id}{k}" width="60" height="60">"#);
         // (label, cell content, ids of its images)
-        type Cell = (&'static str, fn(usize, &dyn Fn(&str, usize) -> String, &str) -> String);
+        type Cell = (
+            &'static str,
+            fn(usize, &dyn Fn(&str, usize) -> String, &str) -> String,
+        );
         let shapes: [Cell; 4] = [
-            ("img img words", |k, i, w| format!("{}<br>{}<br>{w}", i("a", k), i("b", k))),
+            ("img img words", |k, i, w| {
+                format!("{}<br>{}<br>{w}", i("a", k), i("b", k))
+            }),
             ("img img img words", |k, i, w| {
                 format!("{}<br>{}<br>{}<br>{w}", i("a", k), i("b", k), i("c", k))
             }),
-            ("words img img", |k, i, w| format!("{w}<br>{}<br>{}", i("a", k), i("b", k))),
-            ("img words img", |k, i, w| format!("{}<br>{w}<br>{}", i("a", k), i("b", k))),
+            ("words img img", |k, i, w| {
+                format!("{w}<br>{}<br>{}", i("a", k), i("b", k))
+            }),
+            ("img words img", |k, i, w| {
+                format!("{}<br>{w}<br>{}", i("a", k), i("b", k))
+            }),
         ];
         // (label, table style, td style)
         let tables = [
@@ -12140,6 +12161,67 @@ h2 { string-set: chapter-title content(text); }
             "{} failures in {cut_cells} cut cells: {:#?}",
             failures.len(),
             &failures[..failures.len().min(8)]
+        );
+    }
+
+    /// html-to-pdf F183 (plan 7.8): the first thing an inline root with a box in it needs below its top is its first
+    /// two lines (orphans), as for a cut paragraph, not the bottom of its first box. A cell of `text<br><img><br>text`
+    /// whose two text lines fit the room but not the image under them is entered and cut after the text, as Chrome
+    /// does; it used to ask for the text and the image, did not fit, and moved to the next page whole.
+    #[test]
+    fn an_inline_root_asks_for_its_first_lines_not_for_its_first_box() {
+        let font = Arc::new(
+            std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../examples/.fonts/NotoSans-Regular.ttf"
+            ))
+            .expect("the bundled Noto Sans"),
+        );
+        let words = |from: usize| {
+            (from..from + 28)
+                .map(|i| format!("w{i:03}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let html = format!(
+            r#"<style>body{{margin:0;font:16px 'Noto Sans'}}td{{padding:5px;vertical-align:top}}</style><body>
+            <div style="height:1030px"></div><table style="width:100%"><tr><td id="td">{}<br><img id="im" width="60" height="60"><br>{}</td></tr></table></body>"#,
+            words(1),
+            words(29)
+        );
+        let mut doc = blitz_adapter::parse(&html, 794.0, std::slice::from_ref(&font));
+        blitz_adapter::resolve(&mut doc);
+        let table = run_pass(&mut doc, 1122.52);
+        let td = &table[&find_by_id(doc.deref(), "td").unwrap()];
+        let lines = collect_inline_line_metrics(
+            doc.get_node(find_by_id(doc.deref(), "td").unwrap())
+                .unwrap(),
+        )
+        .len();
+        assert_eq!(lines, 5, "two text lines, the image line, two text lines");
+        assert_eq!(
+            td.fragments
+                .iter()
+                .map(|f| f.page_index)
+                .collect::<Vec<_>>(),
+            [0, 1],
+            "the cell is cut: {td:?}"
+        );
+        assert_eq!(
+            td.line_slices
+                .iter()
+                .map(|s| (s.first, s.end))
+                .collect::<Vec<_>>(),
+            [(0, 2), (2, 5)],
+            "after the two text lines"
+        );
+        let im = &table[&find_by_id(doc.deref(), "im").unwrap()];
+        assert_eq!(
+            im.fragments
+                .iter()
+                .map(|f| f.page_index)
+                .collect::<Vec<_>>(),
+            [1]
         );
     }
 
