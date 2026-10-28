@@ -4596,6 +4596,22 @@ fn fragment_block_subtree(
                 keeps_whole,
                 tail_over_at(page_index, child_page_y, content_above_child),
             );
+        // html-to-pdf F183 (plan 7.8): the gate enters an inline root because one of its inline boxes (an `<img>`, the
+        // second line's) overflows the strip. The children of an inline root are not block children: the lines put
+        // them where they are, and the block walk cut the root between two boxes, in fragments as tall as the boxes,
+        // without line ranges (a 64 px line of a 60 px image no longer fitted its fragment and was dropped, with the
+        // text under it). Where an inline root has to be cut it is cut between its line boxes, as one that is first
+        // on its strip or taller than a page already is. A forced break inside it (an inline-block holding one) still
+        // enters it, and a root the line splitter must keep whole (`split_barrier`) is entered as before.
+        if needs_recursion
+            && mc_split.is_none()
+            && !forced_break_below(facts, doc, column_styles, child_id)
+            && !page_name_change_below(facts, doc, used_page_names, child_id)
+            && let Some(split) = line_split_candidate(doc, parent, child)
+        {
+            line_split = Some(split);
+            needs_recursion = false;
+        }
         // F83b: an avoid box taller than a page breaks like `auto`, but when
         // content precedes it (or something that starts with it) the break
         // before it is preferred to one inside it (css-break-3 §4.5): it
@@ -12016,6 +12032,115 @@ h2 { string-set: chapter-title content(text); }
                 );
             }
         }
+    }
+
+    /// html-to-pdf F183 (plan 7.8): an inline root that holds inline boxes (an `<img>` on each of its lines) and that
+    /// the strip cannot hold is cut between its lines, never between its boxes. The block walk used to enter it because
+    /// one of its children (an image on a later line) overflowed the strip, and cut it between the images in fragments
+    /// as tall as the images: with no line ranges the renderer measured the lines from those heights, and a line taller
+    /// than its fragment (the 64 px line of a 60 px image) was dropped, with the text on it. The cells below are not the
+    /// first of their table (row 5), so `nested_line_split` leaves them alone. Every cell that is cut has line ranges
+    /// that tile its lines, and every image has one fragment.
+    #[test]
+    fn an_inline_root_with_boxes_is_never_cut_between_its_boxes() {
+        let font = Arc::new(
+            std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../examples/.fonts/NotoSans-Regular.ttf"
+            ))
+            .expect("the bundled Noto Sans"),
+        );
+        let words = |k: usize| {
+            (0..20)
+                .map(|i| format!("w{:03}", k * 20 + i))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let img = |id: &str, k: usize| format!(r#"<img id="{id}{k}" width="60" height="60">"#);
+        // (label, cell content, ids of its images)
+        type Cell = (&'static str, fn(usize, &dyn Fn(&str, usize) -> String, &str) -> String);
+        let shapes: [Cell; 4] = [
+            ("img img words", |k, i, w| format!("{}<br>{}<br>{w}", i("a", k), i("b", k))),
+            ("img img img words", |k, i, w| {
+                format!("{}<br>{}<br>{}<br>{w}", i("a", k), i("b", k), i("c", k))
+            }),
+            ("words img img", |k, i, w| format!("{w}<br>{}<br>{}", i("a", k), i("b", k))),
+            ("img words img", |k, i, w| format!("{}<br>{w}<br>{}", i("a", k), i("b", k))),
+        ];
+        // (label, table style, td style)
+        let tables = [
+            (
+                "collapsed",
+                "border-collapse:collapse;table-layout:fixed;width:100%",
+                "padding:6px;border:1px solid #000",
+            ),
+            (
+                "separated",
+                "border-collapse:separate;border-spacing:0;table-layout:fixed;width:100%",
+                "padding:6px;border:1px solid #000",
+            ),
+            ("no border", "width:100%", "padding:6px"),
+        ];
+        let mut cut_cells = 0;
+        let mut failures = Vec::new();
+        for (shape, content) in shapes {
+            for (label, table_style, td_style) in tables {
+                for filler in (0..260).step_by(6) {
+                    let rows: String = (0..8)
+                        .map(|k| {
+                            format!(
+                                r#"<tr><td id="td{k}">{}</td><td>x</td></tr>"#,
+                                content(k, &img, &words(k))
+                            )
+                        })
+                        .collect();
+                    let html = format!(
+                        r#"<style>body{{margin:0;font:16px 'Noto Sans'}}table{{{table_style}}}td{{{td_style};vertical-align:top}}</style><body><div style="height:{filler}px"></div><table>{rows}</table></body>"#
+                    );
+                    let mut doc = blitz_adapter::parse(&html, 794.0, std::slice::from_ref(&font));
+                    blitz_adapter::resolve(&mut doc);
+                    let table = run_pass(&mut doc, 1122.52);
+                    for k in 0..8 {
+                        let td_id = find_by_id(doc.deref(), &format!("td{k}")).unwrap();
+                        let lines = collect_inline_line_metrics(doc.get_node(td_id).unwrap()).len();
+                        let td = &table[&td_id];
+                        let what = format!("{shape}, {label}, filler {filler}, td{k}");
+                        if td.fragments.len() > 1 {
+                            cut_cells += 1;
+                            if !line_slices_tile(&td.line_slices, lines) {
+                                failures.push(format!(
+                                    "{what}: cut into {:?} with line ranges {:?} of {lines} lines",
+                                    td.fragments
+                                        .iter()
+                                        .map(|f| (f.page_index, f.y.to_f32(), f.height.to_f32()))
+                                        .collect::<Vec<_>>(),
+                                    td.line_slices
+                                        .iter()
+                                        .map(|s| (s.first, s.end))
+                                        .collect::<Vec<_>>()
+                                ));
+                            }
+                        }
+                        for pre in ["a", "b", "c"] {
+                            let Some(id) = find_by_id(doc.deref(), &format!("{pre}{k}")) else {
+                                continue;
+                            };
+                            let n = table[&id].fragments.len();
+                            if n != 1 {
+                                failures.push(format!("{what}: image {pre}{k} has {n} fragments"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cut_cells > 0, "no cell was cut: the test does not test");
+        assert!(
+            failures.is_empty(),
+            "{} failures in {cut_cells} cut cells: {:#?}",
+            failures.len(),
+            &failures[..failures.len().min(8)]
+        );
     }
 
     /// Cell content for the `avoid` tests: an image, then `n` words that a 60 px cell wraps one per line (20 px lines). The
