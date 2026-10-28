@@ -1527,6 +1527,10 @@ pub struct PaginationGeometry {
     /// `(top, bottom)` px bigger, the top on every fragment and the bottom on the
     /// last. `None` for everything else.
     pub line_split_insets: Option<(crate::units::Px, crate::units::Px)>,
+    /// html-to-pdf F30f-d: with `line_split_insets`, the box is sliced at its breaks (`box-decoration-break: slice`,
+    /// css-break-3 §5.4): the top inset is on the first fragment only, the bottom one on the last, and the renderer
+    /// opens the edges at a break (no border, padding or radius there). `false` keeps the frame closed on every page.
+    pub line_split_slice: bool,
     /// F78: for an inline root split between line boxes by
     /// [`fragment_inline_root`] or [`fragment_nested_inline_root`], the lines each
     /// fragment holds, parallel to `fragments`. Empty for everything else (the
@@ -2570,12 +2574,31 @@ impl<'a> PaginationLayoutTree<'a> {
             .flatten();
             let clip_whole_now = clip_limit_here.is_some()
                 && cursor_y + child_h <= self.strips.bottom(page_index) + 0.5;
+            // html-to-pdf F30f-d: a paragraph with a border or padding that does not fit its page is cut by the splitter
+            // that knows its insets, and sliced at its breaks (`box-decoration-break: slice`, css-break-3 §5.4). The line
+            // fit of `fragment_inline_root` below counts the lines from the top of the border box, while the renderer
+            // paints them `inset_top` lower: the last line of every page stood past the content box (in the margin, or
+            // under the clip of an `overflow` box), and the frame closed `inset_top + inset_bottom` too early on the last
+            // page. A box without insets, a clip box (above), `break-inside: avoid`, a float and a box that is not in
+            // block flow keep the path they had (F30c for the unpadded ones).
+            let has_insets = layout.border.top
+                + layout.padding.top
+                + layout.border.bottom
+                + layout.padding.bottom
+                > 0.0;
+            let inset_split_here = clip_limit_here.is_none()
+                && has_insets
+                && body_block_flow
+                && !is_float
+                && !avoid_inside
+                && !crate::blitz_adapter::is_multicol_container(child)
+                && cursor_y + child_h > self.strips.bottom(page_index) + 0.5;
             if line_metrics.len() > 1
-                && clip_limit_here.is_some()
-                && !clip_whole_now
+                && (clip_limit_here.is_some() && !clip_whole_now || inset_split_here)
                 && let Some(body_node) = self.doc.get_node(body_id)
-                && let Some(split) = line_split_candidate(self.doc, body_node, child)
+                && let Some(mut split) = line_split_candidate(self.doc, body_node, child)
             {
+                split.slice = inset_split_here;
                 // A paragraph that is itself the clip box: the lines at or below the clip are dropped.
                 let leading = split.leading();
                 if cursor_y > 0.0
@@ -2602,7 +2625,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 page_index = new_page_index;
                 cursor_y = new_cursor_y;
                 emitted += 1;
-                after_clip_box = true;
+                after_clip_box = clip_limit_here.is_some();
                 prev_bottom_y_in_body = this_top_in_body + child_h;
                 if let Some((row_page, row_end, row_bottom)) = parallel_row {
                     if page_index == row_page {
@@ -5926,6 +5949,12 @@ struct LineSplit {
     /// F30f-b: the border-box height of the paragraph when the paragraph is itself the clip box that hid the lines:
     /// its frames add up to this height over the pages, however far its last visible line reaches.
     own_box_height: Option<f32>,
+    /// html-to-pdf F30f-d: the box is sliced at its breaks (`box-decoration-break: slice`, css-break-3 §5.4, the
+    /// initial value): its top border and padding are on the first fragment only, the bottom ones on the last, and a
+    /// fragment that is not the last has its frame run to the page bottom. A continuation page then starts its lines at
+    /// the top of the page, without `inset_top`. `false` keeps the geometry of the nested splitter (the insets of
+    /// the frame reserved on every strip, F30).
+    slice: bool,
 }
 
 /// F30f-b: a line whose top is less than this far (px) inside the clip does not show. The writer's slack is 0.5 pt
@@ -6675,6 +6704,7 @@ fn inline_root_lines(child: &blitz_dom::Node) -> Option<LineSplit> {
         inset_bottom: layout.border.bottom + layout.padding.bottom,
         hidden_tail: 0,
         own_box_height: None,
+        slice: false,
     })
 }
 
@@ -6826,13 +6856,16 @@ fn fragment_nested_inline_root(
     // to a line; a bottom padding taller than that overflows, as in browsers,
     // instead of pushing lines onto pages of their own.
     let first_line = split.lines[0].1 - split.lines[0].0;
-    let usable = strips.fresh() - top_floor - split.inset_top - first_line;
+    // F30f-d: a sliced box has no top border or padding on a continuation page (css-break-3 §5.4), so its lines start at
+    // the top there; otherwise the frame's top inset is reserved on every strip.
+    let continuation_inset = if split.slice { 0.0 } else { split.inset_top };
+    let usable = strips.fresh() - top_floor - continuation_inset - first_line;
     let below = split.inset_bottom + tail;
     let last_extra = if below <= usable { below } else { 0.0 };
     let ranges = plan_line_breaks(
         &split.lines,
         strips.bottom(page_in) - y_in - split.inset_top,
-        strips.fresh() - top_floor - split.inset_top,
+        strips.fresh() - top_floor - continuation_inset,
         last_extra,
         max_strips,
     );
@@ -6860,13 +6893,26 @@ fn fragment_nested_inline_root(
             offset: (top - split.lines[0].0).as_px(),
         });
         // Where the lines of this strip start, so that a descendant can be
-        // placed relative to the strip: `y + (local_y - top)`.
-        placements.push((page, y - top, top));
-        cursor_y = y + split.inset_top + (bottom - top);
+        // placed relative to the strip: `y + (local_y - top)`. A descendant's
+        // paragraph-local y counts the first strip's top inset, which a sliced
+        // continuation strip does not have (F30f-d).
+        let strip_inset = if k == 0 {
+            split.inset_top
+        } else {
+            continuation_inset
+        };
+        let base_y = if strip_inset == split.inset_top {
+            y - top
+        } else {
+            y - top - (split.inset_top - strip_inset)
+        };
+        placements.push((page, base_y, top));
+        cursor_y = y + strip_inset + (bottom - top);
     }
     cursor_y += split.inset_bottom;
     let entry = geometry.entry(child_id).or_default();
     entry.line_split_insets = Some((split.inset_top.as_px(), split.inset_bottom.as_px()));
+    entry.line_split_slice = split.slice;
     debug_assert!(
         line_slices_tile(&entry.line_slices, split.lines.len()),
         "fragment_nested_inline_root: line slices do not tile 0..{}: {:?}",
@@ -6884,23 +6930,42 @@ fn fragment_nested_inline_root(
     // F30f-b: a paragraph that is itself the clip box that hid lines is as tall as its box over the pages: every frame
     // but the last runs to the page bottom (the break between two line boxes leaves the room under the last line to
     // the box, like Chrome's), and the last one is what is left of the box's height.
+    //
+    // F30f-d: a sliced box is the same without the clip: it fills the fragmentainer on every page but its last
+    // (css-break-3 §5.4; Chrome's side borders run to the content box bottom). The frame's top inset is only on the
+    // first fragment of a sliced box.
+    let n = ranges.len();
+    let first = entry.fragments.len() - n;
+    let frame_inset = |k: usize| {
+        if k == 0 {
+            split.inset_top
+        } else {
+            continuation_inset
+        }
+    };
     if let Some(box_height) = split.own_box_height {
-        let first = entry.fragments.len() - ranges.len();
         let mut used = 0.0_f32;
-        for fragment in &mut entry.fragments[first..first + ranges.len() - 1] {
+        for (k, fragment) in entry.fragments[first..first + n - 1].iter_mut().enumerate() {
             let room = strips.chrome_bottom(fragment.page_index) - fragment.y.to_f32();
             used += room;
-            fragment.height = (room - split.inset_top)
+            fragment.height = (room - frame_inset(k))
                 .max(fragment.height.to_f32())
                 .as_px();
         }
-        let last = &mut entry.fragments[first + ranges.len() - 1];
+        let last = &mut entry.fragments[first + n - 1];
         let room = strips.chrome_bottom(last.page_index) - last.y.to_f32();
         let frame = (box_height - used).clamp(0.0, room.max(0.0));
-        last.height = (frame - split.inset_top - split.inset_bottom)
+        last.height = (frame - frame_inset(n - 1) - split.inset_bottom)
             .max(0.0)
             .as_px();
         cursor_y = last.y.to_f32() + frame;
+    } else if split.slice {
+        for (k, fragment) in entry.fragments[first..first + n - 1].iter_mut().enumerate() {
+            let room = strips.chrome_bottom(fragment.page_index) - fragment.y.to_f32();
+            fragment.height = (room - frame_inset(k))
+                .max(fragment.height.to_f32())
+                .as_px();
+        }
     }
     record_split_inline_root_descendants(
         geometry,
@@ -15240,6 +15305,7 @@ h2 { string-set: chapter-title content(text); }
             inset_bottom: 0.0,
             hidden_tail: 0,
             own_box_height: None,
+            slice: false,
         };
         // 100px: lines at 0..80 show, the one at 100 does not.
         let clipped = split(0.0).clip_to(100.0);
@@ -15256,6 +15322,63 @@ h2 { string-set: chapter-title content(text); }
         // The first line is always kept.
         let clipped = split(0.0).clip_to(0.0);
         assert_eq!((clipped.lines.len(), clipped.hidden_tail), (1, 9));
+    }
+
+    #[test]
+    fn a_padded_body_level_paragraph_is_sliced_at_its_page_breaks() {
+        // html-to-pdf F30f-d: 30 lines of 20px in a box with border 1 + padding 9 = 10px above and below, on 200px
+        // pages. The first strip leaves the top inset (190px: 9 lines); a continuation strip starts at the top of its
+        // page and keeps no top inset (200px: 10 lines), because the box is sliced (css-break-3 §5.4); the bottom inset
+        // is on the last fragment only. Main fitted the lines as if they sat at the top of the border box and the
+        // renderer painted them 10px lower: the last line of each page stood below it.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div id=\"b\" style=\"border:1px solid #000;padding:9px\">{}</div><p id=\"a\">AFTER</p>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let geom = geometry_of(&doc, &table, "b").expect("geometry");
+        assert!(geom.line_split_slice, "sliced");
+        let (top, bottom) = geom.line_split_insets.expect("insets recorded");
+        assert_eq!((top.to_f32(), bottom.to_f32()), (10.0, 10.0));
+        let slices: Vec<(u32, u32)> = geom.line_slices.iter().map(|l| (l.first, l.end)).collect();
+        assert_eq!(slices, vec![(0, 9), (9, 19), (19, 28), (28, 30)]);
+        let frags = &geom.fragments;
+        // The first fragment is where the box starts; every continuation one is at the top of its page.
+        assert_eq!(frags[0].y.to_f32(), 0.0);
+        for f in &frags[1..] {
+            assert_eq!(f.y.to_f32(), 0.0, "{frags:?}");
+        }
+        // Lines end inside the page: the first strip after its 10px inset, the others from the top.
+        assert!(frags[0].y.to_f32() + 10.0 + 9.0 * 20.0 <= 200.0);
+        assert!(frags[1].y.to_f32() + 10.0 * 20.0 <= 200.0);
+        // A fragment that is not the last fills the page (the frame runs to the bottom), the last one is its lines.
+        let heights: Vec<f32> = frags.iter().map(|f| f.height.to_f32()).collect();
+        assert_eq!(heights, vec![190.0, 200.0, 200.0, 40.0], "{frags:?}");
+        // What follows starts below the last line and the bottom inset: 40 + 10 + 10 = 60px... lines 40, top 0, bottom 10.
+        assert_frames(
+            frames_of(&doc, &table, "a"),
+            &[(3, 50.0, 20.0)],
+            "after the box",
+        );
+    }
+
+    #[test]
+    fn a_padded_body_level_paragraph_that_fits_is_not_sliced() {
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div id=\"b\" style=\"border:1px solid #000;padding:9px\">{}</div><p id=\"a\">AFTER</p>",
+                br_lines(5)
+            ),
+            200.0,
+        );
+        let geom = geometry_of(&doc, &table, "b").expect("geometry");
+        assert!(!geom.line_split_slice);
+        assert_eq!(geom.fragments.len(), 1);
+        // (The fitting path leaves `AFTER` at 100px, over the box's last line: `fragment_inline_root` returns the lines'
+        // end without the insets. Not this change's: html-to-pdf finding F30f-h.)
+        assert_frames(frames_of(&doc, &table, "a"), &[(0, 100.0, 20.0)], "after");
     }
 
     #[test]
