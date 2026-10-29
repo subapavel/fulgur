@@ -1311,6 +1311,15 @@ pub fn node_is_floating(node: &Node) -> bool {
         .is_some_and(|s| s.get_box().clone_float().is_floating())
 }
 
+/// html-to-pdf F66f: true if `node` generates an inline-level box (outer display type `inline`: `<br>`, `<span>`, `<img>`,
+/// `inline-block`, ...). An element that is a flex or grid item, floats or is positioned has a blockified display and is
+/// not inline-level here. `display: contents` and `display: none` generate no box and are not either.
+pub(crate) fn is_inline_level_box(node: &Node) -> bool {
+    use ::style::values::specified::box_::DisplayOutside;
+    node.primary_styles()
+        .is_some_and(|s| s.clone_display().outside() == DisplayOutside::Inline)
+}
+
 fn is_block_level_outside(node: &Node) -> bool {
     use ::style::values::specified::box_::DisplayOutside;
     node.primary_styles()
@@ -7077,6 +7086,45 @@ mod tests {
             props.break_inside,
             Some(crate::draw_primitives::BreakInside::Avoid)
         );
+    }
+
+    /// html-to-pdf F66f (validator round 1): css-break-3 §3.1 lets `break-before` / `break-after` act on block-level
+    /// boxes, flex and grid items and table parts, not on inline-level boxes. Chrome ignores them on `<br>`, `<span>`,
+    /// `<img>` and an inline-block; the reader used to honour them and cut the line they sit in (text was lost).
+    #[test]
+    fn extract_column_style_table_drops_breaks_on_inline_level_boxes() {
+        let html = r#"<!doctype html><html><head><style>
+            .b { break-after: page; break-before: page }
+        </style></head><body>
+          <div id="div" class="b">x</div>
+          <div id="host">a
+            <br id="br" style="page-break-after: always">
+            <span id="span" class="b">s</span>
+            <span id="ib" class="b" style="display: inline-block">i</span>
+            <img id="img" class="b" width="4" height="4">
+            <b id="empty" style="break-after: page"></b>
+            <span id="blk" class="b" style="display: block">k</span>
+            <span id="fl" class="b" style="float: left">f</span>
+          </div>
+          <div style="display: flex"><span id="item" class="b">f</span></div>
+          <table><tbody><tr id="tr" class="b"><td>c</td></tr></tbody></table>
+        </body></html>"#;
+        let mut doc = parse(html, 400.0, &[]);
+        resolve(&mut doc);
+        use std::ops::Deref;
+        let table = extract_column_style_table(&doc);
+        let breaks = |id: &str| {
+            let n = find_element_by_attr_id(doc.deref(), id);
+            table
+                .get(&n)
+                .is_some_and(|p| p.break_before.is_some() || p.break_after.is_some())
+        };
+        for inline in ["br", "span", "ib", "img", "empty"] {
+            assert!(!breaks(inline), "#{inline} is inline-level: no break");
+        }
+        for block in ["div", "blk", "fl", "item", "tr"] {
+            assert!(breaks(block), "#{block} is block-level: its break stays");
+        }
     }
 
     /// F87: the break / column reader and Stylo read the same `@media` blocks. The reader matches

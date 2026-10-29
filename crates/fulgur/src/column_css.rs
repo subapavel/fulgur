@@ -1317,6 +1317,15 @@ fn walk(
             props.merge(rules[index].important.clone());
         }
         props.merge(inline.important);
+        // css-break-3 §3.1: `break-before` / `break-after` (and the legacy `page-break-*`) apply to block-level boxes,
+        // flex and grid items and table parts. On an inline-level box (`<br>`, `<span>`, `<img>`, an inline-block) they
+        // have no effect; Chrome ignores them there. Kept in the table they cut the line they sit in (html-to-pdf F66f).
+        if (props.break_before.is_some() || props.break_after.is_some())
+            && crate::blitz_adapter::is_inline_level_box(node)
+        {
+            props.break_before = None;
+            props.break_after = None;
+        }
         if !props.is_empty() {
             table.insert(node_id, props);
         }

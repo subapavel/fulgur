@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn anonymous_wrappers_and_mixed_inline_and_block_children() {
         let (doc, forced, names) = check(
-            "<html><body><div id=m>text <b>bold</b><div style=\"page:a\">1</div>more <i style=\"break-before:page\">text</i>\
+            "<html><body><div id=m>text <b>bold</b><div style=\"page:a\">1</div>more <i style=\"display:inline-block\"><div style=\"break-before:page\">text</div></i>\
              <div style=\"page:b;break-after:page\">2</div>tail</div></body></html>",
         );
         let base: &BaseDocument = &doc;
@@ -440,6 +440,7 @@ mod tests {
         assert!(forced.contains(&id_of(&doc, "m")));
         assert!(names.contains(&id_of(&doc, "m")));
         // The wrapper that holds "more <i>" is reachable only through `layout_children`, and the gate may ask about it.
+        // (The break sits in a block inside an inline-block: `break-before` does not act on an inline-level box.)
         assert!(
             base.tree()
                 .iter()

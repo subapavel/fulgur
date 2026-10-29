@@ -9787,3 +9787,32 @@ fn render_smoke_padded_body_level_paragraph_that_fits_is_followed_below_its_fram
         assert!(text_items_of(&pdf, "f.pdf") >= 6, "{style}");
     }
 }
+
+#[test]
+fn render_smoke_forced_break_on_an_inline_level_box_is_ignored() {
+    // html-to-pdf F66f (validator round 1), css-break-3 §3.1: `break-before` / `break-after` do not apply to an
+    // inline-level box. A `<br>` or an empty `<span>` that carries one used to cut the line it sits in: the text before
+    // it was lost, or the page was cut in the middle of a paragraph. One page, every word written.
+    for body in [
+        "<div>a<br style=\"page-break-after:always\"></div>b",
+        "<div>a<span style=\"break-after:page\"></span></div>b",
+        "<div>a<br><span style=\"break-after:page\"></span></div>b",
+        "<p>a<br clear=all style=\"page-break-before:always\"></p><p>b</p>",
+        "<p>a</p><p><span><br style=\"break-after:page\"></span></p><p>b</p>",
+    ] {
+        let html = format!(
+            "<!DOCTYPE html><html><head><style>@page {{ margin: 0 }} body {{ margin: 0 }}</style></head><body>{body}</body></html>"
+        );
+        let pdf = noto_engine().render(&html).expect("render");
+        assert_eq!(page_count(&pdf), 1, "{body}");
+        assert!(
+            text_items_of(&pdf, "i.pdf") >= 2,
+            "{body}: a and b are written"
+        );
+    }
+    // What the property is for stays: a block-level box breaks.
+    let pdf = noto_engine()
+        .render("<!DOCTYPE html><html><head><style>@page { margin: 0 }</style></head><body><div style=\"break-after:page\">a</div>b</body></html>")
+        .expect("render");
+    assert_eq!(page_count(&pdf), 2);
+}
