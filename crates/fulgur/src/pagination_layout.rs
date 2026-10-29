@@ -286,11 +286,13 @@ pub(crate) struct McBox {
 /// distance of the item's left edge from the content box of the box that holds it.
 #[derive(Clone, Debug, PartialEq)]
 enum McBoxItem {
-    /// An inline root of glyph runs only, cut between its lines: `source` is shaped at its own width (Blitz's layout
-    /// of it), `advances` the height of each line.
+    /// An inline root cut between its lines: `source` is shaped at its own width (Blitz's layout of it), `advances` the
+    /// height of each line. `inline_boxes` is set when its lines hold inline boxes (an image, an `<svg>`, an inline-block
+    /// or inline-flex box), which move with their line and are recorded and painted at its piece (html-to-pdf F198b).
     Lines {
         source: usize,
         advances: Vec<crate::units::Px>,
+        inline_boxes: bool,
         lead: f32,
         x: f32,
     },
@@ -484,6 +486,7 @@ impl McFlat {
                     advances,
                     lead,
                     x: ix,
+                    ..
                 } => {
                     for (index, h) in advances.iter().enumerate() {
                         let ctx = self.ctx(
@@ -1219,19 +1222,20 @@ fn mc_has_frame(node: &blitz_dom::Node) -> bool {
         > 0.0
 }
 
-/// F198: the heights of the lines of the inline root `node` when its layout is glyph runs only (the multicol
-/// convert pass shapes nothing else), else `None`.
-fn mc_line_advances(node: &blitz_dom::Node) -> Option<Vec<crate::units::Px>> {
+/// F198 / F198b: the heights of the lines of the inline root `node`, and whether its lines hold inline boxes, or `None`
+/// when the planner cannot cut it: a line taller than a page (`fresh`) stays one atom that overflows (an inline box taller
+/// than the page: ADR-0004's shape, F198g). A layout of glyph runs only has no such line; one with inline boxes can: an
+/// image or an inline-block makes its line as tall as itself. One px of slack, as everywhere else.
+fn mc_line_advances(node: &blitz_dom::Node, fresh: f32) -> Option<(Vec<crate::units::Px>, bool)> {
     use crate::units::F32Units;
     let layout = &node.element_data()?.inline_layout_data.as_ref()?.layout;
-    if !crate::multicol_layout::parley_layout_is_glyph_run_only(layout) {
+    let inline_boxes = !crate::multicol_layout::parley_layout_is_glyph_run_only(layout);
+    let heights = crate::blitz_adapter::parley_line_heights(layout);
+    if inline_boxes && heights.iter().any(|h| *h > fresh + 1.0) {
         return None;
     }
-    let advances: Vec<crate::units::Px> = crate::blitz_adapter::parley_line_heights(layout)
-        .into_iter()
-        .map(F32Units::as_px)
-        .collect();
-    (!advances.is_empty()).then_some(advances)
+    let advances: Vec<crate::units::Px> = heights.into_iter().map(F32Units::as_px).collect();
+    (!advances.is_empty()).then_some((advances, inline_boxes))
 }
 
 /// How deep [`mc_box`] follows boxes inside boxes.
@@ -1316,7 +1320,7 @@ fn mc_box_at(
     let left = l.border.left + l.padding.left;
     let inset_bottom = l.border.bottom + l.padding.bottom;
     if node.flags.is_inline_root() {
-        let advances = mc_line_advances(node)?;
+        let (advances, inline_boxes) = mc_line_advances(node, fresh)?;
         return Some(McBox {
             top,
             left,
@@ -1324,6 +1328,7 @@ fn mc_box_at(
             items: vec![McBoxItem::Lines {
                 source: node_id,
                 advances,
+                inline_boxes,
                 lead: 0.0,
                 x: 0.0,
             }],
@@ -1363,13 +1368,16 @@ fn mc_box_at(
         let (lead, x) = (lead.max(0.0), cx.max(0.0));
         let described = if mc_box_eligible(doc, child, column_styles, fresh) {
             if child.flags.is_inline_root() {
-                match mc_line_advances(child) {
-                    Some(advances) if !mc_has_frame(child) => Some(McBoxItem::Lines {
-                        source: id,
-                        advances,
-                        lead,
-                        x,
-                    }),
+                match mc_line_advances(child, fresh) {
+                    Some((advances, inline_boxes)) if !mc_has_frame(child) => {
+                        Some(McBoxItem::Lines {
+                            source: id,
+                            advances,
+                            inline_boxes,
+                            lead,
+                            x,
+                        })
+                    }
                     Some(_) => mc_box_at(doc, id, column_styles, fresh, depth + 1).map(|inner| {
                         McBoxItem::Box {
                             node: id,
@@ -1992,22 +2000,33 @@ fn record_multicol_row(
             FlowItem::Block { .. } => None,
         })
         .collect();
-    // F198: the lines of the paragraphs inside the boxes that were cut.
-    fn box_advances<'a>(b: &'a McBox, out: &mut BTreeMap<usize, &'a [crate::units::Px]>) {
+    // F198: the lines of the paragraphs inside the boxes that were cut, and (F198b) which of them hold inline boxes.
+    fn box_advances<'a>(
+        b: &'a McBox,
+        out: &mut BTreeMap<usize, &'a [crate::units::Px]>,
+        inline: &mut BTreeSet<usize>,
+    ) {
         for item in &b.items {
             match item {
                 McBoxItem::Lines {
-                    source, advances, ..
+                    source,
+                    advances,
+                    inline_boxes,
+                    ..
                 } => {
                     out.insert(*source, advances.as_slice());
+                    if *inline_boxes {
+                        inline.insert(*source);
+                    }
                 }
-                McBoxItem::Box { inner, .. } => box_advances(inner, out),
+                McBoxItem::Box { inner, .. } => box_advances(inner, out, inline),
                 McBoxItem::Leaf { .. } => {}
             }
         }
     }
+    let mut inline_sources: BTreeSet<usize> = BTreeSet::new();
     for b in boxes.values() {
-        box_advances(b, &mut advances);
+        box_advances(b, &mut advances, &mut inline_sources);
     }
     // F198: the paragraphs that are boxes of their own: their pieces are the fragments of the frames.
     let framed: BTreeSet<usize> = row
@@ -2058,6 +2077,19 @@ fn record_multicol_row(
                     y: piece_y,
                     x: piece_x,
                 } => {
+                    // F198b: the inline boxes of these lines (an image, an `<svg>`, an inline-block) are painted by the
+                    // paragraph at its piece; they need a fragment on this page, whichever piece of the paragraph it is.
+                    if inline_sources.contains(source) {
+                        record_line_inline_boxes(
+                            geometry,
+                            doc,
+                            *source,
+                            *first..*end_line,
+                            page,
+                            col_x + piece_x.to_f32(),
+                            row_top + piece_y.to_f32(),
+                        );
+                    }
                     // A container that is itself the paragraph is painted from its own fragments, and so is a
                     // paragraph that is a box cut by the plan (F198): its pieces stand in.
                     if *source == container_id
@@ -2230,6 +2262,69 @@ fn record_multicol_row(
                 }
             }
         }
+    }
+}
+
+/// html-to-pdf F198b: record the inline boxes (images, `<svg>`s, inline-blocks, inline-flex boxes) that sit on the lines
+/// `lines` of the paragraph `source`, which a multicol container cut between its lines: each as a fragment on `page`
+/// with its subtree (`record_descendant`), at its Parley position relative to the piece whose first line's top is at
+/// `(x, y)` (page-local, body coordinates). The paragraph's slice paints each box under a translation to its place in the
+/// line (`paragraph::draw_shaped_lines`), so the position only has to be consistent inside the box; the fragment is what
+/// makes the box (and what is in it) reachable on this page.
+fn record_line_inline_boxes(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    source: usize,
+    lines: std::ops::Range<u32>,
+    page: u32,
+    x: f32,
+    y: f32,
+) {
+    let Some(layout) = doc
+        .get_node(source)
+        .and_then(|n| n.element_data())
+        .and_then(|e| e.inline_layout_data.as_ref())
+        .map(|d| &d.layout)
+    else {
+        return;
+    };
+    let (first, end) = (lines.start as usize, lines.end as usize);
+    let (mut top, mut first_top) = (0.0_f32, 0.0_f32);
+    let mut found: Vec<(usize, f32, f32)> = Vec::new();
+    for (i, line) in layout.lines().enumerate() {
+        if i >= end {
+            break;
+        }
+        if i == first {
+            first_top = top;
+        }
+        if i >= first {
+            for item in line.items() {
+                if let parley::PositionedLayoutItem::InlineBox(b) = item {
+                    found.push((b.id as usize, b.x, b.y));
+                }
+            }
+        }
+        top += line.metrics().line_height;
+    }
+    for (id, bx, by) in found {
+        let Some(node) = doc.get_node(id) else {
+            continue;
+        };
+        // An absolutely positioned box in a line is placed by its own rules, not by the line.
+        if is_out_of_flow_positioned(node) {
+            continue;
+        }
+        let at = node.final_layout.location;
+        record_descendant(
+            geometry,
+            doc,
+            id,
+            page,
+            y + (by - first_top) - at.y,
+            x + bx - at.x,
+            0,
+        );
     }
 }
 
@@ -18696,6 +18791,7 @@ h2 { string-set: chapter-title content(text); }
         McBoxItem::Lines {
             source,
             advances: vec![h.as_px(); count],
+            inline_boxes: false,
             lead,
             x,
         }
@@ -19068,6 +19164,7 @@ h2 { string-set: chapter-title content(text); }
             McBoxItem::Lines {
                 source,
                 advances,
+                inline_boxes,
                 lead,
                 x,
             },
@@ -19076,6 +19173,7 @@ h2 { string-set: chapter-title content(text); }
             panic!("one run of lines: {:?}", b.items);
         };
         assert_eq!((*source, *lead, *x), (t, 0.0, 0.0));
+        assert!(!inline_boxes, "glyph runs only");
         let h = doc.get_node(t).unwrap().final_layout.size.height;
         let total: f32 = advances.iter().map(|a| a.to_f32()).sum();
         assert!((h - 24.0 - total).abs() < 1.0, "{h} vs {total}");
@@ -19164,17 +19262,58 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(*lead, 0.0);
         // A table taller than a page cannot be cut by this path: the whole box is left as it was.
         assert!(mc_box(&doc, t, None, 30.0).is_none());
-        // An inline root with an image (not glyph runs only) fits a page: a leaf.
+    }
+
+    #[test]
+    fn mc_box_cuts_an_inline_root_with_inline_boxes_between_its_lines() {
+        // F198b: an image, an inline-block and an inline-flex box are part of their line and move with it, so the
+        // paragraph is cut between its lines like one of glyph runs; the flag says its pieces hold inline boxes.
+        for inline in [
+            "<img width=10 height=10>",
+            "<span style=\"display:inline-block;border:1px solid\">in</span>",
+            "<span style=\"display:inline-flex\">in</span>",
+            "<svg width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>",
+        ] {
+            let (doc, t) = box_doc(&format!(
+                "<div class=\"t\" style=\"padding:8px\"><p>{}</p><p>{} {inline} {}</p></div>",
+                text(40),
+                text(30),
+                text(30)
+            ));
+            let b = mc_box(&doc, t, None, 200.0).unwrap_or_else(|| panic!("a card with {inline}"));
+            let flags: Vec<bool> = b
+                .items
+                .iter()
+                .map(|i| match i {
+                    McBoxItem::Lines { inline_boxes, .. } => *inline_boxes,
+                    other => panic!("{inline}: not a run of lines: {other:?}"),
+                })
+                .collect();
+            assert_eq!(flags, [false, true], "{inline}");
+        }
+        // The inline root of the box itself.
         let (doc, t) = box_doc(&format!(
-            "<div class=\"t\"><p>{}</p><p>x <img width=10 height=10> y</p></div>",
-            text(40)
+            "<div class=\"t\" style=\"padding:8px\">{} <img width=10 height=10> {}</div>",
+            text(60),
+            text(60)
         ));
-        let b = mc_box(&doc, t, None, 200.0).expect("a card with an inline image");
-        assert!(
-            matches!(b.items[1], McBoxItem::Leaf { .. }),
-            "{:?}",
-            b.items
-        );
+        let b = mc_box(&doc, t, None, 200.0).expect("a div of text with an image");
+        assert!(matches!(
+            b.items.as_slice(),
+            [McBoxItem::Lines {
+                inline_boxes: true,
+                ..
+            }]
+        ));
+        // A line taller than a page cannot be cut: the box stays as it was (ADR-0004's shape, F198g).
+        let (doc, t) = box_doc(&format!(
+            "<div class=\"t\">{} <img width=10 height=300> {}</div>",
+            text(20),
+            text(20)
+        ));
+        assert!(mc_box(&doc, t, None, 200.0).is_none());
+        // An image that fits does not stop the cut.
+        assert!(mc_box(&doc, t, None, 400.0).is_some());
     }
 
     #[test]
