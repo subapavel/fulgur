@@ -1723,6 +1723,9 @@ pub(crate) fn dispatch_fragment(
     // lines as the fragment height; its frame (border + padding) is
     // `line_split_insets` bigger. The paragraph slicing below still reads
     // `geom.fragments`, so only the frame sees the adjusted fragment.
+    // html-to-pdf F198: a paragraph that is a box cut over columns has a fragment (a frame) in each of them, and the
+    // slices of all its columns on a page are painted once, from the first of its fragments there.
+    let first_piece_on_page = is_first_piece_on_page(geom, frag);
     let (frame_frag, edges) = frame_fragment(geom, frag);
     let frag = &frame_frag;
     // F30f-d: a box sliced at its breaks paints its open edges without border, padding or radius.
@@ -1828,7 +1831,7 @@ pub(crate) fn dispatch_fragment(
                 margin_left_pt,
                 margin_top_pt,
             );
-            if has_paragraph_slices {
+            if has_paragraph_slices && first_piece_on_page {
                 paint_multicol_paragraph_slices(
                     canvas,
                     drawables,
@@ -1856,15 +1859,17 @@ pub(crate) fn dispatch_fragment(
         return;
     }
     if has_paragraph_slices {
-        paint_multicol_paragraph_slices(
-            canvas,
-            drawables,
-            geometry,
-            node_id,
-            margin_left_pt,
-            margin_top_pt,
-            page_index,
-        );
+        if first_piece_on_page {
+            paint_multicol_paragraph_slices(
+                canvas,
+                drawables,
+                geometry,
+                node_id,
+                margin_left_pt,
+                margin_top_pt,
+                page_index,
+            );
+        }
         return;
     }
     if let Some(para) = drawables.paragraphs.get(&node_id) {
@@ -3608,6 +3613,20 @@ fn draw_svg_inner_paint(
     canvas.surface.pop();
 }
 
+/// html-to-pdf F198: whether `frag` is the first fragment of `geom` on its page. Always true for a box that was not cut
+/// into column pieces ([`PaginationGeometry::piece_edges`]): it has one fragment on a page.
+fn is_first_piece_on_page(
+    geom: &crate::pagination_layout::PaginationGeometry,
+    frag: &crate::pagination_layout::Fragment,
+) -> bool {
+    geom.piece_edges.is_empty()
+        || geom
+            .fragments
+            .iter()
+            .find(|f| f.page_index == frag.page_index)
+            .is_none_or(|first| std::ptr::eq(first, frag) || first == frag)
+}
+
 /// F30: the fragment whose height is the height of the box's frame on this
 /// page. For a paragraph that `fragment_nested_inline_root` split between line
 /// boxes, every fragment records the span of its lines only; the frame also
@@ -3628,6 +3647,18 @@ pub(crate) fn frame_fragment(
     crate::draw_primitives::FrameEdges,
 ) {
     use crate::draw_primitives::FrameEdges;
+    // html-to-pdf F198: a box a multicol container cut between its lines has one fragment per column piece, each its
+    // own closed or open frame (the plan knows which). Two pieces share a page, so the page cannot say.
+    if geom.piece_edges.len() == geom.fragments.len()
+        && !geom.piece_edges.is_empty()
+        && let Some(i) = geom
+            .fragments
+            .iter()
+            .position(|f| std::ptr::eq(f, frag))
+            .or_else(|| geom.fragments.iter().position(|f| f == frag))
+    {
+        return (frag.clone(), geom.piece_edges[i]);
+    }
     let mut frame = frag.clone();
     let mut edges = FrameEdges::default();
     if let Some((top, bottom)) = geom.line_split_insets

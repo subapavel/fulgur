@@ -1639,7 +1639,9 @@ fn slice_lines_with_first_col_remainder(
 /// faithfully reproduce fall back to atomic placement (whole paragraph
 /// in column 0). Until inline-box reconstruction lands in the convert
 /// path, the fallback is a strict improvement over silent data loss.
-fn parley_layout_is_glyph_run_only(layout: &parley::Layout<blitz_dom::node::TextBrush>) -> bool {
+pub(crate) fn parley_layout_is_glyph_run_only(
+    layout: &parley::Layout<blitz_dom::node::TextBrush>,
+) -> bool {
     for line in layout.lines() {
         for item in line.items() {
             match item {

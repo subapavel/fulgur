@@ -970,6 +970,7 @@ fn convert_paged_multicol_slices(
                     first,
                     end,
                     y,
+                    x,
                 } = piece
                 else {
                     continue;
@@ -998,7 +999,8 @@ fn convert_paged_multicol_slices(
                 inline_root::recalculate_paragraph_line_boxes(&mut lines);
                 let height: crate::units::Pt = lines.iter().map(|l| l.height).sum();
                 let origin_pt = (
-                    (group.x_offset.to_f32() + col as f32 * stride)
+                    // F198: a paragraph inside a box that was cut starts `x` right of the column's edge.
+                    (group.x_offset.to_f32() + col as f32 * stride + x.to_f32())
                         .as_px()
                         .in_pt(),
                     (top + y.to_f32()).as_px().in_pt(),

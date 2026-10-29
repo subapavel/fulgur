@@ -149,11 +149,36 @@ pub enum McPiece {
     Block { node: usize, y: crate::units::Px },
     /// Lines `[first, end)` of the Parley layout of `source`: the renderer paints exactly these lines, whatever
     /// their heights add up to (the F78 rule).
+    ///
+    /// F198: `x` is the distance of the paragraph's left edge (its content box: the lines start there) from the
+    /// column's left edge. It is 0 for a paragraph that is a direct child of the container, whose lines are laid out at
+    /// the column's width, and the sum of the insets of the boxes around it when it is inside a box that was cut.
     Lines {
         source: usize,
         first: u32,
         end: u32,
         y: crate::units::Px,
+        x: crate::units::Px,
+    },
+    /// F198: a box inside a box that was cut, placed whole at `x` from the column's left edge and this y (it fits a
+    /// page: [`McBoxItem::Leaf`]); its subtree is recorded there.
+    Leaf {
+        node: usize,
+        x: crate::units::Px,
+        y: crate::units::Px,
+    },
+    /// F198: the frame of a box that was cut ([`McBox`]) in this column: its background, border and padding as one
+    /// fragment of `node` at `x` from the column's left edge, `y` from the column's top, `height` tall (the border box
+    /// of the piece). At a break the frame is open (css-break-3 §5.4, `box-decoration-break: slice`): `open_top` is set
+    /// when the box began in an earlier column, `open_bottom` when it goes on in a later one, and the renderer draws no
+    /// border, padding or radius there.
+    Frame {
+        node: usize,
+        x: crate::units::Px,
+        y: crate::units::Px,
+        height: crate::units::Px,
+        open_top: bool,
+        open_bottom: bool,
     },
     /// F174: the row bands `[first, end)` of the table `table` ([`McTable::bands`]): the renderer paints one table
     /// fragment for them at the column's x and this y, and each cell of the bands below it. `head` is set when the
@@ -237,18 +262,148 @@ impl McTable {
     }
 }
 
+/// html-to-pdf F198: a box of a multicol flow that is taller than a page, described so that the planner can cut it
+/// between its lines like Chrome does (css-break-3 §4.1 / §4.4: the content of a box that does not fit is cut
+/// between line boxes and between children, the box's frame is sliced, §5.4) instead of placing it whole in one column
+/// where it overflows the page and loses everything below the edge ([`mc_box`]).
+///
+/// Every offset is a CSS px distance read from the layout Blitz made at the column width (`final_layout`), so the
+/// pieces of a cut box are placed where the unbroken box would have put them.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct McBox {
+    /// The box's top border and padding.
+    top: f32,
+    /// The distance of the content box's left edge from the box's left edge (left border and padding).
+    left: f32,
+    /// What is below the last item down to the box's bottom edge (bottom padding, border and whatever the layout
+    /// left there); never less than the bottom border and padding.
+    bottom: f32,
+    items: Vec<McBoxItem>,
+}
+
+/// One child of an [`McBox`], in source order. `lead` is the gap above it in the unbroken box: from the previous
+/// item's bottom edge, or from the top of the box's content box for the first item (margins, mostly). `x` is the
+/// distance of the item's left edge from the content box of the box that holds it.
+#[derive(Clone, Debug, PartialEq)]
+enum McBoxItem {
+    /// An inline root of glyph runs only, cut between its lines: `source` is shaped at its own width (Blitz's layout
+    /// of it), `advances` the height of each line.
+    Lines {
+        source: usize,
+        advances: Vec<crate::units::Px>,
+        lead: f32,
+        x: f32,
+    },
+    /// A box that cannot be described but fits a page: placed whole, like a [`FlowItem::Block`](crate::multicol_layout::FlowItem::Block).
+    Leaf {
+        node: usize,
+        h: f32,
+        lead: f32,
+        x: f32,
+    },
+    /// A box with a frame of its own (border, padding, background) that holds items itself.
+    Box {
+        node: usize,
+        inner: McBox,
+        lead: f32,
+        x: f32,
+    },
+}
+
+/// F198: one box of a flattened [`McBox`]: its frame is cut into one piece per column it has atoms in.
+#[derive(Clone, Debug, PartialEq)]
+struct McFrame {
+    node: usize,
+    /// Top border and padding (counted at the atom that opens the box).
+    top: f32,
+    /// Bottom padding, border and slack (counted at the atom that closes the box).
+    bottom: f32,
+    /// The gap above the box in its parent: a margin, dropped at the top of a column.
+    gap: f32,
+    /// The distance of the box's left edge from the left edge of the column.
+    x: f32,
+}
+
+/// F198: the frames of a flattened flow and, for every one, the chain of boxes around it (outermost first).
+#[derive(Clone, Debug, Default)]
+struct McFrames {
+    frames: Vec<McFrame>,
+    chains: Vec<Vec<u32>>,
+}
+
+/// `AtomCtx::chain` of an atom outside every [`McBox`].
+const NO_CHAIN: u32 = u32::MAX;
+
+/// What an atom of an expanded box knows about the boxes around it. The default (no chain) is every atom of a flow
+/// that is not expanded: no frame, no gap, no offset, planned exactly as before F198.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AtomCtx {
+    /// Index into [`McFrames::chains`]: the boxes the atom is in, or [`NO_CHAIN`].
+    chain: u32,
+    /// The boxes `chain[opens..]` start at this atom: it is the first thing in them.
+    opens: u32,
+    /// The boxes `chain[closes..]` end at this atom: it is the last thing in them.
+    closes: u32,
+    /// The gap above the atom's own item (a margin): dropped at the top of a column unless a box opens here.
+    gap: f32,
+    /// The distance of the atom's left edge (the content edge of a paragraph) from the column's left edge.
+    x: f32,
+}
+
+impl AtomCtx {
+    const PLAIN: Self = Self {
+        chain: NO_CHAIN,
+        opens: 0,
+        closes: 0,
+        gap: 0.0,
+        x: 0.0,
+    };
+}
+
+impl McFrames {
+    /// The block-size an atom adds above and below its own height: `(lead, trail)`. `col_has` says whether the
+    /// column already holds an atom: at the top of a column the margin above the outermost box that opens (or above
+    /// the atom, when none does) is dropped (css-break-3 §5.2); the border and padding of a box that opens stay.
+    fn lead_trail(&self, ctx: &AtomCtx, col_has: bool) -> (f32, f32) {
+        if ctx.chain == NO_CHAIN {
+            return (0.0, 0.0);
+        }
+        let chain = &self.chains[ctx.chain as usize];
+        let mut lead = 0.0;
+        let mut first = true;
+        for &f in &chain[ctx.opens as usize..] {
+            let f = &self.frames[f as usize];
+            if col_has || !first {
+                lead += f.gap;
+            }
+            first = false;
+            lead += f.top;
+        }
+        if col_has || !first {
+            lead += ctx.gap;
+        }
+        let trail = chain[ctx.closes as usize..]
+            .iter()
+            .map(|&f| self.frames[f as usize].bottom)
+            .sum();
+        (lead, trail)
+    }
+}
+
 /// An indivisible unit of a multicol flow: a box, one line of a paragraph, or the bands `[first, end)` of a table
 /// (F174: one band, except the first unit of a table that repeats its header, which holds the header bands and the
-/// first body band).
+/// first body band). F198: a [`McBox`] is flattened into lines and leaf boxes; `ctx` ties them to their frames.
 enum McAtom {
     Block {
         node: usize,
         h: f32,
+        ctx: AtomCtx,
     },
     Line {
         source: usize,
         index: u32,
         h: f32,
+        ctx: AtomCtx,
     },
     Row {
         table: usize,
@@ -264,6 +419,128 @@ impl McAtom {
             Self::Block { h, .. } | Self::Line { h, .. } | Self::Row { h, .. } => *h,
         }
     }
+
+    fn ctx(&self) -> AtomCtx {
+        match self {
+            Self::Block { ctx, .. } | Self::Line { ctx, .. } => *ctx,
+            Self::Row { .. } => AtomCtx::PLAIN,
+        }
+    }
+
+    fn ctx_mut(&mut self) -> Option<&mut AtomCtx> {
+        match self {
+            Self::Block { ctx, .. } | Self::Line { ctx, .. } => Some(ctx),
+            Self::Row { .. } => None,
+        }
+    }
+}
+
+/// F198: the atoms of a flow and the frames they belong to, while [`plan_multicol_pages`] flattens it.
+#[derive(Default)]
+struct McFlat {
+    atoms: Vec<McAtom>,
+    frames: McFrames,
+    /// The depth of the outermost box opened since the last atom: that atom is the first thing in it.
+    pending_open: Option<u32>,
+}
+
+impl McFlat {
+    fn ctx(&mut self, chain: u32, gap: f32, x: f32) -> AtomCtx {
+        let len = self.frames.chains[chain as usize].len() as u32;
+        AtomCtx {
+            chain,
+            opens: self.pending_open.take().unwrap_or(len),
+            closes: len,
+            gap,
+            x,
+        }
+    }
+
+    /// The atoms of `b`, the content of `node`, whose left edge is `x` from the column's and which sits `gap` below
+    /// what is above it. `parent` is the chain of the box around it.
+    fn push_box(&mut self, node: usize, b: &McBox, parent: Option<u32>, x: f32, gap: f32) {
+        let frame = self.frames.frames.len() as u32;
+        self.frames.frames.push(McFrame {
+            node,
+            top: b.top,
+            bottom: b.bottom,
+            gap,
+            x,
+        });
+        let mut chain = parent
+            .map(|c| self.frames.chains[c as usize].clone())
+            .unwrap_or_default();
+        chain.push(frame);
+        let depth = chain.len() as u32 - 1;
+        let chain_id = self.frames.chains.len() as u32;
+        self.frames.chains.push(chain);
+        self.pending_open = Some(self.pending_open.map_or(depth, |p| p.min(depth)));
+        let content_x = x + b.left;
+        let first_atom = self.atoms.len();
+        for item in &b.items {
+            match item {
+                McBoxItem::Lines {
+                    source,
+                    advances,
+                    lead,
+                    x: ix,
+                } => {
+                    for (index, h) in advances.iter().enumerate() {
+                        let ctx = self.ctx(
+                            chain_id,
+                            if index == 0 { *lead } else { 0.0 },
+                            content_x + ix,
+                        );
+                        self.atoms.push(McAtom::Line {
+                            source: *source,
+                            index: index as u32,
+                            h: h.to_f32().max(0.0),
+                            ctx,
+                        });
+                    }
+                }
+                McBoxItem::Leaf {
+                    node,
+                    h,
+                    lead,
+                    x: ix,
+                } => {
+                    let ctx = self.ctx(chain_id, *lead, content_x + ix);
+                    self.atoms.push(McAtom::Block {
+                        node: *node,
+                        h: h.max(0.0),
+                        ctx,
+                    });
+                }
+                McBoxItem::Box {
+                    node,
+                    inner,
+                    lead,
+                    x: ix,
+                } => self.push_box(*node, inner, Some(chain_id), content_x + ix, *lead),
+            }
+        }
+        // The last atom of the box closes it (and every box that ends with it).
+        if self.atoms.len() > first_atom
+            && let Some(ctx) = self.atoms.last_mut().and_then(McAtom::ctx_mut)
+        {
+            ctx.closes = ctx.closes.min(depth);
+        }
+    }
+}
+
+/// The first unit of an expanded box (F28): its frame's top, the gaps down to the first thing and that thing's first
+/// line (or the whole of a leaf), px.
+fn mc_box_first_unit(b: &McBox) -> f32 {
+    b.top
+        + match b.items.first() {
+            Some(McBoxItem::Lines { advances, lead, .. }) => {
+                lead + advances.first().map_or(0.0, |h| h.to_f32())
+            }
+            Some(McBoxItem::Leaf { h, lead, .. }) => lead + h,
+            Some(McBoxItem::Box { inner, lead, .. }) => lead + mc_box_first_unit(inner),
+            None => 0.0,
+        }
 }
 
 /// One page of columns filled greedily by [`fill_multicol_columns`].
@@ -276,6 +553,13 @@ struct McFill {
 
 /// Slack for the sum of line heights against a column budget (accumulated f32 error).
 const MC_EPS: f32 = 1e-3;
+
+/// A frame that is open in the column [`fill_multicol_columns`] is filling.
+struct OpenFrame {
+    frame: u32,
+    y0: f32,
+    open_top: bool,
+}
 
 /// Fill `n` columns of `budget` block-size from `atoms[start..]` in order: an atom goes below the previous
 /// one in the same column unless it does not fit, then it opens the next column; the first atom of a column
@@ -292,8 +576,15 @@ const MC_EPS: f32 = 1e-3;
 /// "Fit the column" is `head_limit`, the block-size of a column of the page, not a trial `budget` that balancing
 /// tries: a row gets its header whatever the balanced columns turn out to be (Chrome repeats the header over the
 /// last two rows of a table in both columns), and the columns grow to hold it.
+///
+/// F198: an atom of an expanded box counts the border and padding of the boxes it opens above it and of the boxes it
+/// closes below it, and the margin above it (dropped at the top of a column, css-break-3 §5.2). Every box that has
+/// atoms in a column gets one [`McPiece::Frame`] there, open at the top when the box began in an earlier column and open
+/// at the bottom when it goes on in a later one.
+#[allow(clippy::too_many_arguments)]
 fn fill_multicol_columns(
     atoms: &[McAtom],
+    frames: &McFrames,
     tables: &BTreeMap<usize, McTable>,
     start: usize,
     n: usize,
@@ -306,19 +597,71 @@ fn fill_multicol_columns(
     let mut used = 0.0f32;
     let mut height = 0.0f32;
     let mut at = start;
+    let mut open: Vec<OpenFrame> = Vec::new();
+    // The frames still open in column `col` end here, at `y`, and go on in the next column or page.
+    let flush = |columns: &mut Vec<Vec<McPiece>>, open: &mut Vec<OpenFrame>, col: usize, y: f32| {
+        for st in open.drain(..) {
+            columns[col].push(McPiece::Frame {
+                node: frames.frames[st.frame as usize].node,
+                x: frames.frames[st.frame as usize].x.as_px(),
+                y: st.y0.as_px(),
+                height: (y - st.y0).max(0.0).as_px(),
+                open_top: st.open_top,
+                open_bottom: true,
+            });
+        }
+    };
     while at < atoms.len() {
         let h = atoms[at].height();
-        if used > 0.0 && used + h > budget + MC_EPS {
+        let ctx = atoms[at].ctx();
+        let col_has = used > 0.0;
+        let (lead, trail) = frames.lead_trail(&ctx, col_has);
+        let mut need = lead + h + trail;
+        if col_has && used + need > budget + MC_EPS {
             if col + 1 >= n {
                 break;
             }
+            flush(&mut columns, &mut open, col, used);
             col += 1;
             used = 0.0;
+            let (lead, trail) = frames.lead_trail(&ctx, false);
+            need = lead + h + trail;
         }
-        if !fresh_page && at > start && h > budget + MC_EPS {
+        if !fresh_page && at > start && need > budget + MC_EPS {
             break;
         }
-        let y = used.as_px();
+        // At the top of a column the boxes the atom goes on in are open from its top.
+        if open.is_empty() && ctx.chain != NO_CHAIN {
+            for &f in &frames.chains[ctx.chain as usize][..ctx.opens as usize] {
+                open.push(OpenFrame {
+                    frame: f,
+                    y0: 0.0,
+                    open_top: true,
+                });
+            }
+        }
+        // Walk down from the column's cursor to the atom: the margin above, the boxes it opens with their tops.
+        let mut cursor = used;
+        if ctx.chain != NO_CHAIN {
+            let chain = &frames.chains[ctx.chain as usize];
+            let mut first = used <= 0.0;
+            for &f in &chain[ctx.opens as usize..] {
+                if !first {
+                    cursor += frames.frames[f as usize].gap;
+                }
+                first = false;
+                open.push(OpenFrame {
+                    frame: f,
+                    y0: cursor,
+                    open_top: false,
+                });
+                cursor += frames.frames[f as usize].top;
+            }
+            if !first {
+                cursor += ctx.gap;
+            }
+        }
+        let y = cursor.as_px();
         let mut band = 0.0f32;
         if let McAtom::Row { table, .. } = &atoms[at]
             && columns[col].is_empty()
@@ -330,8 +673,17 @@ fn fill_multicol_columns(
             band = head.height;
         }
         match &atoms[at] {
-            McAtom::Block { node, .. } => columns[col].push(McPiece::Block { node: *node, y }),
-            McAtom::Line { source, index, .. } => match columns[col].last_mut() {
+            McAtom::Block { node, ctx, .. } if ctx.chain == NO_CHAIN => {
+                columns[col].push(McPiece::Block { node: *node, y })
+            }
+            McAtom::Block { node, ctx, .. } => columns[col].push(McPiece::Leaf {
+                node: *node,
+                x: ctx.x.as_px(),
+                y,
+            }),
+            McAtom::Line {
+                source, index, ctx, ..
+            } => match columns[col].last_mut() {
                 Some(McPiece::Lines {
                     source: s, end: e, ..
                 }) if *s == *source && *e == *index => *e += 1,
@@ -340,6 +692,7 @@ fn fill_multicol_columns(
                     first: *index,
                     end: *index + 1,
                     y,
+                    x: ctx.x.as_px(),
                 }),
             },
             McAtom::Row {
@@ -357,10 +710,32 @@ fn fill_multicol_columns(
                 }),
             },
         }
-        used += band + h;
+        if ctx.chain == NO_CHAIN {
+            used += band + h;
+        } else {
+            // The boxes the atom closes end below it, innermost first.
+            let mut bottom = cursor + h;
+            let chain = &frames.chains[ctx.chain as usize];
+            for &f in chain[ctx.closes as usize..].iter().rev() {
+                bottom += frames.frames[f as usize].bottom;
+                if let Some(st) = open.pop() {
+                    debug_assert_eq!(st.frame, f, "the box that closes is the innermost open one");
+                    columns[col].push(McPiece::Frame {
+                        node: frames.frames[f as usize].node,
+                        x: frames.frames[f as usize].x.as_px(),
+                        y: st.y0.as_px(),
+                        height: (bottom - st.y0).max(0.0).as_px(),
+                        open_top: st.open_top,
+                        open_bottom: false,
+                    });
+                }
+            }
+            used = bottom;
+        }
         height = height.max(used);
         at += 1;
     }
+    flush(&mut columns, &mut open, col, used);
     McFill {
         columns,
         height,
@@ -371,7 +746,7 @@ fn fill_multicol_columns(
 /// F30d: distribute the flow of a multicol container over pages (css-multicol-1 §8.2, css-break-3 §2: a
 /// column box that does not fit the page continues in the columns of the next one).
 ///
-/// `first_room` is the block-size of the columns on the first page, `page_room` on every later page.
+/// `first_room` is the block-size of the columns on the first page, `page_room` on every later one.
 /// `last_inset` (the container's bottom padding and border) is kept free on the page that holds the end of the
 /// flow. Every page but the last is filled column after column to its room; the last one is filled the same
 /// way for `column-fill: auto` and balanced (the smallest budget in which the rest fits `n` columns) for
@@ -381,6 +756,11 @@ fn fill_multicol_columns(
 /// F174: a box of `tables` (keyed by node) is not one atom but one per row band, cut between rows; its header
 /// repeats at the top of the columns it continues in (see [`fill_multicol_columns`]). The header bands and the
 /// first body band are one atom: a header is never left alone at the bottom of a column.
+///
+/// F198: a box of `boxes` (keyed by node, whether a [`FlowItem::Block`](crate::multicol_layout::FlowItem::Block)
+/// or the source of a [`FlowItem::Lines`](crate::multicol_layout::FlowItem::Lines)) is expanded into the lines and
+/// leaf boxes it holds, each tied to the frames around it. An empty `boxes` reproduces the plans of before.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_multicol_pages(
     flow: &[crate::multicol_layout::FlowItem],
     n: u32,
@@ -389,23 +769,30 @@ pub(crate) fn plan_multicol_pages(
     fill: crate::column_css::ColumnFill,
     last_inset: f32,
     tables: &BTreeMap<usize, McTable>,
+    boxes: &BTreeMap<usize, McBox>,
 ) -> Vec<McPage> {
     use crate::multicol_layout::FlowItem;
     let n = n.max(1) as usize;
-    let mut atoms: Vec<McAtom> = Vec::new();
+    let mut flat = McFlat::default();
     for item in flow {
         match item {
+            FlowItem::Block { node, .. } if boxes.contains_key(node) => {
+                flat.push_box(*node, &boxes[node], None, 0.0, 0.0)
+            }
+            FlowItem::Lines { source, .. } if boxes.contains_key(source) => {
+                flat.push_box(*source, &boxes[source], None, 0.0, 0.0)
+            }
             FlowItem::Block { node, height } => match tables.get(node) {
                 Some(table) => {
                     let lead = table.first_unit_end();
-                    atoms.push(McAtom::Row {
+                    flat.atoms.push(McAtom::Row {
                         table: *node,
                         first: 0,
                         end: lead as u32,
                         h: table.height_of(0, lead).max(0.0),
                     });
                     for (b, band) in table.bands.iter().enumerate().skip(lead) {
-                        atoms.push(McAtom::Row {
+                        flat.atoms.push(McAtom::Row {
                             table: *node,
                             first: b as u32,
                             end: b as u32 + 1,
@@ -413,22 +800,25 @@ pub(crate) fn plan_multicol_pages(
                         });
                     }
                 }
-                None => atoms.push(McAtom::Block {
+                None => flat.atoms.push(McAtom::Block {
                     node: *node,
                     h: height.to_f32().max(0.0),
+                    ctx: AtomCtx::PLAIN,
                 }),
             },
             FlowItem::Lines { source, advances } => {
                 for (index, h) in advances.iter().enumerate() {
-                    atoms.push(McAtom::Line {
+                    flat.atoms.push(McAtom::Line {
                         source: *source,
                         index: index as u32,
                         h: h.to_f32().max(0.0),
+                        ctx: AtomCtx::PLAIN,
                     });
                 }
             }
         }
     }
+    let McFlat { atoms, frames, .. } = flat;
     let mut pages: Vec<McPage> = Vec::new();
     let mut at = 0usize;
     while at < atoms.len() {
@@ -449,6 +839,7 @@ pub(crate) fn plan_multicol_pages(
         let room_for_end = (room - last_inset).max(0.0);
         let trial = fill_multicol_columns(
             &atoms,
+            &frames,
             tables,
             at,
             n,
@@ -460,16 +851,23 @@ pub(crate) fn plan_multicol_pages(
             // The rest fits on this page: it is the last one.
             match fill {
                 crate::column_css::ColumnFill::Auto => trial,
-                crate::column_css::ColumnFill::Balance => {
-                    balance_multicol_columns(&atoms, tables, at, n, room_for_end, fresh_page)
-                }
+                crate::column_css::ColumnFill::Balance => balance_multicol_columns(
+                    &atoms,
+                    &frames,
+                    tables,
+                    at,
+                    n,
+                    room_for_end,
+                    fresh_page,
+                ),
             }
         } else {
-            let full = fill_multicol_columns(&atoms, tables, at, n, room, room, fresh_page);
+            let full =
+                fill_multicol_columns(&atoms, &frames, tables, at, n, room, room, fresh_page);
             if full.next >= atoms.len() && fill == crate::column_css::ColumnFill::Balance {
                 // The rest fits only when the bottom padding is allowed to hang below the page: balance it
                 // within the room anyway.
-                balance_multicol_columns(&atoms, tables, at, n, room, fresh_page)
+                balance_multicol_columns(&atoms, &frames, tables, at, n, room, fresh_page)
             } else {
                 full
             }
@@ -488,6 +886,7 @@ pub(crate) fn plan_multicol_pages(
 /// them fit. Next-fit never needs more columns for a larger budget, so a bisection finds it.
 fn balance_multicol_columns(
     atoms: &[McAtom],
+    frames: &McFrames,
     tables: &BTreeMap<usize, McTable>,
     start: usize,
     n: usize,
@@ -498,12 +897,13 @@ fn balance_multicol_columns(
     let total: f32 = rest.iter().map(McAtom::height).sum();
     let tallest = rest.iter().map(McAtom::height).fold(0.0f32, f32::max);
     let fits = |budget: f32| {
-        fill_multicol_columns(atoms, tables, start, n, budget, room, fresh_page).next >= atoms.len()
+        fill_multicol_columns(atoms, frames, tables, start, n, budget, room, fresh_page).next
+            >= atoms.len()
     };
     let mut lo = tallest.max(total / n as f32);
     let mut hi = room.max(lo);
     if fits(lo) {
-        return fill_multicol_columns(atoms, tables, start, n, lo, room, fresh_page);
+        return fill_multicol_columns(atoms, frames, tables, start, n, lo, room, fresh_page);
     }
     // `lo` does not fit, `hi` is the room the rest was already known to fit in (or more, when `room` is below
     // the tallest atom: then nothing smaller helps either).
@@ -515,7 +915,7 @@ fn balance_multicol_columns(
             lo = mid;
         }
     }
-    fill_multicol_columns(atoms, tables, start, n, hi, room, fresh_page)
+    fill_multicol_columns(atoms, frames, tables, start, n, hi, room, fresh_page)
 }
 
 /// F30d: a multi-column container the fragmenter can cut over pages, and what it needs to know about it.
@@ -534,6 +934,8 @@ struct McContainer<'a> {
     first_unit: f32,
     /// F174: the tables of the container's flows (boxes of the groups) the fragmenter cuts between rows, by node.
     tables: BTreeMap<usize, McTable>,
+    /// F198: the boxes of the flows that are taller than a page and are cut between their lines, by node ([`mc_box`]).
+    boxes: BTreeMap<usize, McBox>,
 }
 
 impl McContainer<'_> {
@@ -552,17 +954,26 @@ impl McContainer<'_> {
 ///
 /// F174: of a table in `tables` the first unit is its header and first body row, not the whole table (F28 would
 /// otherwise move a container that starts with a long table to the next page).
+///
+/// F198: of a box in `boxes` it is the frame's top, the gaps and the first line (or leaf) inside it.
 fn flow_first_unit(
     flow: &[crate::multicol_layout::FlowItem],
     tables: &BTreeMap<usize, McTable>,
+    boxes: &BTreeMap<usize, McBox>,
 ) -> f32 {
     use crate::multicol_layout::FlowItem;
     flow.iter()
         .find_map(|item| match item {
+            FlowItem::Block { node, .. } if boxes.contains_key(node) => {
+                Some(mc_box_first_unit(&boxes[node]))
+            }
             FlowItem::Block { node, height } => Some(match tables.get(node) {
                 Some(table) => table.height_of(0, table.first_unit_end()),
                 None => height.to_f32(),
             }),
+            FlowItem::Lines { source, .. } if boxes.contains_key(source) => {
+                Some(mc_box_first_unit(&boxes[source]))
+            }
             FlowItem::Lines { advances, .. } => advances.first().map(|h| h.to_f32()),
         })
         .unwrap_or(0.0)
@@ -640,6 +1051,31 @@ fn multicol_container<'a>(
     {
         return None;
     }
+    // F198: the boxes taller than a page among the boxes of the flows, which are cut between their lines.
+    let mut boxes: BTreeMap<usize, McBox> = BTreeMap::new();
+    for group in &geometry.groups {
+        for item in &group.flow {
+            match item {
+                FlowItem::Block { node, height }
+                    if height.to_f32() > fresh + 1.0 && !tables.contains_key(node) =>
+                {
+                    if let Some(b) = mc_box(doc, *node, column_styles, fresh) {
+                        boxes.insert(*node, b);
+                    }
+                }
+                // A paragraph with a frame of its own: its padding and border are the box's.
+                FlowItem::Lines { source, advances }
+                    if advances.iter().map(|h| h.to_f32()).sum::<f32>() > fresh + 1.0
+                        && doc.get_node(*source).is_some_and(mc_has_frame) =>
+                {
+                    if let Some(b) = mc_box(doc, *source, column_styles, fresh) {
+                        boxes.insert(*source, b);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     let layout = node.final_layout;
     let (top_inset, first_unit) = match geometry.segments.first()? {
         // The group sits below the container's top padding and border.
@@ -647,7 +1083,7 @@ fn multicol_container<'a>(
             let group = geometry.groups.get(*g)?;
             (
                 group.y_offset.to_f32(),
-                flow_first_unit(&group.flow, &BTreeMap::new()),
+                flow_first_unit(&group.flow, &BTreeMap::new(), &boxes),
             )
         }
         SegmentGeom::SpanAll { node: span } => (
@@ -667,6 +1103,7 @@ fn multicol_container<'a>(
         bottom_inset: layout.border.bottom + layout.padding.bottom,
         first_unit,
         tables,
+        boxes,
     })
 }
 
@@ -766,6 +1203,217 @@ fn mc_table(
         })
     });
     Some(McTable { bands, head })
+}
+
+/// F198: whether `node` has a frame of its own: a border or padding on any side, as Blitz laid it out.
+fn mc_has_frame(node: &blitz_dom::Node) -> bool {
+    let l = &node.final_layout;
+    l.border.top
+        + l.border.right
+        + l.border.bottom
+        + l.border.left
+        + l.padding.top
+        + l.padding.right
+        + l.padding.bottom
+        + l.padding.left
+        > 0.0
+}
+
+/// F198: the heights of the lines of the inline root `node` when its layout is glyph runs only (the multicol
+/// convert pass shapes nothing else), else `None`.
+fn mc_line_advances(node: &blitz_dom::Node) -> Option<Vec<crate::units::Px>> {
+    use crate::units::F32Units;
+    let layout = &node.element_data()?.inline_layout_data.as_ref()?.layout;
+    if !crate::multicol_layout::parley_layout_is_glyph_run_only(layout) {
+        return None;
+    }
+    let advances: Vec<crate::units::Px> = crate::blitz_adapter::parley_line_heights(layout)
+        .into_iter()
+        .map(F32Units::as_px)
+        .collect();
+    (!advances.is_empty()).then_some(advances)
+}
+
+/// How deep [`mc_box`] follows boxes inside boxes.
+const MC_BOX_DEPTH: usize = 16;
+
+/// F198: whether the box `node` is one [`mc_box`] may cut: a block-level box of normal flow (a block container, not a
+/// table, flex, grid or multicol box, a float, an absolutely positioned box or a list item) that
+///
+/// - is not clipped, transformed or translucent, nor is a box around it ([`table_subtree_is_wrapped`]: such a subtree is
+///   painted through a wrapper the pieces would not pass through),
+/// - has no block size of its own ([`block_size_constrained`]: a box shorter than its content hides the rest),
+/// - is not `break-inside: avoid` while it fits a page (`fresh`), as everywhere else ([`avoid_inside_holds`]).
+fn mc_box_eligible(
+    doc: &BaseDocument,
+    node: &blitz_dom::Node,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    fresh: f32,
+) -> bool {
+    use ::style::values::specified::box_::{DisplayInside, DisplayOutside};
+    let Some(styles) = node.primary_styles() else {
+        return false;
+    };
+    let display = styles.clone_display();
+    let height = node.final_layout.size.height;
+    display.outside() == DisplayOutside::Block
+        && matches!(
+            display.inside(),
+            DisplayInside::Flow | DisplayInside::FlowRoot
+        )
+        && !display.is_list_item()
+        && height.is_finite()
+        && is_block_flow_container(doc, node)
+        && !is_root_or_body(node)
+        && !crate::blitz_adapter::node_is_floating(node)
+        && !is_out_of_flow_positioned(node)
+        && !block_size_constrained(node)
+        && !has_percentage_vertical_padding(node)
+        && !avoid_inside_holds(has_avoid(column_styles, node.id), height, fresh)
+        && !table_subtree_is_wrapped(doc, node.id)
+}
+
+/// F198: the content of the box `node_id`, a child of a multi-column container (or of a box inside one) that is taller
+/// than a page, described so that the planner can cut it between its lines ([`McBox`]); `None` leaves the box a single
+/// atom placed whole in its column, which overflows the page and loses what is below its edge (the warning of
+/// `record_multicol_row` names it). Boxes taller than a page that are cut, css-break-3 §4.1 / §4.4: the content of a
+/// box that does not fit breaks between line boxes and between children; §5.4: the frame is sliced.
+///
+/// The box is described when it is [`mc_box_eligible`] and every child is one of
+///
+/// - an inline root of glyph runs only: [`McBoxItem::Lines`], cut between its lines. With a border or padding of its own it
+///   is a box ([`McBoxItem::Box`]) around its lines, like `node_id` itself when it is an inline root (`<div>` with text,
+///   whose lines are its content);
+/// - an eligible box all of whose children are described the same way, to [`MC_BOX_DEPTH`]: [`McBoxItem::Box`];
+/// - any other box that fits a page (`fresh`): [`McBoxItem::Leaf`], placed whole (a table, an image, an inline root with
+///   inline boxes, a clip box, a flex row, `break-inside: avoid`).
+///
+/// A child that is none of these (out of flow, text next to boxes, a box that does not fit a page and cannot be cut: a table
+/// of 130 rows, F174c) makes the whole box `None`. Every position is the layout's (`final_layout`), so a cut box puts
+/// its pieces where the unbroken box has them.
+fn mc_box(
+    doc: &BaseDocument,
+    node_id: usize,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    fresh: f32,
+) -> Option<McBox> {
+    mc_box_at(doc, node_id, column_styles, fresh, 0)
+}
+
+fn mc_box_at(
+    doc: &BaseDocument,
+    node_id: usize,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    fresh: f32,
+    depth: usize,
+) -> Option<McBox> {
+    let node = doc.get_node(node_id)?;
+    if depth >= MC_BOX_DEPTH || !mc_box_eligible(doc, node, column_styles, fresh) {
+        return None;
+    }
+    let l = &node.final_layout;
+    let top = l.border.top + l.padding.top;
+    let left = l.border.left + l.padding.left;
+    let inset_bottom = l.border.bottom + l.padding.bottom;
+    if node.flags.is_inline_root() {
+        let advances = mc_line_advances(node)?;
+        return Some(McBox {
+            top,
+            left,
+            bottom: inset_bottom,
+            items: vec![McBoxItem::Lines {
+                source: node_id,
+                advances,
+                lead: 0.0,
+                x: 0.0,
+            }],
+        });
+    }
+    let layout_children = node.layout_children.borrow();
+    let children: &[usize] = layout_children
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .unwrap_or(&node.children);
+    let mut items: Vec<McBoxItem> = Vec::new();
+    let mut prev_bottom = top;
+    for &id in children {
+        let child = doc.get_node(id)?;
+        if let Some(text) = child.text_data() {
+            if text.content.chars().all(char::is_whitespace) {
+                continue;
+            }
+            return None;
+        }
+        if child.element_data().is_none()
+            || child
+                .primary_styles()
+                .is_some_and(|s| s.clone_display().is_none())
+        {
+            continue;
+        }
+        if crate::blitz_adapter::node_is_floating(child) || is_out_of_flow_positioned(child) {
+            return None;
+        }
+        let cl = &child.final_layout;
+        let (cy, ch, cx) = (cl.location.y, cl.size.height, cl.location.x - left);
+        let lead = cy - prev_bottom;
+        if !(cy.is_finite() && ch.is_finite() && cx.is_finite()) || lead < -0.5 || cx < -0.5 {
+            return None;
+        }
+        let (lead, x) = (lead.max(0.0), cx.max(0.0));
+        let described = if mc_box_eligible(doc, child, column_styles, fresh) {
+            if child.flags.is_inline_root() {
+                match mc_line_advances(child) {
+                    Some(advances) if !mc_has_frame(child) => Some(McBoxItem::Lines {
+                        source: id,
+                        advances,
+                        lead,
+                        x,
+                    }),
+                    Some(_) => mc_box_at(doc, id, column_styles, fresh, depth + 1).map(|inner| {
+                        McBoxItem::Box {
+                            node: id,
+                            inner,
+                            lead,
+                            x,
+                        }
+                    }),
+                    None => None,
+                }
+            } else {
+                mc_box_at(doc, id, column_styles, fresh, depth + 1).map(|inner| McBoxItem::Box {
+                    node: id,
+                    inner,
+                    lead,
+                    x,
+                })
+            }
+        } else {
+            None
+        };
+        let item = match described {
+            Some(item) => item,
+            // Not a box the planner can cut: it goes in whole when it fits a page.
+            None if ch <= fresh + 1.0 => McBoxItem::Leaf {
+                node: id,
+                h: ch.max(0.0),
+                lead,
+                x,
+            },
+            None => return None,
+        };
+        items.push(item);
+        prev_bottom = cy + ch;
+    }
+    if items.is_empty() {
+        return None;
+    }
+    Some(McBox {
+        top,
+        left,
+        bottom: (l.size.height - prev_bottom).max(inset_bottom),
+        items,
+    })
 }
 
 /// F30d: whether a multi-column container of block-size `height` is cut over pages when `room` is what is
@@ -1165,7 +1813,7 @@ fn fragment_multicol_container(
                 // F28 for a group below a spanner: when its first unit does not fit the room under it, the
                 // group starts on the next page.
                 if i > 0 && frag.has_content {
-                    let unit = flow_first_unit(&group.flow, &c.tables);
+                    let unit = flow_first_unit(&group.flow, &c.tables, &c.boxes);
                     if unit > strips.bottom(frag.page) - frag.cursor() && unit <= strips.fresh() {
                         next_page(geometry, &mut frag);
                     }
@@ -1183,6 +1831,7 @@ fn fragment_multicol_container(
                     fill,
                     if last { c.bottom_inset } else { 0.0 },
                     &c.tables,
+                    &c.boxes,
                 );
                 let plan_len = plan.len();
                 for (k, mut page) in plan.into_iter().enumerate() {
@@ -1203,6 +1852,7 @@ fn fragment_multicol_container(
                         container_id,
                         strips,
                         &c.tables,
+                        &c.boxes,
                     );
                     frag.used += page.height.to_f32();
                     frag.has_content = true;
@@ -1331,14 +1981,42 @@ fn record_multicol_row(
     container_id: usize,
     strips: PageStrips,
     tables: &BTreeMap<usize, McTable>,
+    boxes: &BTreeMap<usize, McBox>,
 ) {
     use crate::multicol_layout::FlowItem;
-    let advances: BTreeMap<usize, &[crate::units::Px]> = group
+    let mut advances: BTreeMap<usize, &[crate::units::Px]> = group
         .flow
         .iter()
         .filter_map(|item| match item {
             FlowItem::Lines { source, advances } => Some((*source, advances.as_slice())),
             FlowItem::Block { .. } => None,
+        })
+        .collect();
+    // F198: the lines of the paragraphs inside the boxes that were cut.
+    fn box_advances<'a>(b: &'a McBox, out: &mut BTreeMap<usize, &'a [crate::units::Px]>) {
+        for item in &b.items {
+            match item {
+                McBoxItem::Lines {
+                    source, advances, ..
+                } => {
+                    out.insert(*source, advances.as_slice());
+                }
+                McBoxItem::Box { inner, .. } => box_advances(inner, out),
+                McBoxItem::Leaf { .. } => {}
+            }
+        }
+    }
+    for b in boxes.values() {
+        box_advances(b, &mut advances);
+    }
+    // F198: the paragraphs that are boxes of their own: their pieces are the fragments of the frames.
+    let framed: BTreeSet<usize> = row
+        .columns
+        .iter()
+        .flatten()
+        .filter_map(|p| match p {
+            McPiece::Frame { node, .. } => Some(*node),
+            _ => None,
         })
         .collect();
     let col_w = group.col_w.to_f32();
@@ -1378,9 +2056,14 @@ fn record_multicol_row(
                     first,
                     end: end_line,
                     y: piece_y,
+                    x: piece_x,
                 } => {
-                    // A container that is itself the paragraph is painted from its own fragments.
-                    if *source == container_id || !paragraphs_on_page.insert(*source) {
+                    // A container that is itself the paragraph is painted from its own fragments, and so is a
+                    // paragraph that is a box cut by the plan (F198): its pieces stand in.
+                    if *source == container_id
+                        || framed.contains(source)
+                        || !paragraphs_on_page.insert(*source)
+                    {
                         continue;
                     }
                     let h: f32 = advances
@@ -1398,11 +2081,65 @@ fn record_multicol_row(
                         .fragments
                         .push(Fragment {
                             page_index: page,
-                            x: col_x.as_px(),
+                            x: (col_x + piece_x.to_f32()).as_px(),
                             y: (row_top + piece_y.to_f32()).as_px(),
-                            width: col_w.as_px(),
+                            // A paragraph inside a box is as wide as that box's content, not the column.
+                            width: if piece_x.to_f32() == 0.0 {
+                                col_w
+                            } else {
+                                doc.get_node(*source)
+                                    .map_or(col_w, |n| n.final_layout.size.width)
+                            }
+                            .as_px(),
                             height: h.as_px(),
                         });
+                }
+                McPiece::Leaf {
+                    node,
+                    x: piece_x,
+                    y: piece_y,
+                } => {
+                    let piece_y = row_top + piece_y.to_f32();
+                    let Some(n) = doc.get_node(*node) else {
+                        continue;
+                    };
+                    record_descendant(
+                        geometry,
+                        doc,
+                        *node,
+                        page,
+                        piece_y - n.final_layout.location.y,
+                        col_x + piece_x.to_f32() - n.final_layout.location.x,
+                        0,
+                    );
+                }
+                McPiece::Frame {
+                    node,
+                    x: piece_x,
+                    y: piece_y,
+                    height,
+                    open_top,
+                    open_bottom,
+                } => {
+                    let Some(n) = doc.get_node(*node) else {
+                        continue;
+                    };
+                    let entry = geometry.entry(*node).or_default();
+                    entry.piece_edges.resize(
+                        entry.fragments.len(),
+                        crate::draw_primitives::FrameEdges::default(),
+                    );
+                    entry.fragments.push(Fragment {
+                        page_index: page,
+                        x: (col_x + piece_x.to_f32()).as_px(),
+                        y: (row_top + piece_y.to_f32()).as_px(),
+                        width: n.final_layout.size.width.as_px(),
+                        height: *height,
+                    });
+                    entry.piece_edges.push(crate::draw_primitives::FrameEdges {
+                        top_open: *open_top,
+                        bottom_open: *open_bottom,
+                    });
                 }
                 McPiece::Rows {
                     table,
@@ -1549,6 +2286,11 @@ pub struct PaginationGeometry {
     /// background, border and shadow from these instead of at a page-high box on every page. Empty for everything else
     /// (and for a body that was not fragmented, which has no body fragment).
     pub box_slices: Vec<Fragment>,
+    /// html-to-pdf F198: for a box that a multicol container cut between its lines ([`McPiece::Frame`]), the edges of
+    /// its frame that are open in each fragment (it is sliced at its breaks, css-break-3 §5.4), parallel to `fragments`.
+    /// Two pieces of one box can share a page (its columns), so the page does not say which piece is first or last. Empty
+    /// for everything else, whose edges come from the page ([`crate::render::frame_fragment`]).
+    pub piece_edges: Vec<crate::draw_primitives::FrameEdges>,
 }
 
 impl PaginationGeometry {
@@ -17335,6 +18077,7 @@ h2 { string-set: chapter-title content(text); }
             fill,
             last_inset,
             &BTreeMap::new(),
+            &BTreeMap::new(),
         )
     }
 
@@ -17533,7 +18276,8 @@ h2 { string-set: chapter-title content(text); }
                 source: 11,
                 first: 0,
                 end: 6,
-                y: 30.0.as_px()
+                y: 30.0.as_px(),
+                x: 0.0.as_px()
             }
         );
         assert_eq!(line_range(&pages[0], 1, 11), Some((6, 12)));
@@ -17724,6 +18468,7 @@ h2 { string-set: chapter-title content(text); }
             ColumnFill::Auto,
             0.0,
             &tables_of(7, table),
+            &BTreeMap::new(),
         );
         assert_rows_tile(&pages, 7, 30);
         assert_eq!(pages.len(), 2, "20 bands a page, 10 on the second");
@@ -17746,6 +18491,7 @@ h2 { string-set: chapter-title content(text); }
             ColumnFill::Balance,
             0.0,
             &tables_of(7, table_of(&[20.0; 20], None)),
+            &BTreeMap::new(),
         );
         assert_eq!(pages.len(), 1);
         assert_eq!(row_pieces(&pages[0], 0, 7), vec![(0, 10, 0.0, false)]);
@@ -17765,6 +18511,7 @@ h2 { string-set: chapter-title content(text); }
             ColumnFill::Auto,
             0.0,
             &tables_of(7, table),
+            &BTreeMap::new(),
         );
         assert_rows_tile(&pages, 7, 41);
         // Column 1: the header and four rows. Every later column: the repeated header (20 px) and four rows.
@@ -17800,6 +18547,7 @@ h2 { string-set: chapter-title content(text); }
             ColumnFill::Auto,
             0.0,
             &tables_of(7, table),
+            &BTreeMap::new(),
         );
         assert_eq!(pages[0].columns[0].len(), 1, "only the lines");
         assert_eq!(row_pieces(&pages[0], 1, 7), vec![(0, 5, 0.0, false)]);
@@ -17813,6 +18561,7 @@ h2 { string-set: chapter-title content(text); }
             ColumnFill::Auto,
             0.0,
             &tables_of(7, table_of(&[20.0; 7], None)),
+            &BTreeMap::new(),
         );
         assert_eq!(row_pieces(&pages[0], 0, 7), vec![(0, 1, 80.0, false)]);
     }
@@ -17832,6 +18581,7 @@ h2 { string-set: chapter-title content(text); }
             ColumnFill::Auto,
             0.0,
             &tables_of(7, table),
+            &BTreeMap::new(),
         );
         assert_rows_tile(&pages, 7, 5);
         assert_eq!(row_pieces(&pages[0], 0, 7), vec![(0, 2, 0.0, false)]);
@@ -17854,6 +18604,7 @@ h2 { string-set: chapter-title content(text); }
             ColumnFill::Balance,
             0.0,
             &tables_of(7, table),
+            &BTreeMap::new(),
         );
         assert_rows_tile(&pages, 7, 13);
         assert_eq!(row_pieces(&pages[0], 0, 7), vec![(0, 5, 0.0, false)]);
@@ -17872,6 +18623,7 @@ h2 { string-set: chapter-title content(text); }
             ColumnFill::Balance,
             0.0,
             &tables_of(7, table),
+            &BTreeMap::new(),
         );
         let last = pages.last().unwrap();
         assert_eq!(row_pieces(last, 0, 7), vec![(9, 10, 0.0, true)]);
@@ -17890,6 +18642,7 @@ h2 { string-set: chapter-title content(text); }
             ColumnFill::Auto,
             0.0,
             &tables_of(7, table),
+            &BTreeMap::new(),
         );
         assert_rows_tile(&pages, 7, 3);
         assert_eq!(row_pieces(&pages[0], 0, 7), vec![(0, 1, 0.0, false)]);
@@ -17915,14 +18668,530 @@ h2 { string-set: chapter-title content(text); }
     #[test]
     fn flow_first_unit_of_a_table_is_its_header_and_first_row() {
         let flow = [block(7, 400.0)];
-        assert_eq!(flow_first_unit(&flow, &BTreeMap::new()), 400.0);
+        assert_eq!(
+            flow_first_unit(&flow, &BTreeMap::new(), &BTreeMap::new()),
+            400.0
+        );
         let with_head = tables_of(
             7,
             table_of(&[vec![30.0], vec![20.0; 18]].concat(), Some((1, 30.0))),
         );
-        assert_eq!(flow_first_unit(&flow, &with_head), 50.0);
+        assert_eq!(flow_first_unit(&flow, &with_head, &BTreeMap::new()), 50.0);
         let plain = tables_of(7, table_of(&[20.0; 20], None));
-        assert_eq!(flow_first_unit(&flow, &plain), 20.0);
+        assert_eq!(flow_first_unit(&flow, &plain, &BTreeMap::new()), 20.0);
+    }
+
+    // ── F198: boxes taller than a page ──────────────────────────────────────
+
+    fn mcbox(top: f32, left: f32, bottom: f32, items: Vec<McBoxItem>) -> McBox {
+        McBox {
+            top,
+            left,
+            bottom,
+            items,
+        }
+    }
+
+    fn box_lines(source: usize, count: usize, h: f32, lead: f32, x: f32) -> McBoxItem {
+        McBoxItem::Lines {
+            source,
+            advances: vec![h.as_px(); count],
+            lead,
+            x,
+        }
+    }
+
+    fn plan_boxes(
+        flow: &[FlowItem],
+        n: u32,
+        room: f32,
+        fill: ColumnFill,
+        last_inset: f32,
+        boxes: &BTreeMap<usize, McBox>,
+    ) -> Vec<McPage> {
+        plan_multicol_pages(
+            flow,
+            n,
+            room,
+            room,
+            fill,
+            last_inset,
+            &BTreeMap::new(),
+            boxes,
+        )
+    }
+
+    /// `(node, y, height, open_top, open_bottom)` of the frames in column `col` of `page`.
+    fn frames_in(page: &McPage, col: usize) -> Vec<(usize, f32, f32, bool, bool)> {
+        page.columns[col]
+            .iter()
+            .filter_map(|p| match p {
+                McPiece::Frame {
+                    node,
+                    y,
+                    height,
+                    open_top,
+                    open_bottom,
+                    ..
+                } => Some((*node, y.to_f32(), height.to_f32(), *open_top, *open_bottom)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(first, end, y, x)` of the `Lines` pieces of `source` in column `col` of `page`.
+    fn lines_in(page: &McPage, col: usize, source: usize) -> Vec<(u32, u32, f32, f32)> {
+        page.columns[col]
+            .iter()
+            .filter_map(|p| match p {
+                McPiece::Lines {
+                    source: s,
+                    first,
+                    end,
+                    y,
+                    x,
+                } if *s == source => Some((*first, *end, y.to_f32(), x.to_f32())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plan_with_no_boxes_is_the_plan_of_before() {
+        // A box that is not in the flow changes nothing, and neither does an empty map.
+        let flow = [block(10, 30.0), lines(11, 12, 20.0), block(12, 50.0)];
+        let plain = plan_no_tables(&flow, 2, 160.0, 160.0, ColumnFill::Balance, 0.0);
+        let mut other = BTreeMap::new();
+        other.insert(
+            99,
+            mcbox(5.0, 5.0, 5.0, vec![box_lines(99, 3, 10.0, 0.0, 0.0)]),
+        );
+        let same = plan_boxes(&flow, 2, 160.0, ColumnFill::Balance, 0.0, &other);
+        assert_eq!(plain, same);
+        // A paragraph that is not in a box has no x.
+        assert_eq!(lines_in(&plain[0], 0, 11), vec![(0, 6, 30.0, 0.0)]);
+    }
+
+    #[test]
+    fn plan_a_box_is_cut_between_its_lines_with_its_frame_sliced() {
+        // A card with 17 px of border and padding above and below holds 20 lines of 10 px (source 5) at x = 17,
+        // in two columns of 100 px: the top inset and 8 lines (97 px) in column 1, 10 lines in column 2, the last two
+        // lines and the bottom inset on the next page.
+        let mut boxes = BTreeMap::new();
+        boxes.insert(
+            7,
+            mcbox(17.0, 17.0, 17.0, vec![box_lines(5, 20, 10.0, 0.0, 0.0)]),
+        );
+        let pages = plan_boxes(
+            &[block(7, 400.0)],
+            2,
+            100.0,
+            ColumnFill::Balance,
+            0.0,
+            &boxes,
+        );
+        assert_eq!(pages.len(), 2);
+        assert_eq!(lines_in(&pages[0], 0, 5), vec![(0, 8, 17.0, 17.0)]);
+        assert_eq!(lines_in(&pages[0], 1, 5), vec![(8, 18, 0.0, 17.0)]);
+        // Frames: closed at the top where the box starts, open at the top of every continuation, open at the
+        // bottom wherever it goes on.
+        assert_eq!(frames_in(&pages[0], 0), vec![(7, 0.0, 97.0, false, true)]);
+        assert_eq!(frames_in(&pages[0], 1), vec![(7, 0.0, 100.0, true, true)]);
+        // The last two lines and the bottom inset are balanced over the columns of the last page: one line each,
+        // the box closes below the second (10 + 17 px).
+        assert_eq!(lines_in(&pages[1], 0, 5), vec![(18, 19, 0.0, 17.0)]);
+        assert_eq!(lines_in(&pages[1], 1, 5), vec![(19, 20, 0.0, 17.0)]);
+        assert_eq!(frames_in(&pages[1], 0), vec![(7, 0.0, 10.0, true, true)]);
+        assert_eq!(frames_in(&pages[1], 1), vec![(7, 0.0, 27.0, true, false)]);
+        assert_eq!(pages[1].height.to_f32(), 27.0);
+        assert_lines_tile_of(&pages, 5, 20);
+    }
+
+    /// Every line of `source` once, in order (any piece kind that holds lines).
+    fn assert_lines_tile_of(pages: &[McPage], source: usize, count: u32) {
+        let mut next = 0;
+        for page in pages {
+            for col in 0..page.columns.len() {
+                for (first, end, _, _) in lines_in(page, col, source) {
+                    assert_eq!(first, next);
+                    next = end;
+                }
+            }
+        }
+        assert_eq!(next, count);
+    }
+
+    #[test]
+    fn plan_lead_and_trail_stay_with_the_first_and_last_line() {
+        // The top inset is part of the first line: a first line that does not fit under the inset goes to the
+        // next column with it. 95 px of room, 10 px inset, lines of 10: the 8th line would end at 90 + 10.
+        let mut boxes = BTreeMap::new();
+        boxes.insert(
+            7,
+            mcbox(10.0, 0.0, 30.0, vec![box_lines(5, 3, 40.0, 0.0, 0.0)]),
+        );
+        // Before the box a 60 px block; the box's first line (10 + 40) does not fit the 40 px left: it opens column 2.
+        let pages = plan_boxes(
+            &[block(1, 60.0), block(7, 200.0)],
+            2,
+            100.0,
+            ColumnFill::Auto,
+            0.0,
+            &boxes,
+        );
+        assert_eq!(
+            pages[0].columns[0],
+            vec![McPiece::Block {
+                node: 1,
+                y: 0.0.as_px()
+            }]
+        );
+        assert_eq!(lines_in(&pages[0], 1, 5), vec![(0, 2, 10.0, 0.0)]);
+        // The third line, with the bottom 30 px that go with it, does not fit column 2 (10 + 80 + 40 + 30 > 100).
+        // It is the last column of the page, so the page ends and the line, with its bottom inset, is on the next one,
+        // at its top: the box goes on there, open at the top.
+        assert_eq!(pages.len(), 2, "{pages:?}");
+        assert_eq!(lines_in(&pages[1], 0, 5), vec![(2, 3, 0.0, 0.0)]);
+        assert_eq!(frames_in(&pages[1], 0), vec![(7, 0.0, 70.0, true, false)]);
+    }
+
+    #[test]
+    fn plan_the_margin_above_an_item_is_dropped_at_the_top_of_a_column() {
+        // Two paragraphs in a card without frame: A has 3 lines of 10, B starts 8 px below it. In 40 px columns B's
+        // first line does not fit under A (30 + 8 + 10): it opens column 2 at its top, the 8 px margin dropped
+        // (css-break-3 §5.2). With 60 px of room it stays below A, 8 px down.
+        let mut boxes = BTreeMap::new();
+        boxes.insert(
+            7,
+            mcbox(
+                0.0,
+                0.0,
+                0.0,
+                vec![
+                    box_lines(1, 3, 10.0, 0.0, 0.0),
+                    box_lines(2, 3, 10.0, 8.0, 0.0),
+                ],
+            ),
+        );
+        let pages = plan_boxes(&[block(7, 98.0)], 2, 40.0, ColumnFill::Auto, 0.0, &boxes);
+        assert_eq!(lines_in(&pages[0], 0, 1), vec![(0, 3, 0.0, 0.0)]);
+        assert_eq!(lines_in(&pages[0], 1, 2), vec![(0, 3, 0.0, 0.0)]);
+        let pages = plan_boxes(&[block(7, 98.0)], 2, 60.0, ColumnFill::Auto, 0.0, &boxes);
+        // B's third line (58 + 10 > 60) opens column 2.
+        assert_eq!(lines_in(&pages[0], 0, 2), vec![(0, 2, 38.0, 0.0)]);
+        assert_eq!(lines_in(&pages[0], 1, 2), vec![(2, 3, 0.0, 0.0)]);
+    }
+
+    #[test]
+    fn plan_nested_boxes_open_and_close_together() {
+        // A card (inset 10 / 10) holds a paragraph and a framed box (inset 5 / 5, at x 4) of 4 lines of 10 px.
+        // Columns of 70 px: column 1 = card top 10 + paragraph 2 lines (20) + the inner box's top 5 + its first line
+        // (10) = 45 + a second line (55) + a third (65), column 2 = the 4th line, the inner bottom 5 and the card bottom 10.
+        let inner = mcbox(5.0, 5.0, 5.0, vec![box_lines(3, 4, 10.0, 0.0, 0.0)]);
+        let mut boxes = BTreeMap::new();
+        boxes.insert(
+            7,
+            mcbox(
+                10.0,
+                10.0,
+                10.0,
+                vec![
+                    box_lines(2, 2, 10.0, 0.0, 0.0),
+                    McBoxItem::Box {
+                        node: 8,
+                        inner,
+                        lead: 0.0,
+                        x: 4.0,
+                    },
+                ],
+            ),
+        );
+        let pages = plan_boxes(&[block(7, 100.0)], 2, 70.0, ColumnFill::Auto, 0.0, &boxes);
+        assert_eq!(pages.len(), 1, "{pages:?}");
+        assert_eq!(lines_in(&pages[0], 0, 2), vec![(0, 2, 10.0, 10.0)]);
+        // The inner box opens below the paragraph: y 30, its text at x 10 + 4 + 5, y 35.
+        assert_eq!(lines_in(&pages[0], 0, 3), vec![(0, 3, 35.0, 19.0)]);
+        assert_eq!(lines_in(&pages[0], 1, 3), vec![(3, 4, 0.0, 19.0)]);
+        // Column 1 ends below the third line of the inner box (65 px); both boxes go on in column 2.
+        assert_eq!(
+            frames_in(&pages[0], 0),
+            vec![(7, 0.0, 65.0, false, true), (8, 30.0, 35.0, false, true)]
+        );
+        // Column 2: the inner box closes below its last line (10 + 5), then the card (+ 10).
+        let col2 = frames_in(&pages[0], 1);
+        assert_eq!(col2.len(), 2);
+        assert!(col2.contains(&(8, 0.0, 15.0, true, false)), "{col2:?}");
+        assert!(col2.contains(&(7, 0.0, 25.0, true, false)), "{col2:?}");
+    }
+
+    #[test]
+    fn plan_a_box_in_three_columns_and_with_fill_auto() {
+        let mut boxes = BTreeMap::new();
+        boxes.insert(
+            7,
+            mcbox(0.0, 0.0, 0.0, vec![box_lines(5, 100, 10.0, 0.0, 0.0)]),
+        );
+        // Three columns of 200 px: 20 + 20 + 20 lines on a page, 100 lines = 2 pages (60 + 40, the 40 balanced 14 / 14 / 12).
+        let pages = plan_boxes(
+            &[block(7, 1000.0)],
+            3,
+            200.0,
+            ColumnFill::Balance,
+            0.0,
+            &boxes,
+        );
+        assert_eq!(pages.len(), 2);
+        assert_lines_tile_of(&pages, 5, 100);
+        assert_eq!(lines_in(&pages[0], 0, 5), vec![(0, 20, 0.0, 0.0)]);
+        assert_eq!(lines_in(&pages[0], 2, 5), vec![(40, 60, 0.0, 0.0)]);
+        let last: Vec<u32> = (0..3)
+            .map(|c| lines_in(&pages[1], c, 5).iter().map(|l| l.1 - l.0).sum())
+            .collect();
+        assert_eq!(last, vec![14, 14, 12]);
+        // `auto`: the last page is not balanced.
+        let pages = plan_boxes(&[block(7, 1000.0)], 3, 200.0, ColumnFill::Auto, 0.0, &boxes);
+        let last: Vec<u32> = (0..3)
+            .map(|c| lines_in(&pages[1], c, 5).iter().map(|l| l.1 - l.0).sum())
+            .collect();
+        assert_eq!(last, vec![20, 20, 0]);
+        // Every column of every page has a frame piece, open at the top unless the box started there.
+        assert_eq!(frames_in(&pages[0], 0), vec![(7, 0.0, 200.0, false, true)]);
+        assert_eq!(frames_in(&pages[0], 1), vec![(7, 0.0, 200.0, true, true)]);
+        assert!(frames_in(&pages[1], 2).is_empty());
+    }
+
+    #[test]
+    fn plan_a_paragraph_that_is_a_box_is_the_source_of_its_own_frame() {
+        // F: a `<p>` with a 17 px frame in the flow (a `FlowItem::Lines`): the box replaces it.
+        let mut boxes = BTreeMap::new();
+        boxes.insert(
+            5,
+            mcbox(17.0, 17.0, 17.0, vec![box_lines(5, 30, 10.0, 0.0, 0.0)]),
+        );
+        let pages = plan_boxes(
+            &[lines(5, 30, 10.0)],
+            2,
+            100.0,
+            ColumnFill::Balance,
+            0.0,
+            &boxes,
+        );
+        assert_eq!(lines_in(&pages[0], 0, 5), vec![(0, 8, 17.0, 17.0)]);
+        assert_eq!(frames_in(&pages[0], 0), vec![(5, 0.0, 97.0, false, true)]);
+        assert_lines_tile_of(&pages, 5, 30);
+    }
+
+    #[test]
+    fn plan_a_leaf_inside_a_box_is_placed_whole_at_its_x() {
+        let mut boxes = BTreeMap::new();
+        boxes.insert(
+            7,
+            mcbox(
+                10.0,
+                10.0,
+                10.0,
+                vec![
+                    box_lines(1, 4, 10.0, 0.0, 0.0),
+                    McBoxItem::Leaf {
+                        node: 9,
+                        h: 30.0,
+                        lead: 6.0,
+                        x: 3.0,
+                    },
+                ],
+            ),
+        );
+        // 70 px columns: 10 + 4 lines (50), the leaf needs 6 + 30: column 2, margin dropped, y 0, x 10 + 3.
+        let pages = plan_boxes(&[block(7, 100.0)], 2, 70.0, ColumnFill::Auto, 0.0, &boxes);
+        assert_eq!(
+            pages[0].columns[1].iter().find_map(|p| match p {
+                McPiece::Leaf { node, x, y } => Some((*node, x.to_f32(), y.to_f32())),
+                _ => None,
+            }),
+            Some((9, 13.0, 0.0))
+        );
+    }
+
+    #[test]
+    fn mc_box_first_unit_is_the_frame_top_and_the_first_line() {
+        let b = mcbox(
+            17.0,
+            17.0,
+            17.0,
+            vec![
+                box_lines(5, 3, 20.0, 4.0, 0.0),
+                box_lines(6, 3, 20.0, 4.0, 0.0),
+            ],
+        );
+        assert_eq!(mc_box_first_unit(&b), 17.0 + 4.0 + 20.0);
+        let mut boxes = BTreeMap::new();
+        boxes.insert(7, b);
+        let flow = [block(7, 500.0)];
+        assert_eq!(flow_first_unit(&flow, &BTreeMap::new(), &boxes), 41.0);
+        assert_eq!(
+            flow_first_unit(&flow, &BTreeMap::new(), &BTreeMap::new()),
+            500.0
+        );
+    }
+
+    // ── F198: mc_box ────────────────────────────────────────────────────────
+
+    /// Lay `html` out at 600 px (body without margin, 16px / 20px text) and return the document and `.t`.
+    fn box_doc(html: &str) -> (blitz_html::HtmlDocument, usize) {
+        let doc = parse(
+            &format!(
+                "<!doctype html><html><head><style>body{{margin:0;font-size:16px;line-height:20px}}\
+                 p{{margin:0}}</style></head><body>{html}</body></html>"
+            ),
+            600.0,
+        );
+        let id = node_by_class(&doc, "t");
+        (doc, id)
+    }
+
+    fn text(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("word{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn mc_box_describes_a_div_of_text_as_its_own_lines() {
+        let (doc, t) = box_doc(&format!(
+            "<div class=\"t\" style=\"padding:10px;border:2px solid\">{}</div>",
+            text(300)
+        ));
+        let b = mc_box(&doc, t, None, 100.0).expect("a div of text");
+        assert_eq!((b.top, b.left, b.bottom), (12.0, 12.0, 12.0));
+        let [
+            McBoxItem::Lines {
+                source,
+                advances,
+                lead,
+                x,
+            },
+        ] = b.items.as_slice()
+        else {
+            panic!("one run of lines: {:?}", b.items);
+        };
+        assert_eq!((*source, *lead, *x), (t, 0.0, 0.0));
+        let h = doc.get_node(t).unwrap().final_layout.size.height;
+        let total: f32 = advances.iter().map(|a| a.to_f32()).sum();
+        assert!((h - 24.0 - total).abs() < 1.0, "{h} vs {total}");
+    }
+
+    #[test]
+    fn mc_box_describes_a_card_of_paragraphs_and_nested_cards() {
+        let (doc, t) = box_doc(&format!(
+            "<div class=\"t\" style=\"padding:16px\"><p>{}</p><p style=\"margin-top:12px\">{}</p>\
+             <div style=\"padding:6px;margin-left:5px\"><p>{}</p></div></div>",
+            text(40),
+            text(40),
+            text(40)
+        ));
+        let b = mc_box(&doc, t, None, 100.0).expect("a card");
+        assert_eq!((b.top, b.left), (16.0, 16.0));
+        assert_eq!(b.items.len(), 3);
+        let McBoxItem::Lines {
+            lead: l0, x: x0, ..
+        } = &b.items[0]
+        else {
+            panic!("{:?}", b.items[0]);
+        };
+        assert_eq!((*l0, *x0), (0.0, 0.0));
+        let McBoxItem::Lines { lead: l1, .. } = &b.items[1] else {
+            panic!("{:?}", b.items[1]);
+        };
+        assert_eq!(*l1, 12.0);
+        let McBoxItem::Box { inner, x, .. } = &b.items[2] else {
+            panic!("a nested card is a box: {:?}", b.items[2]);
+        };
+        assert_eq!((*x, inner.top, inner.left), (5.0, 6.0, 6.0));
+        assert!(matches!(inner.items[0], McBoxItem::Lines { .. }));
+    }
+
+    #[test]
+    fn mc_box_refuses_what_it_cannot_cut() {
+        // A clip box, a box with a height, a `break-inside: avoid` box that fits a page, a box with a transform.
+        for style in [
+            "overflow:hidden",
+            "height:300px",
+            "max-height:300px",
+            "break-inside:avoid",
+            "transform:translateX(1px)",
+            "opacity:0.5",
+            "float:left;width:200px",
+            "display:flex",
+            "display:grid",
+            "display:table",
+            "display:list-item",
+        ] {
+            let html = format!("<div class=\"t\" style=\"{style}\">{}</div>", text(60));
+            let (doc, t) = box_doc(&html);
+            let styles = blitz_adapter::extract_column_style_table(&doc);
+            let big = doc.get_node(t).unwrap().final_layout.size.height + 10.0;
+            // `fresh` bigger than the box: avoid holds. Others refuse regardless.
+            assert!(
+                mc_box(&doc, t, Some(&styles), big).is_none(),
+                "{style} must not be described"
+            );
+        }
+        // Avoid is relaxed when the box is taller than a page.
+        let (doc, t) = box_doc(&format!(
+            "<div class=\"t\" style=\"break-inside:avoid\">{}</div>",
+            text(60)
+        ));
+        let styles = blitz_adapter::extract_column_style_table(&doc);
+        assert!(mc_box(&doc, t, Some(&styles), 100.0).is_some());
+    }
+
+    #[test]
+    fn mc_box_treats_what_fits_a_page_as_a_leaf_and_what_does_not_as_a_refusal() {
+        let (doc, t) = box_doc(&format!(
+            "<div class=\"t\" style=\"padding:8px\"><p>{}</p>\
+             <table><tr><td>a</td></tr><tr><td>b</td></tr></table><p>{}</p></div>",
+            text(40),
+            text(40)
+        ));
+        let b = mc_box(&doc, t, None, 200.0).expect("a card with a small table");
+        assert_eq!(b.items.len(), 3);
+        assert!(matches!(b.items[0], McBoxItem::Lines { .. }));
+        let McBoxItem::Leaf { h, lead, .. } = &b.items[1] else {
+            panic!("the table is a leaf: {:?}", b.items[1]);
+        };
+        assert!((30.0..60.0).contains(h), "the table's height: {h}");
+        assert_eq!(*lead, 0.0);
+        // A table taller than a page cannot be cut by this path: the whole box is left as it was.
+        assert!(mc_box(&doc, t, None, 30.0).is_none());
+        // An inline root with an image (not glyph runs only) fits a page: a leaf.
+        let (doc, t) = box_doc(&format!(
+            "<div class=\"t\"><p>{}</p><p>x <img width=10 height=10> y</p></div>",
+            text(40)
+        ));
+        let b = mc_box(&doc, t, None, 200.0).expect("a card with an inline image");
+        assert!(
+            matches!(b.items[1], McBoxItem::Leaf { .. }),
+            "{:?}",
+            b.items
+        );
+    }
+
+    #[test]
+    fn mc_box_refuses_text_next_to_boxes_and_floats() {
+        let (doc, t) = box_doc(&format!(
+            "<div class=\"t\"><p>{}</p>bare<p>{}</p></div>",
+            text(20),
+            text(20)
+        ));
+        let b = mc_box(&doc, t, None, 100.0);
+        // Blitz wraps the bare text in an anonymous block, which is an inline root of glyph runs: described.
+        assert!(b.is_some(), "{b:?}");
+        let (doc, t) = box_doc(&format!(
+            "<div class=\"t\"><p>{}</p><div style=\"float:left;width:50px\">f</div></div>",
+            text(20)
+        ));
+        assert!(mc_box(&doc, t, None, 100.0).is_none());
     }
 
     // ── F174: mc_table ──────────────────────────────────────────────────────
