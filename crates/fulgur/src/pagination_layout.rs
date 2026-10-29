@@ -2601,8 +2601,9 @@ impl<'a> PaginationLayoutTree<'a> {
                 && let Some(body_node) = self.doc.get_node(body_id)
                 && let Some(mut split) = line_split_candidate(self.doc, body_node, child)
             {
-                // The clip box that is fragmented in place is sliced like the paragraph with insets (F30f-d, step 4).
-                split.slice = split.inset_top + split.inset_bottom > 0.0;
+                // The clip box that is fragmented in place keeps the closed frame (F30f-b): sliced, its last page shows one
+                // line more than Chrome's (plan F30f-d, 7, step 4). Only the paragraph with insets is sliced.
+                split.slice = inset_split_here;
                 // A paragraph that is itself the clip box: the lines at or below the clip are dropped.
                 let leading = split.leading();
                 if cursor_y > 0.0
@@ -6725,10 +6726,12 @@ fn slices_at_breaks(
 ) -> bool {
     use ::style::values::specified::box_::DisplayInside;
     let inside = |n: &blitz_dom::Node| n.primary_styles().map(|s| s.clone_display().inside());
-    // Nothing to open on a box without a border or padding; a box with a block size of its own keeps the frame it had
-    // (F83c), unless it is the clip box whose height the fragmenter lays over the pages ([`LineSplit::own_box_height`]).
+    // Nothing to open on a box without a border or padding. A box with a block size of its own keeps the frame it had
+    // (F83c), and so does the clip box whose height the fragmenter lays over the pages ([`LineSplit::own_box_height`]):
+    // sliced, its last page shows the line that starts below the end of its content box, which Chrome does not.
     split.inset_top + split.inset_bottom > 0.0
-        && (split.own_box_height.is_some() || !block_size_constrained(child))
+        && split.own_box_height.is_none()
+        && !block_size_constrained(child)
         && is_block_flow_container(doc, parent)
         && matches!(
             inside(parent),
@@ -15440,6 +15443,24 @@ h2 { string-set: chapter-title content(text); }
             assert!(!geom.line_split_slice, "{style}");
             assert_eq!(geom.line_split_insets, None, "{style}");
         }
+    }
+
+    #[test]
+    fn a_padded_clip_box_with_a_height_keeps_its_closed_frame() {
+        // html-to-pdf F30f-d, step 4: the clip box that is fragmented by its own block size is not sliced: sliced, the last
+        // page showed the line that starts below the end of its content box, which Chrome's does not (15 sweep cases
+        // moved one line away from Chrome). It keeps the F30f-b geometry: the top inset reserved on every page.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:120px\"></div><div id=\"b\" style=\"overflow:hidden;height:300px;border:1px solid #000;padding:9px\">{}</div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let geom = geometry_of(&doc, &table, "b").expect("geometry");
+        assert!(geom.fragments.len() >= 2, "{:?}", geom.fragments);
+        assert!(!geom.line_split_slice, "not sliced");
+        assert_eq!(geom.fragments[1].y.to_f32(), 0.0);
     }
 
     #[test]
