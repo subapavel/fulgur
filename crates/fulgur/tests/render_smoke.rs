@@ -9767,3 +9767,23 @@ fn render_smoke_padded_body_level_paragraph_is_sliced_at_its_page_breaks() {
     // 120 lines and AFTER, each written once (a `<br>` ends a text item).
     assert!(text_items_of(&pdf, "s.pdf") >= 121);
 }
+
+#[test]
+fn render_smoke_padded_body_level_paragraph_that_fits_is_followed_below_its_frame() {
+    // html-to-pdf F30f-h: a bordered, padded box with five lines of direct text that fits its page ends at the bottom of
+    // its border box (also with a `min-height`); what follows is placed below it. One page, every line written.
+    let lines: String = (1..=5).map(|i| format!("line{i}<br>")).collect();
+    for style in [
+        "border:2px solid #000;padding:12px;line-height:20px",
+        "border:2px solid #000;padding:12px;line-height:20px;min-height:300px",
+        "overflow:hidden;border:2px solid #000;padding:12px;line-height:20px;margin-bottom:24px",
+    ] {
+        let html = format!(
+            "<!DOCTYPE html><html><head><style>@page {{ margin: 0 }} body {{ margin: 0 }}</style></head><body>\
+             <div style=\"{style}\">{lines}</div><p style=\"margin:0\">AFTER</p></body></html>"
+        );
+        let pdf = noto_engine().render(&html).expect("render");
+        assert_eq!(page_count(&pdf), 1, "{style}");
+        assert!(text_items_of(&pdf, "f.pdf") >= 6, "{style}");
+    }
+}

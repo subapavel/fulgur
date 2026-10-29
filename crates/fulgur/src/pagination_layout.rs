@@ -3557,6 +3557,8 @@ impl<'a> PaginationLayoutTree<'a> {
                     cursor_y = 0.0;
                 }
                 let para_x = layout.location.x;
+                let fit_top = cursor_y;
+                let fit_page = page_index;
                 let (new_page_index, new_cursor_y, frag_count, placements) = fragment_inline_root(
                     &mut self.geometry,
                     child_id,
@@ -3583,6 +3585,17 @@ impl<'a> PaginationLayoutTree<'a> {
                 );
                 page_index = new_page_index;
                 cursor_y = new_cursor_y;
+                // html-to-pdf F30f-h: a box that is not cut ends at the bottom of its border box, not at the end of its
+                // lines (CSS 2.1 §10.6.3, §8.1): `fragment_inline_root` returns the lines' end, so what follows started
+                // `border + padding` (or the extra of a `height` / `min-height`) too high, over the box's last line. The
+                // frame was right already (a box in one fragment is painted from its layout size). A plain paragraph,
+                // whose lines are its box up to the line-box rounding (F30f-j), keeps the cursor it had.
+                if frag_count == 1
+                    && new_page_index == fit_page
+                    && (insets > 0.0 || child_h > (new_cursor_y - fit_top) + LINE_BOX_SLACK)
+                {
+                    cursor_y = fit_top + child_h;
+                }
                 emitted += frag_count;
                 prev_bottom_y_in_body = this_top_in_body + child_h;
                 if let Some((row_page, row_end, row_bottom)) = parallel_row {
@@ -16361,9 +16374,105 @@ h2 { string-set: chapter-title content(text); }
         let geom = geometry_of(&doc, &table, "b").expect("geometry");
         assert!(!geom.line_split_slice);
         assert_eq!(geom.fragments.len(), 1);
-        // (The fitting path leaves `AFTER` at 100px, over the box's last line: `fragment_inline_root` returns the lines'
-        // end without the insets. Not this change's: html-to-pdf finding F30f-h.)
+        // html-to-pdf F30f-h: what follows starts below the box: 5 lines of 20px and 10px above and below (it was 100px,
+        // over the box's last line, when `fragment_inline_root`'s end of the lines was the cursor).
+        assert_frames(frames_of(&doc, &table, "a"), &[(0, 120.0, 20.0)], "after");
+    }
+
+    #[test]
+    fn a_body_level_box_that_fits_ends_at_its_border_box() {
+        // html-to-pdf F30f-h (CSS 2.1 §10.6.3, §8.1): 5 lines of 20px; what follows starts at the bottom of the border
+        // box, not at the end of the lines. Shapes: border and padding (120px), padding on one side, a margin below
+        // (collapsed with nothing: the gap is added once), a `height` and a `min-height` taller than the lines, `overflow:
+        // hidden` that hides nothing, and two cards in a row.
+        let cases: [(&str, &str, f32); 7] = [
+            (
+                "border and padding",
+                "border:1px solid #000;padding:9px",
+                120.0,
+            ),
+            ("padding-top only", "padding-top:12px", 112.0),
+            ("padding-bottom only", "padding-bottom:12px", 112.0),
+            (
+                "margin below",
+                "border:1px solid #000;padding:9px;margin-bottom:24px",
+                144.0,
+            ),
+            (
+                "height",
+                "box-sizing:border-box;border:1px solid #000;padding:9px;height:150px",
+                150.0,
+            ),
+            (
+                "min-height",
+                "box-sizing:border-box;border:1px solid #000;padding:9px;min-height:130px",
+                130.0,
+            ),
+            (
+                "overflow hidden",
+                "overflow:hidden;border:1px solid #000;padding:9px",
+                120.0,
+            ),
+        ];
+        for (what, style, after_y) in cases {
+            let (doc, table) = nested_geometry(
+                &format!(
+                    "<div id=\"b\" style=\"{style}\">{}</div><p id=\"a\">AFTER</p>",
+                    br_lines(5)
+                ),
+                400.0,
+            );
+            assert_frames(frames_of(&doc, &table, "a"), &[(0, after_y, 20.0)], what);
+        }
+        // Two cards in a row: the second starts where the first ends (+ its margin) and AFTER below both.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div id=\"b\" style=\"border:1px solid #000;padding:9px;margin-bottom:6px\">{}</div>\
+                 <div id=\"c\" style=\"border:1px solid #000;padding:9px\">{}</div><p id=\"a\">AFTER</p>",
+                br_lines(3),
+                br_lines(3)
+            ),
+            400.0,
+        );
+        assert_frames(
+            frames_of(&doc, &table, "c"),
+            &[(0, 86.0, 60.0)],
+            "second card",
+        );
+        assert_frames(
+            frames_of(&doc, &table, "a"),
+            &[(0, 166.0, 20.0)],
+            "after both",
+        );
+    }
+
+    #[test]
+    fn a_plain_body_level_paragraph_keeps_the_end_of_its_lines() {
+        // html-to-pdf F30f-h guard: no border, padding or block size beyond the lines: the cursor stays what
+        // `fragment_inline_root` returned (the byte identity of every unpadded paragraph).
+        let (doc, table) = nested_geometry(
+            &format!("<div id=\"b\">{}</div><p id=\"a\">AFTER</p>", br_lines(5)),
+            400.0,
+        );
         assert_frames(frames_of(&doc, &table, "a"), &[(0, 100.0, 20.0)], "after");
+    }
+
+    #[test]
+    fn a_padded_card_that_fills_the_page_pushes_what_follows_to_the_next_page() {
+        // html-to-pdf F30f-h: a card of 3 lines of 20px and 20px of insets ends at 15 + 80 = 95px on a page of 105px, below a
+        // 15px spacer, and `AFTER` (20px) does not fit the 10px left: it starts the next page. Before, it was placed at
+        // 75px over the card's last line, on the same page.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:15px\"></div><div id=\"b\" style=\"border:1px solid #000;padding:9px\">{}</div><p id=\"a\">AFTER</p>",
+                br_lines(3)
+            ),
+            105.0,
+        );
+        let geom = geometry_of(&doc, &table, "b").expect("geometry");
+        assert_eq!(geom.fragments.len(), 1, "the card fits");
+        assert!(!geom.line_split_slice);
+        assert_frames(frames_of(&doc, &table, "a"), &[(1, 0.0, 20.0)], "after");
     }
 
     #[test]
