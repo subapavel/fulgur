@@ -19317,6 +19317,68 @@ h2 { string-set: chapter-title content(text); }
     }
 
     #[test]
+    fn record_line_inline_boxes_records_the_boxes_of_the_lines_asked_for_at_the_piece() {
+        // F198b: the inline boxes of the lines of a piece get a fragment on the piece's page, placed by their position in
+        // the line relative to the piece; the boxes of other lines get none.
+        let (doc, t) = box_doc(&format!(
+            "<p class=\"t\">{} <span class=\"ib\" style=\"display:inline-block;width:30px;height:12px\"></span> {}</p>",
+            text(30),
+            text(30)
+        ));
+        let ib = node_by_class(&doc, "ib");
+        let layout = &doc
+            .get_node(t)
+            .unwrap()
+            .element_data()
+            .unwrap()
+            .inline_layout_data
+            .as_ref()
+            .unwrap()
+            .layout;
+        let line_of_box = layout
+            .lines()
+            .position(|l| {
+                l.items()
+                    .any(|i| matches!(i, parley::PositionedLayoutItem::InlineBox(_)))
+            })
+            .expect("a line holds the box");
+        assert!(line_of_box > 0, "the box is not on the first line");
+        let mut geometry = PaginationGeometryTable::new();
+        // The lines before the box's: nothing recorded.
+        record_line_inline_boxes(
+            &mut geometry,
+            &doc,
+            t,
+            0..line_of_box as u32,
+            3,
+            100.0,
+            200.0,
+        );
+        assert!(!geometry.contains_key(&ib));
+        // The box's own line, as the first line of a piece at (100, 200) on page 3.
+        record_line_inline_boxes(
+            &mut geometry,
+            &doc,
+            t,
+            line_of_box as u32..line_of_box as u32 + 2,
+            3,
+            100.0,
+            200.0,
+        );
+        let frags = &geometry[&ib].fragments;
+        assert_eq!(frags.len(), 1, "{frags:?}");
+        let f = &frags[0];
+        assert_eq!(f.page_index, 3);
+        assert_eq!((f.width.to_f32(), f.height.to_f32()), (30.0, 12.0));
+        // At its x in the line, and in the first line of the piece: within a line height of the piece's top.
+        assert!(
+            f.x.to_f32() >= 100.0 && f.x.to_f32() < 100.0 + 600.0,
+            "{f:?}"
+        );
+        assert!((199.0..230.0).contains(&f.y.to_f32()), "{f:?}");
+    }
+
+    #[test]
     fn mc_box_refuses_text_next_to_boxes_and_floats() {
         let (doc, t) = box_doc(&format!(
             "<div class=\"t\"><p>{}</p>bare<p>{}</p></div>",

@@ -8062,6 +8062,102 @@ fn render_v2_smoke_multicol_card_taller_than_a_page_prints_every_word_once() {
     }
 }
 
+#[test]
+fn render_v2_smoke_tagged_multicol_card_with_inline_boxes_prints_every_word_once() {
+    // html-to-pdf F198b: a card taller than a page in two columns whose paragraphs hold inline boxes: an image, an image
+    // inside a link, an inline `<svg>`, an inline-block that holds a paragraph (in a card of `<div>` text: a `<p>` cannot
+    // be inside a `<p>`). The lines are cut between the columns with their boxes. Tagged, a box dispatched inside a
+    // tagged slice must not open a second marked-content sequence (Krilla's `start_tagged` does not nest), and the text
+    // of the paragraphs stays marked content.
+    let png = "data:image/png;base64,\
+        iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQAAAAA3bvkkAAAAB0lEQVR42mNgAAAAAgABc3UBGAAAAABJRU5ErkJggg==";
+    let svg =
+        "<svg width=\"12\" height=\"12\"><rect width=\"12\" height=\"12\" fill=\"#f00\"/></svg>";
+    let img = format!("<img src=\"{png}\" width=\"12\" height=\"12\">");
+    let n = std::cell::Cell::new(0usize);
+    let chunk = |k: usize| -> String {
+        let from = n.get();
+        n.set(from + k);
+        (from..from + k)
+            .map(|i| format!("w{i:04}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut paragraphs = String::new();
+    for _ in 0..8 {
+        paragraphs.push_str(&format!(
+            "<p>{} {img} {} <a href=\"https://example.cz/x\">{img}</a> {} {svg} {}</p>",
+            chunk(75),
+            chunk(75),
+            chunk(75),
+            chunk(75),
+        ));
+    }
+    let paragraphs_total = n.get();
+    let mut blocks = String::new();
+    for _ in 0..8 {
+        blocks.push_str(&format!(
+            "{} <span style=\"display:inline-block;border:1px solid #888\"><p>{}</p></span> {} ",
+            chunk(150),
+            chunk(3),
+            chunk(150),
+        ));
+    }
+    let blocks_total = n.get() - paragraphs_total;
+    for (what, inner, first, total, links) in [
+        ("card of paragraphs", paragraphs, 0, paragraphs_total, 8),
+        (
+            "div with inline-blocks",
+            blocks,
+            paragraphs_total,
+            blocks_total,
+            0,
+        ),
+    ] {
+        let html = format!(
+            "<!doctype html><html><body style=\"margin:0\"><div style=\"column-count:2\">\
+             <div style=\"padding:16px;border:1px solid #888\">{inner}</div></div><p>AFTER</p></body></html>"
+        );
+        for tagged in [false, true] {
+            let pdf = if tagged {
+                tagged_render_with_noto(&html)
+            } else {
+                noto_engine().render(&html).expect("render")
+            };
+            let printed = extract_pdf_text(&pdf).expect("pdftotext");
+            let mut got: Vec<&str> = printed
+                .split_whitespace()
+                .filter(|w| w.len() == 5 && w.starts_with('w'))
+                .collect();
+            assert_eq!(
+                got.len(),
+                total,
+                "{what} (tagged: {tagged}): every word printed"
+            );
+            got.sort_unstable();
+            got.dedup();
+            assert_eq!(got.len(), total, "{what} (tagged: {tagged}): no word twice");
+            assert_eq!(got[0], format!("w{first:04}"));
+            assert_eq!(printed.matches("AFTER").count(), 1, "{what}: AFTER once");
+            assert!(
+                page_count(&pdf) >= 2,
+                "{what} (tagged: {tagged}): the card is taller than a page and is cut over the columns"
+            );
+            assert_eq!(
+                count_bytes(&pdf, "/Subtype /Link") + count_bytes(&pdf, "/Subtype/Link"),
+                links,
+                "{what} (tagged: {tagged}): a link annotation per linked image"
+            );
+            // The text of a `<div>` is not tagged anywhere, multicol or not (F200); paragraphs are.
+            if tagged && what == "card of paragraphs" {
+                let (outside, empty) = untagged_text_and_empty_p(&pdf);
+                assert_eq!(outside, 0, "{what}: text outside marked content");
+                assert_eq!(empty, 0, "{what}: /P elements without content");
+            }
+        }
+    }
+}
+
 /// F99b: the margin-box documents of one render share a style and font environment. A multi-page document whose
 /// footer text differs per page (`counter(page)`, `counter(pages)`) and a constant box builds one environment and
 /// many documents from it; every page gets its box.

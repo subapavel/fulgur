@@ -976,7 +976,7 @@ fn convert_paged_multicol_slices(
                     continue;
                 };
                 let all_lines = shaped.entry(*source).or_insert_with(|| {
-                    shape_multicol_source(doc, node_id, *source, group.col_w, ctx)
+                    multicol_source_lines(doc, node_id, *source, group.col_w, ctx, out)
                 });
                 let (first, end) = (*first as usize, *end as usize);
                 if first >= end || end > all_lines.len() {
@@ -1025,6 +1025,32 @@ fn convert_paged_multicol_slices(
             },
         );
     }
+}
+
+/// html-to-pdf F198b: the lines of the paragraph `source_id` that a multicol container cut between its lines. A paragraph
+/// whose layout holds inline boxes (an image, an `<svg>`, an inline-block) takes the lines `extract_paragraph` made of it
+/// when the node was converted (`out.paragraphs`): they have the boxes' items, with the node of each box and its place
+/// in the line, which [`shape_multicol_source`] leaves out. The paragraph is a child of the box that holds it, so
+/// Blitz laid it out at the width it is painted at (never the container itself: Case A re-breaks its layout). A paragraph
+/// of glyph runs only is shaped as before, so what was painted already stays byte for byte what it was.
+fn multicol_source_lines(
+    doc: &BaseDocument,
+    container_id: usize,
+    source_id: usize,
+    col_w: crate::units::Px,
+    ctx: &mut ConvertContext<'_>,
+    out: &crate::drawables::Drawables,
+) -> Vec<ShapedLine> {
+    let has_inline_boxes = source_id != container_id
+        && doc
+            .get_node(source_id)
+            .and_then(|n| n.element_data())
+            .and_then(|e| e.inline_layout_data.as_ref())
+            .is_some_and(|d| !crate::multicol_layout::parley_layout_is_glyph_run_only(&d.layout));
+    if has_inline_boxes && let Some(para) = out.paragraphs.get(&source_id) {
+        return para.lines.clone();
+    }
+    shape_multicol_source(doc, container_id, source_id, col_w, ctx)
 }
 
 /// The shaped lines of the paragraph `source_id` of the multicol container `container_id`, at the column

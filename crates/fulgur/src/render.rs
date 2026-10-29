@@ -2075,11 +2075,15 @@ fn paint_multicol_paragraph_slices(
                     draw_slice_tagged(
                         canvas,
                         drawables,
+                        geometry,
                         source_node_id,
                         use_run_tagging,
                         slice,
                         abs_x,
                         abs_y,
+                        page_index,
+                        margin_left_pt,
+                        margin_top_pt,
                     );
                 }
                 continue;
@@ -2108,11 +2112,15 @@ fn paint_multicol_paragraph_slices(
             draw_slice_tagged(
                 canvas,
                 drawables,
+                geometry,
                 source_node_id,
                 use_run_tagging,
                 slice,
                 abs_x,
                 abs_y,
+                page_index,
+                margin_left_pt,
+                margin_top_pt,
             );
         }
     });
@@ -2125,21 +2133,37 @@ fn paint_multicol_paragraph_slices(
 /// one marked-content sequence of its source's tag, like a paragraph painted by `draw_paragraph_v2`: a paragraph
 /// cut over columns and pages is several sequences under the same structure element (F30d review: its text was
 /// outside any marked content and its `/P` elements were empty).
+///
+/// html-to-pdf F198b: the inline boxes of its lines (an image, an `<svg>`, an inline-block) are painted like any paragraph's
+/// (`inline_box_ctx`): the fragmenter recorded each of them on the page of its piece. It is a no-op for a slice without
+/// inline boxes.
+#[allow(clippy::too_many_arguments)]
 fn draw_slice_tagged(
     canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
     drawables: &Drawables,
+    geometry: &crate::pagination_layout::PaginationGeometryTable,
     source_node_id: usize,
     use_run_tagging: bool,
     slice: &crate::drawables::ParagraphSlice,
     abs_x: crate::units::Pt,
     abs_y: crate::units::Pt,
+    page_index: u32,
+    margin_left_pt: f32,
+    margin_top_pt: f32,
 ) {
     let tag_info = if use_run_tagging {
         None
     } else {
         try_start_tagged(canvas, source_node_id, drawables)
     };
-    crate::paragraph::draw_shaped_lines(canvas, &slice.lines, abs_x, abs_y, None);
+    let inline_box_ctx = Some(crate::paragraph::InlineBoxRenderCtx {
+        drawables,
+        geometry,
+        page_index,
+        margin_left_pt,
+        margin_top_pt,
+    });
+    crate::paragraph::draw_shaped_lines(canvas, &slice.lines, abs_x, abs_y, inline_box_ctx);
     finish_tagged(canvas, tag_info);
 }
 
