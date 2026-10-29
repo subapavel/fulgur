@@ -1724,8 +1724,8 @@ pub(crate) fn dispatch_fragment(
     // `line_split_insets` bigger. The paragraph slicing below still reads
     // `geom.fragments`, so only the frame sees the adjusted fragment.
     // html-to-pdf F198: a paragraph that is a box cut over columns has a fragment (a frame) in each of them, and the
-    // slices of all its columns on a page are painted once, from the first of its fragments there.
-    let first_piece_on_page = is_first_piece_on_page(geom, frag);
+    // slices of all its columns on a page are painted once, with the last of its fragments there (after every frame).
+    let last_piece_on_page = is_last_piece_on_page(geom, frag);
     let (frame_frag, edges) = frame_fragment(geom, frag);
     let frag = &frame_frag;
     // F30f-d: a box sliced at its breaks paints its open edges without border, padding or radius.
@@ -1831,7 +1831,7 @@ pub(crate) fn dispatch_fragment(
                 margin_left_pt,
                 margin_top_pt,
             );
-            if has_paragraph_slices && first_piece_on_page {
+            if has_paragraph_slices && last_piece_on_page {
                 paint_multicol_paragraph_slices(
                     canvas,
                     drawables,
@@ -1859,7 +1859,7 @@ pub(crate) fn dispatch_fragment(
         return;
     }
     if has_paragraph_slices {
-        if first_piece_on_page {
+        if last_piece_on_page {
             paint_multicol_paragraph_slices(
                 canvas,
                 drawables,
@@ -3613,9 +3613,11 @@ fn draw_svg_inner_paint(
     canvas.surface.pop();
 }
 
-/// html-to-pdf F198: whether `frag` is the first fragment of `geom` on its page. Always true for a box that was not cut
-/// into column pieces ([`PaginationGeometry::piece_edges`]): it has one fragment on a page.
-fn is_first_piece_on_page(
+/// html-to-pdf F198: whether `frag` is the last fragment of `geom` on its page. Always true for a box that was not cut
+/// into column pieces ([`PaginationGeometry::piece_edges`]): it has one fragment on a page. The slices of a paragraph
+/// that is a box cut over columns are painted once per page, after the frames of all its pieces on that page (the
+/// background of a later piece would cover the text of the columns before it).
+fn is_last_piece_on_page(
     geom: &crate::pagination_layout::PaginationGeometry,
     frag: &crate::pagination_layout::Fragment,
 ) -> bool {
@@ -3623,8 +3625,8 @@ fn is_first_piece_on_page(
         || geom
             .fragments
             .iter()
-            .find(|f| f.page_index == frag.page_index)
-            .is_none_or(|first| std::ptr::eq(first, frag) || first == frag)
+            .rfind(|f| f.page_index == frag.page_index)
+            .is_none_or(|last| std::ptr::eq(last, frag) || last == frag)
 }
 
 /// F30: the fragment whose height is the height of the box's frame on this
