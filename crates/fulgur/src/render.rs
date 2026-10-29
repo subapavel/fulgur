@@ -288,6 +288,7 @@ pub fn render_v2(
                     fonts: &mut krilla_fonts,
                     paint_extent: Default::default(),
                     clip_band: Default::default(),
+                    slice_window: None,
                 };
                 // Root `<html>` + `<body>` background pre-pass. Root
                 // `<html>` / `<body>` backgrounds repeat per page
@@ -440,6 +441,7 @@ pub fn render_v2(
                 fonts: &mut krilla_fonts,
                 paint_extent: Default::default(),
                 clip_band: Default::default(),
+                slice_window: None,
             };
             let page_content_width = content_area.width.to_f32();
             let any_margin_box_painted = margin_box_renderer.render_page(
@@ -800,6 +802,7 @@ fn paint_repeated_table_headers(
                 fonts: &mut *canvas.fonts,
                 paint_extent: Default::default(),
                 clip_band: Default::default(),
+                slice_window: None,
             };
             if tagging {
                 copy_canvas
@@ -1726,6 +1729,9 @@ pub(crate) fn dispatch_fragment(
     // html-to-pdf F198: a paragraph that is a box cut over columns has a fragment (a frame) in each of them, and the
     // slices of all its columns on a page are painted once, with the last of its fragments there (after every frame).
     let last_piece_on_page = is_last_piece_on_page(geom, frag);
+    // html-to-pdf F198b: inside the piece of a clip box (`draw_under_clip`) the slices are painted by the scope, once
+    // the frames of the piece are down, and only those that start in it.
+    let in_piece_scope = canvas.slice_window.is_some();
     let (frame_frag, edges) = frame_fragment(geom, frag);
     let frag = &frame_frag;
     // F30f-d: a box sliced at its breaks paints its open edges without border, padding or radius.
@@ -1831,7 +1837,7 @@ pub(crate) fn dispatch_fragment(
                 margin_left_pt,
                 margin_top_pt,
             );
-            if has_paragraph_slices && last_piece_on_page {
+            if has_paragraph_slices && last_piece_on_page && !in_piece_scope {
                 paint_multicol_paragraph_slices(
                     canvas,
                     drawables,
@@ -1859,7 +1865,7 @@ pub(crate) fn dispatch_fragment(
         return;
     }
     if has_paragraph_slices {
-        if last_piece_on_page {
+        if last_piece_on_page && !in_piece_scope {
             paint_multicol_paragraph_slices(
                 canvas,
                 drawables,
@@ -2072,6 +2078,9 @@ fn paint_multicol_paragraph_slices(
                 if slice_page == page_index {
                     let abs_x = container_x_pt + slice.origin_pt.0;
                     let abs_y = container_y_pt + slice.origin_pt.1;
+                    if !slice_in_window(canvas.slice_window, abs_x.to_f32(), abs_y.to_f32()) {
+                        continue;
+                    }
                     draw_slice_tagged(
                         canvas,
                         drawables,
@@ -2127,6 +2136,14 @@ fn paint_multicol_paragraph_slices(
     if use_run_tagging {
         canvas.link_run_node_id = None;
     }
+}
+
+/// html-to-pdf F198b: whether a slice that starts at `(x, y)` (page pt) belongs to the piece whose border box is `window`
+/// (`None`: no piece, every slice does). The pieces of a box on one page are in different columns, so they do not
+/// overlap; half a pt of slack where a line starts at the top edge.
+fn slice_in_window(window: Option<[f32; 4]>, x: f32, y: f32) -> bool {
+    const SLACK: f32 = 0.5;
+    window.is_none_or(|w| x >= w[0] - SLACK && x < w[2] && y >= w[1] - SLACK && y < w[3])
 }
 
 /// Paint one multicol paragraph slice. Unless per-run link tagging is on (it tags the runs itself), the slice is
@@ -2615,6 +2632,9 @@ fn draw_under_clip(
     // (PR #313 follow-up Devin Review — completes the PR #316 fix.)
     let is_split = geom.is_split();
     let (frame_frag, edges) = frame_fragment(geom, frag);
+    // html-to-pdf F198b: a clip box that a multicol container cut between its lines has a fragment per column piece;
+    // each is a clip scope of its own, and what is painted in it is what the plan put inside it.
+    let pieces = !geom.piece_edges.is_empty() && geom.piece_edges.len() == geom.fragments.len();
     // F30f-d: the edges of a box sliced at its breaks are open on this page: no border, padding or radius there, and
     // the clip is the padding box of this fragment.
     let sliced = crate::draw_primitives::sliced_style(&block.style, edges);
@@ -2622,7 +2642,7 @@ fn draw_under_clip(
     let total_height = block
         .layout_size
         .map(|s| {
-            if is_split && frame_frag.height > crate::units::Px::ZERO {
+            if (is_split || pieces) && frame_frag.height > crate::units::Px::ZERO {
                 frame_frag.height.in_pt().to_f32()
             } else {
                 s.height.to_f32()
@@ -2712,6 +2732,11 @@ fn draw_under_clip(
         // is written (ADR-0009 of html-to-pdf). The band is in page coordinates; it is intersected with the one of the
         // clip boxes around this one and restored below.
         let outer_clip_band = canvas.clip_band;
+        // F198b: the piece's border box, for the slices of the paragraphs in it.
+        let outer_slice_window = canvas.slice_window;
+        if pieces {
+            canvas.slice_window = Some([x_pt, y_pt, x_pt + total_width, y_pt + total_height]);
+        }
         // A box whose block size the author does not constrain hides nothing: it gets no band.
         if clip_pushed
             && style.overflow_y == crate::draw_primitives::Overflow::Clip
@@ -2732,7 +2757,10 @@ fn draw_under_clip(
         // not the border-box. Mirrors `draw_block_with_inner_content`.
         let inner_x = x_pt + inner_inset.0;
         let inner_y = y_pt + inner_inset.1;
-        if let Some(p) = para_for_block {
+        // F198b: a card that is itself the paragraph and was cut over columns paints its slices below, from the plan.
+        if let Some(p) = para_for_block
+            .filter(|_| !(pieces && drawables.paragraph_slices.contains_key(&node_id)))
+        {
             let run_tag_node_id = run_tag_target(drawables, node_id);
             let use_run_tagging = canvas.tag_collector.is_some()
                 && para_has_link_runs(p)
@@ -2865,6 +2893,10 @@ fn draw_under_clip(
                 }
                 let desc_x = margin_left_pt + desc_frag.x.in_pt().to_f32();
                 let desc_y = margin_top_pt + desc_frag.y.in_pt().to_f32();
+                // F198b: of the pieces of a box on this page, this one paints what starts inside it.
+                if pieces && !slice_in_window(canvas.slice_window, desc_x, desc_y) {
+                    continue;
+                }
                 if let Some(desc_tx) = drawables.transforms.get(&desc_id) {
                     draw_under_transform(
                         canvas,
@@ -2983,6 +3015,30 @@ fn draw_under_clip(
             drawables,
         );
 
+        // F198b: the text of the paragraphs the plan cut over columns, above the frames of this piece (a later frame must
+        // not cover it), the slices that start in the piece. Those in nested clip, transform and opacity scopes are
+        // painted by theirs.
+        if pieces {
+            for id in std::iter::once(node_id).chain(block.clip_descendants.iter().copied()) {
+                if transform_skip.contains(&id)
+                    || nested_clip_skip.contains(&id)
+                    || nested_opacity_skip.contains(&id)
+                    || !drawables.paragraph_slices.contains_key(&id)
+                {
+                    continue;
+                }
+                paint_multicol_paragraph_slices(
+                    canvas,
+                    drawables,
+                    geometry,
+                    id,
+                    margin_left_pt,
+                    margin_top_pt,
+                    page_index,
+                );
+            }
+        }
+        canvas.slice_window = outer_slice_window;
         canvas.clip_band = outer_clip_band;
         if clip_pushed {
             canvas.paint_extent.leave_local();
@@ -6974,6 +7030,7 @@ mod tests {
             fonts: &mut Default::default(),
             paint_extent: Default::default(),
             clip_band: Default::default(),
+            slice_window: None,
         };
         f(&mut canvas)
     }
@@ -9330,6 +9387,54 @@ mod tests {
             </body></html>"#,
         );
         assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    /// Text-show operators on every page of `pdf` (`Tj`, `TJ`, `'`, `"`).
+    fn text_show_operators(pdf: &[u8]) -> usize {
+        let doc = lopdf::Document::load_mem(pdf).expect("PDF must parse");
+        let mut n = 0;
+        for (_, page_id) in doc.get_pages() {
+            let bytes = doc.get_page_content(page_id).expect("page content");
+            let content = lopdf::content::Content::decode(&bytes).expect("content decodes");
+            n += content
+                .operations
+                .iter()
+                .filter(|op| matches!(op.operator.as_str(), "Tj" | "TJ" | "'" | "\""))
+                .count();
+        }
+        n
+    }
+
+    #[test]
+    fn draw_under_clip_paints_each_slice_of_a_cut_card_once() {
+        // html-to-pdf F198b: an auto-height clip card taller than a page, in two columns, is cut into pieces, each its own
+        // clip scope. A piece paints the slices that start in it, not the ones of the other column (which the loop over
+        // the card's descendants would reach with the same fragment): the text-show operators are those of the same
+        // card without the clip, where each slice is painted once.
+        let words = |from: usize, n: usize| -> String {
+            (from..from + n)
+                .map(|i| format!("w{i:04}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let doc = |clip: &str| {
+            format!(
+                "<!doctype html><html><body style=\"margin:0\"><div style=\"column-count:2;column-gap:20px\">\
+                 <div style=\"padding:8px;border:1px solid #888;{clip}\"><p>{}</p><p>{}</p><p>{}</p></div></div>\
+                 </body></html>",
+                words(0, 500),
+                words(500, 500),
+                words(1000, 500)
+            )
+        };
+        let plain = render_html(&doc(""));
+        let clipped = render_html(&doc("overflow:hidden;border-radius:6px"));
+        let (a, b) = (text_show_operators(&plain), text_show_operators(&clipped));
+        assert!(a > 100, "the card has lines: {a} text-show operators");
+        assert_eq!(
+            a, b,
+            "each slice is painted once under the clip as without it"
+        );
     }
 
     // --- paint_multicol_paragraph_slices: long paragraph spanning columns ---

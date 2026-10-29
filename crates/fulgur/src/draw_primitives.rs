@@ -735,6 +735,11 @@ pub struct Canvas<'a, 'b> {
     /// html-to-pdf F30f-b: the block-axis band that the clip boxes around what is being drawn leave visible, see
     /// [`ClipBand`].
     pub clip_band: ClipBand,
+    /// html-to-pdf F198b: while the piece of a clip box that a multicol container cut between its lines is drawn, the
+    /// piece's border box `(x_min, y_min, x_max, y_max)` in page pt. The paragraphs in it are painted from the slices the
+    /// plan placed in the columns ([`crate::drawables::ParagraphSlice`]): only the slices that start inside the window are
+    /// the piece's, the others are drawn by the piece they are in. `None` everywhere else.
+    pub slice_window: Option<[f32; 4]>,
 }
 
 /// F30f-b: the block-axis clip of the boxes around the content being drawn, in pt from the page's top edge: the
@@ -3579,6 +3584,7 @@ mod dp_unit_tests {
             fonts: &mut Default::default(),
             paint_extent: Default::default(),
             clip_band: Default::default(),
+            slice_window: None,
         };
         f(&mut canvas);
     }

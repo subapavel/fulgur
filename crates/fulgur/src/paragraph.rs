@@ -1308,6 +1308,7 @@ mod tests {
                 fonts: &mut Default::default(),
                 paint_extent: Default::default(),
                 clip_band: Default::default(),
+                slice_window: None,
             };
             // Draw origin (5, 7) pt; rect must land at (5+2, 7+3, 20, 10).
             draw_shaped_lines(&mut canvas, &[line], 5.0_f32.as_pt(), 7.0_f32.as_pt(), None);
@@ -1359,6 +1360,7 @@ mod tests {
                 fonts: &mut Default::default(),
                 paint_extent: Default::default(),
                 clip_band: band,
+                slice_window: None,
             };
             draw_shaped_lines(&mut canvas, &lines, 0.0_f32.as_pt(), 0.0_f32.as_pt(), None);
         }

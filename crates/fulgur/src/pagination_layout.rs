@@ -1238,14 +1238,61 @@ fn mc_line_advances(node: &blitz_dom::Node, fresh: f32) -> Option<(Vec<crate::un
     (!advances.is_empty()).then_some((advances, inline_boxes))
 }
 
+/// html-to-pdf F198b: whether the box `node` has a wrapper [`mc_box`] cannot cut through. The box itself keeps its own: a
+/// transform or an opacity below 1 (a group the pieces would not pass through), or a clip with a block size of its own
+/// (it hides what does not fit: a band of the page, ADR-0009; F198g). An auto-height clip box (`overflow-hidden rounded-lg
+/// border`, Tailwind's card idiom) hides nothing in the block axis and is fragmented like any block (css-break-3 §2: only a
+/// clip box with a block size of its own is monolithic): each piece clips to its own padding box
+/// (`draw_under_clip`). Above the box, the boxes down from the multicol container are boxes of the same plan, each
+/// checked when it is entered; the container and everything above it are wrappers that stay (any clip, transform or
+/// opacity), as [`table_subtree_is_wrapped`] has it.
+fn mc_box_wrapped(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
+    use ::style::values::computed::Overflow as Ov;
+    let clips = |s: &::style::properties::ComputedValues| {
+        s.clone_overflow_x() != Ov::Visible || s.clone_overflow_y() != Ov::Visible
+    };
+    let transformed_or_translucent = |s: &::style::properties::ComputedValues| {
+        !s.get_box().transform.0.is_empty() || s.clone_opacity() < 1.0
+    };
+    if let Some(s) = node.primary_styles()
+        && (transformed_or_translucent(&s) || (clips(&s) && block_size_constrained(node)))
+    {
+        return true;
+    }
+    // From the box up to the container the ancestors are boxes of this plan; from the container up, wrappers.
+    let mut above_container = false;
+    let mut cur = node.parent;
+    while let Some(id) = cur {
+        let Some(n) = doc.get_node(id) else {
+            break;
+        };
+        if let Some(elem) = n.element_data() {
+            let tag = elem.name.local.as_ref();
+            if tag == "body" || tag == "html" {
+                break;
+            }
+        }
+        above_container |= crate::blitz_adapter::is_multicol_container(n);
+        if above_container
+            && let Some(s) = n.primary_styles()
+            && (clips(&s) || transformed_or_translucent(&s))
+        {
+            return true;
+        }
+        cur = n.parent;
+    }
+    false
+}
+
 /// How deep [`mc_box`] follows boxes inside boxes.
 const MC_BOX_DEPTH: usize = 16;
 
 /// F198: whether the box `node` is one [`mc_box`] may cut: a block-level box of normal flow (a block container, not a
 /// table, flex, grid or multicol box, a float, an absolutely positioned box or a list item) that
 ///
-/// - is not clipped, transformed or translucent, nor is a box around it ([`table_subtree_is_wrapped`]: such a subtree is
-///   painted through a wrapper the pieces would not pass through),
+/// - is not transformed or translucent, has no clip with a block size of its own, and the container and what is above it
+///   are not wrappers either ([`mc_box_wrapped`]: such a subtree is painted through a wrapper the pieces would not pass
+///   through; an auto-height clip box is cut and clips each piece),
 /// - has no block size of its own ([`block_size_constrained`]: a box shorter than its content hides the rest),
 /// - is not `break-inside: avoid` while it fits a page (`fresh`), as everywhere else ([`avoid_inside_holds`]).
 fn mc_box_eligible(
@@ -1274,7 +1321,7 @@ fn mc_box_eligible(
         && !block_size_constrained(node)
         && !has_percentage_vertical_padding(node)
         && !avoid_inside_holds(has_avoid(column_styles, node.id), height, fresh)
-        && !table_subtree_is_wrapped(doc, node.id)
+        && !mc_box_wrapped(doc, node)
 }
 
 /// F198: the content of the box `node_id`, a child of a multi-column container (or of a box inside one) that is taller
@@ -1362,7 +1409,9 @@ fn mc_box_at(
         let cl = &child.final_layout;
         let (cy, ch, cx) = (cl.location.y, cl.size.height, cl.location.x - left);
         let lead = cy - prev_bottom;
-        if !(cy.is_finite() && ch.is_finite() && cx.is_finite()) || lead < -0.5 || cx < -0.5 {
+        // Blitz rounds every position and size to a whole px on its own, so a box can start 1 px above the bottom of the
+        // one before it (the gap is then 0); more than that is a real overlap (a negative margin) this path cannot cut.
+        if !(cy.is_finite() && ch.is_finite() && cx.is_finite()) || lead < -1.5 || cx < -0.5 {
             return None;
         }
         let (lead, x) = (lead.max(0.0), cx.max(0.0));
@@ -19211,9 +19260,11 @@ h2 { string-set: chapter-title content(text); }
 
     #[test]
     fn mc_box_refuses_what_it_cannot_cut() {
-        // A clip box, a box with a height, a `break-inside: avoid` box that fits a page, a box with a transform.
+        // A clip box with a block size of its own, a box with a height, a `break-inside: avoid` box that fits a page, a
+        // box with a transform. (An auto-height clip box is cut: F198b, below.)
         for style in [
-            "overflow:hidden",
+            "overflow:hidden;height:300px",
+            "overflow:hidden;max-height:300px",
             "height:300px",
             "max-height:300px",
             "break-inside:avoid",
@@ -19262,6 +19313,44 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(*lead, 0.0);
         // A table taller than a page cannot be cut by this path: the whole box is left as it was.
         assert!(mc_box(&doc, t, None, 30.0).is_none());
+    }
+
+    #[test]
+    fn mc_box_cuts_an_auto_height_clip_box_but_not_a_wrapper_above_the_container() {
+        // F198b: `overflow:hidden rounded-lg border` (Tailwind's card) is cut like any block, and so is a clip box
+        // between the container and the text; a clip, a transform or an opacity on the container or above it is a wrapper
+        // the pieces do not pass through.
+        for style in [
+            "overflow:hidden",
+            "overflow:clip;border-radius:8px",
+            "overflow:auto",
+        ] {
+            let (doc, t) = box_doc(&format!(
+                "<div class=\"t\" style=\"{style}\"><div style=\"overflow:hidden;padding:4px\"><p>{}</p></div></div>",
+                text(60)
+            ));
+            let b = mc_box(&doc, t, None, 100.0).unwrap_or_else(|| panic!("{style} is cut"));
+            assert!(
+                matches!(b.items.as_slice(), [McBoxItem::Box { .. }]),
+                "{style}"
+            );
+        }
+        for wrapper in ["overflow:hidden", "transform:scale(1)", "opacity:0.9"] {
+            let (doc, t) = box_doc(&format!(
+                "<div style=\"{wrapper}\"><div class=\"mc\" style=\"column-count:2\">\
+                 <div class=\"t\">{}</div></div></div>",
+                text(60)
+            ));
+            assert!(
+                mc_box(&doc, t, None, 100.0).is_none(),
+                "a box inside a container with {wrapper} above it stays whole"
+            );
+        }
+        let (doc, t) = box_doc(&format!(
+            "<div class=\"mc\" style=\"column-count:2\"><div class=\"t\">{}</div></div>",
+            text(60)
+        ));
+        assert!(mc_box(&doc, t, None, 100.0).is_some());
     }
 
     #[test]
