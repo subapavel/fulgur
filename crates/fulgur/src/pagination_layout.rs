@@ -3590,7 +3590,10 @@ impl<'a> PaginationLayoutTree<'a> {
                 // `border + padding` (or the extra of a `height` / `min-height`) too high, over the box's last line. The
                 // frame was right already (a box in one fragment is painted from its layout size). A plain paragraph,
                 // whose lines are its box up to the line-box rounding (F30f-j), keeps the cursor it had.
+                // A float is out of flow and takes no space below it (Chrome: `AFTER` at the top beside it): it keeps the
+                // cursor it had, a separate defect (floats are not placed by this path).
                 if frag_count == 1
+                    && !is_float
                     && new_page_index == fit_page
                     && (insets > 0.0 || child_h > (new_cursor_y - fit_top) + LINE_BOX_SLACK)
                 {
@@ -16443,6 +16446,24 @@ h2 { string-set: chapter-title content(text); }
             frames_of(&doc, &table, "a"),
             &[(0, 166.0, 20.0)],
             "after both",
+        );
+    }
+
+    #[test]
+    fn a_floating_padded_box_keeps_the_cursor_it_had() {
+        // html-to-pdf F30f-h guard: a float is out of flow; the fix for boxes in flow does not move what follows it (the
+        // placement of floats by this path is a separate defect, `AFTER` stays where it was: 100px, the lines' end).
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div id=\"b\" style=\"float:left;width:300px;border:1px solid #000;padding:9px\">{}</div><p id=\"a\">AFTER</p>",
+                br_lines(5)
+            ),
+            400.0,
+        );
+        assert_frames(
+            frames_of(&doc, &table, "a"),
+            &[(0, 100.0, 20.0)],
+            "after a float",
         );
     }
 
