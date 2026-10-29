@@ -19408,6 +19408,118 @@ h2 { string-set: chapter-title content(text); }
         }
     }
 
+    /// `n` words `word000 …`, for the F198 tests (the `text` helper of `mc_box` is defined further down).
+    fn text_words(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("word{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// html-to-pdf F198: a padded card taller than a page, holding text directly, is cut between its lines: one
+    /// fragment of the card per column piece, at the column's x, closed at the top where it starts and open at the
+    /// top of every continuation, open at the bottom wherever it goes on, closed at its end; every line once.
+    #[test]
+    fn multicol_card_taller_than_a_page_has_a_frame_piece_per_column() {
+        let html = format!(
+            "<!doctype html><html><head><style>body{{margin:0;font-size:16px;line-height:20px}}\
+             .mc{{column-count:2;column-gap:20px}}.card{{padding:10px;border:1px solid #888}}</style></head><body>\
+             <div class=\"mc\"><div class=\"card\">{}</div></div></body></html>",
+            text_words(500)
+        );
+        let (doc, mc, geom) = multicol_fragments(&html, 200.0);
+        let mc_id = node_by_class(&doc, "mc");
+        let card = node_by_class(&doc, "card");
+        let col_w = mc[&mc_id].groups[0].col_w.to_f32();
+        let g = &geom[&card];
+        assert!(g.fragments.len() >= 4, "{:?}", g.fragments);
+        assert_eq!(g.piece_edges.len(), g.fragments.len());
+        // Page 0: column 1 then column 2.
+        assert_eq!(g.fragments[0].page_index, 0);
+        assert_eq!(g.fragments[1].page_index, 0);
+        assert!(g.fragments[0].x.to_f32().abs() < 0.6);
+        assert!((g.fragments[1].x.to_f32() - (col_w + 20.0)).abs() < 0.6);
+        use crate::draw_primitives::FrameEdges;
+        assert_eq!(
+            g.piece_edges[0],
+            FrameEdges {
+                top_open: false,
+                bottom_open: true
+            }
+        );
+        assert_eq!(
+            g.piece_edges[1],
+            FrameEdges {
+                top_open: true,
+                bottom_open: true
+            }
+        );
+        let last = g.piece_edges.last().unwrap();
+        assert!(last.top_open && !last.bottom_open, "{last:?}");
+        // Top inset 11 px and nine 20 px lines in column 1 (180 + 11), ten lines in column 2.
+        assert!((g.fragments[0].height.to_f32() - 191.0).abs() < 1.0);
+        assert!((g.fragments[1].height.to_f32() - 200.0).abs() < 1.0);
+        // The card's lines are pieces of the container's plan, every line once, in order, `x` inside the frame.
+        let mut next = 0u32;
+        for (_, page) in &geom[&mc_id].multicol_pages {
+            for col in &page.columns {
+                for piece in col {
+                    if let McPiece::Lines {
+                        source,
+                        first,
+                        end,
+                        x,
+                        ..
+                    } = piece
+                    {
+                        assert_eq!(*source, card);
+                        assert_eq!(*first, next);
+                        assert_eq!(x.to_f32(), 11.0);
+                        next = *end;
+                    }
+                }
+            }
+        }
+        assert!(next > 100, "{next} lines");
+        // The container is cut over pages with a fragment on each.
+        assert!(geom[&mc_id].fragments.len() >= 3);
+    }
+
+    /// A card that fits a page is one box in one column, as before F198 (no frame pieces).
+    #[test]
+    fn multicol_card_that_fits_a_page_is_not_cut() {
+        let html = format!(
+            "<!doctype html><html><head><style>body{{margin:0;font-size:16px;line-height:20px}}\
+             .mc{{column-count:2;column-gap:20px}}.card{{padding:10px;border:1px solid #888}}\
+             .tall{{height:300px}}</style></head><body><div class=\"tall\"></div>\
+             <div class=\"mc\"><div class=\"card\">{}</div></div></body></html>",
+            text_words(30)
+        );
+        let (doc, _, geom) = multicol_fragments(&html, 400.0);
+        let card = node_by_class(&doc, "card");
+        let g = &geom[&card];
+        assert!(g.piece_edges.is_empty(), "{:?}", g.piece_edges);
+        assert_eq!(g.fragments.len(), 1);
+    }
+
+    /// A padded paragraph that is a direct child of the container is a box of its own too: its lines start inside the
+    /// frame (F198, shape F).
+    #[test]
+    fn multicol_padded_paragraph_taller_than_a_page_keeps_its_padding() {
+        let html = format!(
+            "<!doctype html><html><head><style>body{{margin:0;font-size:16px;line-height:20px}}\
+             .mc{{column-count:2;column-gap:20px}}p{{margin:0}}.t{{padding:10px;border:1px solid #888}}</style></head><body>\
+             <div class=\"mc\"><p class=\"t\">{}</p></div></body></html>",
+            text_words(500)
+        );
+        let (doc, _, geom) = multicol_fragments(&html, 200.0);
+        let p = node_by_class(&doc, "t");
+        let g = &geom[&p];
+        assert!(g.fragments.len() >= 4);
+        assert_eq!(g.piece_edges.len(), g.fragments.len());
+        assert!(!g.piece_edges[0].top_open && g.piece_edges[0].bottom_open);
+    }
+
     /// A paragraph in two columns over pages: every line is in exactly one piece, in order, one fragment of the
     /// paragraph per page.
     #[test]

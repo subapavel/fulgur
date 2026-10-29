@@ -8002,6 +8002,66 @@ fn render_v2_smoke_tagged_multicol_paragraphs_are_marked_content() {
     }
 }
 
+#[test]
+fn render_v2_smoke_multicol_card_taller_than_a_page_prints_every_word_once() {
+    // html-to-pdf F198: a bordered card taller than a page in a two-column container is cut between its lines, its frame
+    // sliced at the breaks. Every word is printed once; tagged, the paragraphs of the card are marked content.
+    let words: Vec<String> = (0..1800).map(|i| format!("w{i:04}")).collect();
+    let text = words.join(" ");
+    let card = "padding:16px;border:1px solid #888;border-radius:8px;background:#f5f5f5";
+    for (what, inner) in [
+        (
+            "card of text",
+            format!("<div style=\"{card}\">{text}</div>"),
+        ),
+        (
+            "card of paragraphs",
+            format!(
+                "<div style=\"{card}\"><p>{}</p><p>{}</p></div>",
+                &text[..text.len() / 2 / 6 * 6],
+                &text[text.len() / 2 / 6 * 6..]
+            ),
+        ),
+    ] {
+        let html = format!(
+            "<!doctype html><html><body style=\"margin:0\"><div style=\"column-count:2\">{inner}</div>\
+             <p>AFTER</p></body></html>"
+        );
+        for tagged in [false, true] {
+            let pdf = if tagged {
+                tagged_render_with_noto(&html)
+            } else {
+                noto_engine().render(&html).expect("render")
+            };
+            let printed = extract_pdf_text(&pdf).expect("pdftotext");
+            let got: Vec<&str> = printed
+                .split_whitespace()
+                .filter(|w| w.len() == 5 && w.starts_with('w'))
+                .collect();
+            let mut sorted = got.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                got.len(),
+                1800,
+                "{what} (tagged: {tagged}): every word printed"
+            );
+            assert_eq!(
+                sorted.len(),
+                1800,
+                "{what} (tagged: {tagged}): no word twice"
+            );
+            assert_eq!(printed.matches("AFTER").count(), 1, "{what}: AFTER once");
+            // The text of a `<div>` is not tagged anywhere, multicol or not (F200); paragraphs are.
+            if tagged && what == "card of paragraphs" {
+                let (outside, empty) = untagged_text_and_empty_p(&pdf);
+                assert_eq!(outside, 0, "{what}: text outside marked content");
+                assert_eq!(empty, 0, "{what}: /P elements without content");
+            }
+        }
+    }
+}
+
 /// F99b: the margin-box documents of one render share a style and font environment. A multi-page document whose
 /// footer text differs per page (`counter(page)`, `counter(pages)`) and a constant box builds one environment and
 /// many documents from it; every page gets its box.
