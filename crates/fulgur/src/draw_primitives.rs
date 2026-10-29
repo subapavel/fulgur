@@ -899,6 +899,11 @@ pub struct BlockStyle {
     pub block_size_constrained: bool,
     /// Box shadows in CSS declaration order (first = top-most in paint stack).
     pub box_shadows: Vec<BoxShadow>,
+    /// html-to-pdf F30f-d: the edges of the frame that are breaks of a sliced box ([`sliced_style`] sets them; a box
+    /// painted whole has none). Their border width, padding and radii are already zero; the border painter needs them
+    /// to tell a rounded box with a side cut off at a break (the border follows the curve of the corners that are
+    /// left) from one whose border simply has no such side, and a box shadow is not drawn beyond them.
+    pub open_edges: FrameEdges,
 }
 
 /// CSS border-style values supported by fulgur.
@@ -1156,7 +1161,7 @@ pub struct BackgroundLayer {
 /// html-to-pdf F30f-d: the edges of a box's frame that are open on one page because the box is sliced at its breaks
 /// (`box-decoration-break: slice`, css-break-3 §5.4): there is no border, padding or radius at a break edge.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct FrameEdges {
+pub struct FrameEdges {
     /// The top edge is a break (a continuation page of the box).
     pub top_open: bool,
     /// The bottom edge is a break (the box goes on on the next page).
@@ -1165,7 +1170,7 @@ pub(crate) struct FrameEdges {
 
 impl FrameEdges {
     /// Whether any edge is open.
-    pub(crate) fn any(self) -> bool {
+    pub fn any(self) -> bool {
         self.top_open || self.bottom_open
     }
 }
@@ -1183,6 +1188,7 @@ pub(crate) fn sliced_style(
         return std::borrow::Cow::Borrowed(style);
     }
     let mut s = style.clone();
+    s.open_edges = edges;
     let zero = crate::units::Pt::ZERO;
     if edges.top_open {
         s.border_widths[0] = zero;
@@ -1295,6 +1301,9 @@ impl BookmarkCollector {
 
 // ─── Drawing helper functions ────────────────────────────
 
+/// Bézier approximation constant for a quarter circle.
+const KAPPA: f32 = 0.552_284_8;
+
 /// Build a rounded rectangle path using cubic Bézier approximation.
 pub fn build_rounded_rect_path(
     x: f32,
@@ -1320,9 +1329,6 @@ pub(crate) fn append_rounded_rect_subpath(
     h: f32,
     radii: &[[f32; 2]; 4],
 ) {
-    // Bézier approximation constant for quarter circle
-    const KAPPA: f32 = 0.552_284_8;
-
     // CSS spec: if adjacent radii sum exceeds an edge, scale all radii proportionally.
     // Compute the minimum scale factor across all four edges.
     let scale = |a: f32, b: f32, edge: f32| -> f32 {
@@ -1773,6 +1779,16 @@ pub(crate) fn draw_block_border(
     let uniform_colour = style.uniform_border_color();
     let bc = &uniform_colour.unwrap_or(style.border_colors[0]);
 
+    // F30f-d: a rounded box cut at a break has a side with no border, so its widths are not uniform; the border
+    // follows the curves of the corners that are left instead of falling to the straight lines of the last branch.
+    if style.open_edges.any()
+        && style.has_radius()
+        && uniform_colour.is_some()
+        && draw_open_rounded_border(canvas, style, (x, y, w, h))
+    {
+        return;
+    }
+
     let uniform_width = bt == br && br == bb && bb == bl;
     let uniform_style = st == sr && sr == sb && sb == sl;
     if style.has_radius()
@@ -1832,7 +1848,10 @@ pub(crate) fn draw_block_border(
             }
         }
         canvas.surface.set_stroke(None);
-    } else if uniform_colour.is_none() && style.has_radius() && ring_sides_are_solid(style) {
+    } else if (uniform_colour.is_none() || style.open_edges.any())
+        && style.has_radius()
+        && ring_sides_are_solid(style)
+    {
         draw_border_ring(canvas, style, x, y, w, h);
     } else {
         canvas.surface.set_fill(None);
@@ -1888,6 +1907,153 @@ pub(crate) fn draw_block_border(
 
         canvas.surface.set_stroke(None);
     }
+}
+
+/// One segment of an open border path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BorderSeg {
+    Move(f32, f32),
+    Line(f32, f32),
+    Cubic([f32; 6]),
+}
+
+/// The centre line of the border of a rounded box with its top or bottom edge cut off at a break (`style.open_edges`,
+/// css-break-3 section 5.4), as one open path: the side that is left on the cut edge's side runs to the edge, goes round
+/// the two corners of the other edge that keep their radius, and up the other side. `None` when the border is not of
+/// that shape: not every drawn side has the same width and style, a left or right side is missing, both edges are cut
+/// (no corner is left), or a drawn side is not a stroke (`none`).
+///
+/// The result is `(segments, stroke width, border style)`; it is stroked with butt caps, so the border ends square on the
+/// cut edge.
+fn open_rounded_border_segments(
+    style: &BlockStyle,
+    (x, y, w, h): (f32, f32, f32, f32),
+) -> Option<(Vec<BorderSeg>, f32, BorderStyleValue)> {
+    let edges = style.open_edges;
+    if edges.top_open == edges.bottom_open {
+        return None;
+    }
+    let [bt, br, bb, bl] = style.border_widths.map(crate::units::Pt::to_f32);
+    let [st, sr, sb, sl] = style.border_styles;
+    let bw = bl;
+    // The edge that is not cut has the same border as the sides; the cut one has none (its width is zero).
+    let closed = if edges.top_open { (bb, sb) } else { (bt, st) };
+    if bw <= 0.0
+        || br != bw
+        || sl != sr
+        || closed.0 != bw
+        || closed.1 != sl
+        || sl == BorderStyleValue::None
+    {
+        return None;
+    }
+    let inset = bw / 2.0;
+    let radii = fit_border_radii(
+        &style.border_radii.map(|p| p.map(crate::units::Pt::to_f32)),
+        w,
+        h,
+    )
+    .map(|[rx, ry]| [(rx - inset).max(0.0), (ry - inset).max(0.0)]);
+    let (left, right) = (x + inset, x + w - inset);
+    let mut segs = Vec::with_capacity(6);
+    let k = 1.0 - KAPPA;
+    if edges.top_open {
+        // Down the left side, along the bottom, up the right side. Corners: [2] bottom-right, [3] bottom-left.
+        let bottom = y + h - inset;
+        let [bl_rx, bl_ry] = radii[3];
+        let [br_rx, br_ry] = radii[2];
+        segs.push(BorderSeg::Move(left, y));
+        segs.push(BorderSeg::Line(left, bottom - bl_ry));
+        if bl_rx > 0.0 || bl_ry > 0.0 {
+            segs.push(BorderSeg::Cubic([
+                left,
+                bottom - bl_ry * k,
+                left + bl_rx * k,
+                bottom,
+                left + bl_rx,
+                bottom,
+            ]));
+        }
+        segs.push(BorderSeg::Line(right - br_rx, bottom));
+        if br_rx > 0.0 || br_ry > 0.0 {
+            segs.push(BorderSeg::Cubic([
+                right - br_rx * k,
+                bottom,
+                right,
+                bottom - br_ry * k,
+                right,
+                bottom - br_ry,
+            ]));
+        }
+        segs.push(BorderSeg::Line(right, y));
+    } else {
+        // Up the left side from the cut, along the top, down the right side. Corners: [0] top-left, [1] top-right.
+        let top = y + inset;
+        let [tl_rx, tl_ry] = radii[0];
+        let [tr_rx, tr_ry] = radii[1];
+        segs.push(BorderSeg::Move(left, y + h));
+        segs.push(BorderSeg::Line(left, top + tl_ry));
+        if tl_rx > 0.0 || tl_ry > 0.0 {
+            segs.push(BorderSeg::Cubic([
+                left,
+                top + tl_ry * k,
+                left + tl_rx * k,
+                top,
+                left + tl_rx,
+                top,
+            ]));
+        }
+        segs.push(BorderSeg::Line(right - tr_rx, top));
+        if tr_rx > 0.0 || tr_ry > 0.0 {
+            segs.push(BorderSeg::Cubic([
+                right - tr_rx * k,
+                top,
+                right,
+                top + tr_ry * k,
+                right,
+                top + tr_ry,
+            ]));
+        }
+        segs.push(BorderSeg::Line(right, y + h));
+    }
+    Some((segs, bw, sl))
+}
+
+/// Strokes [`open_rounded_border_segments`] in the border colour. Returns `false` (nothing drawn) when the border is
+/// not of the shape that path covers, so the caller takes its other branches.
+fn draw_open_rounded_border(
+    canvas: &mut Canvas<'_, '_>,
+    style: &BlockStyle,
+    rect: (f32, f32, f32, f32),
+) -> bool {
+    let Some((segs, bw, border_style)) = open_rounded_border_segments(style, rect) else {
+        return false;
+    };
+    let mut pb = krilla::geom::PathBuilder::new();
+    for seg in segs {
+        match seg {
+            BorderSeg::Move(x, y) => pb.move_to(x, y),
+            BorderSeg::Line(x, y) => pb.line_to(x, y),
+            BorderSeg::Cubic([x1, y1, x2, y2, x, y]) => pb.cubic_to(x1, y1, x2, y2, x, y),
+        }
+    }
+    let Some(path) = pb.finish() else {
+        return true;
+    };
+    let bc = &style.border_colors[0];
+    let base = krilla::paint::Stroke {
+        paint: krilla::color::rgb::Color::new(bc[0], bc[1], bc[2]).into(),
+        width: bw,
+        opacity: alpha_to_opacity(bc[3]),
+        ..Default::default()
+    };
+    if let Some(styled) = apply_border_style(base, border_style, bw) {
+        canvas.surface.set_fill(None);
+        canvas.surface.set_stroke(Some(styled));
+        canvas.surface.draw_path(&path);
+        canvas.surface.set_stroke(None);
+    }
+    true
 }
 
 /// Whether side `side` and its neighbour `other` meet in a coloured mitre: both are drawn (non-zero width), both are
@@ -2093,6 +2259,144 @@ mod dp_unit_tests {
         let (_, x2, y2) = reg.get("anchor2").expect("recorded");
         assert!((x2.to_f32() - 1.0).abs() < 1e-4);
         assert!((y2.to_f32() - 2.0).abs() < 1e-4);
+    }
+
+    // ── F30f-d: the border of a rounded box cut at a break ─────────────
+
+    fn sliced_card(edges: FrameEdges) -> BlockStyle {
+        let style = BlockStyle {
+            border_colors: [[136, 136, 136, 255]; 4],
+            border_widths: [2.0_f32.as_pt(); 4],
+            border_styles: [BorderStyleValue::Solid; 4],
+            border_radii: [[8.0_f32.as_pt(); 2]; 4],
+            ..Default::default()
+        };
+        sliced_style(&style, edges).into_owned()
+    }
+
+    fn cubics(segs: &[BorderSeg]) -> usize {
+        segs.iter()
+            .filter(|s| matches!(s, BorderSeg::Cubic(_)))
+            .count()
+    }
+
+    #[test]
+    fn open_border_of_a_first_fragment_curves_at_the_top_corners_and_ends_square_at_the_cut() {
+        let style = sliced_card(FrameEdges {
+            top_open: false,
+            bottom_open: true,
+        });
+        let (segs, width, _) = open_rounded_border_segments(&style, (10.0, 20.0, 100.0, 200.0))
+            .expect("a rounded open border");
+        assert_eq!(cubics(&segs), 2);
+        assert_eq!(width, 2.0);
+        // Both ends are on the cut edge (y + h), on the centre lines of the side borders (x + 1, x + w - 1).
+        assert_eq!(segs.first(), Some(&BorderSeg::Move(11.0, 220.0)));
+        assert_eq!(segs.last(), Some(&BorderSeg::Line(109.0, 220.0)));
+        // The top edge is the centre line of the top border, 1 below the border box (y + 1) ...
+        assert!(
+            segs.iter()
+                .any(|s| matches!(s, BorderSeg::Line(_, y) if *y == 21.0))
+        );
+        // ... and nothing is drawn below the cut or along it.
+        assert!(
+            segs.iter()
+                .all(|s| !matches!(s, BorderSeg::Line(_, y) if *y > 220.0))
+        );
+    }
+
+    #[test]
+    fn open_border_of_a_last_fragment_curves_at_the_bottom_corners_only() {
+        let style = sliced_card(FrameEdges {
+            top_open: true,
+            bottom_open: false,
+        });
+        let (segs, _, _) = open_rounded_border_segments(&style, (10.0, 20.0, 100.0, 200.0))
+            .expect("a rounded open border");
+        assert_eq!(cubics(&segs), 2);
+        assert_eq!(segs.first(), Some(&BorderSeg::Move(11.0, 20.0)));
+        assert_eq!(segs.last(), Some(&BorderSeg::Line(109.0, 20.0)));
+        // The bottom edge is 1 above the bottom of the border box.
+        assert!(
+            segs.iter()
+                .any(|s| matches!(s, BorderSeg::Line(_, y) if *y == 219.0))
+        );
+    }
+
+    #[test]
+    fn open_border_needs_exactly_one_cut_edge_and_a_uniform_stroke() {
+        let rect = (0.0, 0.0, 100.0, 100.0);
+        // A box cut at both edges has no corner left; its sides are straight lines.
+        let both = sliced_card(FrameEdges {
+            top_open: true,
+            bottom_open: true,
+        });
+        assert!(open_rounded_border_segments(&both, rect).is_none());
+        // A box with no cut edge takes the uniform branch.
+        let none = sliced_card(FrameEdges::default());
+        assert!(open_rounded_border_segments(&none, rect).is_none());
+        // Sides of different widths, or a missing side, are the ring painter's.
+        let mut uneven = sliced_card(FrameEdges {
+            top_open: false,
+            bottom_open: true,
+        });
+        uneven.border_widths[3] = 4.0_f32.as_pt();
+        assert!(open_rounded_border_segments(&uneven, rect).is_none());
+        let mut no_top = sliced_card(FrameEdges {
+            top_open: false,
+            bottom_open: true,
+        });
+        no_top.border_widths[0] = 0.0_f32.as_pt();
+        assert!(open_rounded_border_segments(&no_top, rect).is_none());
+    }
+
+    #[test]
+    fn draw_block_border_of_a_sliced_rounded_box_smoke() {
+        // Uniform colour: the open path; mixed colours and a non-uniform width: the ring painter; dashed: the open path.
+        for (edges, colours) in [
+            (
+                FrameEdges {
+                    top_open: false,
+                    bottom_open: true,
+                },
+                [[0, 0, 0, 255]; 4],
+            ),
+            (
+                FrameEdges {
+                    top_open: true,
+                    bottom_open: false,
+                },
+                [[0, 0, 0, 255]; 4],
+            ),
+            (
+                FrameEdges {
+                    top_open: true,
+                    bottom_open: false,
+                },
+                [
+                    [1, 0, 0, 255],
+                    [0, 1, 0, 255],
+                    [0, 0, 1, 255],
+                    [1, 1, 0, 255],
+                ],
+            ),
+        ] {
+            let mut style = sliced_card(edges);
+            style.border_colors = colours;
+            with_canvas_smoke(|canvas| draw_block_border(canvas, &style, 5.0, 5.0, 80.0, 80.0));
+        }
+        let mut uneven = sliced_card(FrameEdges {
+            top_open: false,
+            bottom_open: true,
+        });
+        uneven.border_widths[3] = 4.0_f32.as_pt();
+        with_canvas_smoke(|canvas| draw_block_border(canvas, &uneven, 5.0, 5.0, 80.0, 80.0));
+        let mut dashed = sliced_card(FrameEdges {
+            top_open: false,
+            bottom_open: true,
+        });
+        dashed.border_styles = [BorderStyleValue::Dashed; 4];
+        with_canvas_smoke(|canvas| draw_block_border(canvas, &dashed, 5.0, 5.0, 80.0, 80.0));
     }
 
     // ── LinkCollector ──────────────────────────────────────

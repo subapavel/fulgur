@@ -6602,6 +6602,15 @@ mod tests {
         );
         assert_eq!(open.border_widths[0], Pt::ZERO);
         assert_eq!(open.padding[0], Pt::ZERO);
+        // The painters of the border and the shadow read which edges are cut.
+        assert_eq!(
+            open.open_edges,
+            FrameEdges {
+                top_open: true,
+                bottom_open: false
+            }
+        );
+        assert_eq!(closed.open_edges, FrameEdges::default());
         assert_eq!(open.content_inset(), (13.0, 0.0));
         assert_eq!(open.border_radii[0], [Pt::ZERO; 2]);
         assert_eq!(open.border_radii[1], [Pt::ZERO; 2]);

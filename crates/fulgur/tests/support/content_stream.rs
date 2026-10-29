@@ -11,6 +11,7 @@ use std::process::Command;
 pub struct OpCounts {
     pub m: usize,
     pub l: usize,
+    pub c: usize,
     pub re: usize,
     pub s_stroke: usize,
     pub q: usize,
@@ -65,6 +66,8 @@ pub fn count_ops(pdf_bytes: &[u8]) -> Option<OpCounts> {
             c.m += 1;
         } else if line.ends_with(b" l") || line == b"l" {
             c.l += 1;
+        } else if line.ends_with(b" c") {
+            c.c += 1;
         } else if line.ends_with(b" re") {
             c.re += 1;
         } else if line == b"S" || line.ends_with(b" S") {

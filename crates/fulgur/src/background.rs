@@ -30,8 +30,73 @@ pub fn draw_box_shadows(
         if shadow.inset {
             continue; // defensive; inset shadows are excluded upstream in convert.rs
         }
-        draw_single_box_shadow(canvas, style, shadow, x, y, w, h);
+        if style.open_edges.any() {
+            draw_sliced_box_shadow(canvas, style, shadow, (x, y, w, h));
+        } else {
+            draw_single_box_shadow(canvas, style, shadow, x, y, w, h);
+        }
     }
+}
+
+/// A rectangle as `(x, y, width, height)`.
+type XywhRect = (f32, f32, f32, f32);
+
+/// How far a shadow reaches from the box it belongs to: the largest offset, spread and blur on any side, plus one for
+/// the anti-aliased rim.
+fn shadow_reach(shadow: &crate::draw_primitives::BoxShadow) -> f32 {
+    shadow
+        .offset_x
+        .to_f32()
+        .abs()
+        .max(shadow.offset_y.to_f32().abs())
+        + shadow.spread.to_f32().abs()
+        + shadow.blur.to_f32()
+        + 1.0
+}
+
+/// The rectangle a shadow of a box cut at a break is drawn for, and the one it is clipped to (both `(x, y, w, h)`).
+///
+/// A box whose top or bottom edge is a break (`style.open_edges`, css-break-3 section 5.4) is "rendered with no breaks
+/// present, and then sliced": its shadow runs on past the cut edge and is cut there, it is neither drawn around the
+/// fragment as if that were the whole box (a shadow beyond the cut edge) nor faded out at the cut. The shadow is
+/// therefore drawn for the frame extended by the shadow's reach over each cut edge and clipped to the frame on that side;
+/// the sides that are not cut keep the whole reach.
+fn sliced_shadow_rects(
+    edges: crate::draw_primitives::FrameEdges,
+    shadow: &crate::draw_primitives::BoxShadow,
+    (x, y, w, h): (f32, f32, f32, f32),
+) -> (XywhRect, XywhRect) {
+    let reach = shadow_reach(shadow);
+    let ext_top = if edges.top_open { reach } else { 0.0 };
+    let ext_bottom = if edges.bottom_open { reach } else { 0.0 };
+    let drawn = (x, y - ext_top, w, h + ext_top + ext_bottom);
+    // The clip is the frame on a cut side and the reach of the shadow on the others.
+    let clip_top = if edges.top_open { y } else { y - reach };
+    let clip_bottom = if edges.bottom_open {
+        y + h
+    } else {
+        y + h + reach
+    };
+    let clip = (x - reach, clip_top, w + 2.0 * reach, clip_bottom - clip_top);
+    (drawn, clip)
+}
+
+/// [`draw_single_box_shadow`] for a box with a cut edge: see [`sliced_shadow_rects`].
+fn draw_sliced_box_shadow(
+    canvas: &mut Canvas<'_, '_>,
+    style: &BlockStyle,
+    shadow: &crate::draw_primitives::BoxShadow,
+    frame: (f32, f32, f32, f32),
+) {
+    let (drawn, clip) = sliced_shadow_rects(style.open_edges, shadow, frame);
+    let Some(clip_path) = build_rect_path(clip.0, clip.1, clip.2, clip.3) else {
+        return;
+    };
+    canvas
+        .surface
+        .push_clip_path(&clip_path, &krilla::paint::FillRule::default());
+    draw_single_box_shadow(canvas, style, shadow, drawn.0, drawn.1, drawn.2, drawn.3);
+    canvas.surface.pop();
 }
 
 /// Build an EvenOdd clip path: `outer` rect minus the element's border-box interior.
@@ -2689,6 +2754,89 @@ mod tests {
     use crate::image::ImageFormat;
     use crate::units::{F32Units, Pt};
     use std::sync::Arc;
+
+    // ── F30f-d: a box shadow is not painted beyond a cut edge ──────────
+
+    fn shadow(offset_y: f32, blur: f32, spread: f32) -> crate::draw_primitives::BoxShadow {
+        crate::draw_primitives::BoxShadow {
+            offset_x: 0.0.as_pt(),
+            offset_y: offset_y.as_pt(),
+            blur: blur.as_pt(),
+            spread: spread.as_pt(),
+            color: [0, 0, 0, 128],
+            inset: false,
+        }
+    }
+
+    #[test]
+    fn sliced_shadow_is_clipped_at_the_cut_edge_and_free_on_the_others() {
+        use crate::draw_primitives::FrameEdges;
+        let sh = shadow(4.0, 12.0, 0.0);
+        let reach = 4.0 + 12.0 + 1.0;
+        let frame = (50.0, 100.0, 200.0, 300.0);
+        // Bottom cut (first fragment): drawn for a frame that goes on below, clipped at the frame bottom.
+        let (drawn, clip) = sliced_shadow_rects(
+            FrameEdges {
+                top_open: false,
+                bottom_open: true,
+            },
+            &sh,
+            frame,
+        );
+        assert_eq!(drawn, (50.0, 100.0, 200.0, 300.0 + reach));
+        assert_eq!(clip.1, 100.0 - reach, "the top keeps the whole reach");
+        assert_eq!(clip.1 + clip.3, 400.0, "nothing below the frame bottom");
+        // Top cut (last fragment): the mirror image.
+        let (drawn, clip) = sliced_shadow_rects(
+            FrameEdges {
+                top_open: true,
+                bottom_open: false,
+            },
+            &sh,
+            frame,
+        );
+        assert_eq!(drawn, (50.0, 100.0 - reach, 200.0, 300.0 + reach));
+        assert_eq!(clip.1, 100.0, "nothing above the frame top");
+        assert_eq!(clip.1 + clip.3, 400.0 + reach);
+        // Both cut (a page between): the clip is the frame, the box is extended on both sides.
+        let (drawn, clip) = sliced_shadow_rects(
+            FrameEdges {
+                top_open: true,
+                bottom_open: true,
+            },
+            &sh,
+            frame,
+        );
+        assert_eq!(drawn.3, 300.0 + 2.0 * reach);
+        assert_eq!((clip.1, clip.1 + clip.3), (100.0, 400.0));
+        // The sides stay open for the shadow in every case.
+        assert_eq!((clip.0, clip.0 + clip.2), (50.0 - reach, 250.0 + reach));
+    }
+
+    #[test]
+    fn sliced_shadow_reach_covers_offset_spread_and_blur() {
+        let sh = shadow(-6.0, 10.0, 3.0);
+        assert_eq!(shadow_reach(&sh), 6.0 + 3.0 + 10.0 + 1.0);
+    }
+
+    #[test]
+    fn sliced_box_shadow_smoke() {
+        use crate::draw_primitives::FrameEdges;
+        for blur in [0.0, 8.0] {
+            let style = BlockStyle {
+                box_shadows: vec![shadow(4.0, blur, 0.0)],
+                border_radii: [[8.0_f32.as_pt(); 2]; 4],
+                open_edges: FrameEdges {
+                    top_open: false,
+                    bottom_open: true,
+                },
+                ..Default::default()
+            };
+            with_scratch_canvas(|canvas| {
+                draw_box_shadows(canvas, &style, 20.0, 20.0, 100.0, 100.0)
+            });
+        }
+    }
 
     fn make_layer(iw: Pt, ih: Pt, size: BgSize) -> BackgroundLayer {
         BackgroundLayer {
