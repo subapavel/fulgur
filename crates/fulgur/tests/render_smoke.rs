@@ -9816,3 +9816,51 @@ fn render_smoke_forced_break_on_an_inline_level_box_is_ignored() {
         .expect("render");
     assert_eq!(page_count(&pdf), 2);
 }
+
+#[test]
+fn render_smoke_block_one_line_taller_than_its_page_leaves_two_lines_for_the_next() {
+    // html-to-pdf F30f-l, css-break-3 §4.4: 54 lines of 21px at `@page { margin: 0 }` (a page holds 53, 1113 of 1122.5 px)
+    // used to stay on one page with the last line at the page edge, cut off; the break is pulled back so that two lines
+    // are carried over (52 / 2): two pages, every line written. The same with an inline image on the last line of page 1
+    // (it follows its line) and with margins.
+    let lines: String = (0..54).map(|i| format!("line{i:02}<br>")).collect();
+    let html = format!(
+        "<!DOCTYPE html><html><head><style>@page {{ margin: 0 }} body {{ margin: 0; font-size: 14px; line-height: 21px }}</style></head>\
+         <body><div>{lines}</div></body></html>"
+    );
+    let pdf = noto_engine().render(&html).expect("render");
+    assert_eq!(page_count(&pdf), 2);
+    assert!(text_items_of(&pdf, "w.pdf") >= 54);
+
+    let png: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    let mut with_image = String::new();
+    for i in 0..54 {
+        if i == 51 {
+            with_image.push_str("<img src=\"dot.png\" width=\"10\" height=\"10\">");
+        }
+        with_image.push_str(&format!("line{i:02}<br>"));
+    }
+    let html = format!(
+        "<!DOCTYPE html><html><head><style>@page {{ margin: 0 }} body {{ margin: 0; font-size: 14px; line-height: 21px }}</style></head>\
+         <body><div>{with_image}</div></body></html>"
+    );
+    let mut bundle = AssetBundle::default();
+    bundle.add_image("dot.png", png);
+    let font_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/.fonts/NotoSans-Regular.ttf");
+    bundle.add_font_file(&font_path).expect("font");
+    bundle.add_css("body { font-family: 'Noto Sans', sans-serif; }");
+    let pdf = Engine::builder()
+        .assets(bundle)
+        .build()
+        .render(&html)
+        .expect("render");
+    assert_eq!(page_count(&pdf), 2);
+    assert!(text_items_of(&pdf, "i.pdf") >= 54);
+}

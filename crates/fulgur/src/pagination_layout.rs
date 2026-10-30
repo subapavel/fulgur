@@ -8072,6 +8072,16 @@ fn warn_unprinted_inline_lines(
     }
 }
 
+/// The break that leaves the next fragment `WIDOWS` lines when the natural break before line `i` would leave fewer:
+/// `Some(j)` with `start + ORPHANS <= j < i`, or `None` when no such break exists (the first fragment would be left with
+/// fewer than `ORPHANS` lines). `start` is the first line of the current fragment and `total` the number of lines of the
+/// paragraph (html-to-pdf F30f-l; CSS Fragmentation §4.4: a break needs at least `orphans` lines before it and `widows`
+/// after it).
+fn widow_safe_break(start: usize, i: usize, total: usize) -> Option<usize> {
+    let j = total.checked_sub(WIDOWS)?;
+    (j >= start + ORPHANS && j < i).then_some(j)
+}
+
 /// fulgur-p55h: split a multi-line inline root across page boundaries
 /// at line edges, append one Fragment per page span to the geometry
 /// table, and return the updated `(page_index, cursor_y, fragments_emitted)`.
@@ -8081,15 +8091,22 @@ fn warn_unprinted_inline_lines(
 /// paragraph-local coords would push the bottom past
 /// `strips.bottom(page) - paragraph_top_in_body`.
 ///
-/// fulgur-s67g Phase 2.1 (widow / orphan): each candidate split point
-/// must leave the **first** fragment with `>= ORPHANS_MIN` lines and
-/// the **remainder** of the paragraph with `>= WIDOWS_MIN` lines
-/// (CSS Fragmentation §4.4). When neither holds at the natural
-/// overflow point, the split is skipped — subsequent lines accumulate
-/// into the current fragment (overflow-tolerant) until a valid split
-/// is found or the paragraph ends, in which case the paragraph emits
-/// whole (oversized or pushed to a fresh page by sibling-driven
-/// flow).
+/// fulgur-s67g Phase 2.1 (widow / orphan): each split point must leave
+/// the **first** fragment with `>= ORPHANS_MIN` lines and the
+/// **remainder** of the paragraph with `>= WIDOWS_MIN` lines
+/// (CSS Fragmentation §4.4). When the natural break before the first
+/// line that does not fit would leave fewer than `WIDOWS_MIN` lines, the
+/// break is pulled back to `total - WIDOWS_MIN` (html-to-pdf F30f-l; see
+/// `widow_safe_break`): the lines after it move to the next page and the
+/// lines between the pulled break and the natural one are examined again
+/// against that page. Only when no break honours both minimums (the
+/// pulled break would leave fewer than `ORPHANS_MIN` lines before it) is
+/// the split skipped — subsequent lines accumulate into the current
+/// fragment (overflow-tolerant) until a valid split is found or the
+/// paragraph ends, in which case the paragraph emits whole (oversized or
+/// pushed to a fresh page by sibling-driven flow). The rules are relaxed
+/// only then (§4.4: "if the above doesn't provide enough break points to
+/// keep fragmented content from overflowing the fragmentainer").
 ///
 /// CSS `orphans` / `widows` properties are not parsed today, so the
 /// fragmenter uses the CSS 3 Fragmentation defaults (`2` for both).
@@ -8124,10 +8141,9 @@ pub(crate) fn fragment_inline_root(
     strips: PageStrips,
     line_metrics: &[(f32, f32)],
 ) -> (u32, f32, usize, Vec<(u32, f32, f32)>) {
-    /// CSS 3 Fragmentation default for `orphans`.
-    const ORPHANS_MIN: usize = 2;
-    /// CSS 3 Fragmentation default for `widows`.
-    const WIDOWS_MIN: usize = 2;
+    // CSS 3 Fragmentation defaults for `orphans` and `widows` (`ORPHANS`, `WIDOWS`).
+    const ORPHANS_MIN: usize = ORPHANS;
+    const WIDOWS_MIN: usize = WIDOWS;
 
     if line_metrics.is_empty() {
         return (initial_page_index, initial_cursor_y, 0, Vec::new());
@@ -8141,7 +8157,11 @@ pub(crate) fn fragment_inline_root(
     // `(page, y - top, top)` per fragment, as `record_split_inline_root_descendants` takes them.
     let mut placements: Vec<(u32, f32, f32)> = Vec::new();
 
-    for (i, &(_line_top_local, line_bottom_local)) in line_metrics.iter().enumerate() {
+    // `i` is the line being examined; a pulled-back break moves it back to the line that starts the next
+    // fragment, so that the lines after it are checked against the new page.
+    let mut i = 0usize;
+    while i < total_lines {
+        let line_bottom_local = line_metrics[i].1;
         let frag_top_local = line_metrics[fragment_start_idx].0;
         let projected_bottom_in_body = paragraph_top_in_body + (line_bottom_local - frag_top_local);
 
@@ -8149,22 +8169,26 @@ pub(crate) fn fragment_inline_root(
             // fulgur-s67g Phase 2.1: honour widow / orphan minimums.
             let first_size = i - fragment_start_idx;
             let remaining_size = total_lines - i;
-            if first_size < ORPHANS_MIN || remaining_size < WIDOWS_MIN {
-                // Cannot split here without violating widow/orphan.
-                // Skip — keep accumulating into the current fragment.
-                // If no future split point honours both constraints,
-                // the loop falls through to "emit final fragment"
-                // below and the paragraph emits as a single oversized
-                // fragment (CSS Fragmentation §4.4: widows/orphans
-                // constraints are treated as preferences that can be
-                // relaxed to avoid unfulfillable breaks).
+            let break_at = if first_size < ORPHANS_MIN {
+                None
+            } else if remaining_size < WIDOWS_MIN {
+                // html-to-pdf F30f-l: the natural break would leave a widow; pull it back.
+                widow_safe_break(fragment_start_idx, i, total_lines)
+            } else {
+                Some(i)
+            };
+            let Some(break_at) = break_at else {
+                // No break honours both minimums here: skip, keep accumulating into the current
+                // fragment (CSS Fragmentation §4.4: the minimums are relaxed only when no break
+                // keeps the content inside the fragmentainer).
+                i += 1;
                 continue;
-            }
+            };
 
-            // Lines [fragment_start_idx, i) fit on the current page.
+            // Lines [fragment_start_idx, break_at) fit on the current page.
             // Emit them as one fragment, advance to the next page, and
-            // start the next fragment at line i.
-            let prev_line_bottom = line_metrics[i - 1].1;
+            // start the next fragment at line `break_at`.
+            let prev_line_bottom = line_metrics[break_at - 1].1;
             let frag_h = prev_line_bottom - frag_top_local;
             let frag = Fragment {
                 page_index,
@@ -8177,7 +8201,7 @@ pub(crate) fn fragment_inline_root(
             entry.fragments.push(frag);
             entry.line_slices.push(LineSlice {
                 first: fragment_start_idx as u32,
-                end: i as u32,
+                end: break_at as u32,
                 offset: (frag_top_local - line_metrics[0].0).as_px(),
             });
             placements.push((
@@ -8189,8 +8213,12 @@ pub(crate) fn fragment_inline_root(
 
             page_index += 1;
             paragraph_top_in_body = 0.0;
-            fragment_start_idx = i;
+            fragment_start_idx = break_at;
+            // `break_at == i` continues with the next line; a pulled-back break re-examines the lines
+            // after it against the new page.
+            i = break_at;
         }
+        i += 1;
     }
 
     // Final fragment covers lines [fragment_start_idx, end).
@@ -12646,7 +12674,11 @@ h2 { string-set: chapter-title content(text); }
     /// fulgur-s67g Phase 2.1: a 3-line paragraph that overflows the
     /// page strip after line 2 cannot split between line 2 and the
     /// final line — the second fragment would have only 1 line, below
-    /// the widows = 2 minimum. Spike emits the paragraph whole.
+    /// the widows = 2 minimum, and the break pulled back to leave the
+    /// widows (before line 1) would leave 1 line before it, below the
+    /// orphans = 2 minimum (html-to-pdf F30f-l). No break honours both
+    /// minimums, so they are relaxed (css-break-3 §4.4) and the
+    /// paragraph emits whole.
     #[test]
     fn widow_minimum_blocks_single_line_tail_fragment() {
         let mut geom = PaginationGeometryTable::new();
@@ -12673,6 +12705,164 @@ h2 { string-set: chapter-title content(text); }
         let frags = &geom.get(&1).unwrap().fragments;
         assert_eq!(frags.len(), 1);
         assert_eq!(frags[0].page_index, 0);
+    }
+
+    /// `n` line boxes of 21 px, as `collect_inline_line_metrics` reports a `14px/21px` paragraph.
+    fn lines_of_21px(n: usize) -> Vec<(f32, f32)> {
+        (0..n)
+            .map(|i| (i as f32 * 21.0, (i + 1) as f32 * 21.0))
+            .collect()
+    }
+
+    /// The line ranges of the fragments of node 1, with their pages.
+    fn fragment_ranges(geom: &PaginationGeometryTable) -> Vec<(u32, u32, u32)> {
+        let entry = geom.get(&1).unwrap();
+        entry
+            .fragments
+            .iter()
+            .zip(&entry.line_slices)
+            .map(|(f, s)| (f.page_index, s.first, s.end))
+            .collect()
+    }
+
+    /// html-to-pdf F30f-l: 49 lines of 21 px (1029 px) on a 1009.13 px strip: line 48 is the first that does not fit and
+    /// would be left alone on page 1 (a widow of one). The break is pulled back to 47 / 2 like Chrome's (css-break-3
+    /// §4.4), instead of keeping all 49 lines on the page with the last one in the bottom margin.
+    #[test]
+    fn fragment_inline_root_pulls_a_line_back_for_a_widow() {
+        let lines = lines_of_21px(49);
+        let mut geom = PaginationGeometryTable::new();
+        let (page, cursor, emitted, placements) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            0.0,
+            0,
+            PageStrips::new(1009.13, 0.0),
+            &lines,
+        );
+        assert_eq!(emitted, 2);
+        assert_eq!(page, 1);
+        assert_eq!(fragment_ranges(&geom), vec![(0, 0, 47), (1, 47, 49)]);
+        assert!(
+            (cursor - 42.0).abs() < 0.01,
+            "the cursor is the two lines on page 1, got {cursor}"
+        );
+        let frags = &geom.get(&1).unwrap().fragments;
+        assert!((frags[0].height.to_f32() - 47.0 * 21.0).abs() < 0.01);
+        assert!((frags[1].height.to_f32() - 42.0).abs() < 0.01);
+        // A descendant on line 46 stays on page 0, one on line 47 goes to page 1 at the strip top.
+        assert_eq!(placements.len(), 2);
+        assert_eq!(placements[0], (0, 0.0, 0.0));
+        assert_eq!(placements[1].0, 1);
+        assert!((placements[1].1 + 47.0 * 21.0).abs() < 0.01);
+        assert!((placements[1].2 - 47.0 * 21.0).abs() < 0.01);
+    }
+
+    /// 48 lines fit (1008 px), 50 lines split 48 / 2 without a pull: the natural break already leaves two lines.
+    #[test]
+    fn fragment_inline_root_keeps_the_natural_break_when_it_leaves_two_lines() {
+        for (n, expect) in [
+            (48, vec![(0, 0, 48)]),
+            (50, vec![(0, 0, 48), (1, 48, 50)]),
+            (51, vec![(0, 0, 48), (1, 48, 51)]),
+        ] {
+            let lines = lines_of_21px(n);
+            let mut geom = PaginationGeometryTable::new();
+            super::fragment_inline_root(
+                &mut geom,
+                1,
+                0.0,
+                100.0,
+                0.0,
+                0,
+                PageStrips::new(1009.13, 0.0),
+                &lines,
+            );
+            assert_eq!(fragment_ranges(&geom), expect, "{n} lines");
+        }
+    }
+
+    /// A pulled break on a later page: 97 lines are 48 + 48 + 1; page 1 is full, the break on page 2 is pulled back one
+    /// line (48 / 47 / 2, Chrome's split).
+    #[test]
+    fn fragment_inline_root_pulls_a_line_back_on_a_later_page() {
+        let lines = lines_of_21px(97);
+        let mut geom = PaginationGeometryTable::new();
+        let (page, _, emitted, _) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            0.0,
+            0,
+            PageStrips::new(1009.13, 0.0),
+            &lines,
+        );
+        assert_eq!((page, emitted), (2, 3));
+        assert_eq!(
+            fragment_ranges(&geom),
+            vec![(0, 0, 48), (1, 48, 95), (2, 95, 97)]
+        );
+        let entry = geom.get(&1).unwrap();
+        assert!(super::line_slices_tile(&entry.line_slices, 97));
+    }
+
+    /// The paragraph starts below other content (cursor 100 px): the pulled break leaves the first fragment on page 0
+    /// with the lines that fit and the rest on page 1.
+    #[test]
+    fn fragment_inline_root_pulls_a_line_back_below_other_content() {
+        let lines = lines_of_21px(44);
+        let mut geom = PaginationGeometryTable::new();
+        super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            100.0,
+            0,
+            PageStrips::new(1009.13, 0.0),
+            &lines,
+        );
+        // The last line (43) ends at 100 + 44 * 21 = 1024 > 1009.13 while line 42 ends at 1003: a widow of one,
+        // pulled back to 42 / 2.
+        assert_eq!(fragment_ranges(&geom), vec![(0, 0, 42), (1, 42, 44)]);
+    }
+
+    /// The orphans minimum stops the pull: 3 lines where the third does not fit leave `3 - 2 = 1` line before the pulled
+    /// break (below orphans = 2), so the minimums are relaxed and the paragraph stays whole.
+    #[test]
+    fn fragment_inline_root_does_not_pull_below_the_orphans_minimum() {
+        let lines = lines_of_21px(3);
+        let mut geom = PaginationGeometryTable::new();
+        super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            0.0,
+            0,
+            PageStrips::new(50.0, 0.0),
+            &lines,
+        );
+        assert_eq!(fragment_ranges(&geom), vec![(0, 0, 3)]);
+    }
+
+    #[test]
+    fn widow_safe_break_pulls_back_to_leave_the_widows() {
+        // 49 lines, natural break before line 48: the break before line 47 leaves two.
+        assert_eq!(super::widow_safe_break(0, 48, 49), Some(47));
+        // The first fragment must keep ORPHANS lines: start 45 allows 47, start 46 does not.
+        assert_eq!(super::widow_safe_break(45, 48, 49), Some(47));
+        assert_eq!(super::widow_safe_break(46, 48, 49), None);
+        // Fewer lines than orphans + widows: no break.
+        assert_eq!(super::widow_safe_break(0, 2, 3), None);
+        assert_eq!(super::widow_safe_break(0, 1, 1), None);
+        // The pulled break must be before the natural one.
+        assert_eq!(super::widow_safe_break(0, 47, 49), None);
+        // A paragraph shorter than the widows minimum cannot underflow.
+        assert_eq!(super::widow_safe_break(0, 0, 1), None);
     }
 
     /// fulgur-s67g Phase 2.1: a 4-line paragraph splittable at line 2
