@@ -9864,3 +9864,18 @@ fn render_smoke_block_one_line_taller_than_its_page_leaves_two_lines_for_the_nex
     assert_eq!(page_count(&pdf), 2);
     assert!(text_items_of(&pdf, "i.pdf") >= 54);
 }
+
+#[test]
+fn render_smoke_body_level_paragraph_starts_below_a_spacer_and_splits() {
+    // html-to-pdf F30c, css-break-3 §4.1 / §4.4: a 60-line paragraph below a 900px spacer (A4, `@page { margin: 0 }`, 21px
+    // lines: 10 lines of room) starts on page 1 and is split between its lines; it used to move whole to page 2. Two
+    // pages, every line written once, and `AFTER` after the last.
+    let lines: String = (0..60).map(|i| format!("line{i:02}<br>")).collect();
+    let html = format!(
+        "<!DOCTYPE html><html><head><style>@page {{ margin: 0 }} body {{ margin: 0; font-size: 14px; line-height: 21px }}\
+         p {{ margin: 0 }}</style></head><body><div style=\"height:900px\"></div><p>{lines}</p><p>AFTER</p></body></html>"
+    );
+    let pdf = noto_engine().render(&html).expect("render");
+    assert_eq!(page_count(&pdf), 2);
+    assert!(text_items_of(&pdf, "s.pdf") >= 61);
+}

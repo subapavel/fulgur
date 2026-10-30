@@ -3466,7 +3466,7 @@ impl<'a> PaginationLayoutTree<'a> {
             // paints them `inset_top` lower: the last line of every page stood past the content box (in the margin, or
             // under the clip of an `overflow` box), and the frame closed `inset_top + inset_bottom` too early on the last
             // page. A box without insets, a clip box (above), `break-inside: avoid`, a float and a box that is not in
-            // block flow keep the path they had (F30c for the unpadded ones).
+            // block flow keep the path they had.
             let insets = layout.border.top
                 + layout.padding.top
                 + layout.border.bottom
@@ -3538,20 +3538,35 @@ impl<'a> PaginationLayoutTree<'a> {
                 continue;
             }
             if line_metrics.len() > 1 && !clip_whole_now {
-                // fulgur-s67g Phase 2.2: if the paragraph cannot fit
-                // the remaining space on the current page strip but
-                // would fit (or at least start fresh) on a new page,
-                // advance the page boundary before calling
-                // `fragment_inline_root`. This is the "split before
-                // the child" fallback (CSS Fragmentation §4.2, class A
-                // break point) taken when the inline split path can't
-                // honour widow / orphan constraints within the strip.
+                // fulgur-s67g Phase 2.2: if the paragraph cannot fit the remaining space on the current page strip but
+                // would fit (or at least start fresh) on a new page, advance the page boundary before calling
+                // `fragment_inline_root`: the "break before the child" fallback (CSS Fragmentation §4.2, class A break
+                // point) for a paragraph that has no allowed break on this strip.
+                //
+                // html-to-pdf F30c: it fired whenever the whole paragraph did not fit, also when an allowed break exists.
+                // A paragraph whose first `ORPHANS` lines fit the room starts where it is and `fragment_inline_root`
+                // breaks it between lines (css-break-3 §4.1, §4.4: a break between line boxes is as good as one between
+                // blocks; Chrome starts it below what is above it and fills the page). That holds for one taller than a
+                // page too. Not for a box with insets or extra height (the splitter does not know them: F30f-d, F30f-h),
+                // a float (not placed by this path), a clip or multicol box (F30f-b, F30d) or a relaxed `avoid`
+                // paragraph (Chrome starts it on the next page: fixture 13). A paragraph of fewer than four lines keeps
+                // moving whole (Chrome splits a 3-line one 2 / 1: F30c-w).
                 let para_total_h = line_metrics
                     .last()
                     .map(|l| l.1 - line_metrics[0].0)
                     .unwrap_or(child_h);
+                let start_here = !avoid_inside
+                    && !is_float
+                    && insets == 0.0
+                    && clip_limit_here.is_none()
+                    && body_block_flow
+                    && !crate::blitz_adapter::is_multicol_container(child)
+                    && !block_size_constrained(child)
+                    && child_h <= para_total_h + LINE_BOX_SLACK
+                    && starts_in_place(&line_metrics, cursor_y, self.strips.bottom(page_index));
                 if cursor_y > 0.0
                     && cursor_y + para_total_h > self.strips.bottom(page_index) + clip_end_slack
+                    && !start_here
                 {
                     page_index += 1;
                     cursor_y = 0.0;
@@ -7152,10 +7167,10 @@ pub(crate) fn clip_semantics_apply(node: &blitz_dom::Node) -> bool {
 /// can place where Chrome does: direct text (the box is itself the inline root), or exactly one in-flow child that
 /// starts at the content top of the box and is such a shape in turn: a paragraph, or a block-level wrapper around one.
 ///
-/// The fragmenter splits only the first thing on a strip (F30c). With anything above the paragraph (a heading, a
+/// The nested fragmenter splits only the first thing on a strip (F30c-n). With anything above the paragraph (a heading, a
 /// margin, a float, an image, an earlier paragraph) the paragraph moved whole to the next page and was clipped there,
 /// and lines Chrome shows on the page the box starts on were not written; a second paragraph is not placed at all. Such
-/// a box keeps main's output until F30c (finding F30f-f).
+/// a box keeps main's output until F30c-n (finding F30f-f).
 ///
 /// Positions are the layout's: a child is "at the top" when its offset equals the resolved border and padding of its
 /// parent (so margins count), not what the style says. A percentage `padding-top` or `padding-bottom` is the exception
@@ -7666,7 +7681,7 @@ fn block_walk_line_split(
 /// A paragraph is split when it cannot fit any page whole (taller than a page),
 /// or when it is the first thing on its strip and overflows it. A paragraph that
 /// fits a page keeps moving whole to the next one when it does not fit the rest
-/// of this one (splitting those, as body level does, is F30c).
+/// of this one (body level splits them since F30c; the nested half is F30c-n).
 fn nested_line_split(
     doc: &BaseDocument,
     parent: &blitz_dom::Node,
@@ -7684,7 +7699,7 @@ fn nested_line_split(
     // to the pixel above the cell), which is no content above the cell, and measuring from the border edge left such
     // a cell "not first": it was not split between its lines, the block path cut it between its boxes instead
     // (html-to-pdf F183, plan 7.5). Only table cells and boxes inside a clip box that hides content (the box itself or an
-    // ancestor, `tightest_clip_limit`): a block child of another padded box keeps moving whole (F30c). A clip box with a
+    // ancestor, `tightest_clip_limit`): a block child of another padded box keeps moving whole (F30c-n). A clip box with a
     // block size is fragmented where it is (F30f-b), so the lines of its first descendant paragraph stay on the page the
     // box starts on, below the padding and border of the boxes above them, as the lines of a clip box with direct text
     // do; the paragraph, cut by the clip, would otherwise fit a page and move whole, and leave its box's frame empty
@@ -8080,6 +8095,17 @@ fn warn_unprinted_inline_lines(
 fn widow_safe_break(start: usize, i: usize, total: usize) -> Option<usize> {
     let j = total.checked_sub(WIDOWS)?;
     (j >= start + ORPHANS && j < i).then_some(j)
+}
+
+/// html-to-pdf F30c: whether a paragraph with these `lines` (`(top, bottom)` in paragraph-local px) placed with its top at
+/// `top` on a strip that ends at `bottom` has an allowed break there: its first `ORPHANS` lines fit and a break after
+/// them can leave `WIDOWS` lines (`lines.len() >= ORPHANS + WIDOWS`). The fit is the comparison `fragment_inline_root`
+/// makes at the first line that does not fit (same operands, same order, so the two never disagree by a rounding), and
+/// the length rule is what makes that function always find a break on this strip: `i >= ORPHANS`, and either `WIDOWS`
+/// lines remain after `i` or `widow_safe_break` returns `n - WIDOWS >= ORPHANS`. A paragraph without such a break is
+/// placed at the top of the next page (css-break-3 §4.4: the class A break before it is the allowed one).
+fn starts_in_place(lines: &[(f32, f32)], top: f32, bottom: f32) -> bool {
+    lines.len() >= ORPHANS + WIDOWS && top + (lines[ORPHANS - 1].1 - lines[0].0) <= bottom
 }
 
 /// fulgur-p55h: split a multi-line inline root across page boundaries
@@ -12865,6 +12891,29 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(super::widow_safe_break(0, 0, 1), None);
     }
 
+    /// html-to-pdf F30c: a paragraph starts where it is when its first two lines fit and it has four lines or more.
+    #[test]
+    fn starts_in_place_needs_two_fitting_lines_and_four_lines() {
+        let four = lines_of_21px(4);
+        // Fewer than ORPHANS + WIDOWS lines: no allowed break inside, the break before is the one.
+        assert!(!super::starts_in_place(&lines_of_21px(3), 0.0, 1000.0));
+        assert!(!super::starts_in_place(&lines_of_21px(1), 0.0, 1000.0));
+        assert!(!super::starts_in_place(&[], 0.0, 1000.0));
+        // Two lines fit: 100 + 42 <= 142 (an exact fit counts, as in `fragment_inline_root`).
+        assert!(super::starts_in_place(&four, 100.0, 142.0));
+        assert!(super::starts_in_place(&four, 100.0, 200.0));
+        // One line fits, or none, or the room is negative.
+        assert!(!super::starts_in_place(&four, 100.0, 141.9));
+        assert!(!super::starts_in_place(&four, 100.0, 121.0));
+        assert!(!super::starts_in_place(&four, 100.0, 90.0));
+        assert!(!super::starts_in_place(&four, 100.0, -5.0));
+        // The first line's top is the origin (a paragraph whose lines start below its top).
+        let shifted: Vec<(f32, f32)> = (0..4)
+            .map(|i| (10.0 + i as f32 * 21.0, 10.0 + (i + 1) as f32 * 21.0))
+            .collect();
+        assert!(super::starts_in_place(&shifted, 100.0, 142.0));
+    }
+
     /// fulgur-s67g Phase 2.1: a 4-line paragraph splittable at line 2
     /// (first 2 lines on page 0, last 2 on page 1) honours both
     /// orphans = 2 and widows = 2.
@@ -15884,6 +15933,148 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(frags[1].y.to_f32(), 0.0);
     }
 
+    // ---- F30c: a body-level paragraph starts where its first two lines fit ----
+
+    /// `(page, first line, end line, y)` per fragment of `id`.
+    fn slices_of(
+        doc: &blitz_html::HtmlDocument,
+        table: &PaginationGeometryTable,
+        id: &str,
+    ) -> Vec<(u32, u32, u32, i32)> {
+        let geom = &table[&find_by_id(doc.deref(), id).unwrap()];
+        assert_eq!(geom.fragments.len(), geom.line_slices.len());
+        geom.fragments
+            .iter()
+            .zip(&geom.line_slices)
+            .map(|(f, s)| (f.page_index, s.first, s.end, f.y.to_f32().round() as i32))
+            .collect()
+    }
+
+    /// 10 lines of 20px after a 100px spacer on a 200px page: five lines fit, so the paragraph starts on page 0 at
+    /// y = 100 and the other five are on page 1 (they used to move whole: `[(1, 0, 10, 0)]`).
+    #[test]
+    fn a_body_level_paragraph_starts_below_the_spacer_and_splits() {
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:100px\"></div><p id=\"p\">{}</p>",
+                br_lines(10)
+            ),
+            200.0,
+        );
+        assert_eq!(
+            slices_of(&doc, &table, "p"),
+            vec![(0, 0, 5, 100), (1, 5, 10, 0)]
+        );
+        let f = fragments_of(&doc, &table, "p");
+        assert!((f[0].height.to_f32() - 100.0).abs() < 0.5, "{f:?}");
+    }
+
+    /// An image on line 2 (index 1) is placed on page 0 with its line; one on line 7 on page 1.
+    #[test]
+    fn the_inline_boxes_of_a_paragraph_that_starts_in_place_follow_their_lines() {
+        let lines: Vec<String> = (1..=10)
+            .map(|i| match i {
+                2 => "L2 <img id=\"a\" width=\"10\" height=\"10\">".to_string(),
+                7 => "L7 <img id=\"b\" width=\"10\" height=\"10\">".to_string(),
+                _ => format!("L{i}"),
+            })
+            .collect();
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:100px\"></div><p id=\"p\">{}</p>",
+                lines.join("<br>")
+            ),
+            200.0,
+        );
+        assert_eq!(
+            slices_of(&doc, &table, "p"),
+            vec![(0, 0, 5, 100), (1, 5, 10, 0)]
+        );
+        let a = fragments_of(&doc, &table, "a");
+        let b = fragments_of(&doc, &table, "b");
+        assert_eq!(a[0].page_index, 0, "{a:?}");
+        assert_eq!(b[0].page_index, 1, "{b:?}");
+        assert!(a[0].y.to_f32() >= 100.0 && a[0].y.to_f32() < 200.0, "{a:?}");
+        assert!(b[0].y.to_f32() < 100.0, "{b:?}");
+    }
+
+    /// A paragraph taller than a page started the next page; it starts where it is now (7 lines on page 0, then 10 and
+    /// 3 of the 20 lines).
+    #[test]
+    fn a_paragraph_taller_than_a_page_starts_below_the_spacer() {
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:60px\"></div><p id=\"p\">{}</p>",
+                br_lines(20)
+            ),
+            200.0,
+        );
+        assert_eq!(
+            slices_of(&doc, &table, "p"),
+            vec![(0, 0, 7, 60), (1, 7, 17, 0), (2, 17, 20, 0)]
+        );
+    }
+
+    /// Three lines have no break that leaves two on each side: the paragraph moves whole (Chrome 2 / 1, F30c-w). So does
+    /// a paragraph of any length when only one line fits.
+    #[test]
+    fn a_three_line_paragraph_or_one_with_a_single_line_of_room_moves_whole() {
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:150px\"></div><p id=\"p\">{}</p>",
+                br_lines(3)
+            ),
+            200.0,
+        );
+        assert_eq!(slices_of(&doc, &table, "p"), vec![(1, 0, 3, 0)]);
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:170px\"></div><p id=\"p\">{}</p>",
+                br_lines(10)
+            ),
+            200.0,
+        );
+        assert_eq!(slices_of(&doc, &table, "p"), vec![(1, 0, 10, 0)]);
+        // Four lines with room for two: 2 / 2.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:150px\"></div><p id=\"p\">{}</p>",
+                br_lines(4)
+            ),
+            200.0,
+        );
+        assert_eq!(
+            slices_of(&doc, &table, "p"),
+            vec![(0, 0, 2, 150), (1, 2, 4, 0)]
+        );
+    }
+
+    /// A relaxed `avoid` paragraph (taller than a page) starts the next page, as in Chrome (fixture 13).
+    #[test]
+    fn a_relaxed_avoid_paragraph_still_starts_the_next_page() {
+        let (doc, table) = avoid_fragments(&format!(
+            "<div style=\"height:100px\"></div><p id=\"p\" class=\"av\">{}</p>",
+            br_lines(15)
+        ));
+        assert_eq!(
+            slices_of(&doc, &table, "p"),
+            vec![(1, 0, 10, 0), (2, 10, 15, 0)]
+        );
+    }
+
+    /// A floated paragraph is not placed by this path: it keeps moving whole (F30c-f).
+    #[test]
+    fn a_floated_paragraph_keeps_moving_whole() {
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:100px\"></div><p id=\"p\" style=\"float:left;width:200px\">{}</p>",
+                br_lines(10)
+            ),
+            200.0,
+        );
+        assert_eq!(slices_of(&doc, &table, "p")[0].0, 1);
+    }
+
     #[test]
     fn a_paragraph_that_cannot_start_with_two_lines_moves_to_the_next_page() {
         // Room for one line below the spacer (orphans).
@@ -17203,7 +17394,7 @@ h2 { string-set: chapter-title content(text); }
     fn a_clip_box_with_two_paragraphs_is_not_fragmented_by_its_block_size() {
         // F30f-f (plan 7, "Supported shapes"): the second paragraph starts at 200px, below the clip of the 100px box that
         // straddles the page bottom. Content below the clip getting no page needs the fragmenter to place more than the
-        // first thing on a strip (F30c); until then a box with two paragraphs has no limit and is laid out as on main.
+        // first thing on a strip (F30c-n); until then a box with two paragraphs has no limit and is laid out as on main.
         let (doc, table) = nested_geometry(
             &format!(
                 "<div style=\"height:150px\"></div><div id=\"w\" style=\"overflow:hidden;height:100px\">\
@@ -18383,17 +18574,29 @@ h2 { string-set: chapter-title content(text); }
 
     #[test]
     fn a_paragraph_after_a_spacer_moves_whole_when_page_zero_has_no_room() {
-        // 100px spacer, 40px offset, 5 lines of 20px: 100 + 100 fits a 200px page but not the 160px that
-        // page 0 has, so the paragraph (which is not taller than a page) starts page 1.
+        // 125px spacer, 40px offset, 5 lines of 20px: page 0 has 160px, so 35px are left below the spacer: one line
+        // fits, which is below `orphans`, and the paragraph (not taller than a page) starts page 1.
         let body = format!(
-            "<div style=\"height:100px\"></div><p id=\"p\">{}</p>",
+            "<div style=\"height:125px\"></div><p id=\"p\">{}</p>",
             br_lines(5)
         );
         let (doc, table) = offset_geometry("body{margin:40px}", &body, 200.0);
         let f = fragments_of(&doc, &table, "p");
         assert_eq!((f.len(), f[0].page_index), (1, 1), "{f:?}");
+        // Without an offset 75px are left, three lines (F30c: it starts there and keeps two for page 1).
         let (doc, table) = offset_geometry("body{margin:0}", &body, 200.0);
-        assert_eq!(fragments_of(&doc, &table, "p")[0].page_index, 0);
+        let f = fragments_of(&doc, &table, "p");
+        let got: Vec<(u32, i32, i32)> = f
+            .iter()
+            .map(|f| {
+                (
+                    f.page_index,
+                    f.y.to_f32().round() as i32,
+                    f.height.to_f32().round() as i32,
+                )
+            })
+            .collect();
+        assert_eq!(got, vec![(0, 125, 60), (1, 0, 40)], "{f:?}");
     }
 
     #[test]
