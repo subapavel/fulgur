@@ -8555,10 +8555,17 @@ fn line_break_at(start: usize, i: usize, total: usize, rules: LineRules) -> Opti
 /// `Some(start + rules.orphans)` when at least `rules.orphans` lines fit (`i - start`), the lines after `i` are fewer than
 /// `rules.widows` and pulling the break back to `total - widows` would leave the fragment fewer lines than `rules.orphans`
 /// but still some (`total - widows > start`); `None` otherwise. With nothing left of the fragment after the pull-back
-/// (`widows` is at least as large as the rest) Chrome keeps the natural break.
+/// (`widows` is at least as large as the rest) Chrome keeps the natural break, except in the first fragment when `widows`
+/// is at least the whole paragraph: then it keeps the `orphans`.
 fn keep_orphans_break(start: usize, i: usize, total: usize, rules: LineRules) -> Option<usize> {
     if rules == LineRules::INITIAL || i - start < rules.orphans || total - i >= rules.widows {
         return None;
+    }
+    // html-to-pdf F30c-o3 (sweep `sw_52_1_60_*`): `widows` as large as the whole paragraph cannot be had at all, and Chrome
+    // ignores it in the first fragment but keeps the orphans: 52 lines, `orphans: 1; widows: 60`, any room: 1 / 48 / 3. Only
+    // a paragraph taller than a page gets here (a shorter one has no allowed break and moves whole, ADR-0010).
+    if start == 0 && total <= rules.widows {
+        return Some(rules.orphans);
     }
     let j = total.checked_sub(rules.widows)?;
     (j > start && j < start + rules.orphans).then_some(start + rules.orphans)
@@ -21623,6 +21630,12 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(keep_orphans_break(0, 48, 100, rules(30, 30)), None);
         // Pulling back honours the orphans: `line_break_at` already found it.
         assert_eq!(keep_orphans_break(0, 48, 52, rules(2, 10)), None);
+        // `widows` as large as the paragraph: the first fragment keeps its orphans (Chrome 52 lines, 1 / 60: 1 / 48 / 3).
+        assert_eq!(keep_orphans_break(0, 33, 52, rules(1, 60)), Some(1));
+        assert_eq!(keep_orphans_break(0, 33, 52, rules(10, 60)), Some(10));
+        assert_eq!(keep_orphans_break(0, 33, 52, rules(10, 52)), Some(10));
+        // ... a continuation fragment keeps the natural break.
+        assert_eq!(keep_orphans_break(48, 96, 100, rules(1, 60)), None);
         // The initial values never give up the widows here (F30c-w keeps its own behaviour).
         assert_eq!(keep_orphans_break(0, 2, 3, LineRules::INITIAL), None);
     }
