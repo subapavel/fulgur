@@ -221,6 +221,16 @@ pub(crate) fn has_forced_page_break(table: &ColumnStyleTable) -> bool {
     })
 }
 
+/// F215: true if some node of `table` declares `break-before` / `break-after` as `avoid` or `avoid-page` (also through the
+/// legacy `page-break-*: avoid`). When none does, there is no keep-with-next to compute, and every walk takes the path it
+/// took before F215.
+pub(crate) fn has_avoid_page_break(table: &ColumnStyleTable) -> bool {
+    table.values().any(|p| {
+        p.break_before.is_some_and(BreakBefore::avoids_page_break)
+            || p.break_after.is_some_and(BreakAfter::avoids_page_break)
+    })
+}
+
 /// F144: true if some node of `table` names a page (`page: <custom-ident>`). With none, every used page-name is the
 /// unnamed page, so there is nothing to compute or compare.
 pub(crate) fn has_named_page(table: &ColumnStyleTable) -> bool {
@@ -529,40 +539,53 @@ fn parse_break_inside_value<'i>(
     }
 }
 
-/// Value of `break-before` / `break-after`, as the side table models it: `true` is a forced page break.
-///
+/// Value of `break-before` / `break-after`, as the side table models it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BreakValue {
+    Auto,
+    /// A forced page break (`page`, `left`, `right`, `recto`, `verso`, legacy `always`).
+    Page,
+    Avoid,
+    AvoidPage,
+    AvoidColumn,
+}
+
 /// css-break-3 §3.1: `break-*` takes `auto | avoid | avoid-page | page | left | right | recto | verso | avoid-column |
-/// column` (and region values, which are dropped). `avoid*` and `column` force no page break (`column` only breaks
-/// columns, and the table has no column breaks); what matters is that a later one overrides an earlier `page`.
+/// column` (and region values, which are dropped). `avoid` and `avoid-page` forbid a page break (F215); `avoid-column`
+/// only a column break, and `column` only breaks columns (the table has no column breaks), so both are `auto` for pages;
+/// what matters is that a later value overrides an earlier `page`.
 /// §3.4: the legacy `page-break-*` takes `auto | always | avoid | left | right`; `always` is not a value of
 /// `break-*` (Chrome ignores it there), and `page`, `recto`, `verso`, `column`, `avoid-page` are not legacy values.
-fn parse_break_forced<'i>(
+fn parse_break_value<'i>(
     input: &mut Parser<'i, '_>,
     legacy: bool,
-) -> Result<bool, ParseError<'i, ()>> {
+) -> Result<BreakValue, ParseError<'i, ()>> {
     let ident = input.expect_ident()?.clone();
     let lower = ident.as_ref().to_ascii_lowercase();
-    let forced = match (lower.as_str(), legacy) {
-        ("auto" | "avoid", _) => false,
-        ("left" | "right", _) => true,
-        ("always", true) => true,
-        ("avoid-page" | "avoid-column" | "column", false) => false,
-        ("page" | "recto" | "verso", false) => true,
+    let value = match (lower.as_str(), legacy) {
+        ("auto", _) => BreakValue::Auto,
+        ("avoid", _) => BreakValue::Avoid,
+        ("left" | "right", _) => BreakValue::Page,
+        ("always", true) => BreakValue::Page,
+        ("avoid-page", false) => BreakValue::AvoidPage,
+        ("avoid-column", false) => BreakValue::AvoidColumn,
+        ("column", false) => BreakValue::Auto,
+        ("page" | "recto" | "verso", false) => BreakValue::Page,
         _ => return Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid)),
     };
-    Ok(forced)
+    Ok(value)
 }
 
 fn parse_break_after_value<'i>(
     input: &mut Parser<'i, '_>,
     legacy: bool,
 ) -> Result<BreakAfter, ParseError<'i, ()>> {
-    parse_break_forced(input, legacy).map(|f| {
-        if f {
-            BreakAfter::Page
-        } else {
-            BreakAfter::Auto
-        }
+    parse_break_value(input, legacy).map(|v| match v {
+        BreakValue::Auto => BreakAfter::Auto,
+        BreakValue::Page => BreakAfter::Page,
+        BreakValue::Avoid => BreakAfter::Avoid,
+        BreakValue::AvoidPage => BreakAfter::AvoidPage,
+        BreakValue::AvoidColumn => BreakAfter::AvoidColumn,
     })
 }
 
@@ -570,12 +593,12 @@ fn parse_break_before_value<'i>(
     input: &mut Parser<'i, '_>,
     legacy: bool,
 ) -> Result<BreakBefore, ParseError<'i, ()>> {
-    parse_break_forced(input, legacy).map(|f| {
-        if f {
-            BreakBefore::Page
-        } else {
-            BreakBefore::Auto
-        }
+    parse_break_value(input, legacy).map(|v| match v {
+        BreakValue::Auto => BreakBefore::Auto,
+        BreakValue::Page => BreakBefore::Page,
+        BreakValue::Avoid => BreakBefore::Avoid,
+        BreakValue::AvoidPage => BreakBefore::AvoidPage,
+        BreakValue::AvoidColumn => BreakBefore::AvoidColumn,
     })
 }
 
@@ -2758,22 +2781,29 @@ mod tests {
     }
 
     #[test]
-    fn avoid_and_column_values_map_to_no_forced_break() {
-        // css-break-3 §3.1. The table models "forced page break" or "none"; `avoid*` and `column` (outside a
-        // multicol) are none, and an unknown region value is dropped.
-        for v in [
-            "auto",
-            "avoid",
-            "avoid-page",
-            "avoid-column",
-            "column",
-            "AVOID-PAGE",
+    fn avoid_and_column_values_are_not_forced_breaks() {
+        // css-break-3 §3.1. `avoid` and `avoid-page` forbid a page break (F215), `avoid-column` only a column break, `column`
+        // only breaks columns (the table has none): none of them is forced. An unknown region value is dropped.
+        for (v, before, after) in [
+            ("auto", BreakBefore::Auto, BreakAfter::Auto),
+            ("avoid", BreakBefore::Avoid, BreakAfter::Avoid),
+            ("AVOID", BreakBefore::Avoid, BreakAfter::Avoid),
+            ("avoid-page", BreakBefore::AvoidPage, BreakAfter::AvoidPage),
+            ("AVOID-PAGE", BreakBefore::AvoidPage, BreakAfter::AvoidPage),
+            (
+                "avoid-column",
+                BreakBefore::AvoidColumn,
+                BreakAfter::AvoidColumn,
+            ),
+            ("column", BreakBefore::Auto, BreakAfter::Auto),
         ] {
             assert_eq!(
                 before_after(&format!("break-before:{v};break-after:{v}")),
-                (Some(BreakBefore::Auto), Some(BreakAfter::Auto)),
+                (Some(before), Some(after)),
                 "{v}"
             );
+            assert_ne!(before, BreakBefore::Page, "{v}");
+            assert_ne!(after, BreakAfter::Page, "{v}");
         }
         for v in ["page", "left", "right", "recto", "verso"] {
             assert_eq!(
@@ -2794,15 +2824,81 @@ mod tests {
     #[test]
     fn a_later_avoid_value_overrides_an_earlier_page() {
         // `bf_page_then_always` of the validator: Chrome, page 1.
-        for v in ["avoid", "avoid-page", "avoid-column", "column"] {
+        for (v, before, after) in [
+            ("avoid", BreakBefore::Avoid, BreakAfter::Avoid),
+            ("avoid-page", BreakBefore::AvoidPage, BreakAfter::AvoidPage),
+            (
+                "avoid-column",
+                BreakBefore::AvoidColumn,
+                BreakAfter::AvoidColumn,
+            ),
+            ("column", BreakBefore::Auto, BreakAfter::Auto),
+        ] {
             assert_eq!(
                 before_after(&format!(
                     "break-before:page;break-before:{v};break-after:page;break-after:{v}"
                 )),
-                (Some(BreakBefore::Auto), Some(BreakAfter::Auto)),
+                (Some(before), Some(after)),
                 "{v}"
             );
         }
+        // and a later `page` overrides an earlier `avoid-page` (F215, Chrome: the later of two rules wins)
+        assert_eq!(
+            before_after(
+                "break-before:avoid-page;break-before:page;break-after:avoid;break-after:page"
+            ),
+            (Some(BreakBefore::Page), Some(BreakAfter::Page))
+        );
+    }
+
+    #[test]
+    fn the_avoid_values_that_constrain_pages() {
+        for (v, expect) in [
+            ("auto", false),
+            ("avoid", true),
+            ("avoid-page", true),
+            ("avoid-column", false),
+            ("column", false),
+            ("page", false),
+        ] {
+            let (b, a) = before_after(&format!("break-before:{v};break-after:{v}"));
+            assert_eq!(b.unwrap().avoids_page_break(), expect, "before {v}");
+            assert_eq!(a.unwrap().avoids_page_break(), expect, "after {v}");
+        }
+        // the legacy alias: `page-break-*: avoid` is `avoid` (§3.4), `avoid-page` is not a legacy value
+        let (b, a) = before_after("page-break-before:avoid;page-break-after:avoid");
+        assert_eq!((b, a), (Some(BreakBefore::Avoid), Some(BreakAfter::Avoid)));
+        assert_eq!(
+            before_after("page-break-before:avoid-page;page-break-after:avoid-page"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn has_avoid_page_break_truth_table() {
+        let table = |css: &str| {
+            let mut t = ColumnStyleTable::new();
+            t.insert(1, parse_declaration_block(css));
+            t.insert(2, ColumnStyleProps::default());
+            t
+        };
+        assert!(!has_avoid_page_break(&ColumnStyleTable::new()));
+        assert!(!has_avoid_page_break(&table("")));
+        assert!(!has_avoid_page_break(&table("break-before:auto")));
+        assert!(!has_avoid_page_break(&table("break-after:page")));
+        assert!(!has_avoid_page_break(&table("break-before:avoid-column")));
+        assert!(!has_avoid_page_break(&table("break-after:column")));
+        assert!(has_avoid_page_break(&table("break-after:avoid")));
+        assert!(has_avoid_page_break(&table("break-before:avoid")));
+        assert!(has_avoid_page_break(&table("break-before:avoid-page")));
+        assert!(has_avoid_page_break(&table("page-break-after:avoid")));
+        // a later value replaces the earlier one
+        assert!(!has_avoid_page_break(&table(
+            "break-after:avoid;break-after:page"
+        )));
+        assert!(has_avoid_page_break(&table(
+            "break-after:page;break-after:avoid"
+        )));
     }
 
     #[test]
@@ -2824,7 +2920,7 @@ mod tests {
         // `avoid` maps through the alias too, and the new-only values are not legacy ones.
         assert_eq!(
             before_after("page-break-before:page;page-break-before:avoid"),
-            (Some(BreakBefore::Auto), None)
+            (Some(BreakBefore::Avoid), None)
         );
         for v in ["page", "recto", "verso", "column", "avoid-page"] {
             assert_eq!(

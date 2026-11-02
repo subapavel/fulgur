@@ -265,16 +265,40 @@ impl Point2 {
     }
 }
 
+/// `break-before` as the side table models it (css-break-3 §3.1). `Page` is a forced page break (also `left`, `right`,
+/// `recto`, `verso`); `Avoid` and `AvoidPage` forbid a page break at that point (F215); `AvoidColumn` only constrains column
+/// breaks, so for pages it is `Auto`. `column` stays `Auto`: the table has no column breaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakBefore {
     Auto,
     Page,
+    Avoid,
+    AvoidPage,
+    AvoidColumn,
 }
 
+impl BreakBefore {
+    /// True if the value forbids a page break at this point (`avoid`, `avoid-page`).
+    pub(crate) fn avoids_page_break(self) -> bool {
+        matches!(self, BreakBefore::Avoid | BreakBefore::AvoidPage)
+    }
+}
+
+/// `break-after`, see [`BreakBefore`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakAfter {
     Auto,
     Page,
+    Avoid,
+    AvoidPage,
+    AvoidColumn,
+}
+
+impl BreakAfter {
+    /// True if the value forbids a page break at this point (`avoid`, `avoid-page`).
+    pub(crate) fn avoids_page_break(self) -> bool {
+        matches!(self, BreakAfter::Avoid | BreakAfter::AvoidPage)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
