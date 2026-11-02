@@ -6911,7 +6911,13 @@ fn plan_line_breaks(
         // html-to-pdf F30c-o3: the break the body-level splitter takes at this line ([`choose_line_break`]); `None`
         // keeps the greedy break (this splitter never overflows a strip by more than the one line it must take).
         if end < n {
-            end = choose_line_break(start, end, n, rules).unwrap_or(end);
+            let page_top = start > 0 || first_room >= page_room - 0.01;
+            let capacity = if rules != LineRules::INITIAL && page_top {
+                page_capacity(lines, start, page_room)
+            } else {
+                usize::MAX
+            };
+            end = choose_line_break(start, end, n, rules, capacity, page_top).unwrap_or(end);
         }
         ranges.push(start..end);
         start = end;
@@ -8569,7 +8575,25 @@ fn keep_orphans_break(start: usize, i: usize, total: usize, rules: LineRules) ->
 /// `None` when not even the initial rules have a break there. With `rules` equal to [`LineRules::INITIAL`] steps 2 and 3
 /// are empty, and the result is the break of before F30c-o. [`fragment_inline_root`] keeps accumulating lines on `None`
 /// (F30c-w); [`plan_line_breaks`] keeps its greedy break.
-fn choose_line_break(start: usize, i: usize, total: usize, rules: LineRules) -> Option<usize> {
+///
+/// `capacity` is the number of lines a full page holds from `start` on, `page_top` whether the fragment starts at the top of
+/// a page (every fragment but a first one that follows content on its page). At the top of a page a `widows` larger than
+/// that capacity cannot be had by any pull-back, and Chrome ignores it: 100 lines, `orphans: 10; widows: 47` give
+/// 48 / 10 / 42 and `widows: 49` gives 48 / 48 / 4; a 60-line paragraph at the top of a page gives 48 / 12 for `widows: 49`,
+/// and 11 / 48 / 1 after 40 lines of other content (probes `out/scratch/f30co3/wid`, F30c-o2). The widows count as 1 there.
+fn choose_line_break(
+    start: usize,
+    i: usize,
+    total: usize,
+    rules: LineRules,
+    capacity: usize,
+    page_top: bool,
+) -> Option<usize> {
+    let rules = if page_top && rules.widows > capacity {
+        LineRules { widows: 1, ..rules }
+    } else {
+        rules
+    };
     line_break_at(start, i, total, rules)
         .or_else(|| keep_orphans_break(start, i, total, rules))
         .or_else(|| {
@@ -8577,6 +8601,18 @@ fn choose_line_break(start: usize, i: usize, total: usize, rules: LineRules) -> 
                 .then(|| line_break_at(start, i, total, LineRules::INITIAL))
                 .flatten()
         })
+}
+
+/// html-to-pdf F30c-o3: how many of the lines from `start` fit a strip of `room` px (at least one: a line box is monolithic).
+fn page_capacity(lines: &[(f32, f32)], start: usize, room: f32) -> usize {
+    let Some(first) = lines.get(start) else {
+        return 1;
+    };
+    lines[start..]
+        .iter()
+        .take_while(|l| l.1 - first.0 <= room + 0.01)
+        .count()
+        .max(1)
 }
 
 /// html-to-pdf F30c: whether a paragraph with these `lines` (`(top, bottom)` in paragraph-local px) placed with its top at
@@ -8709,8 +8745,21 @@ pub(crate) fn fragment_inline_root(
         if projected_bottom_in_body > strips.bottom(page_index) && i > fragment_start_idx {
             // fulgur-s67g Phase 2.1: honour widow / orphan minimums (F30f-l: a natural break that would leave a widow
             // is pulled back; F30c-o: the paragraph's own minimums, relaxed in steps when the page cannot keep them).
-            let Some(break_at) = choose_line_break(fragment_start_idx, i, total_lines, rules)
-            else {
+            let page_top = fragment_start_idx > 0
+                || strips.bottom(page_index) - paragraph_top_in_body >= strips.fresh() - 0.01;
+            let capacity = if rules != LineRules::INITIAL && page_top {
+                page_capacity(line_metrics, fragment_start_idx, strips.fresh())
+            } else {
+                usize::MAX
+            };
+            let Some(break_at) = choose_line_break(
+                fragment_start_idx,
+                i,
+                total_lines,
+                rules,
+                capacity,
+                page_top,
+            ) else {
                 // No break honours the minimums here: skip, keep accumulating into the current
                 // fragment (CSS Fragmentation §4.4: the minimums are relaxed only when no break
                 // keeps the content inside the fragmentainer).
@@ -22171,7 +22220,7 @@ h2 { string-set: chapter-title content(text); }
                 for start in 0..total {
                     for i in start + 1..total {
                         assert_eq!(
-                            choose_line_break(start, i, total, rules),
+                            choose_line_break(start, i, total, rules, usize::MAX, false),
                             old_chain(start, i, total, rules),
                             "start {start}, i {i}, total {total}, {rules:?}"
                         );
@@ -22180,12 +22229,108 @@ h2 { string-set: chapter-title content(text); }
             }
         }
         // Chrome: orphans 30 / widows 30 on 100 lines, the second page (start 48, 48 lines fit): keep the 30.
-        assert_eq!(choose_line_break(48, 96, 100, rules(30, 30)), Some(78));
+        assert_eq!(
+            choose_line_break(48, 96, 100, rules(30, 30), 48, true),
+            Some(78)
+        );
         // Orphans no page can keep: the initial 2 / 2.
-        assert_eq!(choose_line_break(0, 48, 100, rules(60, 2)), Some(48));
-        assert_eq!(choose_line_break(0, 48, 100, rules(49, 2)), Some(48));
+        assert_eq!(
+            choose_line_break(0, 48, 100, rules(60, 2), 48, true),
+            Some(48)
+        );
+        assert_eq!(
+            choose_line_break(0, 48, 100, rules(49, 2), 48, true),
+            Some(48)
+        );
         // Not even the initial rules have a break: one line fits.
-        assert_eq!(choose_line_break(0, 1, 100, rules(60, 2)), None);
+        assert_eq!(choose_line_break(0, 1, 100, rules(60, 2), 48, true), None);
+    }
+
+    #[test]
+    fn choose_line_break_ignores_widows_no_page_can_hold_in_a_continuation_fragment() {
+        // Chrome, 100 lines, 48 per page, `orphans: 10`: widows 47 / 48 keep the orphans (48 / 10 / 42), widows 49 / 50 give
+        // the natural break (48 / 48 / 4). The first fragment pulls back whatever the widows.
+        for (w, want) in [(47, 58), (48, 58), (49, 96), (50, 96)] {
+            assert_eq!(
+                choose_line_break(48, 96, 100, rules(10, w), 48, true),
+                Some(want),
+                "widows {w}"
+            );
+        }
+        assert_eq!(
+            choose_line_break(0, 40, 60, rules(10, 49), 48, false),
+            Some(11)
+        );
+        assert_eq!(
+            choose_line_break(0, 40, 60, rules(30, 49), 48, false),
+            Some(30)
+        );
+        // `orphans: 1; widows: 50` on the second fragment: natural, not the pull-back to line 50.
+        assert_eq!(
+            choose_line_break(48, 96, 100, rules(1, 50), 48, true),
+            Some(96)
+        );
+        // A first fragment at the top of a page ignores them too: 60 lines, widows 49: 48 / 12 (Chrome), not 11 / 49.
+        assert_eq!(
+            choose_line_break(0, 48, 60, rules(10, 49), 48, true),
+            Some(48)
+        );
+        assert_eq!(
+            choose_line_break(0, 48, 60, rules(30, 49), 48, true),
+            Some(48)
+        );
+    }
+
+    #[test]
+    fn page_capacity_counts_the_lines_of_a_full_page() {
+        let lines = uniform_lines(100);
+        assert_eq!(page_capacity(&lines, 48, 960.0), 48);
+        assert_eq!(page_capacity(&lines, 48, 10.0), 1, "at least one line");
+        assert_eq!(page_capacity(&lines, 90, 960.0), 10);
+        assert_eq!(page_capacity(&lines, 100, 960.0), 1);
+    }
+
+    #[test]
+    fn plan_line_breaks_ignores_widows_larger_than_a_page_after_the_first_strip() {
+        // 100 lines, 48 per strip, orphans 10, widows 50: 48 / 48 / 4 like Chrome (it was 48 / 10 / 42 with the first F30c-o3
+        // chooser, which the planner did not do before).
+        let plan = plan_line_breaks(
+            &uniform_lines(100),
+            960.0,
+            960.0,
+            0.0,
+            usize::MAX,
+            rules(10, 50),
+        );
+        assert_eq!(plan, [0..48, 48..96, 96..100]);
+        let plan = plan_line_breaks(
+            &uniform_lines(100),
+            960.0,
+            960.0,
+            0.0,
+            usize::MAX,
+            rules(10, 47),
+        );
+        assert_eq!(plan, [0..48, 48..58, 58..100]);
+        // 60 lines at the top of a page, widows 49: natural 48 / 12; after 40 lines of other content the first strip pulls back.
+        let at_top = plan_line_breaks(
+            &uniform_lines(60),
+            960.0,
+            960.0,
+            0.0,
+            usize::MAX,
+            rules(30, 49),
+        );
+        assert_eq!(at_top, [0..48, 48..60]);
+        let mid_page = plan_line_breaks(
+            &uniform_lines(60),
+            800.0,
+            960.0,
+            0.0,
+            usize::MAX,
+            rules(30, 49),
+        );
+        assert_eq!(mid_page, [0..30, 30..60]);
     }
 
     /// `plan_line_breaks` as it was before F30c-o3 (the greedy pull-back for the widows, nothing else).
