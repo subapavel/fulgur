@@ -6961,10 +6961,10 @@ impl LineSplit {
     }
 
     /// html-to-pdf F30c-n: the paragraph has a break between its line boxes that leaves `rules.orphans` lines before it and
-    /// `rules.widows` after it (css-break-3 §4.4): it has at least `orphans + widows` lines. Room-independent; the same
-    /// length rule as [`starts_in_place`] at body level.
+    /// `rules.widows` after it (css-break-3 §4.4). Room-independent; the length rule is [`has_allowed_break`], shared with the
+    /// body-level [`starts_in_place`] (F30c-o3 changes it in that one place).
     fn has_inner_break(&self) -> bool {
-        self.rules.orphans >= 1 && self.lines.len() >= self.rules.orphans + self.rules.widows
+        has_allowed_break(self.lines.len(), self.rules)
     }
 
     /// html-to-pdf F30c-n: the paragraph, with its top border edge at `y`, has an allowed break on the strip that ends at
@@ -8435,8 +8435,16 @@ fn keep_orphans_break(start: usize, i: usize, total: usize, rules: LineRules) ->
 /// placed at the top of the next page (css-break-3 §4.4: the class A break before it is the allowed one). With the author's
 /// values (F30c-o) it is the same argument, the paragraph's own `rules` for the constants.
 fn starts_in_place(lines: &[(f32, f32)], top: f32, bottom: f32, rules: LineRules) -> bool {
-    lines.len() >= rules.orphans + rules.widows
+    has_allowed_break(lines.len(), rules)
         && top + (lines[rules.orphans - 1].1 - lines[0].0) <= bottom
+}
+
+/// html-to-pdf F30c-n: whether a paragraph of `n` lines has a break between its line boxes that leaves `rules.orphans`
+/// lines before it and `rules.widows` after it (css-break-3 §4.4): `n >= orphans + widows`. The one place of this length
+/// rule: the body-level [`starts_in_place`] and the nested [`LineSplit::has_inner_break`] ask it, so a change of the rule
+/// (the author values give Chrome's keep-the-orphans model, F30c-o3) is made here.
+fn has_allowed_break(n: usize, rules: LineRules) -> bool {
+    rules.orphans >= 1 && n >= rules.orphans + rules.widows
 }
 
 /// fulgur-p55h: split a multi-line inline root across page boundaries
