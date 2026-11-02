@@ -48,6 +48,9 @@ static UNNAMED: (Option<String>, Option<String>) = (None, None);
 pub(crate) struct SubtreeFacts {
     forced_level: Option<Vec<u16>>,
     page_name_level: Option<Vec<u16>>,
+    /// F215: some node declares `break-before` / `break-after` as `avoid` or `avoid-page`. Without one the fragmenter
+    /// computes no keep-with-next and takes the paths it took before.
+    keep_with_next: bool,
 }
 
 fn level_of(levels: &Option<Vec<u16>>, node_id: usize) -> u16 {
@@ -66,10 +69,12 @@ impl SubtreeFacts {
         used_page_names: Option<&UsedPageNameTable>,
     ) -> Self {
         let forced_styles = column_styles.filter(|cs| column_css::has_forced_page_break(cs));
+        let keep_with_next = column_styles.is_some_and(column_css::has_avoid_page_break);
         if forced_styles.is_none() && used_page_names.is_none() {
             return Self {
                 forced_level: None,
                 page_name_level: None,
+                keep_with_next,
             };
         }
         let len = doc.tree().iter().map(|(k, _)| k + 1).max().unwrap_or(0);
@@ -112,7 +117,13 @@ impl SubtreeFacts {
         Self {
             forced_level: forced,
             page_name_level: names,
+            keep_with_next,
         }
+    }
+
+    /// F215: whether the document declares an `avoid` break value ([`column_css::has_avoid_page_break`]).
+    pub(crate) fn keeps_with_next(&self) -> bool {
+        self.keep_with_next
     }
 
     /// `has_forced_break_below(doc, node_id, column_styles, 0)`.

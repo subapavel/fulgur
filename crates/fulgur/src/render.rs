@@ -6981,6 +6981,7 @@ mod tests {
             crate::pagination_layout::PageStrips::new(1000.0, 0.0),
             boxes,
             crate::pagination_layout::LineRules::INITIAL,
+            false,
         );
         let g = &geom[&1];
         assert!(last_page >= 50, "about 60 pages, got {}", last_page + 1);

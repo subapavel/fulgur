@@ -10075,3 +10075,51 @@ fn render_smoke_nested_paragraph_starts_in_place_where_its_lines_fit() {
         "avoid moves it whole"
     );
 }
+
+/// html-to-pdf F215: `break-after: avoid` on a heading keeps it with the paragraph after it. A spacer leaves room for the
+/// heading and one line of a 12-line paragraph (two are needed to start it): with the avoid the heading goes to page 2
+/// with the paragraph, without it the heading stays alone at the bottom of page 1.
+#[test]
+fn a_heading_with_break_after_avoid_moves_to_the_next_page_with_its_paragraph() {
+    let html = |avoid: &str| {
+        let lines: Vec<String> = (1..=12).map(|i| format!("Line{i}")).collect();
+        format!(
+            "<html><head><style>@page{{size:A4;margin:15mm}}body{{margin:0;font-size:14px;line-height:21px}}\
+             h2{{margin:0;font-size:14px;line-height:21px;{avoid}}}p{{margin:0}}</style></head><body>\
+             <div style=\"height:966px\"></div><h2>Heading</h2><p>{}</p></body></html>",
+            lines.join("<br>")
+        )
+    };
+    let page_one = |pdf: &[u8]| -> String {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("p.pdf");
+        std::fs::write(&path, pdf).expect("write pdf");
+        match std::process::Command::new("pdftotext")
+            .args(["-f", "1", "-l", "1", "-raw"])
+            .arg(&path)
+            .arg("-")
+            .output()
+        {
+            Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => panic!("pdftotext: {err}"),
+        }
+    };
+    let engine = noto_engine();
+    let kept = engine.render(&html("break-after:avoid")).unwrap();
+    let alone = engine.render(&html("")).unwrap();
+    assert_eq!(page_count(&kept), 2);
+    assert_eq!(page_count(&alone), 2);
+    if extract_pdf_text(&[]).is_none() {
+        eprintln!("pdftotext not installed; skipping the page-one text");
+        return;
+    }
+    assert!(
+        !page_one(&kept).contains("Heading"),
+        "the heading moved with its paragraph"
+    );
+    assert!(
+        page_one(&alone).contains("Heading"),
+        "without the avoid it stays at the bottom of page 1"
+    );
+}

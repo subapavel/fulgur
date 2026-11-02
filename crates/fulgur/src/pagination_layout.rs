@@ -74,6 +74,7 @@
 
 mod abspos_flow;
 pub use abspos_flow::fragment_abspos_flows;
+mod keep_with_next;
 mod subtree_facts;
 use subtree_facts::SubtreeFacts;
 
@@ -3120,8 +3121,29 @@ impl<'a> PaginationLayoutTree<'a> {
         // fragmentainer that is a whole px taller than ours (`PageStrips::chrome_bottom`): the child that follows it
         // may reach that px below the content box without moving to the next page.
         let mut after_clip_box = false;
+        // html-to-pdf F215: keep-with-next is computed only for a document that declares an `avoid` value, and where
+        // the siblings are laid out in block flow (a head of a flex / grid / multicol is F215e). `relax_next` names the
+        // paragraph the keep of the last head asked to start in place with Rule 3 dropped.
+        let keep_on = body_block_flow
+            && self.column_styles.is_some()
+            && self
+                .subtree_facts
+                .as_ref()
+                .is_some_and(|f| f.keeps_with_next());
+        let mut relax_next: Option<usize> = None;
+        // The keep as the nested walk below a child sees it (F215).
+        let keep_env =
+            self.column_styles
+                .filter(|_| keep_on)
+                .map(|styles| keep_with_next::KeepEnv {
+                    styles,
+                    names: self.used_page_names.as_ref(),
+                    multicol: self.multicol,
+                    body_level: false,
+                    body_block_flow: true,
+                });
 
-        for child_id in children {
+        for (child_index, &child_id) in children.iter().enumerate() {
             let Some(child) = self.doc.get_node(child_id) else {
                 continue;
             };
@@ -3355,6 +3377,39 @@ impl<'a> PaginationLayoutTree<'a> {
                 Some(crate::draw_primitives::BreakInside::Avoid)
             );
 
+            // html-to-pdf F215: what this child has to take along when it moves to the next page, because an `avoid` break
+            // joins it to the box after it. Only a child that something precedes can move (`content_above`), but the
+            // paragraph it names is relaxed wherever the head is.
+            let keep = if keep_on
+                && !is_float
+                && let (Some(styles), Some(body_node)) =
+                    (self.column_styles, self.doc.get_node(body_id))
+            {
+                keep_with_next::keep_with_next_extent(
+                    self.doc,
+                    body_node,
+                    &children,
+                    child_index,
+                    keep_with_next::KeepEnv {
+                        styles,
+                        names: self.used_page_names.as_ref(),
+                        multicol: self.multicol,
+                        body_level: true,
+                        body_block_flow,
+                    },
+                    self.strips.fresh(),
+                )
+            } else {
+                None
+            };
+            if let Some(k) = keep {
+                relax_next = k.relax_rule3;
+            }
+            let relaxed_para = relax_next == Some(child_id);
+            let keep_size = keep
+                .filter(|_| cursor_y - gap > 0.5)
+                .map_or(0.0, |k| k.size);
+
             // F30d: a multi-column container that does not fit the room below the cursor is
             // distributed over the pages column by column, wherever it is itself an inline
             // root (the line-split path below would cut the one-column layout Blitz measured, not
@@ -3578,14 +3633,17 @@ impl<'a> PaginationLayoutTree<'a> {
                     .unwrap_or(child_h);
                 // html-to-pdf F30c-o: the paragraph's own `orphans` / `widows`.
                 let rules = line_rules(self.doc, child);
-                let start_here = !avoid_inside
-                    && !is_float
-                    && insets == 0.0
-                    && clip_limit_here.is_none()
-                    && body_block_flow
-                    && !crate::blitz_adapter::is_multicol_container(child)
-                    && !block_size_constrained(child)
-                    && child_h <= para_total_h + LINE_BOX_SLACK
+                let shape_ok = keep_with_next::body_paragraph_shape_ok(
+                    child,
+                    avoid_inside,
+                    is_float,
+                    body_block_flow,
+                    insets,
+                    clip_limit_here.is_none(),
+                    child_h,
+                    para_total_h,
+                );
+                let start_here = shape_ok
                     && starts_in_place(
                         &line_metrics,
                         cursor_y,
@@ -3593,8 +3651,16 @@ impl<'a> PaginationLayoutTree<'a> {
                         self.strips.fresh(),
                         rules,
                     );
+                // html-to-pdf F215: a paragraph the keep cannot avoid relaxing (css-break-3 §4.4: Rule 3 gives way first)
+                // starts where its first line fits, whatever its `orphans` and `widows`.
+                let start_here = start_here
+                    || (relaxed_para
+                        && shape_ok
+                        && cursor_y + (line_metrics[0].1 - line_metrics[0].0)
+                            <= self.strips.bottom(page_index));
                 if cursor_y > 0.0
-                    && cursor_y + para_total_h > self.strips.bottom(page_index) + clip_end_slack
+                    && cursor_y + para_total_h.max(keep_size)
+                        > self.strips.bottom(page_index) + clip_end_slack
                     && !start_here
                 {
                     page_index += 1;
@@ -3613,6 +3679,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     self.strips,
                     &line_metrics,
                     rules,
+                    relaxed_para,
                 );
                 // Atomic inlines and images in the paragraph get their fragments on the page that
                 // holds their line. Without them the paragraph's `InlineBox` items find no geometry
@@ -3841,13 +3908,16 @@ impl<'a> PaginationLayoutTree<'a> {
                 } else {
                     // Counting an avoid box below as a whole only helps when something precedes this child and it can
                     // move; first on its page it would only be moved away from its own top (a blank page).
-                    leading_block_size(
+                    // F215: and a heading that is the first thing in it counts with the start of what follows it.
+                    leading_block_size_with(
                         self.doc,
                         child_id,
                         self.column_styles.filter(|_| content_above),
                         0.0,
                         0,
                         page_height_px,
+                        true,
+                        keep_env.filter(|_| content_above),
                     )
                 };
                 if leading <= page_height_px && cursor_y + leading > strips.bottom(page_index) {
@@ -3916,7 +3986,11 @@ impl<'a> PaginationLayoutTree<'a> {
             // this path too, because the gate no longer enters it. A taller
             // inline root has gone through the line path above (F83); a
             // taller box without lines is cut into strips below.
-            if cursor_y > 0.0 && cursor_y + child_h > strips.bottom(page_index) + clip_end_slack {
+            // html-to-pdf F215: a head with an `avoid` break after it moves for the box it keeps with (`keep_size`, 0 for
+            // any other child and where nothing precedes it).
+            if cursor_y > 0.0
+                && cursor_y + child_h.max(keep_size) > strips.bottom(page_index) + clip_end_slack
+            {
                 page_index += 1;
                 cursor_y = 0.0;
             }
@@ -4513,6 +4587,7 @@ fn leading_block_size(
         depth,
         page_height_px,
         true,
+        None,
     )
 }
 
@@ -4529,6 +4604,12 @@ fn split_leading(split: &LineSplit, clamp: bool, fresh: f32) -> f32 {
 /// `clamp_orphans`: such a paragraph counts as a page ([`LineSplit::leading_within`]), so the box above it moves whole when
 /// something precedes it. `false` where nothing but the box's own insets precedes it (the strip top, a row mate): the
 /// paragraph's raw `leading`, which is taller than a page and makes no gate move anything, as before F30c-o3.
+///
+/// html-to-pdf F215: `keep`, when the document declares an `avoid` break value, adds to the extent of a first-row child
+/// what it keeps with the box after it ([`keep_with_next::keep_with_next_extent`]): a heading that is the first child of a
+/// wrapper cannot move on its own (the cut of the walk below it needs content above it in the box), so the wrapper moves
+/// with it when the heading and the start of what follows do not fit.
+#[allow(clippy::too_many_arguments)]
 fn leading_block_size_with(
     doc: &BaseDocument,
     node_id: usize,
@@ -4537,6 +4618,7 @@ fn leading_block_size_with(
     depth: usize,
     page_height_px: f32,
     clamp_orphans: bool,
+    keep: Option<keep_with_next::KeepEnv<'_>>,
 ) -> f32 {
     let Some(node) = doc.get_node(node_id) else {
         return 0.0;
@@ -4563,7 +4645,7 @@ fn leading_block_size_with(
     };
     let mut first_row_top: Option<f32> = None;
     let mut leading: f32 = 0.0;
-    for &child_id in walk_children {
+    for (child_index, &child_id) in walk_children.iter().enumerate() {
         let Some(child) = doc.get_node(child_id) else {
             continue;
         };
@@ -4675,7 +4757,23 @@ fn leading_block_size_with(
                 depth + 1,
                 page_height_px,
                 clamp_orphans,
+                keep,
             ),
+        };
+        // F215: a head in this row keeps the start of what follows it on its page.
+        let child_leading = match keep {
+            Some(env) if avoid_applies && !crate::blitz_adapter::node_is_floating(child) => {
+                keep_with_next::keep_with_next_extent(
+                    doc,
+                    node,
+                    walk_children,
+                    child_index,
+                    env,
+                    page_height_px,
+                )
+                .map_or(child_leading, |k| child_leading.max(k.size))
+            }
+            _ => child_leading,
         };
         leading = leading.max(top + child_leading);
     }
@@ -5254,7 +5352,13 @@ fn fragment_block_subtree(
     // so it is closed below a split item like a block (css-flexbox-1 §12.1).
     // Items of a row are level with each other and keep today's handling.
     let closes_like_block = !allow_same_row_rebase || items_stack_vertically(doc, &walk_children);
-    for &child_id in &walk_children {
+    // html-to-pdf F215: keep-with-next, in plain block flow only (a head in a flex / grid box, a table or an atomic inline
+    // is F215e), and only for a document that declares an `avoid` value. `relax_next` names the paragraph the keep of the
+    // last head asked to start in place with Rule 3 dropped.
+    let keep_on =
+        clip_flow && column_styles.is_some() && facts.is_some_and(|f| f.keeps_with_next());
+    let mut relax_next: Option<usize> = None;
+    for (walk_index, &child_id) in walk_children.iter().enumerate() {
         let Some(child) = doc.get_node(child_id) else {
             continue;
         };
@@ -5755,6 +5859,35 @@ fn fragment_block_subtree(
                 && !child.flags.is_inline_root()
                 && !child.children.is_empty()
         };
+        // html-to-pdf F215: what this child takes along to the next page because an `avoid` break joins it to the box after
+        // it (the head), and whether the paragraph it names starts in place with Rule 3 dropped.
+        let keep_env = column_styles
+            .filter(|_| keep_on && first_in_row)
+            .map(|styles| keep_with_next::KeepEnv {
+                styles,
+                names: used_page_names,
+                multicol,
+                body_level: false,
+                body_block_flow: true,
+            });
+        let keep = if let Some(env) = keep_env
+            && !is_float
+        {
+            keep_with_next::keep_with_next_extent(
+                doc,
+                parent,
+                &walk_children,
+                walk_index,
+                env,
+                strips.fresh(),
+            )
+        } else {
+            None
+        };
+        if let Some(k) = keep {
+            relax_next = k.relax_rule3;
+        }
+        let relaxed_para = relax_next == Some(child_id);
         let mut line_split = if row_whole || clip_whole_at(page_index, child_page_y) {
             None
         } else {
@@ -5767,6 +5900,7 @@ fn fragment_block_subtree(
                 strips,
                 page_index,
                 avoid_inside_child,
+                relaxed_para,
             )
         };
         // F30d: a multi-column container that does not fit the room below it is distributed over the
@@ -5873,7 +6007,12 @@ fn fragment_block_subtree(
             // paragraph that cannot even start here moves to the next page.
             // An `orphans` no page can keep counts as a page only when something precedes the paragraph (F30c-o3); with
             // nothing but the insets of its boxes above it, moving it would leave their tops behind (validator round 1).
-            let leading = split_leading(split, content_above_child, strips.fresh());
+            let leading = if relaxed_para {
+                // F215: Rule 3 is dropped, so only its inset and first line have to fit.
+                split.inset_top + split.lines[0].1 - split.lines[0].0
+            } else {
+                split_leading(split, content_above_child, strips.fresh())
+            };
             // Of a flex / grid row only the first item decides, as for an
             // entered item below (F28).
             if first_in_row && leading <= strips.fresh() {
@@ -5906,6 +6045,7 @@ fn fragment_block_subtree(
                     0,
                     strips.fresh(),
                     content_above_child,
+                    keep_env.filter(|_| movable),
                 )
             };
             if leading <= strips.fresh() {
@@ -5927,6 +6067,11 @@ fn fragment_block_subtree(
             (child_h + leaf_tail - 1.0).max(0.0)
         } else {
             child_h + leaf_tail
+        };
+        // html-to-pdf F215: a head with an `avoid` break after it moves for the box it keeps with, not for itself alone.
+        let first_break_h = match keep {
+            Some(k) if !relaxed_start && block_parent => first_break_h.max(k.size),
+            _ => first_break_h,
         };
         if child_page_y > page_start_y + band
             && (content_above_child || !block_parent || !parent_avoids)
@@ -5984,6 +6129,7 @@ fn fragment_block_subtree(
                         strips,
                         page_index,
                         avoid_inside_child,
+                        relaxed_para,
                     )
                 };
             } else if needs_recursion {
@@ -6971,7 +7117,7 @@ fn plan_line_breaks(
             } else {
                 usize::MAX
             };
-            end = choose_line_break(
+            end = choose_line_break_with(
                 start,
                 end,
                 n,
@@ -6979,6 +7125,7 @@ fn plan_line_breaks(
                 capacity,
                 continuation || short_first,
                 at_top,
+                false,
             )
             .unwrap_or(end);
         }
@@ -7629,9 +7776,23 @@ fn may_start_in_place(
     avoid_inside: bool,
     page_h: f32,
 ) -> bool {
+    split.has_inner_break()
+        && may_start_in_place_shape(doc, parent, child, split, avoid_inside, page_h)
+}
+
+/// [`may_start_in_place`] without the length rule ([`LineSplit::has_inner_break`]): the room-independent shape of the box.
+/// F215: a paragraph without an allowed break that the keep cannot avoid relaxing (Rule 3 dropped) starts in place by this
+/// shape alone.
+fn may_start_in_place_shape(
+    doc: &BaseDocument,
+    parent: &blitz_dom::Node,
+    child: &blitz_dom::Node,
+    split: &LineSplit,
+    avoid_inside: bool,
+    page_h: f32,
+) -> bool {
     let height = child.final_layout.size.height;
     !avoid_inside
-        && split.has_inner_break()
         && split.hidden_tail == 0
         && split.own_box_height.is_none()
         && height.is_finite()
@@ -8118,6 +8279,7 @@ fn block_walk_line_split(
     strips: PageStrips,
     page: u32,
     avoid_inside: bool,
+    relaxed: bool,
 ) -> Option<LineSplit> {
     let split = line_split_candidate(doc, parent, child)?;
     let mut split = if nested_split_needed(
@@ -8137,6 +8299,15 @@ fn block_walk_line_split(
     {
         // The cheap tests first: the walk up the ancestors runs only for a paragraph that overflows the room and has
         // an allowed break on this page.
+        split
+    } else if relaxed
+        && split.inset_top + split.span() + child_page_y > strips.bottom(page) + 1.0
+        && child_page_y + split.inset_top + split.lines[0].1 - split.lines[0].0
+            <= strips.bottom(page)
+        && may_start_in_place_shape(doc, parent, child, &split, avoid_inside, strips.fresh())
+    {
+        // html-to-pdf F215: the keep cannot avoid relaxing Rule 3 (css-break-3 §4.4): the paragraph starts where its first
+        // line fits, and `plan_line_breaks` takes the greedy break where no rule has one.
         split
     } else {
         return None;
@@ -8271,7 +8442,7 @@ fn row_mate_can_split(
                 m.element_data().is_some()
                     && (m.final_layout.location.y - top).abs() < 0.5
                     && m.final_layout.size.height > page_height_px
-                    && (leading_block_size_with(doc, id, None, 0.0, 0, page_height_px, false)
+                    && (leading_block_size_with(doc, id, None, 0.0, 0, page_height_px, false, None)
                         <= page_height_px
                         || line_split_candidate(doc, parent, m)
                             .is_some_and(|split| split.leading() <= page_height_px))
@@ -8667,6 +8838,7 @@ fn keep_orphans_break(start: usize, i: usize, total: usize, rules: LineRules) ->
 /// A first fragment with a `widows` smaller than the paragraph keeps its pull-back whatever its page: Chrome's numbers for a
 /// 60-line paragraph at the top of a page are irregular (`widows: 49` 48 / 12 but `50` 10 / 48 / 2 and, with `orphans: 30`,
 /// 30 / 30), and the rest stays F30c-o2.
+#[cfg(test)]
 fn choose_line_break(
     start: usize,
     i: usize,
@@ -8675,6 +8847,34 @@ fn choose_line_break(
     capacity: usize,
     continuation: bool,
     at_top: bool,
+) -> Option<usize> {
+    choose_line_break_with(
+        start,
+        i,
+        total,
+        rules,
+        capacity,
+        continuation,
+        at_top,
+        false,
+    )
+}
+
+/// [`choose_line_break`] with a last fallback for a paragraph whose Rule 3 the keep-with-next relaxation drops
+/// (html-to-pdf F215, css-break-3 §4.4: Rule 3, orphans and widows, gives way before Rules 1, 2 and 4): `rule3_dropped`
+/// takes any break between two lines, `Some(i)` for `start < i < total`, when none of the steps above has one. Chrome
+/// breaks a 3-line paragraph 2 / 1 and a 5-line one with `orphans: 3; widows: 3` 1 / 4 after a heading that fills a page.
+/// With `rule3_dropped` false this is [`choose_line_break`] as it was.
+#[allow(clippy::too_many_arguments)]
+fn choose_line_break_with(
+    start: usize,
+    i: usize,
+    total: usize,
+    rules: LineRules,
+    capacity: usize,
+    continuation: bool,
+    at_top: bool,
+    rule3_dropped: bool,
 ) -> Option<usize> {
     let rules = if (continuation && rules.widows > capacity) || (at_top && rules.widows >= total) {
         LineRules { widows: 1, ..rules }
@@ -8700,6 +8900,7 @@ fn choose_line_break(
                 })
                 .flatten()
         })
+        .or_else(|| (rule3_dropped && start < i && i < total).then_some(i))
 }
 
 /// html-to-pdf F30c-o3: how many of the lines from `start` fit a strip of `room` px (at least one: a line box is monolithic).
@@ -8820,6 +9021,7 @@ pub(crate) fn fragment_inline_root(
     strips: PageStrips,
     line_metrics: &[(f32, f32)],
     rules: LineRules,
+    rule3_dropped: bool,
 ) -> (u32, f32, usize, Vec<(u32, f32, f32)>) {
     if line_metrics.is_empty() {
         return (initial_page_index, initial_cursor_y, 0, Vec::new());
@@ -8852,7 +9054,7 @@ pub(crate) fn fragment_inline_root(
             } else {
                 usize::MAX
             };
-            let Some(break_at) = choose_line_break(
+            let Some(break_at) = choose_line_break_with(
                 fragment_start_idx,
                 i,
                 total_lines,
@@ -8860,6 +9062,7 @@ pub(crate) fn fragment_inline_root(
                 capacity,
                 continuation,
                 at_top,
+                rule3_dropped,
             ) else {
                 // No break honours the minimums here: skip, keep accumulating into the current
                 // fragment (CSS Fragmentation §4.4: the minimums are relaxed only when no break
@@ -13409,6 +13612,7 @@ h2 { string-set: chapter-title content(text); }
             /*strips=*/ PageStrips::new(200.0, 0.0),
             &lines,
             LineRules::INITIAL,
+            false,
         );
         assert_eq!(emitted, 1, "widow violation → single oversized fragment");
         assert_eq!(new_page, 0);
@@ -13456,6 +13660,7 @@ h2 { string-set: chapter-title content(text); }
             PageStrips::new(1009.13, 0.0),
             &lines,
             LineRules::INITIAL,
+            false,
         );
         assert_eq!(emitted, 2);
         assert_eq!(page, 1);
@@ -13495,6 +13700,7 @@ h2 { string-set: chapter-title content(text); }
                 PageStrips::new(1009.13, 0.0),
                 &lines,
                 LineRules::INITIAL,
+                false,
             );
             assert_eq!(fragment_ranges(&geom), expect, "{n} lines");
         }
@@ -13516,6 +13722,7 @@ h2 { string-set: chapter-title content(text); }
             PageStrips::new(1009.13, 0.0),
             &lines,
             LineRules::INITIAL,
+            false,
         );
         assert_eq!((page, emitted), (2, 3));
         assert_eq!(
@@ -13542,6 +13749,7 @@ h2 { string-set: chapter-title content(text); }
             PageStrips::new(1009.13, 0.0),
             &lines,
             LineRules::INITIAL,
+            false,
         );
         // The last line (43) ends at 100 + 44 * 21 = 1024 > 1009.13 while line 42 ends at 1003: a widow of one,
         // pulled back to 42 / 2.
@@ -13564,6 +13772,7 @@ h2 { string-set: chapter-title content(text); }
             PageStrips::new(50.0, 0.0),
             &lines,
             LineRules::INITIAL,
+            false,
         );
         assert_eq!(fragment_ranges(&geom), vec![(0, 0, 3)]);
     }
@@ -13696,6 +13905,7 @@ h2 { string-set: chapter-title content(text); }
             PageStrips::new(200.0, 0.0),
             &lines,
             LineRules::INITIAL,
+            false,
         );
         assert_eq!(emitted, 2, "valid split → 2 fragments");
         assert_eq!(new_page, 1);
@@ -13732,6 +13942,7 @@ h2 { string-set: chapter-title content(text); }
             PageStrips::new(100.0, 0.0),
             &lines,
             LineRules::INITIAL,
+            false,
         );
         assert_eq!(emitted, 1, "orphan violation → single oversized fragment");
         assert_eq!(new_page, 0);
@@ -13767,6 +13978,7 @@ h2 { string-set: chapter-title content(text); }
             PageStrips::new(1000.0, 0.0),
             &lines,
             LineRules::INITIAL,
+            false,
         );
         assert!(emitted > 50, "about 60 pages, got {emitted}");
         assert_eq!(last_page as usize, emitted - 1);
@@ -21771,6 +21983,7 @@ h2 { string-set: chapter-title content(text); }
             PageStrips::new(page, 0.0),
             &lines,
             rules,
+            false,
         );
         let entry = geom.get(&1).unwrap();
         // Every fragment fits its page (a value no break can keep must not overflow).
@@ -22826,9 +23039,11 @@ h2 { string-set: chapter-title content(text); }
         let styles = blitz_adapter::extract_column_style_table(&doc);
         let s = find_by_id(doc.deref(), "s").unwrap();
         let _scope = LineRulesScope::enter(&styles);
-        let clamped = leading_block_size_with(doc.deref(), s, Some(&styles), 0.0, 0, 200.0, true);
+        let clamped =
+            leading_block_size_with(doc.deref(), s, Some(&styles), 0.0, 0, 200.0, true, None);
         assert!((clamped - 200.0).abs() < 0.5, "{clamped}");
-        let raw = leading_block_size_with(doc.deref(), s, Some(&styles), 0.0, 0, 200.0, false);
+        let raw =
+            leading_block_size_with(doc.deref(), s, Some(&styles), 0.0, 0, 200.0, false, None);
         assert!(raw > 200.0, "{raw}");
     }
 
@@ -22861,5 +23076,519 @@ h2 { string-set: chapter-title content(text); }
             200.0,
         );
         assert_eq!(page_sizes(&table, &doc, "p")[0].0, 1);
+    }
+
+    // ───────── html-to-pdf F215: keep-with-next (`break-before` / `break-after: avoid`) ─────────
+
+    /// The keep's view of `body`'s children at 200 px pages (10 lines of 20 px): the extent of the head with id `head`.
+    fn keep_of(body: &str, head: &str, fresh: f32) -> Option<keep_with_next::KeepExtent> {
+        let doc = laid_out(body);
+        let styles = blitz_adapter::extract_column_style_table(&doc);
+        let _scope = LineRulesScope::enter(&styles);
+        let head_id = find_by_id(doc.deref(), head).unwrap();
+        let parent_id = doc.deref().get_node(head_id).unwrap().parent.unwrap();
+        let parent = doc.deref().get_node(parent_id).unwrap();
+        let siblings = parent.children.clone();
+        let index = siblings.iter().position(|&c| c == head_id).unwrap();
+        keep_with_next::keep_with_next_extent(
+            doc.deref(),
+            parent,
+            &siblings,
+            index,
+            keep_with_next::KeepEnv {
+                styles: &styles,
+                names: None,
+                multicol: None,
+                body_level: parent
+                    .element_data()
+                    .is_some_and(|e| e.name.local.as_ref() == "body"),
+                body_block_flow: true,
+            },
+            fresh,
+        )
+    }
+
+    fn first_page(
+        table: &PaginationGeometryTable,
+        doc: &blitz_html::HtmlDocument,
+        id: &str,
+    ) -> u32 {
+        geometry_of(doc, table, id).expect("geometry").fragments[0].page_index
+    }
+
+    #[test]
+    fn avoid_page_break_between_truth_table() {
+        let table_of = |a: &str, b: &str| {
+            let mut t = crate::column_css::ColumnStyleTable::new();
+            t.insert(1, crate::column_css::parse_declaration_block(a));
+            t.insert(2, crate::column_css::parse_declaration_block(b));
+            t
+        };
+        let between = |a: &str, b: &str| {
+            keep_with_next::avoid_page_break_between(&table_of(a, b), None, 1, 2)
+        };
+        assert!(!between("", ""));
+        assert!(between("break-after:avoid", ""));
+        assert!(between("", "break-before:avoid"));
+        assert!(between("break-after:avoid-page", ""));
+        assert!(between("page-break-after:avoid", ""));
+        assert!(between("", "page-break-before:avoid"));
+        assert!(!between("break-after:avoid-column", ""));
+        assert!(!between("", "break-before:avoid-column"));
+        // a forced value on either side wins (css-break-3 §4.3)
+        assert!(!between("break-after:avoid", "break-before:page"));
+        assert!(!between("break-after:page", "break-before:avoid"));
+        assert!(!between("break-after:avoid;", "page-break-before:always"));
+        // the order of the boxes matters: the value on the other side of the pair does not apply
+        let t = table_of("break-after:avoid", "");
+        assert!(!keep_with_next::avoid_page_break_between(&t, None, 2, 1));
+        // different used page names are an implicit forced break
+        let names: crate::blitz_adapter::UsedPageNameTable = [
+            (1, (None, Some("a".to_string()))),
+            (2, (Some("b".to_string()), None)),
+        ]
+        .into_iter()
+        .collect();
+        assert!(!keep_with_next::avoid_page_break_between(
+            &table_of("break-after:avoid", ""),
+            Some(&names),
+            1,
+            2
+        ));
+        let same: crate::blitz_adapter::UsedPageNameTable = [
+            (1, (None, Some("a".to_string()))),
+            (2, (Some("a".to_string()), None)),
+        ]
+        .into_iter()
+        .collect();
+        assert!(keep_with_next::avoid_page_break_between(
+            &table_of("break-after:avoid", ""),
+            Some(&same),
+            1,
+            2
+        ));
+        // no entry is the unnamed page on both sides
+        assert!(keep_with_next::avoid_page_break_between(
+            &table_of("break-after:avoid", ""),
+            Some(&Default::default()),
+            1,
+            2
+        ));
+    }
+
+    #[test]
+    fn choose_line_break_with_rule3_dropped_only_adds_the_last_fallback() {
+        let sets = [
+            rules(2, 2),
+            rules(3, 3),
+            rules(1, 1),
+            rules(4, 2),
+            rules(2, 5),
+            rules(10, 10),
+        ];
+        for r in sets {
+            for total in 2..=60usize {
+                for start in 0..total {
+                    for i in (start + 1)..total {
+                        let plain = choose_line_break(start, i, total, r, usize::MAX, false, false);
+                        let off = choose_line_break_with(
+                            start,
+                            i,
+                            total,
+                            r,
+                            usize::MAX,
+                            false,
+                            false,
+                            false,
+                        );
+                        assert_eq!(plain, off, "{r:?} {start} {i} {total}");
+                        let on = choose_line_break_with(
+                            start,
+                            i,
+                            total,
+                            r,
+                            usize::MAX,
+                            false,
+                            false,
+                            true,
+                        );
+                        assert_eq!(on, plain.or(Some(i)), "{r:?} {start} {i} {total}");
+                    }
+                }
+            }
+        }
+        // Chrome: 5 lines, orphans 3, widows 3: room for 1, 2, 3 and 4 lines gives 1 / 4, 2 / 3, 3 / 2, 3 / 2
+        let at = |i| choose_line_break_with(0, i, 5, rules(3, 3), usize::MAX, false, true, true);
+        assert_eq!(
+            [at(1), at(2), at(3), at(4)],
+            [Some(1), Some(2), Some(3), Some(3)]
+        );
+        // 3 lines, initial rules: 2 / 1
+        assert_eq!(
+            choose_line_break_with(0, 2, 3, LineRules::INITIAL, usize::MAX, false, false, true),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn unbreakable_extent_cases() {
+        let body = format!(
+            "<p id=\"one\">L</p><p id=\"short\">{}</p><p id=\"long\">{}</p><div id=\"leaf\" style=\"height:50px\"></div>\
+             <div id=\"card\" style=\"break-inside:avoid\"><p>{}</p><p>{}</p></div>\
+             <div id=\"wrap\"><p>{}</p><p>{}</p></div><table id=\"t\"><tr><td>a</td></tr><tr><td>b</td></tr></table>",
+            br_lines(3),
+            br_lines(30),
+            br_lines(2),
+            br_lines(2),
+            br_lines(2),
+            br_lines(2),
+        );
+        let doc = laid_out(&body);
+        let styles = blitz_adapter::extract_column_style_table(&doc);
+        let _scope = LineRulesScope::enter(&styles);
+        let ext = |id: &str| {
+            keep_with_next::unbreakable_extent(
+                doc.deref(),
+                find_by_id(doc.deref(), id).unwrap(),
+                &styles,
+                200.0,
+            )
+        };
+        assert_eq!(ext("one"), Some(20.0));
+        assert_eq!(
+            ext("short"),
+            Some(60.0),
+            "3 lines with 2 / 2: no allowed break"
+        );
+        assert_eq!(ext("long"), None, "an allowed break inside it");
+        assert_eq!(ext("leaf"), Some(50.0));
+        assert_eq!(ext("card"), Some(80.0), "a held avoid box");
+        assert_eq!(
+            ext("wrap"),
+            None,
+            "two paragraphs: the first row is not all of it"
+        );
+        assert_eq!(ext("t"), None, "a table");
+    }
+
+    #[test]
+    fn first_fragment_extent_cases() {
+        let body = format!(
+            "<p id=\"long\">{}</p><p id=\"short\">{}</p><p id=\"tall\" style=\"orphans:3;widows:3\">{}</p>\
+             <div id=\"card\" style=\"break-inside:avoid\"><p>{}</p><p>{}</p></div><section id=\"s\"><p id=\"n\">{}</p><p id=\"ns\">{}</p></section>\
+             <div id=\"wrap\"><p>{}</p><p>{}</p></div>",
+            br_lines(30),
+            br_lines(3),
+            br_lines(30),
+            br_lines(2),
+            br_lines(2),
+            br_lines(30),
+            br_lines(3),
+            br_lines(2),
+            br_lines(2),
+        );
+        let doc = laid_out(&body);
+        let styles = blitz_adapter::extract_column_style_table(&doc);
+        let _scope = LineRulesScope::enter(&styles);
+        let d = doc.deref();
+        let body_node = d
+            .get_node(
+                d.get_node(find_by_id(d, "long").unwrap())
+                    .unwrap()
+                    .parent
+                    .unwrap(),
+            )
+            .unwrap();
+        let env = |body_level| keep_with_next::KeepEnv {
+            styles: &styles,
+            names: None,
+            multicol: None,
+            body_level,
+            body_block_flow: true,
+        };
+        let ext = |id: &str, parent: &blitz_dom::Node, body_level| {
+            keep_with_next::first_fragment_extent(
+                d,
+                parent,
+                find_by_id(d, id).unwrap(),
+                env(body_level),
+                200.0,
+            )
+        };
+        assert_eq!(
+            ext("long", body_node, true),
+            40.0,
+            "the first two lines, initial orphans"
+        );
+        assert_eq!(
+            ext("short", body_node, true),
+            60.0,
+            "no allowed break: all of it moves"
+        );
+        assert_eq!(ext("tall", body_node, true), 60.0, "orphans 3");
+        assert_eq!(
+            ext("card", body_node, true),
+            80.0,
+            "a held avoid box: the piece"
+        );
+        let section = d.get_node(find_by_id(d, "s").unwrap()).unwrap();
+        assert_eq!(
+            ext("n", section, false),
+            40.0,
+            "a nested paragraph that starts in place"
+        );
+        assert_eq!(
+            ext("ns", section, false),
+            60.0,
+            "a nested short paragraph: its height"
+        );
+        // a wrapper: its first row, as the F28 cut counts it
+        assert_eq!(ext("wrap", body_node, true), 40.0);
+    }
+
+    #[test]
+    fn keep_with_next_extent_pair_chain_cut_and_ends() {
+        // a pair: the head and the first two lines of the next paragraph
+        let pair = format!(
+            "<p id=\"h\" style=\"break-after:avoid\">H</p><p id=\"p\">{}</p>",
+            br_lines(30)
+        );
+        let k = keep_of(&pair, "h", 200.0).unwrap();
+        assert_eq!(k.size, 60.0);
+        assert_eq!(k.relax_rule3, None);
+        // `break-before: avoid` on the next box is the same break
+        let pair_b = format!(
+            "<p id=\"h\">H</p><p id=\"p\" style=\"break-before:avoid\">{}</p>",
+            br_lines(30)
+        );
+        assert_eq!(keep_of(&pair_b, "h", 200.0).unwrap().size, 60.0);
+        // no avoid: nothing is kept
+        let plain = format!("<p id=\"h\">H</p><p id=\"p\">{}</p>", br_lines(30));
+        assert_eq!(keep_of(&plain, "h", 200.0), None);
+        // a chain: both headings and the first lines of the paragraph
+        let chain = format!(
+            "<p id=\"a\" style=\"break-after:avoid\">A</p><p id=\"b\" style=\"break-after:avoid\">B</p><p>{}</p>",
+            br_lines(30)
+        );
+        assert_eq!(keep_of(&chain, "a", 200.0).unwrap().size, 80.0);
+        // the second heading is a member, not a head: the break in front of it is avoided
+        assert_eq!(keep_of(&chain, "b", 200.0), None);
+        // a forced break after the head, or before the next box, wins over avoid
+        let forced = format!(
+            "<p id=\"h\" style=\"break-after:avoid\">H</p><p style=\"break-before:page\">{}</p>",
+            br_lines(30)
+        );
+        assert_eq!(keep_of(&forced, "h", 200.0), None);
+        let forced_after = format!(
+            "<p id=\"h\" style=\"break-after:page\">H</p><p style=\"break-before:avoid\">{}</p>",
+            br_lines(30)
+        );
+        assert_eq!(keep_of(&forced_after, "h", 200.0), None);
+        // the end of the parent
+        assert_eq!(
+            keep_of("<p id=\"h\" style=\"break-after:avoid\">H</p>", "h", 200.0),
+            None
+        );
+        // a float after the head ends the chain
+        let float = format!(
+            "<p id=\"h\" style=\"break-after:avoid\">H</p><p style=\"float:left\">{}</p>",
+            br_lines(30)
+        );
+        assert_eq!(keep_of(&float, "h", 200.0), None);
+        // a breakable head keeps nothing (F215b)
+        let breakable = format!(
+            "<p id=\"h\" style=\"break-after:avoid\">{}</p><p>{}</p>",
+            br_lines(30),
+            br_lines(30)
+        );
+        assert_eq!(keep_of(&breakable, "h", 200.0), None);
+        // a chain longer than a page is cut at the last member that fits: 10 one-line members keep 9 of them in 200 px
+        let long: String = (0..12)
+            .map(|i| format!("<p id=\"m{i}\" style=\"break-after:avoid\">M{i}</p>"))
+            .collect();
+        let k = keep_of(&long, "m0", 200.0).unwrap();
+        assert_eq!(k.size, 200.0, "cut at the tenth member (the page)");
+        assert_eq!(k.relax_rule3, None);
+    }
+
+    #[test]
+    fn keep_with_next_extent_names_the_paragraph_that_cannot_avoid_relaxing() {
+        // a head of 8 lines and a 5-line paragraph with orphans 3 / widows 3: together 13 lines, taller than the 10-line
+        // page. The paragraph has no allowed break, so Rule 3 is dropped: the head and its first line (9 lines).
+        let tall = format!(
+            "<p id=\"h\" style=\"break-after:avoid;height:160px\">H</p><p id=\"p\" style=\"orphans:3;widows:3\">{}</p>",
+            br_lines(5)
+        );
+        let doc = laid_out(&tall);
+        let k = keep_of(&tall, "h", 200.0).unwrap();
+        let p = find_by_id(doc.deref(), "p").unwrap();
+        assert_eq!(k.size, 160.0 + 20.0);
+        assert_eq!(k.relax_rule3, Some(p));
+        // the same head with a 30-line paragraph: no relaxation is needed, the paragraph has an allowed break
+        let long = format!(
+            "<p id=\"h\" style=\"break-after:avoid;height:160px\">H</p><p>{}</p>",
+            br_lines(30)
+        );
+        let k = keep_of(&long, "h", 200.0).unwrap();
+        assert_eq!(k.size, 160.0 + 40.0);
+        assert_eq!(k.relax_rule3, None);
+        // a head whose first line does not fit a page with the head keeps nothing
+        let huge = format!(
+            "<p id=\"h\" style=\"break-after:avoid;height:200px\">H</p><p style=\"orphans:3;widows:3\">{}</p>",
+            br_lines(5)
+        );
+        assert_eq!(keep_of(&huge, "h", 200.0), None);
+    }
+
+    #[test]
+    fn a_head_moves_with_the_first_lines_of_a_long_paragraph() {
+        // 200 px pages, 10 lines. A spacer leaves room for the head and one line: the paragraph cannot start (two lines),
+        // the head goes with it.
+        let (doc, table) = ruled_geometry(
+            &format!(
+                "<div style=\"height:160px\"></div><p id=\"h\" style=\"break-after:avoid\">H</p><p id=\"p\">{}</p>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        assert_eq!(first_page(&table, &doc, "h"), 1);
+        // the head takes one line of the new page: 9 + 10 + 9 + 2 lines (the widows pull the third break back)
+        assert_eq!(
+            page_sizes(&table, &doc, "p"),
+            [(1, 9), (2, 10), (3, 9), (4, 2)]
+        );
+        // without the avoid the head stays and the paragraph moves (today's behaviour)
+        let (doc, table) = ruled_geometry(
+            &format!(
+                "<div style=\"height:160px\"></div><p id=\"h\">H</p><p id=\"p\">{}</p>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        assert_eq!(first_page(&table, &doc, "h"), 0);
+        // room for the head and two lines: the pair fits, the paragraph starts in place with 2 lines
+        let (doc, table) = ruled_geometry(
+            &format!(
+                "<div style=\"height:140px\"></div><p id=\"h\" style=\"break-after:avoid\">H</p><p id=\"p\">{}</p>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        assert_eq!(first_page(&table, &doc, "h"), 0);
+        assert_eq!(page_sizes(&table, &doc, "p")[0], (0, 2));
+    }
+
+    #[test]
+    fn a_head_moves_with_a_short_paragraph_and_a_chain_of_headings() {
+        let (doc, table) = ruled_geometry(
+            &format!(
+                "<style>p.s{{orphans:3;widows:3}}</style><div style=\"height:120px\"></div><p id=\"h\" style=\"break-after:avoid\">H</p><p id=\"p\" class=\"s\">{}</p>",
+                br_lines(5)
+            ),
+            200.0,
+        );
+        // room for the head and 3 lines, the paragraph needs all five: the pair moves, 0 / 5
+        assert_eq!(first_page(&table, &doc, "h"), 1);
+        assert_eq!(page_sizes(&table, &doc, "p"), [(1, 5)]);
+        // a chain of two headings
+        let (doc, table) = ruled_geometry(
+            &format!(
+                "<div style=\"height:160px\"></div><p id=\"a\" style=\"break-after:avoid\">A</p><p id=\"b\" style=\"break-after:avoid\">B</p><p id=\"p\">{}</p>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        assert_eq!(first_page(&table, &doc, "a"), 1);
+        assert_eq!(first_page(&table, &doc, "b"), 1);
+        assert_eq!(first_page(&table, &doc, "p"), 1);
+    }
+
+    #[test]
+    fn a_nested_head_moves_with_its_paragraph() {
+        let (doc, table) = ruled_geometry(
+            &format!(
+                "<div style=\"height:160px\"></div><section><p id=\"h\" style=\"break-after:avoid\">H</p><p id=\"p\">{}</p></section>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        assert_eq!(first_page(&table, &doc, "h"), 1);
+        assert_eq!(page_sizes(&table, &doc, "p")[0].0, 1);
+        let (doc, table) = ruled_geometry(
+            &format!(
+                "<div style=\"height:160px\"></div><section><p id=\"h\">H</p><p id=\"p\">{}</p></section>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        assert_eq!(first_page(&table, &doc, "h"), 0);
+    }
+
+    #[test]
+    fn a_head_at_the_page_top_relaxes_rule_3_of_the_paragraph_after_it() {
+        // The head fills the page but 40 px (two lines): it cannot move (it is first), the pair does not fit a page, so
+        // Rule 3 is dropped and the 5-line paragraph with orphans 3 / widows 3 starts in place: 2 / 3.
+        for nested in [false, true] {
+            let (open, close) = if nested {
+                ("<section>", "</section>")
+            } else {
+                ("", "")
+            };
+            let (doc, table) = ruled_geometry(
+                &format!(
+                    "{open}<p id=\"h\" style=\"break-after:avoid;height:160px\">H</p><p id=\"p\" style=\"orphans:3;widows:3\">{}</p>{close}",
+                    br_lines(5)
+                ),
+                200.0,
+            );
+            assert_eq!(first_page(&table, &doc, "h"), 0, "nested {nested}");
+            assert_eq!(
+                page_sizes(&table, &doc, "p"),
+                [(0, 2), (1, 3)],
+                "nested {nested}"
+            );
+            // room for one line: 1 / 4
+            let (doc, table) = ruled_geometry(
+                &format!(
+                    "{open}<p id=\"h\" style=\"break-after:avoid;height:180px\">H</p><p id=\"p\" style=\"orphans:3;widows:3\">{}</p>{close}",
+                    br_lines(5)
+                ),
+                200.0,
+            );
+            assert_eq!(
+                page_sizes(&table, &doc, "p"),
+                [(0, 1), (1, 4)],
+                "nested {nested}"
+            );
+            // no room for a line: the paragraph moves whole, the head stays alone
+            let (doc, table) = ruled_geometry(
+                &format!(
+                    "{open}<p id=\"h\" style=\"break-after:avoid;height:200px\">H</p><p id=\"p\" style=\"orphans:3;widows:3\">{}</p>{close}",
+                    br_lines(5)
+                ),
+                200.0,
+            );
+            assert_eq!(first_page(&table, &doc, "h"), 0, "nested {nested}");
+            assert_eq!(first_page(&table, &doc, "p"), 1, "nested {nested}");
+        }
+    }
+
+    #[test]
+    fn a_document_without_an_avoid_value_takes_the_paths_it_took() {
+        // the facts say so, and the geometry of a pair that would be kept is the unkept one
+        let html = format!(
+            "<html><head>{LINE_CSS}</head><body><div style=\"height:160px\"></div><p id=\"h\">H</p><p>{}</p></body></html>",
+            br_lines(30)
+        );
+        let doc = parse(&html, 600.0);
+        let styles = blitz_adapter::extract_column_style_table(&doc);
+        assert!(!crate::column_css::has_avoid_page_break(&styles));
+        let facts = SubtreeFacts::build(doc.deref(), Some(&styles), None);
+        assert!(!facts.keeps_with_next());
+        let html = html.replace("<p id=\"h\">", "<p id=\"h\" style=\"break-after:avoid\">");
+        let doc = parse(&html, 600.0);
+        let styles = blitz_adapter::extract_column_style_table(&doc);
+        let facts = SubtreeFacts::build(doc.deref(), Some(&styles), None);
+        assert!(facts.keeps_with_next());
     }
 }
