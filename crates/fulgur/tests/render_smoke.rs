@@ -9965,3 +9965,56 @@ fn render_smoke_author_orphans_and_widows_move_the_break() {
     // A break that already leaves enough lines for the next page is not moved by `widows`.
     assert_eq!(lines_on_page_one("p{widows:4}", ""), 4);
 }
+
+#[test]
+fn render_smoke_nested_paragraph_starts_in_place_where_its_lines_fit() {
+    // html-to-pdf F30c-n, css-break-3 §4.1 / §4.4: a 12-line paragraph (240px, it fits a 300px page) inside a `<section>`
+    // after a 200px spacer has room for five lines. It starts there and is split between its lines (5 / 7); it used to
+    // move to page 2 whole. With `break-inside: avoid` it still moves whole.
+    let html = |attrs: &str| {
+        let lines: Vec<String> = (0..12).map(|i| format!("Line{i:02}")).collect();
+        format!(
+            "<!DOCTYPE html><html><head><style>@page{{size:300px 300px;margin:0}}\
+             body{{margin:0;font-size:14px;line-height:20px}}p{{margin:0}}</style></head>\
+             <body><section><div style=\"height:200px\"></div><p{attrs}>{}</p></section></body></html>",
+            lines.join("<br>")
+        )
+    };
+    let page_one = |pdf: &[u8]| -> String {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("p.pdf");
+        std::fs::write(&path, pdf).expect("write pdf");
+        let out = match std::process::Command::new("pdftotext")
+            .args(["-f", "1", "-l", "1", "-raw"])
+            .arg(&path)
+            .arg("-")
+            .output()
+        {
+            Ok(out) => out,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return String::new(),
+            Err(err) => panic!("pdftotext: {err}"),
+        };
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let engine = noto_engine();
+    let split = engine.render(&html("")).unwrap();
+    assert_eq!(page_count(&split), 2);
+    let avoid = engine
+        .render(&html(" style=\"break-inside:avoid\""))
+        .unwrap();
+    assert_eq!(page_count(&avoid), 2);
+    if extract_pdf_text(&[]).is_none() {
+        eprintln!("pdftotext not installed; skipping the line counts");
+        return;
+    }
+    assert_eq!(
+        page_one(&split).matches("Line").count(),
+        5,
+        "five lines of room"
+    );
+    assert_eq!(
+        page_one(&avoid).matches("Line").count(),
+        0,
+        "avoid moves it whole"
+    );
+}

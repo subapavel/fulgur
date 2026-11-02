@@ -4575,6 +4575,22 @@ fn leading_block_size(
             {
                 split.leading().min(layout.size.height)
             }
+            // html-to-pdf F30c-n: so is a paragraph that fits a page but can start where it is ([`may_start_in_place`]):
+            // the block walk splits it when it does not fit the room, so the first place the fragmenter can break in
+            // the box is after its inset and `orphans` lines. Only where the caller passes the break styles: without
+            // them (`None`: a box that cannot move, a table cell) the box counts as before.
+            Some(split)
+                if column_styles.is_some()
+                    && may_start_in_place(
+                        doc,
+                        node,
+                        child,
+                        &split,
+                        has_avoid(column_styles, child_id),
+                    ) =>
+            {
+                split.leading().min(layout.size.height)
+            }
             _ if kept_rows.contains_key(&row_key(top))
                 && above + top + layout.size.height <= page_height_px + 1.0 =>
             {
@@ -5690,6 +5706,7 @@ fn fragment_block_subtree(
                 page_start_y + band,
                 strips,
                 page_index,
+                avoid_inside_child,
             )
         };
         // F30d: a multi-column container that does not fit the room below it is distributed over the
@@ -5903,6 +5920,7 @@ fn fragment_block_subtree(
                         page_start_y + band,
                         strips,
                         page_index,
+                        avoid_inside_child,
                     )
                 };
             } else if needs_recursion {
@@ -6941,6 +6959,21 @@ impl LineSplit {
             None => 0.0,
         }
     }
+
+    /// html-to-pdf F30c-n: the paragraph has a break between its line boxes that leaves `rules.orphans` lines before it and
+    /// `rules.widows` after it (css-break-3 §4.4): it has at least `orphans + widows` lines. Room-independent; the same
+    /// length rule as [`starts_in_place`] at body level.
+    fn has_inner_break(&self) -> bool {
+        self.rules.orphans >= 1 && self.lines.len() >= self.rules.orphans + self.rules.widows
+    }
+
+    /// html-to-pdf F30c-n: the paragraph, with its top border edge at `y`, has an allowed break on the strip that ends at
+    /// `bottom` ([`LineSplit::has_inner_break`]) and its inset and `orphans` lines fit above it. This is the negation of
+    /// the F28 cut's own test (`y + leading > bottom`, with `leading` from [`LineSplit::leading`]), so a paragraph
+    /// that passes is not moved by the cut.
+    fn starts_in_place(&self, y: f32, bottom: f32) -> bool {
+        self.has_inner_break() && y + self.leading() <= bottom
+    }
 }
 
 /// F30f: why the line splitter does not look through a box (`None` from [`split_barrier`]: it does).
@@ -7293,10 +7326,12 @@ pub(crate) fn clip_semantics_apply(node: &blitz_dom::Node) -> bool {
 /// can place where Chrome does: direct text (the box is itself the inline root), or exactly one in-flow child that
 /// starts at the content top of the box and is such a shape in turn: a paragraph, or a block-level wrapper around one.
 ///
-/// The nested fragmenter splits only the first thing on a strip (F30c-n). With anything above the paragraph (a heading, a
-/// margin, a float, an image, an earlier paragraph) the paragraph moved whole to the next page and was clipped there,
+/// Inside a clip box the nested fragmenter splits only the first thing on a strip: F30c-n starts a paragraph in place
+/// only in plain block flow outside clip boxes ([`block_flow_up_to_root`]). With anything above the paragraph (a heading,
+/// a margin, a float, an image, an earlier paragraph) the paragraph moved whole to the next page and was clipped there,
 /// and lines Chrome shows on the page the box starts on were not written; a second paragraph is not placed at all. Such
-/// a box keeps main's output until F30c-n (finding F30f-f).
+/// a box keeps main's output until the clip boxes learn the in-place start (finding F30f-f, which can reuse the
+/// `avoid_inside` parameter of [`block_walk_line_split`]).
 ///
 /// Positions are the layout's: a child is "at the top" when its offset equals the resolved border and padding of its
 /// parent (so margins count), not what the style says. A percentage `padding-top` or `padding-bottom` is the exception
@@ -7326,6 +7361,84 @@ fn in_block_flow(node: &blitz_dom::Node) -> bool {
         && !parent
             .primary_styles()
             .is_some_and(|s| s.clone_display().inside() == DisplayInside::Table)
+}
+
+/// html-to-pdf F30c-n: whether every box from `node` up to the pagination root (`<body>`) is placed by plain block flow, so
+/// that the fragmenter's block walk, and nothing else, places a paragraph inside them: each box is in block flow
+/// ([`in_block_flow`]: its parent is not a flex, grid, multicol, table or atomic inline container), is not a float, a
+/// table part or cell, is not transformed, and does not clip its block axis with a block size of its own
+/// ([`clip_block_limit`]: F30f-b fragments such a box by its own height, and the shapes it supports are F30f-f's).
+/// Flex and grid items are placed in rows, table cells belong to their row (F183), multicol containers distribute their
+/// content over columns (F30d); a paragraph in them keeps the rules of those items.
+fn block_flow_up_to_root(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
+    use ::style::values::specified::box_::DisplayInside;
+    let mut current = node;
+    for _ in 0..crate::MAX_DOM_DEPTH {
+        if is_root_or_body(current) {
+            return true;
+        }
+        let table_part = current.primary_styles().is_some_and(|s| {
+            matches!(
+                s.clone_display().inside(),
+                DisplayInside::Table
+                    | DisplayInside::TableRowGroup
+                    | DisplayInside::TableHeaderGroup
+                    | DisplayInside::TableFooterGroup
+                    | DisplayInside::TableRow
+                    | DisplayInside::TableCell
+                    | DisplayInside::TableColumn
+                    | DisplayInside::TableColumnGroup
+            ) || !s.get_box().transform.0.is_empty()
+        });
+        if table_part
+            || !in_block_flow(current)
+            || crate::blitz_adapter::node_is_floating(current)
+            || (current.id != node.id && clip_block_limit(doc, current).is_some())
+        {
+            return false;
+        }
+        let Some(parent) = current
+            .layout_parent
+            .get()
+            .or(current.parent)
+            .and_then(|id| doc.get_node(id))
+        else {
+            return false;
+        };
+        current = parent;
+    }
+    false
+}
+
+/// html-to-pdf F30c-n: the room-independent shape a paragraph nested in a block needs to start where it is when it does
+/// not fit the room below it, and to be split between its line boxes there (css-break-3 §4.1: the break between line boxes
+/// is a Class B break point, at any nesting depth; §4.4: `orphans` / `widows`). All of:
+///
+/// - no `break-inside: avoid` on the paragraph (`avoid_inside`; an avoid paragraph that fits a page moves whole, a relaxed
+///   one is split by the rules of [`nested_line_split`] already);
+/// - an allowed break inside it ([`LineSplit::has_inner_break`]): a 3-line paragraph with the initial values has none
+///   (Chrome gives up the widows there, F30c-w);
+/// - nothing hidden by a clip and no block size of its own (F83c, F30f-b): the frames of such a box are laid by its
+///   height, not by its lines;
+/// - not a cell of a table (F183: the row is the unit);
+/// - everything above it up to `<body>` is plain block flow ([`block_flow_up_to_root`]).
+fn may_start_in_place(
+    doc: &BaseDocument,
+    parent: &blitz_dom::Node,
+    child: &blitz_dom::Node,
+    split: &LineSplit,
+    avoid_inside: bool,
+) -> bool {
+    let height = child.final_layout.size.height;
+    !avoid_inside
+        && split.has_inner_break()
+        && split.hidden_tail == 0
+        && split.own_box_height.is_none()
+        && height.is_finite()
+        && height <= split.inset_top + split.span() + split.inset_bottom + LINE_BOX_SLACK
+        && !block_size_constrained(child)
+        && !is_cell_of_table(parent, child)
+        && block_flow_up_to_root(doc, child)
 }
 
 fn shape_supported(node: &blitz_dom::Node, depth: usize) -> bool {
@@ -7788,6 +7901,13 @@ fn slices_at_breaks(
 /// [`nested_line_split`] for a child of the block walk (`fragment_block_subtree`): the paragraph is sliced at its breaks
 /// where [`slices_at_breaks`] says so and it has a border or padding to open (F30f-d). The body (F37 slices it itself)
 /// and the multicol column-span caller use [`nested_line_split`] and keep the closed frame.
+///
+/// html-to-pdf F30c-n: a paragraph that fits a page but not the room below it is split too when it can start where it is
+/// ([`may_start_in_place`], and its inset and first `orphans` lines fit the room, [`LineSplit::starts_in_place`]), as the
+/// body-level paragraph is since F30c: a nested paragraph moved whole to the next page where Chrome starts it in place,
+/// so the same text paged differently with and without a wrapper. `avoid_inside` is the paragraph's own
+/// `break-inside: avoid`.
+#[allow(clippy::too_many_arguments)]
 fn block_walk_line_split(
     doc: &BaseDocument,
     parent: &blitz_dom::Node,
@@ -7796,8 +7916,30 @@ fn block_walk_line_split(
     strip_top: f32,
     strips: PageStrips,
     page: u32,
+    avoid_inside: bool,
 ) -> Option<LineSplit> {
-    let mut split = nested_line_split(doc, parent, child, child_page_y, strip_top, strips, page)?;
+    let split = line_split_candidate(doc, parent, child)?;
+    let mut split = if nested_split_needed(
+        doc,
+        parent,
+        child,
+        &split,
+        child_page_y,
+        strip_top,
+        strips,
+        page,
+    ) {
+        split
+    } else if split.inset_top + split.span() + child_page_y > strips.bottom(page) + 1.0
+        && split.starts_in_place(child_page_y, strips.bottom(page))
+        && may_start_in_place(doc, parent, child, &split, avoid_inside)
+    {
+        // The cheap tests first: the walk up the ancestors runs only for a paragraph that overflows the room and has
+        // an allowed break on this page.
+        split
+    } else {
+        return None;
+    };
     split.slice = slices_at_breaks(doc, parent, child, &split);
     Some(split)
 }
@@ -7807,8 +7949,9 @@ fn block_walk_line_split(
 ///
 /// A paragraph is split when it cannot fit any page whole (taller than a page),
 /// or when it is the first thing on its strip and overflows it. A paragraph that
-/// fits a page keeps moving whole to the next one when it does not fit the rest
-/// of this one (body level splits them since F30c; the nested half is F30c-n).
+/// fits a page and is not first moves whole to the next one when it does not fit
+/// the rest of this one, except in the block walk, which starts it in place when it
+/// can ([`block_walk_line_split`], F30c-n; body level splits them since F30c).
 fn nested_line_split(
     doc: &BaseDocument,
     parent: &blitz_dom::Node,
@@ -7819,6 +7962,31 @@ fn nested_line_split(
     page: u32,
 ) -> Option<LineSplit> {
     let split = line_split_candidate(doc, parent, child)?;
+    nested_split_needed(
+        doc,
+        parent,
+        child,
+        &split,
+        child_page_y,
+        strip_top,
+        strips,
+        page,
+    )
+    .then_some(split)
+}
+
+/// [`nested_line_split`]'s decision for the candidate `split` of `child`.
+#[allow(clippy::too_many_arguments)]
+fn nested_split_needed(
+    doc: &BaseDocument,
+    parent: &blitz_dom::Node,
+    child: &blitz_dom::Node,
+    split: &LineSplit,
+    child_page_y: f32,
+    strip_top: f32,
+    strips: PageStrips,
+    page: u32,
+) -> bool {
     let total = split.inset_top + split.span();
     let taller_than_a_page = total > strips.fresh() + 1.0;
     // The first thing in the box: nothing precedes it but the box's own border and padding. A cell of a table with a
@@ -7826,7 +7994,7 @@ fn nested_line_split(
     // to the pixel above the cell), which is no content above the cell, and measuring from the border edge left such
     // a cell "not first": it was not split between its lines, the block path cut it between its boxes instead
     // (html-to-pdf F183, plan 7.5). Only table cells and boxes inside a clip box that hides content (the box itself or an
-    // ancestor, `tightest_clip_limit`): a block child of another padded box keeps moving whole (F30c-n). A clip box with a
+    // ancestor, `tightest_clip_limit`): a block child of another padded box is not "first" (F30c-n starts it in place instead, [`block_walk_line_split`]). A clip box with a
     // block size is fragmented where it is (F30f-b), so the lines of its first descendant paragraph stay on the page the
     // box starts on, below the padding and border of the boxes above them, as the lines of a clip box with direct text
     // do; the paragraph, cut by the clip, would otherwise fit a page and move whole, and leave its box's frame empty
@@ -7845,7 +8013,7 @@ fn nested_line_split(
     let clip_box_overflows = split
         .own_box_height
         .is_some_and(|h| child_page_y + h > strips.bottom(page) + 1.0);
-    (taller_than_a_page || first_and_overflowing || clip_box_overflows).then_some(split)
+    taller_than_a_page || first_and_overflowing || clip_box_overflows
 }
 
 /// F111: the split to apply to `<body>` when it is the inline root of the document: its text and inline elements are
@@ -16469,8 +16637,9 @@ h2 { string-set: chapter-title content(text); }
     }
 
     #[test]
-    fn a_paragraph_that_fits_a_page_still_moves_whole() {
-        // 8 lines (160px) after a 100px spacer on a 200px page: moved, not split.
+    fn a_paragraph_that_fits_a_page_but_not_the_room_starts_in_place() {
+        // F30c-n: 8 lines (160px) after a 100px spacer on a 200px page: five lines fit, three are left for the next
+        // page (it moved whole to page 1 before).
         let (doc, table) = nested_geometry(
             &format!(
                 "<div><div style=\"height:100px\"></div><p id=\"p\">{}</p></div>",
@@ -16479,8 +16648,11 @@ h2 { string-set: chapter-title content(text); }
             200.0,
         );
         let p = fragments_of(&doc, &table, "p");
-        assert_eq!(p.len(), 1, "{p:?}");
-        assert_eq!(p[0].page_index, 1);
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert_eq!((p[0].page_index, p[0].y.to_f32()), (0, 100.0));
+        assert_eq!((p[1].page_index, p[1].y.to_f32()), (1, 0.0));
+        assert_eq!(p[0].height.to_f32(), 100.0);
+        assert_eq!(p[1].height.to_f32(), 60.0);
     }
 
     #[test]
@@ -17631,7 +17803,7 @@ h2 { string-set: chapter-title content(text); }
     fn a_clip_box_with_two_paragraphs_is_not_fragmented_by_its_block_size() {
         // F30f-f (plan 7, "Supported shapes"): the second paragraph starts at 200px, below the clip of the 100px box that
         // straddles the page bottom. Content below the clip getting no page needs the fragmenter to place more than the
-        // first thing on a strip (F30c-n); until then a box with two paragraphs has no limit and is laid out as on main.
+        // first thing on a strip (F30f-f; F30c-n leaves clip boxes alone); until then a box with two paragraphs has no limit and is laid out as on main.
         let (doc, table) = nested_geometry(
             &format!(
                 "<div style=\"height:150px\"></div><div id=\"w\" style=\"overflow:hidden;height:100px\">\
@@ -18618,6 +18790,10 @@ h2 { string-set: chapter-title content(text); }
         // On a page the paragraph fits, it counts whole.
         let whole = super::leading_block_size(doc.deref(), d, None, 0.0, 0, 10_000.0);
         assert!((whole - 600.0).abs() < 0.5, "{whole}");
+        // F30c-n: with the break styles (the caller can move the box) the paragraph counts its first two lines.
+        let styles = blitz_adapter::extract_column_style_table(&doc);
+        let started = super::leading_block_size(doc.deref(), d, Some(&styles), 0.0, 0, 10_000.0);
+        assert!((started - 40.0).abs() < 0.5, "{started}");
     }
 
     #[test]
@@ -21300,5 +21476,268 @@ h2 { string-set: chapter-title content(text); }
             205.0,
             "at most all the lines"
         );
+    }
+
+    // ── html-to-pdf F30c-n: a paragraph nested in a block starts where it is ─────────────────────────────────────
+
+    fn split_of(n: usize, inset_top: f32, rules: LineRules) -> LineSplit {
+        LineSplit {
+            lines: lines_of_21px(n),
+            inset_top,
+            inset_bottom: 0.0,
+            hidden_tail: 0,
+            own_box_height: None,
+            slice: false,
+            rules,
+        }
+    }
+
+    #[test]
+    fn has_inner_break_needs_orphans_plus_widows_lines() {
+        assert!(!split_of(3, 0.0, LineRules::INITIAL).has_inner_break());
+        assert!(split_of(4, 0.0, LineRules::INITIAL).has_inner_break());
+        assert!(!split_of(5, 0.0, rules(3, 3)).has_inner_break());
+        assert!(split_of(6, 0.0, rules(3, 3)).has_inner_break());
+        assert!(!split_of(1, 0.0, LineRules::INITIAL).has_inner_break());
+    }
+
+    #[test]
+    fn starts_in_place_compares_the_inset_and_the_orphans_with_the_room() {
+        // Two lines of 21 px and an inset of 8 px: 50 px must fit below the placement.
+        let split = split_of(6, 8.0, LineRules::INITIAL);
+        assert_eq!(split.leading(), 50.0);
+        assert!(split.starts_in_place(10.0, 60.0), "exact fit");
+        assert!(!split.starts_in_place(10.0, 59.9));
+        assert!(split.starts_in_place(0.0, 50.0));
+        assert!(!split.starts_in_place(100.0, 50.0), "negative room");
+        // Without the inset the same room holds the lines.
+        assert!(split_of(6, 0.0, LineRules::INITIAL).starts_in_place(10.0, 52.0));
+        // No allowed break: the room is irrelevant.
+        assert!(!split_of(3, 0.0, LineRules::INITIAL).starts_in_place(0.0, 1000.0));
+        // The paragraph's own orphans.
+        assert!(!split_of(6, 0.0, rules(3, 3)).starts_in_place(0.0, 62.9));
+        assert!(split_of(6, 0.0, rules(3, 3)).starts_in_place(0.0, 63.0));
+    }
+
+    #[test]
+    fn block_flow_up_to_root_is_plain_block_flow_all_the_way() {
+        let l = br_lines(5);
+        let cases: Vec<(&str, String, bool)> = vec![
+            (
+                "section",
+                format!("<section><p id=\"x\">{l}</p></section>"),
+                true,
+            ),
+            (
+                "nested blocks",
+                format!("<section><div><div><p id=\"x\">{l}</p></div></div></section>"),
+                true,
+            ),
+            ("list item", format!("<ul><li id=\"x\">{l}</li></ul>"), true),
+            (
+                "abspos wrapper",
+                format!("<div style=\"position:absolute\"><p id=\"x\">{l}</p></div>"),
+                true,
+            ),
+            (
+                "flex item",
+                format!("<div style=\"display:flex\"><p id=\"x\">{l}</p></div>"),
+                false,
+            ),
+            (
+                "child of a flex item",
+                format!("<div style=\"display:flex\"><div><p id=\"x\">{l}</p></div></div>"),
+                false,
+            ),
+            (
+                "grid item's child",
+                format!("<div style=\"display:grid\"><div><p id=\"x\">{l}</p></div></div>"),
+                false,
+            ),
+            (
+                "cell",
+                format!("<table><tr><td id=\"x\">{l}</td></tr></table>"),
+                false,
+            ),
+            (
+                "child of a cell",
+                format!("<table><tr><td><p id=\"x\">{l}</p></td></tr></table>"),
+                false,
+            ),
+            (
+                "float wrapper",
+                format!("<div style=\"float:left\"><p id=\"x\">{l}</p></div>"),
+                false,
+            ),
+            (
+                "multicol",
+                format!("<div style=\"column-count:2\"><p id=\"x\">{l}</p></div>"),
+                false,
+            ),
+            (
+                "transformed wrapper",
+                format!("<div style=\"transform:rotate(1deg)\"><p id=\"x\">{l}</p></div>"),
+                false,
+            ),
+            (
+                "clip box with a height",
+                format!("<div style=\"overflow:hidden;height:20px\"><p id=\"x\">{l}</p></div>"),
+                false,
+            ),
+            (
+                "clip box without a height",
+                format!("<div style=\"overflow:hidden\"><p id=\"x\">{l}</p></div>"),
+                true,
+            ),
+        ];
+        for (what, markup, want) in cases {
+            let doc = parse(
+                &format!("<html><head>{LINE_CSS}</head><body>{markup}</body></html>"),
+                600.0,
+            );
+            let x = doc.get_node(find_by_id(doc.deref(), "x").unwrap()).unwrap();
+            assert_eq!(block_flow_up_to_root(doc.deref(), x), want, "{what}");
+        }
+    }
+
+    /// Fragments `(page, y, height)` of the node with class `class`.
+    fn frags_by_class(
+        doc: &blitz_html::HtmlDocument,
+        table: &PaginationGeometryTable,
+        class: &str,
+    ) -> Vec<(u32, f32, f32)> {
+        table[&node_by_class(doc, class)]
+            .fragments
+            .iter()
+            .map(|f| (f.page_index, f.y.to_f32(), f.height.to_f32()))
+            .collect()
+    }
+
+    #[test]
+    fn a_nested_paragraph_below_a_sibling_starts_where_its_lines_fit() {
+        // 200 px pages, 20 px lines: ten lines after a 100 px spacer in one wrapper start on page 0 (5 lines) and go on
+        // at the top of page 1 (5 lines). It moved whole to page 1 before F30c-n.
+        let (doc, table) = avoid_fragments(&format!(
+            "<div><div style=\"height:100px\"></div><p class=\"x\">{}</p></div>",
+            lines_20px(10)
+        ));
+        assert_eq!(
+            frags_by_class(&doc, &table, "x"),
+            [(0, 100.0, 100.0), (1, 0.0, 100.0)]
+        );
+        let geom = &table[&node_by_class(&doc, "x")];
+        let slices: Vec<(u32, u32)> = geom.line_slices.iter().map(|l| (l.first, l.end)).collect();
+        assert_eq!(slices, [(0, 5), (5, 10)]);
+    }
+
+    #[test]
+    fn a_paragraph_first_in_its_own_wrapper_starts_where_its_lines_fit() {
+        // Shape B: the wrapper is entered because its first row, the paragraph, has a break that fits
+        // (`leading_block_size` counts its first two lines, not all ten).
+        let (doc, table) = avoid_fragments(&format!(
+            "<div style=\"height:100px\"></div><div><p class=\"x\">{}</p></div>",
+            lines_20px(10)
+        ));
+        assert_eq!(
+            frags_by_class(&doc, &table, "x"),
+            [(0, 100.0, 100.0), (1, 0.0, 100.0)]
+        );
+        // With one line of room (spacer 180 px) the paragraph and its wrapper move whole.
+        let (doc, table) = avoid_fragments(&format!(
+            "<div style=\"height:180px\"></div><div><p class=\"x\">{}</p></div>",
+            lines_20px(10)
+        ));
+        assert_eq!(frags_by_class(&doc, &table, "x"), [(1, 0.0, 200.0)]);
+    }
+
+    #[test]
+    fn a_nested_paragraph_with_one_line_of_room_moves_whole() {
+        // 8 lines after 180 px on 200 px pages: one line fits, orphans is 2: the break before the paragraph is the one.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div><div style=\"height:180px\"></div><p id=\"p\">{}</p></div>",
+                br_lines(8)
+            ),
+            200.0,
+        );
+        let p = fragments_of(&doc, &table, "p");
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert_eq!(p[0].page_index, 1);
+    }
+
+    #[test]
+    fn a_nested_paragraph_of_three_lines_moves_whole() {
+        // F30c-w: three lines have no break that leaves two on each side.
+        let (doc, table) = avoid_fragments(&format!(
+            "<div><div style=\"height:160px\"></div><p class=\"x\">{}</p></div>",
+            lines_20px(3)
+        ));
+        assert_eq!(frags_by_class(&doc, &table, "x"), [(1, 0.0, 60.0)]);
+    }
+
+    #[test]
+    fn a_padded_nested_paragraph_is_sliced_when_it_starts_in_place() {
+        // eight lines, border 1 + padding 9 = 10 px above: the first strip holds (200 - 100 - 10) / 20 = 4 lines, the next page starts
+        // its lines at the top (no top inset), the page-0 frame runs to the page bottom.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div><div style=\"height:100px\"></div><p id=\"b\" style=\"border:1px solid #000;padding:9px\">{}</p></div>",
+                br_lines(8)
+            ),
+            200.0,
+        );
+        let geom = geometry_of(&doc, &table, "b").expect("geometry");
+        assert!(geom.line_split_slice, "sliced");
+        let frags: Vec<(u32, f32, f32)> = geom
+            .fragments
+            .iter()
+            .map(|f| (f.page_index, f.y.to_f32(), f.height.to_f32()))
+            .collect();
+        assert_eq!(frags[0], (0, 100.0, 90.0), "{frags:?}");
+        assert_eq!(frags[1].0, 1);
+        assert_eq!(frags[1].1, 0.0, "{frags:?}");
+        let slices: Vec<(u32, u32)> = geom.line_slices.iter().map(|l| (l.first, l.end)).collect();
+        assert_eq!(slices, [(0, 4), (4, 8)]);
+    }
+
+    #[test]
+    fn a_nested_avoid_paragraph_moves_whole() {
+        let (doc, table) = avoid_fragments(&format!(
+            "<div><div style=\"height:100px\"></div><p class=\"av\">{}</p></div>",
+            lines_20px(8)
+        ));
+        assert_eq!(frags_by_class(&doc, &table, "av"), [(1, 0.0, 160.0)]);
+        let (doc, table) = avoid_fragments(&format!(
+            "<div style=\"height:100px\"></div><div><p class=\"av\">{}</p></div>",
+            lines_20px(8)
+        ));
+        assert_eq!(frags_by_class(&doc, &table, "av"), [(1, 0.0, 160.0)]);
+    }
+
+    #[test]
+    fn paragraphs_in_a_flex_item_or_a_cell_keep_moving_whole() {
+        for (what, markup) in [
+            (
+                "flex item",
+                format!(
+                    "<div style=\"display:flex\"><div><div style=\"height:100px\"></div><p class=\"x\">{}</p></div></div>",
+                    lines_20px(8)
+                ),
+            ),
+            (
+                "cell",
+                format!(
+                    "<table><tr><td><div style=\"height:100px\"></div><p class=\"x\">{}</p></td></tr></table>",
+                    lines_20px(8)
+                ),
+            ),
+        ] {
+            let (doc, table) = avoid_fragments(&markup);
+            let frags = frags_by_class(&doc, &table, "x");
+            assert!(
+                frags.len() == 1 && frags[0].0 == 1,
+                "{what}: the paragraph is not started in place: {frags:?}"
+            );
+        }
     }
 }
