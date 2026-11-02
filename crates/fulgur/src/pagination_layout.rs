@@ -6911,7 +6911,7 @@ fn plan_line_breaks(
         // html-to-pdf F30c-o3: the break the body-level splitter takes at this line ([`choose_line_break`]); `None`
         // keeps the greedy break (this splitter never overflows a strip by more than the one line it must take).
         if end < n {
-            let page_top = start > 0 || first_room >= page_room - 0.01;
+            let page_top = start > 0;
             let capacity = if rules != LineRules::INITIAL && page_top {
                 page_capacity(lines, start, page_room)
             } else {
@@ -8576,11 +8576,12 @@ fn keep_orphans_break(start: usize, i: usize, total: usize, rules: LineRules) ->
 /// are empty, and the result is the break of before F30c-o. [`fragment_inline_root`] keeps accumulating lines on `None`
 /// (F30c-w); [`plan_line_breaks`] keeps its greedy break.
 ///
-/// `capacity` is the number of lines a full page holds from `start` on, `page_top` whether the fragment starts at the top of
-/// a page (every fragment but a first one that follows content on its page). At the top of a page a `widows` larger than
-/// that capacity cannot be had by any pull-back, and Chrome ignores it: 100 lines, `orphans: 10; widows: 47` give
-/// 48 / 10 / 42 and `widows: 49` gives 48 / 48 / 4; a 60-line paragraph at the top of a page gives 48 / 12 for `widows: 49`,
-/// and 11 / 48 / 1 after 40 lines of other content (probes `out/scratch/f30co3/wid`, F30c-o2). The widows count as 1 there.
+/// `capacity` is the number of lines a full page holds from `start` on, `page_top` whether the fragment is a continuation (it
+/// starts at the top of a page). There a `widows` larger than that capacity cannot be had by any pull-back, and Chrome ignores
+/// it: 100 lines, `orphans: 10; widows: 47` give 48 / 10 / 42 and `widows: 49` gives 48 / 48 / 4 (probes
+/// `out/scratch/f30co3/wid`, F30c-o2). The widows count as 1 there. Not for a first fragment: Chrome's numbers for a 60-line
+/// paragraph at the top of a page are irregular (`widows: 49` 48 / 12 but `50` 10 / 48 / 2 and, with `orphans: 30`, 30 / 30),
+/// and the pull-back and keep-the-orphans of before are right for most of them; the rest stays F30c-o2.
 fn choose_line_break(
     start: usize,
     i: usize,
@@ -8745,8 +8746,7 @@ pub(crate) fn fragment_inline_root(
         if projected_bottom_in_body > strips.bottom(page_index) && i > fragment_start_idx {
             // fulgur-s67g Phase 2.1: honour widow / orphan minimums (F30f-l: a natural break that would leave a widow
             // is pulled back; F30c-o: the paragraph's own minimums, relaxed in steps when the page cannot keep them).
-            let page_top = fragment_start_idx > 0
-                || strips.bottom(page_index) - paragraph_top_in_body >= strips.fresh() - 0.01;
+            let page_top = fragment_start_idx > 0;
             let capacity = if rules != LineRules::INITIAL && page_top {
                 page_capacity(line_metrics, fragment_start_idx, strips.fresh())
             } else {
@@ -22312,16 +22312,7 @@ h2 { string-set: chapter-title content(text); }
             rules(10, 47),
         );
         assert_eq!(plan, [0..48, 48..58, 58..100]);
-        // 60 lines at the top of a page, widows 49: natural 48 / 12; after 40 lines of other content the first strip pulls back.
-        let at_top = plan_line_breaks(
-            &uniform_lines(60),
-            960.0,
-            960.0,
-            0.0,
-            usize::MAX,
-            rules(30, 49),
-        );
-        assert_eq!(at_top, [0..48, 48..60]);
+        // The first strip keeps its pull-back and keep-the-orphans (Chrome after 40 lines of other content: 30 / 30).
         let mid_page = plan_line_breaks(
             &uniform_lines(60),
             800.0,
