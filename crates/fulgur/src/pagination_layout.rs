@@ -4605,6 +4605,7 @@ fn leading_block_size(
                         child,
                         &split,
                         has_avoid(column_styles, child_id),
+                        page_height_px,
                     ) =>
             {
                 split.leading().min(layout.size.height)
@@ -7381,6 +7382,81 @@ fn in_block_flow(node: &blitz_dom::Node) -> bool {
             .is_some_and(|s| s.clone_display().inside() == DisplayInside::Table)
 }
 
+/// html-to-pdf F30c-n validator round 1 (M2): whether `node` is a monolithic box for the fragmenter: an atomic inline
+/// (`inline-block`, `inline-flex`, `inline-grid`, `inline-table`: css-display-3 §2.5, the box takes part in its line as a
+/// single glyph) or a `<button>` (any `display`: HTML §15.5.4, a button's content is not fragmented across pages). Chrome
+/// does not break inside them, so a paragraph in or as one keeps the placement the block walk had (moved whole).
+fn is_monolithic_box(node: &blitz_dom::Node) -> bool {
+    crate::blitz_adapter::is_atomic_inline_container_node(node)
+        || node
+            .element_data()
+            .is_some_and(|e| e.name.local.as_ref() == "button")
+}
+
+/// html-to-pdf F30c-n validator round 1 (M1): whether a box between `node` and `<body>` has a block size of its own that
+/// its content does not account for, so that it ends on a later page than the last line of the paragraph in it:
+///
+/// - its border box reaches more than 1 px below the bottom of its last in-flow child's margin box plus its own bottom
+///   padding and border (`height`, `min-height`: `p10/hs_*`, `vh150`), or
+/// - the bottom padding and border of the boxes above the paragraph, and its own, add up to more than an eighth of
+///   a page of `page_h` px (`padding-bottom: 750px`: `p10/pad_750`, `p8/tail_pad_*`). The planner reserves that tail
+///   under the last line, so a tall one moves lines to a page of their own where Chrome breaks inside the padding.
+///
+/// Such a box keeps the placement it had before F30c-n (moved whole, framed by its own height). Ordinary cards (padding
+/// of a few lines) are well below both limits.
+fn has_own_block_size_above(
+    doc: &BaseDocument,
+    node: &blitz_dom::Node,
+    own_tail: f32,
+    page_h: f32,
+) -> bool {
+    let mut tail = own_tail;
+    let mut current = node;
+    for _ in 0..crate::MAX_DOM_DEPTH {
+        let Some(parent) = current
+            .layout_parent
+            .get()
+            .or(current.parent)
+            .and_then(|id| doc.get_node(id))
+        else {
+            return false;
+        };
+        if is_root_or_body(parent) {
+            return false;
+        }
+        let layout = parent.final_layout;
+        tail += layout.padding.bottom + layout.border.bottom;
+        if tail > page_h / 8.0 {
+            return true;
+        }
+        let children_borrow = parent.layout_children.borrow();
+        let children: &[usize] = children_borrow
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .unwrap_or(&parent.children);
+        let content_bottom = children
+            .iter()
+            .filter_map(|&id| doc.get_node(id))
+            .filter(|c| !is_out_of_flow_positioned(c) && !is_offset_positioned(c))
+            .filter(|c| c.text_data().is_none() && c.final_layout.size.height.is_finite())
+            .map(|c| {
+                c.final_layout.location.y
+                    + c.final_layout.size.height
+                    + c.final_layout.margin.bottom
+            })
+            .fold(None, |acc: Option<f32>, b| {
+                Some(acc.map_or(b, |a| a.max(b)))
+            });
+        if let Some(bottom) = content_bottom
+            && layout.size.height - layout.padding.bottom - layout.border.bottom > bottom + 1.0
+        {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
 /// html-to-pdf F30c-n: whether every box from `node` up to the pagination root (`<body>`) is placed by plain block flow, so
 /// that the fragmenter's block walk, and nothing else, places a paragraph inside them: each box is in block flow
 /// ([`in_block_flow`]: its parent is not a flex, grid, multicol, table or atomic inline container), is not a float, a
@@ -7410,6 +7486,7 @@ fn block_flow_up_to_root(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
         });
         if table_part
             || !in_block_flow(current)
+            || is_monolithic_box(current)
             || crate::blitz_adapter::node_is_floating(current)
             || (current.id != node.id && clip_block_limit(doc, current).is_some())
         {
@@ -7439,13 +7516,16 @@ fn block_flow_up_to_root(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
 /// - nothing hidden by a clip and no block size of its own (F83c, F30f-b): the frames of such a box are laid by its
 ///   height, not by its lines;
 /// - not a cell of a table (F183: the row is the unit);
-/// - everything above it up to `<body>` is plain block flow ([`block_flow_up_to_root`]).
+/// - everything above it up to `<body>` is plain block flow ([`block_flow_up_to_root`]) and no monolithic box (an atomic
+///   inline, a `<button>`; M2 of the validator round 1);
+/// - no box above it has a block size of its own that its content does not account for ([`has_own_block_size_above`]; M1).
 fn may_start_in_place(
     doc: &BaseDocument,
     parent: &blitz_dom::Node,
     child: &blitz_dom::Node,
     split: &LineSplit,
     avoid_inside: bool,
+    page_h: f32,
 ) -> bool {
     let height = child.final_layout.size.height;
     !avoid_inside
@@ -7457,6 +7537,7 @@ fn may_start_in_place(
         && !block_size_constrained(child)
         && !is_cell_of_table(parent, child)
         && block_flow_up_to_root(doc, child)
+        && !has_own_block_size_above(doc, child, split.inset_bottom, page_h)
 }
 
 fn shape_supported(node: &blitz_dom::Node, depth: usize) -> bool {
@@ -7950,7 +8031,7 @@ fn block_walk_line_split(
         split
     } else if split.inset_top + split.span() + child_page_y > strips.bottom(page) + 1.0
         && split.starts_in_place(child_page_y, strips.bottom(page))
-        && may_start_in_place(doc, parent, child, &split, avoid_inside)
+        && may_start_in_place(doc, parent, child, &split, avoid_inside, strips.fresh())
     {
         // The cheap tests first: the walk up the ancestors runs only for a paragraph that overflows the room and has
         // an allowed break on this page.
@@ -9778,6 +9859,15 @@ fn explicit_inset_axes(node: &blitz_dom::Node) -> (bool, bool) {
         is_length_percentage(&pos.left) || is_length_percentage(&pos.right),
         is_length_percentage(&pos.top) || is_length_percentage(&pos.bottom),
     )
+}
+
+/// html-to-pdf F30c-n validator round 1: `position: relative` or `sticky`. The layout location of such a box includes its
+/// `top` / `left` offset, so its bottom says nothing about where the flow of its parent ends.
+fn is_offset_positioned(node: &blitz_dom::Node) -> bool {
+    use ::style::properties::longhands::position::computed_value::T as Pos;
+
+    node.primary_styles()
+        .is_some_and(|s| matches!(s.get_box().clone_position(), Pos::Relative | Pos::Sticky))
 }
 
 fn is_out_of_flow_positioned(node: &blitz_dom::Node) -> bool {
@@ -21615,6 +21705,42 @@ h2 { string-set: chapter-title content(text); }
                 format!("<div style=\"overflow:hidden\"><p id=\"x\">{l}</p></div>"),
                 true,
             ),
+            // F30c-n validator round 1 (M2): monolithic boxes.
+            (
+                "the paragraph is an inline-block",
+                format!(
+                    "<section><p id=\"x\" style=\"display:inline-block;width:300px\">{l}</p></section>"
+                ),
+                false,
+            ),
+            (
+                "inside an inline-block div",
+                format!(
+                    "<section><div style=\"display:inline-block\"><p id=\"x\">{l}</p></div></section>"
+                ),
+                false,
+            ),
+            (
+                "inside an inline-flex box",
+                format!(
+                    "<section><div style=\"display:inline-flex\"><p id=\"x\">{l}</p></div></section>"
+                ),
+                false,
+            ),
+            (
+                "inside a button",
+                format!(
+                    "<section><button style=\"display:block\"><p id=\"x\">{l}</p></button></section>"
+                ),
+                false,
+            ),
+            (
+                "inside an inline-block, deeper",
+                format!(
+                    "<section><div style=\"display:inline-block\"><div><div><p id=\"x\">{l}</p></div></div></div></section>"
+                ),
+                false,
+            ),
         ];
         for (what, markup, want) in cases {
             let doc = parse(
@@ -21781,5 +21907,137 @@ h2 { string-set: chapter-title content(text); }
         let d = find_by_id(doc.deref(), "d").unwrap();
         let counted = super::leading_block_size(doc.deref(), d, Some(&styles), 0.0, 0, 10_000.0);
         assert!((counted - 160.0).abs() < 0.5, "{counted}");
+    }
+    // ───────── html-to-pdf F30c-n validator round 1: boxes with a block size of their own, monolithic boxes ─────────
+
+    #[test]
+    fn has_own_block_size_above_sees_height_min_height_and_a_tall_bottom_inset() {
+        let l = br_lines(5);
+        let cases: Vec<(&str, String, bool)> = vec![
+            (
+                "plain section",
+                format!("<section><p id=\"x\">{l}</p></section>"),
+                false,
+            ),
+            (
+                "a card with padding and a border",
+                format!(
+                    "<section style=\"padding:16px;border:1px solid\"><p id=\"x\">{l}</p></section>"
+                ),
+                false,
+            ),
+            (
+                "height beyond the content",
+                format!("<section style=\"height:600px\"><p id=\"x\">{l}</p></section>"),
+                true,
+            ),
+            (
+                "min-height beyond the content",
+                format!("<section style=\"min-height:600px\"><p id=\"x\">{l}</p></section>"),
+                true,
+            ),
+            (
+                "a height the content fills",
+                format!("<section style=\"height:100px\"><p id=\"x\">{l}</p></section>"),
+                false,
+            ),
+            (
+                "a height beyond the content two boxes up",
+                format!("<section style=\"height:600px\"><div><p id=\"x\">{l}</p></div></section>"),
+                true,
+            ),
+            (
+                "a bottom padding of more than an eighth of a page",
+                format!("<section style=\"padding-bottom:700px\"><p id=\"x\">{l}</p></section>"),
+                true,
+            ),
+            (
+                "a small bottom padding",
+                format!("<section style=\"padding-bottom:50px\"><p id=\"x\">{l}</p></section>"),
+                false,
+            ),
+            (
+                "bottom insets that add up",
+                format!(
+                    "<section style=\"padding-bottom:60px\"><div style=\"padding-bottom:60px\"><p id=\"x\">{l}</p></div></section>"
+                ),
+                true,
+            ),
+            (
+                "a relative paragraph does not make a gap",
+                format!(
+                    "<section><p id=\"x\" style=\"position:relative;top:-5px\">{l}</p></section>"
+                ),
+                false,
+            ),
+            (
+                "the paragraph's own bottom padding",
+                format!("<section><p id=\"x\" style=\"padding-bottom:700px\">{l}</p></section>"),
+                true,
+            ),
+        ];
+        for (what, markup, want) in cases {
+            let doc = parse(
+                &format!("<html><head>{LINE_CSS}</head><body>{markup}</body></html>"),
+                600.0,
+            );
+            let x = doc.get_node(find_by_id(doc.deref(), "x").unwrap()).unwrap();
+            let own_tail = x.final_layout.padding.bottom + x.final_layout.border.bottom;
+            assert_eq!(
+                has_own_block_size_above(doc.deref(), x, own_tail, 800.0),
+                want,
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_paragraph_in_a_box_with_a_block_size_of_its_own_keeps_the_old_path() {
+        // 8 lines of 20 px after 100 px on 200 px pages. A plain `<section>` starts it in place (5 / 3); a section with a
+        // `height` that reaches a later page, or a bottom padding of that size, moves it whole as before F30c-n
+        // (Chrome breaks it, the old path did not; the box must not end up taller than its page, p10/hs_1500, pad_750).
+        let shape = |style: &str| {
+            let (doc, table) = avoid_fragments(&format!(
+                "<div style=\"height:100px\"></div><section style=\"{style}\"><p class=\"x\">{}</p></section>",
+                lines_20px(8)
+            ));
+            frags_by_class(&doc, &table, "x")
+        };
+        assert_eq!(shape(""), [(0, 100.0, 100.0), (1, 0.0, 60.0)]);
+        for style in ["height:600px", "min-height:600px", "padding-bottom:300px"] {
+            assert_eq!(shape(style), [(1, 0.0, 160.0)], "{style}");
+        }
+        // A card of ordinary padding still starts in place.
+        let card = shape("padding:8px 8px 8px 8px;border:1px solid #888");
+        assert_eq!(card[0].0, 0, "{card:?}");
+    }
+
+    #[test]
+    fn a_paragraph_that_is_or_sits_in_a_monolithic_box_keeps_the_old_path() {
+        // M2: an inline-block paragraph, a paragraph in an inline-block or a button moves whole (Chrome does not break
+        // inside them), where the plain section starts it in place.
+        let shape = |markup: &str| {
+            let (doc, table) =
+                avoid_fragments(&format!("<div style=\"height:100px\"></div>{markup}"));
+            frags_by_class(&doc, &table, "x")
+        };
+        let l = lines_20px(8);
+        assert_eq!(
+            shape(&format!("<section><p class=\"x\">{l}</p></section>")),
+            [(0, 100.0, 100.0), (1, 0.0, 60.0)]
+        );
+        for markup in [
+            format!(
+                "<section><p class=\"x\" style=\"display:inline-block;width:300px\">{l}</p></section>"
+            ),
+            format!(
+                "<section><div style=\"display:inline-block\"><p class=\"x\">{l}</p></div></section>"
+            ),
+            format!("<button style=\"display:block\"><p class=\"x\">{l}</p></button>"),
+        ] {
+            let got = shape(&markup);
+            assert_eq!(got.len(), 1, "{markup}: {got:?}");
+            assert_eq!(got[0].0, 1, "{markup}: {got:?}");
+        }
     }
 }
