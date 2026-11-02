@@ -6953,15 +6953,31 @@ fn plan_line_breaks(
         // html-to-pdf F30c-o3: the break the body-level splitter takes at this line ([`choose_line_break`]); `None`
         // keeps the greedy break (this splitter never overflows a strip by more than the one line it must take).
         if end < n {
+            // A first strip at the top of a page that is shorter than a page (the padding or border above the first
+            // line) ignores a `widows` that it cannot hold either, like a continuation (Chrome, validator set E:
+            // `pbord_n49_o3_w48` 47 / 2, `pbord_n100_o10_w99` 47 / 48 / 5).
             let continuation = start > 0;
+            let short_first = start == 0 && first_at_top && first_room < page_room - 0.01;
             let at_top = continuation || first_at_top;
-            let capacity = if rules != LineRules::INITIAL && continuation {
-                page_capacity(lines, start, page_room)
+            let capacity = if rules != LineRules::INITIAL && (continuation || short_first) {
+                page_capacity(
+                    lines,
+                    start,
+                    if continuation { page_room } else { first_room },
+                )
             } else {
                 usize::MAX
             };
-            end = choose_line_break(start, end, n, rules, capacity, continuation, at_top)
-                .unwrap_or(end);
+            end = choose_line_break(
+                start,
+                end,
+                n,
+                rules,
+                capacity,
+                continuation || short_first,
+                at_top,
+            )
+            .unwrap_or(end);
         }
         ranges.push(start..end);
         start = end;
@@ -22763,6 +22779,17 @@ h2 { string-set: chapter-title content(text); }
         };
         assert_eq!(plan(true), [0..47, 47..49]);
         assert_eq!(plan(false), [0..3, 3..49]);
+        // `widows` below the paragraph but above what the short first strip holds (60 lines, widows 59; 100 lines, 99): the same.
+        let lines60 = uniform_lines(60);
+        assert_eq!(
+            plan_line_breaks(&lines60, 940.0, 960.0, 0.0, usize::MAX, rules(10, 59), true),
+            [0..47, 47..60]
+        );
+        // A first strip with the room of a page keeps its pull-back (Chrome 10 / 48 / 2 for widows 50).
+        assert_eq!(
+            plan_line_breaks(&lines60, 960.0, 960.0, 0.0, usize::MAX, rules(10, 50), true),
+            [0..10, 10..58, 58..60]
+        );
     }
 
     #[test]
