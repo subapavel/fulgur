@@ -175,7 +175,7 @@ pub(super) fn try_convert(
                         font_size_pt,
                         color,
                     )?;
-                    Some(LineItem::Text(run))
+                    Some(LineItem::Text(ShapedGlyphRun { visible, ..run }))
                 });
 
         if children.is_empty() {
@@ -242,7 +242,7 @@ pub(super) fn try_convert(
                             font_size_pt,
                             color,
                         )?;
-                        Some(LineItem::Text(run))
+                        Some(LineItem::Text(ShapedGlyphRun { visible, ..run }))
                     });
 
             if let Some(item) = marker_item {
@@ -333,7 +333,14 @@ fn inject_marker_into_first_paragraph(
             LineItem::InlineBox(ib) => ib.x_offset += shift,
         }
     }
+    // A visible marker is painted even where the paragraph around it is not (a hidden `<p>` in a visible `li`).
+    let marker_paints = match &item {
+        LineItem::Text(run) => run.visible,
+        LineItem::Image(img) => img.visible,
+        LineItem::InlineBox(ib) => ib.visible,
+    };
     first_line.items.insert(0, item);
+    entry.visible |= marker_paints;
     Ok(())
 }
 
@@ -397,12 +404,13 @@ fn build_list_item_body(
                 inline_root::recalculate_paragraph_line_boxes(&mut paragraph.lines);
                 paragraph.cached_height = paragraph.lines.iter().map(|l| l.height.to_f32()).sum();
             }
+            let paints = inline_root::paragraph_paints(visible, &paragraph.lines);
             out.paragraphs.insert(
                 node.id,
                 crate::drawables::ParagraphEntry {
                     lines: paragraph.lines,
                     opacity: 1.0,
-                    visible,
+                    visible: paints,
                     id: extract_block_id(node),
                 },
             );
@@ -423,12 +431,14 @@ fn build_list_item_body(
             );
             let font_metrics = inline_root::metrics_from_line(&line);
             crate::paragraph::recalculate_line_box(&mut line, &font_metrics);
+            let lines = vec![line];
+            let paints = inline_root::paragraph_paints(visible, &lines);
             out.paragraphs.insert(
                 node.id,
                 crate::drawables::ParagraphEntry {
-                    lines: vec![line],
+                    lines,
                     opacity: 1.0,
-                    visible,
+                    visible: paints,
                     id: extract_block_id(node),
                 },
             );

@@ -9901,7 +9901,7 @@ fn render_smoke_hidden_inline_text_is_not_written_and_keeps_its_advance() {
     for word in ["HIDDEN", "SPACER", "ROOT", "KONCEPT"] {
         assert!(!text.contains(word), "`{word}` is hidden: {text}");
     }
-    for word in ["alpha", "omega", "Faktura"] {
+    for word in ["alpha", "omega", "SHOWN", "Faktura"] {
         assert!(text.contains(word), "`{word}` is visible: {text}");
     }
     let tagged = tagged_render_with_noto(&html("visibility:hidden"));

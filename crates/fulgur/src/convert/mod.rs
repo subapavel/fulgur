@@ -2485,6 +2485,58 @@ mod visibility_tests {
         assert_eq!(texts(&r, false), "a bold ", "{r:?}");
     }
 
+    /// The paragraph entries of the document, as `(entry visible, the text of its visible runs)`.
+    fn paragraphs(html: &str) -> Vec<(bool, String)> {
+        let d = build_drawables(html);
+        d.paragraphs
+            .values()
+            .map(|e| {
+                let mut shown = String::new();
+                for item in e.lines.iter().flat_map(|l| &l.items) {
+                    if let crate::paragraph::LineItem::Text(r) = item
+                        && r.visible
+                    {
+                        let start = r.glyphs.iter().map(|g| g.text_range.start).min().unwrap();
+                        let end = r.glyphs.iter().map(|g| g.text_range.end).max().unwrap();
+                        shown.push_str(&r.text[start..end]);
+                    }
+                }
+                (e.visible, shown)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_hidden_inline_root_with_a_visible_span_is_painted() {
+        // The entry is painted for the visible span; the runs of the root stay hidden one by one.
+        let p = paragraphs(&page(
+            "<div style='visibility:hidden'>a <span style='visibility:visible'>vis</span> w</div>",
+        ));
+        assert_eq!(p.len(), 1);
+        assert!(p[0].0, "{p:?}");
+        // Nothing visible in it: the entry is not painted, as before.
+        let p = paragraphs(&page("<div style='visibility:hidden'>a <b>b</b> w</div>"));
+        assert_eq!(p.len(), 1);
+        assert!(!p[0].0, "{p:?}");
+        // A visible root is as before.
+        let p = paragraphs(&page(
+            "<div>a <span style='visibility:hidden'>hid</span></div>",
+        ));
+        assert!(p[0].0, "{p:?}");
+    }
+
+    #[test]
+    fn a_hidden_paragraph_with_a_visible_pseudo_element_is_painted() {
+        let p = paragraphs(&page(
+            "<style>.hp::after{content:'ZZ';visibility:visible}</style><p class=hp style='visibility:hidden'>hidden</p>",
+        ));
+        assert_eq!(p.len(), 1);
+        assert!(
+            p[0].0 && p[0].1.contains("ZZ") && !p[0].1.contains("hidden"),
+            "{p:?}"
+        );
+    }
+
     #[test]
     fn a_visible_page_has_only_visible_runs() {
         let r = runs(&page("<div>a <span>b</span> <b>c</b></div><p>d</p>"));

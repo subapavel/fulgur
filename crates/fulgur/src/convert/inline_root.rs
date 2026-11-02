@@ -119,12 +119,13 @@ pub(super) fn try_convert(
         let _opacity_scope = opacity_scope_pre;
 
         // Always insert the paragraph entry keyed by the inline-root id.
+        let paints = paragraph_paints(visible, &paragraph.lines);
         out.paragraphs.insert(
             node_id,
             crate::drawables::ParagraphEntry {
                 lines: paragraph.lines,
                 opacity: if needs_block { 1.0 } else { opacity },
-                visible,
+                visible: paints,
                 id: extract_block_id(node),
             },
         );
@@ -179,12 +180,13 @@ pub(super) fn try_convert(
         let clipping = clipping_pre;
         let _opacity_scope = opacity_scope_pre;
 
+        let paints = paragraph_paints(visible, &lines);
         out.paragraphs.insert(
             node_id,
             crate::drawables::ParagraphEntry {
                 lines,
                 opacity: if needs_block { 1.0 } else { opacity },
-                visible,
+                visible: paints,
                 id: extract_block_id(node),
             },
         );
@@ -428,6 +430,19 @@ fn convert_inline_box_node(
     }
     convert_node(doc, node_id, ctx, depth + 1, out);
     Some(node_id)
+}
+
+/// Whether a paragraph has anything to paint: its inline root is visible, or a line item of it paints on its own (a visible
+/// text run, a visible image, a visible inline box). CSS 2.1 §11.2: a `visibility: visible` descendant of a hidden box is
+/// shown, so a hidden root with a visible span must not be skipped as a whole. A hidden root with nothing visible in it is
+/// `false`, which keeps the early returns of the paint paths (and `heading_title_of`) as they were (html-to-pdf F209).
+pub(super) fn paragraph_paints(root_visible: bool, lines: &[ShapedLine]) -> bool {
+    root_visible
+        || lines.iter().flat_map(|l| &l.items).any(|item| match item {
+            LineItem::Text(run) => run.visible,
+            LineItem::Image(img) => img.visible,
+            LineItem::InlineBox(ib) => ib.visible,
+        })
 }
 
 /// Extract a `ParagraphRender` from an inline root node. The caller
@@ -1156,6 +1171,53 @@ mod tests {
         let (a, b) = (metrics_from_line(&shown), metrics_from_line(&hidden));
         assert!(a.ascent != DEF_ASCENT, "the face was read");
         assert!(approx(a.ascent, b.ascent) && approx(a.descent, b.descent));
+    }
+
+    /// html-to-pdf F209: `paragraph_paints` is the root's visibility, or that of any item that paints on its own.
+    #[test]
+    fn paragraph_paints_truth_table() {
+        let with = |items: Vec<LineItem>| {
+            let mut line = text_line(16.0, 12.0);
+            line.items = items;
+            vec![line]
+        };
+        let text = |visible: bool| {
+            let mut run = make_text_run(vec![]);
+            if let LineItem::Text(r) = &mut run {
+                r.visible = visible;
+            }
+            run
+        };
+        let image = |visible: bool| {
+            let mut img = make_image(5.0, 5.0, VerticalAlign::Baseline);
+            if let LineItem::Image(i) = &mut img {
+                i.visible = visible;
+            }
+            img
+        };
+        let inline_box = |visible: bool| {
+            let mut b = make_inline_box();
+            if let LineItem::InlineBox(ib) = &mut b {
+                ib.visible = visible;
+            }
+            b
+        };
+        // A visible root paints whatever is in it, as before.
+        assert!(paragraph_paints(true, &[]));
+        assert!(paragraph_paints(true, &with(vec![text(false)])));
+        // A hidden root with nothing in it, or nothing visible, does not.
+        assert!(!paragraph_paints(false, &[]));
+        assert!(!paragraph_paints(
+            false,
+            &with(vec![text(false), image(false), inline_box(false)])
+        ));
+        // A hidden root paints for the one visible item.
+        assert!(paragraph_paints(
+            false,
+            &with(vec![text(false), text(true)])
+        ));
+        assert!(paragraph_paints(false, &with(vec![image(true)])));
+        assert!(paragraph_paints(false, &with(vec![inline_box(true)])));
     }
 
     // ── recalculate_paragraph_line_boxes: divergent new_y_acc ─────────────

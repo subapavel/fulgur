@@ -147,7 +147,9 @@ pub(super) fn resolve_inside_image_marker(
                 x_offset: crate::units::Pt::ZERO,
                 vertical_align: VerticalAlign::Baseline,
                 opacity: 1.0,
-                visible: true,
+                // The marker is the `li`'s: a hidden `li` has none, even when a descendant of it is visible and the
+                // paragraph is painted for that (html-to-pdf F209).
+                visible: super::style::extract_opacity_visible(node).1,
                 computed_y: crate::units::Pt::ZERO,
                 link: None,
             })
