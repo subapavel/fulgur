@@ -9967,6 +9967,63 @@ fn render_smoke_author_orphans_and_widows_move_the_break() {
 }
 
 #[test]
+fn render_smoke_orphans_above_a_page_and_a_tall_paragraph_keep_every_line_inside() {
+    // html-to-pdf F30c-o3, css-break-3 §4.4: a 30-line paragraph (600px) on 200px pages (10 lines), after 120px, in a
+    // `<section>`. `orphans: 12` no page can keep: the paragraph starts on page 2 and relaxes to 2 / 2, so nothing is
+    // printed below the page (it used to put a line on the 80px strip left). `orphans: 4; widows: 30` on a body-level
+    // paragraph: no break keeps both and the paragraph is taller than a page, so it starts where it is (4 / 10 / 10 / 6; it used to
+    // move whole).
+    let html = |body: &str| {
+        format!(
+            "<!DOCTYPE html><html><head><style>@page{{size:300px 200px;margin:0}}\
+             body{{margin:0;font-size:14px;line-height:20px}}p{{margin:0}}</style></head>\
+             <body><div style=\"height:120px\"></div>{body}</body></html>"
+        )
+    };
+    let lines = |n: usize| -> String {
+        (0..n)
+            .map(|i| format!("Line{i:02}"))
+            .collect::<Vec<_>>()
+            .join("<br>")
+    };
+    if extract_pdf_text(&[]).is_none() {
+        eprintln!("pdftotext not installed; skipping");
+        return;
+    }
+    let engine = noto_engine();
+    let per_page = |body: &str| -> Vec<usize> {
+        let pdf = engine.render(&html(body)).unwrap();
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("p.pdf");
+        std::fs::write(&path, &pdf).expect("write pdf");
+        let out = std::process::Command::new("pdftotext")
+            .args(["-raw"])
+            .arg(&path)
+            .arg("-")
+            .output()
+            .expect("pdftotext");
+        // pdftotext ends every page with a form feed: the piece after the last one is not a page.
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let mut pages: Vec<usize> = text
+            .split('\x0c')
+            .map(|p| p.matches("Line").count())
+            .collect();
+        pages.pop();
+        pages
+    };
+    let nested = format!(
+        "<section><p style=\"orphans:12\">{}</p></section>",
+        lines(30)
+    );
+    let got = per_page(&nested);
+    assert_eq!(got.iter().sum::<usize>(), 30, "{got:?}");
+    assert_eq!(got[0], 0, "the paragraph starts on page 2: {got:?}");
+    assert_eq!(got, [0, 10, 10, 10]);
+    let tall = format!("<p style=\"orphans:4;widows:30\">{}</p>", lines(30));
+    assert_eq!(per_page(&tall), [4, 10, 10, 6]);
+}
+
+#[test]
 fn render_smoke_nested_paragraph_starts_in_place_where_its_lines_fit() {
     // html-to-pdf F30c-n, css-break-3 §4.1 / §4.4: a 12-line paragraph (240px, it fits a 300px page) inside a `<section>`
     // after a 200px spacer has room for five lines. It starts there and is split between its lines (5 / 7); it used to
