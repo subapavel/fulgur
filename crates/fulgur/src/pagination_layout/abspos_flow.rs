@@ -916,7 +916,21 @@ fn flow_box(
         if page >= crate::MAX_PAGES {
             return false;
         }
-        fragment_nested_inline_root(out, doc, id, x, w, y, page, strips, 0.0, 0.0, &split, 0);
+        fragment_nested_inline_root(
+            out,
+            doc,
+            id,
+            x,
+            w,
+            y,
+            page,
+            strips,
+            0.0,
+            0.0,
+            &split,
+            0,
+            y <= 0.01,
+        );
         return true;
     }
     if !collect_inline_line_metrics(node).is_empty() {
