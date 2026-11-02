@@ -22719,4 +22719,96 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(sizes[0].0, 0, "{sizes:?}");
         assert_eq!(sizes.iter().map(|s| s.1).sum::<u32>(), 30);
     }
+
+    // ───────── html-to-pdf F30c-o3, validator round 1 (PR #85) ─────────
+
+    #[test]
+    fn choose_line_break_drops_the_widows_with_the_orphans_no_page_can_keep() {
+        // 49 lines, 48 fit: Chrome 48 / 1 whatever `orphans` and `widows` (the initial widows 2 pulled it back to 47 / 2).
+        for r in [rules(49, 2), rules(99, 2), rules(99, 99), rules(60, 60)] {
+            assert_eq!(
+                choose_line_break(0, 48, 49, r, 48, false, true),
+                Some(48),
+                "{r:?}"
+            );
+            assert_eq!(
+                choose_line_break(0, 48, 49, r, 48, false, false),
+                Some(48),
+                "{r:?}"
+            );
+        }
+        // One line fits: not even the initial orphans.
+        assert_eq!(
+            choose_line_break(0, 1, 49, rules(99, 2), 48, false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn plan_line_breaks_takes_first_at_top_from_the_caller_not_from_the_room() {
+        // A padded paragraph on a fresh page: its first strip holds 47 lines (the padding above), the next 48. 49 lines with
+        // `orphans: 3; widows: 49`: at the top of a page the widows are ignored (47 / 2, Chrome), after content they keep the
+        // orphans (3 / 46).
+        let lines = uniform_lines(49);
+        let plan = |first_at_top| {
+            plan_line_breaks(
+                &lines,
+                940.0,
+                960.0,
+                0.0,
+                usize::MAX,
+                rules(3, 49),
+                first_at_top,
+            )
+        };
+        assert_eq!(plan(true), [0..47, 47..49]);
+        assert_eq!(plan(false), [0..3, 3..49]);
+    }
+
+    #[test]
+    fn leading_block_size_does_not_clamp_an_orphans_no_page_can_keep_without_content_above() {
+        let html = format!(
+            "<html><head>{LINE_CSS}</head><body><section id=\"s\"><p style=\"orphans:50\">{}</p></section></body></html>",
+            br_lines(60)
+        );
+        let doc = parse(&html, 600.0);
+        let styles = blitz_adapter::extract_column_style_table(&doc);
+        let s = find_by_id(doc.deref(), "s").unwrap();
+        let _scope = LineRulesScope::enter(&styles);
+        let clamped = leading_block_size_with(doc.deref(), s, Some(&styles), 0.0, 0, 200.0, true);
+        assert!((clamped - 200.0).abs() < 0.5, "{clamped}");
+        let raw = leading_block_size_with(doc.deref(), s, Some(&styles), 0.0, 0, 200.0, false);
+        assert!(raw > 200.0, "{raw}");
+    }
+
+    #[test]
+    fn a_box_with_insets_at_a_page_top_keeps_its_paragraph_with_orphans_no_page_can_keep() {
+        // The box's own border and padding are not content above the paragraph: nothing moves, the paragraph breaks
+        // naturally (R1: Chrome 47 / 13 for 60 lines in a padded box, `orphans: 49`).
+        for markup in [
+            "<div style=\"padding:12px;border:1px solid #333\"><p id=\"p\" style=\"orphans:12\">%</p></div>",
+            "<div style=\"border:2px solid #444;padding:10px\"><section style=\"padding:6px\"><p id=\"p\" style=\"orphans:12\">%</p></section></div>",
+            "<div style=\"border:1px solid #333\"><section><p id=\"p\" style=\"orphans:12\">%</p></section></div>",
+        ] {
+            let (doc, table) = ruled_geometry(&markup.replace('%', &br_lines(30)), 200.0);
+            let sizes = page_sizes(&table, &doc, "p");
+            assert_eq!(sizes[0].0, 0, "{markup}: {sizes:?}");
+            assert!(sizes[0].1 >= 8, "{markup}: {sizes:?}");
+            assert_eq!(sizes.iter().map(|s| s.1).sum::<u32>(), 30);
+            assert_eq!(
+                sizes.len(),
+                4 - u32::from(sizes[0].1 >= 10) as usize,
+                "{markup}: {sizes:?}"
+            );
+        }
+        // With a spacer above it the same paragraph moves to the next page (Chrome 0 / 48 / 48 / 4).
+        let (doc, table) = ruled_geometry(
+            &format!(
+                "<div style=\"height:100px\"></div><div style=\"padding:12px;border:1px solid #333\"><p id=\"p\" style=\"orphans:12\">{}</p></div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        assert_eq!(page_sizes(&table, &doc, "p")[0].0, 1);
+    }
 }
