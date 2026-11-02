@@ -6920,6 +6920,7 @@ impl LineRules {
 ///
 /// `max_strips` bounds the number of ranges (the last one takes all the rest and
 /// overflows), so that a huge paragraph cannot create unbounded pages.
+#[allow(clippy::too_many_arguments)]
 fn plan_line_breaks(
     lines: &[(f32, f32)],
     first_room: f32,
@@ -6928,6 +6929,7 @@ fn plan_line_breaks(
     max_strips: usize,
     rules: LineRules,
     first_at_top: bool,
+    own_top_inset: bool,
 ) -> Vec<std::ops::Range<usize>> {
     /// Rounding slack when a run of lines is compared with a room.
     const EPS: f32 = 0.01;
@@ -6953,11 +6955,12 @@ fn plan_line_breaks(
         // html-to-pdf F30c-o3: the break the body-level splitter takes at this line ([`choose_line_break`]); `None`
         // keeps the greedy break (this splitter never overflows a strip by more than the one line it must take).
         if end < n {
-            // A first strip at the top of a page that is shorter than a page (the padding or border above the first
-            // line) ignores a `widows` that it cannot hold either, like a continuation (Chrome, validator set E:
-            // `pbord_n49_o3_w48` 47 / 2, `pbord_n100_o10_w99` 47 / 48 / 5).
+            // A paragraph with a top border or padding of its own at the top of a page has a first strip shorter than a page:
+            // it ignores a `widows` that the strip cannot hold, like a continuation (Chrome, validator set E:
+            // `pbord_n49_o3_w48` 47 / 2, `pbord_n100_o10_w99` 47 / 48 / 5). Insets of its ancestors do not count: a box
+            // with padding around the paragraph keeps the pull-back (set B `avoid_n60_o1_w50` 10 / 48 / 2).
             let continuation = start > 0;
-            let short_first = start == 0 && first_at_top && first_room < page_room - 0.01;
+            let short_first = start == 0 && first_at_top && own_top_inset;
             let at_top = continuation || first_at_top;
             let capacity = if rules != LineRules::INITIAL && (continuation || short_first) {
                 page_capacity(
@@ -8335,6 +8338,7 @@ fn fragment_nested_inline_root(
         max_strips,
         split.rules,
         first_at_top,
+        split.slice && split.inset_top > 0.0,
     );
     let mut placements: Vec<(u32, f32, f32)> = Vec::with_capacity(ranges.len());
     let mut cursor_y = y_in;
@@ -10530,6 +10534,7 @@ mod tests {
             max_strips,
             rules,
             first_room >= page_room - 0.01,
+            false,
         )
     }
     use super::*;
@@ -22775,6 +22780,7 @@ h2 { string-set: chapter-title content(text); }
                 usize::MAX,
                 rules(3, 49),
                 first_at_top,
+                true,
             )
         };
         assert_eq!(plan(true), [0..47, 47..49]);
@@ -22782,12 +22788,30 @@ h2 { string-set: chapter-title content(text); }
         // `widows` below the paragraph but above what the short first strip holds (60 lines, widows 59; 100 lines, 99): the same.
         let lines60 = uniform_lines(60);
         assert_eq!(
-            plan_line_breaks(&lines60, 940.0, 960.0, 0.0, usize::MAX, rules(10, 59), true),
+            plan_line_breaks(
+                &lines60,
+                940.0,
+                960.0,
+                0.0,
+                usize::MAX,
+                rules(10, 59),
+                true,
+                true
+            ),
             [0..47, 47..60]
         );
         // A first strip with the room of a page keeps its pull-back (Chrome 10 / 48 / 2 for widows 50).
         assert_eq!(
-            plan_line_breaks(&lines60, 960.0, 960.0, 0.0, usize::MAX, rules(10, 50), true),
+            plan_line_breaks(
+                &lines60,
+                960.0,
+                960.0,
+                0.0,
+                usize::MAX,
+                rules(10, 50),
+                true,
+                false
+            ),
             [0..10, 10..58, 58..60]
         );
     }
