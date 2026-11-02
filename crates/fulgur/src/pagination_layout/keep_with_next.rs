@@ -469,3 +469,88 @@ pub(super) fn keep_with_next_extent(
         relax_rule3: relax,
     })
 }
+
+/// What [`member_relaxation`] decided for a member of a chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MemberRelax {
+    /// Nothing to relax: the member is placed by the rules it has.
+    No,
+    /// The member does not fit whole where it is: it starts here if its first line fits, with Rule 3 dropped.
+    Start,
+    /// The member fits, but the box after it (avoided break) does not start on this page: its last line goes to the
+    /// next page, with Rule 3 dropped, so that the break falls inside the member and not in the avoided break.
+    LastLine,
+}
+
+/// html-to-pdf F215 step 7: the member of a chain that no break can keep together (css-break-3 §4.4: when the allowed breaks
+/// leave no way to keep the content inside the fragmentainer, Rule 3 gives way before Rules 1 and 2). The chain's head has
+/// decided already (it moved to the next page if the chain fits one, [`keep_with_next_extent`]); what is left are the
+/// members a page boundary falls in. A member is relaxed when it is a multi-line paragraph without an allowed break, the
+/// break in front of it is avoided (it cannot move to the next page without breaking that rule: a head would have been moved
+/// by the keep), and either it does not fit the `room` below its top, or it fits but the next box (joined to it by an
+/// avoided break) does not start in what is left. Blink ranks a break that violates `orphans` and `widows` above one that
+/// violates `break-avoid`: 60 three-line paragraphs with `break-after: avoid` page 47 / 48 / 48 / 37 lines (2 / 1 splits).
+///
+/// Body level only (the nested walk keeps today's behaviour for a chain taller than a page).
+pub(super) fn member_relaxation(
+    doc: &BaseDocument,
+    parent: &blitz_dom::Node,
+    siblings: &[usize],
+    index: usize,
+    env: KeepEnv<'_>,
+    fresh: f32,
+    room: f32,
+) -> MemberRelax {
+    if !env.body_level {
+        return MemberRelax::No;
+    }
+    let Some(&id) = siblings.get(index) else {
+        return MemberRelax::No;
+    };
+    let Some(prev_index) = neighbour(doc, siblings, index, false, env.styles) else {
+        return MemberRelax::No;
+    };
+    if !avoid_page_break_between(env.styles, env.names, siblings[prev_index], id) {
+        return MemberRelax::No;
+    }
+    let Some(node) = doc.get_node(id) else {
+        return MemberRelax::No;
+    };
+    let Some(first_line) = relaxable_first_line(doc, parent, id, env, fresh) else {
+        return MemberRelax::No;
+    };
+    let lines = collect_inline_line_metrics(node);
+    let extent = lines.last().map_or(0.0, |l| l.1) - lines.first().map_or(0.0, |l| l.0);
+    if extent > room {
+        return if first_line <= room {
+            MemberRelax::Start
+        } else {
+            MemberRelax::No
+        };
+    }
+    let Some(next_index) = neighbour(doc, siblings, index, true, env.styles) else {
+        return MemberRelax::No;
+    };
+    let next_id = siblings[next_index];
+    let Some(next) = doc.get_node(next_id) else {
+        return MemberRelax::No;
+    };
+    if crate::blitz_adapter::node_is_floating(node)
+        || crate::blitz_adapter::node_is_floating(next)
+        || next.final_layout.location.y < node.final_layout.location.y + height_of(node) - 0.5
+        || !avoid_page_break_between(env.styles, env.names, id, next_id)
+    {
+        return MemberRelax::No;
+    }
+    // What has to fit below this member for the next box to start on the page: its first line when it is a paragraph that
+    // starts in place with Rule 3 dropped (it is relaxed itself then, and splits where the page ends: a later break than
+    // one inside this member), its first fragment otherwise.
+    let after = relaxable_first_line(doc, parent, next_id, env, fresh)
+        .unwrap_or_else(|| first_fragment_extent(doc, parent, next_id, env, fresh));
+    let need = next.final_layout.location.y - node.final_layout.location.y + after;
+    if need > room {
+        MemberRelax::LastLine
+    } else {
+        MemberRelax::No
+    }
+}

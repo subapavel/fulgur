@@ -3651,6 +3651,30 @@ impl<'a> PaginationLayoutTree<'a> {
                         self.strips.fresh(),
                         rules,
                     );
+                // html-to-pdf F215 step 7: a member of a chain no break can keep together that a page boundary falls in
+                // (Rule 3 gives way first, css-break-3 §4.4).
+                let member = match keep_env {
+                    Some(env) if shape_ok && cursor_y > 0.0 => {
+                        let body_node = self.doc.get_node(body_id);
+                        body_node.map_or(keep_with_next::MemberRelax::No, |body_node| {
+                            keep_with_next::member_relaxation(
+                                self.doc,
+                                body_node,
+                                &children,
+                                child_index,
+                                keep_with_next::KeepEnv {
+                                    body_level: true,
+                                    ..env
+                                },
+                                self.strips.fresh(),
+                                self.strips.bottom(page_index) - cursor_y,
+                            )
+                        })
+                    }
+                    _ => keep_with_next::MemberRelax::No,
+                };
+                let relaxed_para = relaxed_para || member != keep_with_next::MemberRelax::No;
+                let last_line_over = member == keep_with_next::MemberRelax::LastLine;
                 // html-to-pdf F215: a paragraph the keep cannot avoid relaxing (css-break-3 §4.4: Rule 3 gives way first)
                 // starts where its first line fits, whatever its `orphans` and `widows`.
                 let start_here = start_here
@@ -3680,6 +3704,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     &line_metrics,
                     rules,
                     relaxed_para,
+                    last_line_over,
                 );
                 // Atomic inlines and images in the paragraph get their fragments on the page that
                 // holds their line. Without them the paragraph's `InlineBox` items find no geometry
@@ -9022,6 +9047,7 @@ pub(crate) fn fragment_inline_root(
     line_metrics: &[(f32, f32)],
     rules: LineRules,
     rule3_dropped: bool,
+    last_line_over: bool,
 ) -> (u32, f32, usize, Vec<(u32, f32, f32)>) {
     if line_metrics.is_empty() {
         return (initial_page_index, initial_cursor_y, 0, Vec::new());
@@ -9043,7 +9069,13 @@ pub(crate) fn fragment_inline_root(
         let frag_top_local = line_metrics[fragment_start_idx].0;
         let projected_bottom_in_body = paragraph_top_in_body + (line_bottom_local - frag_top_local);
 
-        if projected_bottom_in_body > strips.bottom(page_index) && i > fragment_start_idx {
+        // html-to-pdf F215: the last line of the paragraph goes to the next page although it fits, when the box after it,
+        // joined by an avoided break, does not start on this page and Rule 3 gives way (`rule3_dropped`).
+        let last_line_over_here =
+            last_line_over && rule3_dropped && fragment_start_idx == 0 && i + 1 == total_lines;
+        if (projected_bottom_in_body > strips.bottom(page_index) || last_line_over_here)
+            && i > fragment_start_idx
+        {
             // fulgur-s67g Phase 2.1: honour widow / orphan minimums (F30f-l: a natural break that would leave a widow
             // is pulled back; F30c-o: the paragraph's own minimums, relaxed in steps when the page cannot keep them).
             let continuation = fragment_start_idx > 0;
@@ -13613,6 +13645,7 @@ h2 { string-set: chapter-title content(text); }
             &lines,
             LineRules::INITIAL,
             false,
+            false,
         );
         assert_eq!(emitted, 1, "widow violation → single oversized fragment");
         assert_eq!(new_page, 0);
@@ -13661,6 +13694,7 @@ h2 { string-set: chapter-title content(text); }
             &lines,
             LineRules::INITIAL,
             false,
+            false,
         );
         assert_eq!(emitted, 2);
         assert_eq!(page, 1);
@@ -13701,6 +13735,7 @@ h2 { string-set: chapter-title content(text); }
                 &lines,
                 LineRules::INITIAL,
                 false,
+                false,
             );
             assert_eq!(fragment_ranges(&geom), expect, "{n} lines");
         }
@@ -13722,6 +13757,7 @@ h2 { string-set: chapter-title content(text); }
             PageStrips::new(1009.13, 0.0),
             &lines,
             LineRules::INITIAL,
+            false,
             false,
         );
         assert_eq!((page, emitted), (2, 3));
@@ -13750,6 +13786,7 @@ h2 { string-set: chapter-title content(text); }
             &lines,
             LineRules::INITIAL,
             false,
+            false,
         );
         // The last line (43) ends at 100 + 44 * 21 = 1024 > 1009.13 while line 42 ends at 1003: a widow of one,
         // pulled back to 42 / 2.
@@ -13772,6 +13809,7 @@ h2 { string-set: chapter-title content(text); }
             PageStrips::new(50.0, 0.0),
             &lines,
             LineRules::INITIAL,
+            false,
             false,
         );
         assert_eq!(fragment_ranges(&geom), vec![(0, 0, 3)]);
@@ -13906,6 +13944,7 @@ h2 { string-set: chapter-title content(text); }
             &lines,
             LineRules::INITIAL,
             false,
+            false,
         );
         assert_eq!(emitted, 2, "valid split → 2 fragments");
         assert_eq!(new_page, 1);
@@ -13943,6 +13982,7 @@ h2 { string-set: chapter-title content(text); }
             &lines,
             LineRules::INITIAL,
             false,
+            false,
         );
         assert_eq!(emitted, 1, "orphan violation → single oversized fragment");
         assert_eq!(new_page, 0);
@@ -13978,6 +14018,7 @@ h2 { string-set: chapter-title content(text); }
             PageStrips::new(1000.0, 0.0),
             &lines,
             LineRules::INITIAL,
+            false,
             false,
         );
         assert!(emitted > 50, "about 60 pages, got {emitted}");
@@ -21984,6 +22025,7 @@ h2 { string-set: chapter-title content(text); }
             &lines,
             rules,
             false,
+            false,
         );
         let entry = geom.get(&1).unwrap();
         // Every fragment fits its page (a value no break can keep must not overflow).
@@ -23590,5 +23632,51 @@ h2 { string-set: chapter-title content(text); }
         let styles = blitz_adapter::extract_column_style_table(&doc);
         let facts = SubtreeFacts::build(doc.deref(), Some(&styles), None);
         assert!(facts.keeps_with_next());
+    }
+
+    #[test]
+    fn a_chain_no_break_can_keep_together_breaks_inside_a_short_paragraph() {
+        // 60 three-line paragraphs, each `break-after: avoid`, 48-line pages of 20 px: no allowed break anywhere. Chrome
+        // pages them 47 / 48 / 48 / 37 lines: Rule 3 gives way first, so a paragraph is split 2 / 1 where a page ends, and the
+        // avoided breaks between paragraphs are kept (html-to-pdf F215, step 7).
+        let body: String = (0..60)
+            .map(|i| {
+                format!(
+                    "<p id=\"q{i}\" style=\"break-after:avoid\">{}</p>",
+                    (0..3)
+                        .map(|l| format!("L{}", i * 3 + l))
+                        .collect::<Vec<_>>()
+                        .join("<br>")
+                )
+            })
+            .collect();
+        let (doc, table) = ruled_geometry(&body, 960.0);
+        let mut per_page = [0u32; 8];
+        let mut splits = Vec::new();
+        for i in 0..60 {
+            let sizes = page_sizes(&table, &doc, &format!("q{i}"));
+            for &(page, lines) in &sizes {
+                per_page[page as usize] += lines;
+            }
+            if sizes.len() > 1 {
+                splits.push((i, sizes));
+            }
+        }
+        assert_eq!(per_page, [47, 48, 48, 37, 0, 0, 0, 0], "{splits:?}");
+        assert_eq!(
+            splits.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            [15, 31, 47]
+        );
+        assert_eq!(splits[0].1, [(0, 2), (1, 1)]);
+        // a chain of one-line paragraphs has nothing to split: 48 / 12
+        let body: String = (0..60)
+            .map(|i| format!("<p id=\"q{i}\" style=\"break-after:avoid\">L{i}</p>"))
+            .collect();
+        let (doc, table) = ruled_geometry(&body, 960.0);
+        let pages: Vec<u32> = (0..60)
+            .map(|i| first_page(&table, &doc, &format!("q{i}")))
+            .collect();
+        assert_eq!(pages.iter().filter(|&&p| p == 0).count(), 48);
+        assert_eq!(pages.iter().filter(|&&p| p == 1).count(), 12);
     }
 }
