@@ -1585,6 +1585,21 @@ fn in_avoid_box(
     false
 }
 
+/// html-to-pdf F30c-n: whether `node_id` has a forced `break-before: page` in `column_styles`.
+fn forced_break_before(
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    node_id: usize,
+) -> bool {
+    column_styles
+        .and_then(|t| t.get(&node_id))
+        .is_some_and(|p| {
+            matches!(
+                p.break_before,
+                Some(crate::draw_primitives::BreakBefore::Page)
+            )
+        })
+}
+
 /// F83b: whether `node_id` has `break-inside: avoid` in `column_styles`.
 fn has_avoid(column_styles: Option<&crate::column_css::ColumnStyleTable>, node_id: usize) -> bool {
     column_styles
@@ -4578,9 +4593,12 @@ fn leading_block_size(
             // html-to-pdf F30c-n: so is a paragraph that fits a page but can start where it is ([`may_start_in_place`]):
             // the block walk splits it when it does not fit the room, so the first place the fragmenter can break in
             // the box is after its inset and `orphans` lines. Only where the caller passes the break styles: without
-            // them (`None`: a box that cannot move, a table cell) the box counts as before.
+            // them (`None`: a box that cannot move, a table cell) the box counts as before. Not for a paragraph with a
+            // forced `break-before`: the break is its start, it is not started in place (the wrapper counts whole, as
+            // before; the sweep case `c_h_h_ba_n48_B`).
             Some(split)
                 if column_styles.is_some()
+                    && !forced_break_before(column_styles, child_id)
                     && may_start_in_place(
                         doc,
                         node,
@@ -21747,5 +21765,21 @@ h2 { string-set: chapter-title content(text); }
                 "{what}: the paragraph is not started in place: {frags:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_wrapper_whose_first_paragraph_has_a_forced_break_before_counts_whole() {
+        // F30c-n: the break is the paragraph's start, not a place to start it in place (sweep `c_h_h_ba_n48_B`): after
+        // 100 px of content a wrapper whose first row is a 8-line paragraph with `break-before: page` is not entered
+        // for the room, as before.
+        let html = format!(
+            "<html><head>{LINE_CSS}</head><body><div id=\"d\"><p style=\"break-before:page\">{}</p></div></body></html>",
+            br_lines(8)
+        );
+        let doc = parse(&html, 600.0);
+        let styles = blitz_adapter::extract_column_style_table(&doc);
+        let d = find_by_id(doc.deref(), "d").unwrap();
+        let counted = super::leading_block_size(doc.deref(), d, Some(&styles), 0.0, 0, 10_000.0);
+        assert!((counted - 160.0).abs() < 0.5, "{counted}");
     }
 }
