@@ -651,6 +651,7 @@ mod tests {
             text: Arc::from("• "),
             x_offset: crate::units::Pt::ZERO,
             link: None,
+            visible: true,
         });
         assert!(inject_marker_into_first_paragraph(&mut out, mark, text_marker).is_ok());
         let LineItem::InlineBox(ib) = &out.paragraphs[&5].lines[0].items[1] else {
@@ -750,6 +751,7 @@ mod tests {
             text: Arc::from(""),
             x_offset: x_offset.as_pt(),
             link: None,
+            visible: true,
         })
     }
 
@@ -879,6 +881,7 @@ mod tests {
             text: Arc::from(""),
             x_offset: crate::units::Pt::ZERO,
             link: None,
+            visible: true,
         });
         assert!(inject_marker_into_first_paragraph(&mut out, mark, zero_glyph_marker).is_ok());
         // shift = 0 → existing InlineBox stays at x_offset=7.

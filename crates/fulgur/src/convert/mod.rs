@@ -41,7 +41,9 @@ mod replaced;
 mod style;
 mod table;
 
-use self::style::{absolute_to_rgba, extract_block_style, extract_opacity_visible};
+use self::style::{
+    absolute_to_rgba, extract_block_style, extract_opacity_visible, node_is_visible,
+};
 
 /// Convert a Taffy `Layout` (CSS px) to PDF pt as `(x, y, width, height)`.
 #[inline]
@@ -1180,6 +1182,7 @@ fn shape_paragraph_glyph_runs(
                 let color = get_text_color(doc, brush.id);
                 let decoration = get_text_decoration(doc, brush.id);
                 let link = ctx.link_cache.lookup(doc, brush.id);
+                let visible = node_is_visible(doc, brush.id);
 
                 let run_key = run.cluster_range().start;
                 if run_key != prev_run_key {
@@ -1236,6 +1239,7 @@ fn shape_paragraph_glyph_runs(
                         text: run_text,
                         x_offset: run_x_offset,
                         link,
+                        visible,
                     }));
                 }
             }
@@ -2364,5 +2368,126 @@ mod font_bytes_tests {
         let copy = bytes.get_or_copy(&font_data(&a, 0));
         assert!(!Arc::ptr_eq(&copy, &a));
         assert_eq!(*copy, *a);
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    //! html-to-pdf F209: a glyph run takes the computed `visibility` of the node its brush names, so hidden inline text keeps its
+    //! advance (the run is still there) and is not drawn. CSS 2.1 §11.2: `visibility` is inherited, a `visible` descendant of a
+    //! hidden box is visible again.
+    //!
+    //! These tests shape text, so run them with the pinned fonts (`FONTCONFIG_FILE=examples/.fontconfig/fonts.conf`).
+
+    use crate::units::F32Units;
+    use std::ops::DerefMut;
+
+    fn build_drawables(html: &str) -> crate::drawables::Drawables {
+        let mut doc = crate::blitz_adapter::parse_and_layout(
+            html,
+            595.0_f32.as_px(),
+            842.0_f32.as_px(),
+            &[],
+            true,
+        );
+        let column_styles = crate::blitz_adapter::extract_column_style_table(&doc);
+        let multicol_geometry = crate::multicol_layout::run_pass(doc.deref_mut(), &column_styles);
+        let pagination_geometry = crate::pagination_layout::run_pass(doc.deref_mut(), 842.0);
+        let running_store = crate::gcpm::running::RunningElementStore::new();
+        let mut ctx = super::ConvertContext {
+            running_store: &running_store,
+            assets: None,
+            font_bytes: Default::default(),
+            string_set_by_node: Default::default(),
+            counter_ops_by_node: Default::default(),
+            bookmark_by_node: Default::default(),
+            column_styles,
+            multicol_geometry,
+            pagination_geometry,
+            link_cache: Default::default(),
+            dropped_text: Default::default(),
+            svg_checks: None,
+            viewport_size_px: Some((595.0, 842.0)),
+        };
+        super::dom_to_drawables(&doc, &mut ctx)
+    }
+
+    /// The text runs of every paragraph, in node order: (the text the run's glyphs cover, `run.visible`).
+    fn runs(html: &str) -> Vec<(String, bool)> {
+        let d = build_drawables(html);
+        let mut found = Vec::new();
+        for entry in d.paragraphs.values() {
+            for item in entry.lines.iter().flat_map(|l| &l.items) {
+                if let crate::paragraph::LineItem::Text(run) = item {
+                    let start = run.glyphs.iter().map(|g| g.text_range.start).min().unwrap();
+                    let end = run.glyphs.iter().map(|g| g.text_range.end).max().unwrap();
+                    found.push((run.text[start..end].to_string(), run.visible));
+                }
+            }
+        }
+        found
+    }
+
+    fn texts(runs: &[(String, bool)], visible: bool) -> String {
+        runs.iter()
+            .filter(|r| r.1 == visible)
+            .map(|r| r.0.as_str())
+            .collect()
+    }
+
+    fn page(body: &str) -> String {
+        format!(
+            "<!DOCTYPE html><html><head><style>\
+             .sp::before{{content:'tx';visibility:hidden}}.sp2::after{{content:'0000';visibility:hidden}}\
+             </style></head><body>{body}</body></html>"
+        )
+    }
+
+    #[test]
+    fn a_run_follows_the_visibility_of_its_span() {
+        let r = runs(&page(
+            "<div>a <span style='visibility:hidden'>hid</span> w</div>",
+        ));
+        assert_eq!(texts(&r, false), "hid", "{r:?}");
+        assert_eq!(texts(&r, true), "a  w", "{r:?}");
+        // `collapse` outside a table is `hidden`.
+        let r = runs(&page(
+            "<div>a <span style='visibility:collapse'>hid</span> w</div>",
+        ));
+        assert_eq!(texts(&r, false), "hid", "{r:?}");
+    }
+
+    #[test]
+    fn a_run_follows_the_visibility_of_its_pseudo_element() {
+        let r = runs(&page("<div>a <span class=sp>q</span> w</div>"));
+        assert_eq!(texts(&r, false), "tx", "{r:?}");
+        assert_eq!(texts(&r, true), "a q w", "{r:?}");
+        let r = runs(&page("<div>a <span class=sp2>q</span> w</div>"));
+        assert_eq!(texts(&r, false), "0000", "{r:?}");
+        // Depth 2 (F66i): the host of the pseudo-element is nested in another inline.
+        let r = runs(&page("<div><span><span class=sp2>q</span></span> e</div>"));
+        assert_eq!(texts(&r, false), "0000", "{r:?}");
+        assert_eq!(texts(&r, true), "q e", "{r:?}");
+    }
+
+    #[test]
+    fn a_visible_descendant_of_a_hidden_box_is_visible() {
+        let r = runs(&page(
+            "<div style='visibility:hidden'>a <span style='visibility:visible'>vis</span> w</div>",
+        ));
+        assert_eq!(texts(&r, true), "vis", "{r:?}");
+        assert_eq!(texts(&r, false), "a  w", "{r:?}");
+        // Inherited: the descendant of a hidden span is hidden, and a visible one inside it is not.
+        let r = runs(&page(
+            "<div><span style='visibility:hidden'>a <b>bold</b> <i style='visibility:visible'>it</i></span></div>",
+        ));
+        assert_eq!(texts(&r, true), "it", "{r:?}");
+        assert_eq!(texts(&r, false), "a bold ", "{r:?}");
+    }
+
+    #[test]
+    fn a_visible_page_has_only_visible_runs() {
+        let r = runs(&page("<div>a <span>b</span> <b>c</b></div><p>d</p>"));
+        assert!(!r.is_empty() && r.iter().all(|r| r.1), "{r:?}");
     }
 }

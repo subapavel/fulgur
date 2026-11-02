@@ -9,7 +9,7 @@ mod opacity;
 mod overflow;
 mod shadow;
 
-pub(super) use opacity::extract_opacity_visible;
+pub(super) use opacity::{extract_opacity_visible, node_is_visible};
 
 /// Bundle of references threaded through the per-property style extractors.
 ///

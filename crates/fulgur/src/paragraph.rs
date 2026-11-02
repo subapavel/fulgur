@@ -182,6 +182,10 @@ pub struct ShapedGlyphRun {
     pub text: Arc<str>,
     pub x_offset: crate::units::Pt,
     pub link: Option<Arc<LinkSpan>>,
+    /// The computed `visibility` of the node the run's brush names is not `hidden` / `collapse` (html-to-pdf F209). A hidden run keeps
+    /// its glyphs, so it takes its advance and the line metrics still see it, but it is not drawn: no glyphs, no decoration, no link
+    /// rectangle, no marked content.
+    pub visible: bool,
 }
 
 /// Vertical alignment for inline replaced elements (images).
@@ -543,7 +547,8 @@ fn draw_line_decorations(
             LineItem::Image(_) => continue,
             LineItem::InlineBox(_) => continue,
         };
-        if run.decoration.line.is_none() {
+        // A hidden run has no decoration under it (Chrome: a gap in the underline).
+        if !run.visible || run.decoration.line.is_none() {
             continue;
         }
 
@@ -734,6 +739,7 @@ fn lines_right_edge(lines: &[ShapedLine], x: crate::units::Pt) -> crate::units::
     let mut right = x;
     for item in lines.iter().flat_map(|l| &l.items) {
         let edge = match item {
+            LineItem::Text(run) if !run.visible => continue,
             LineItem::Text(run) => {
                 let advance = |g: &ShapedGlyph| g.x_advance * run.font_size;
                 let trailing_space = run
@@ -784,7 +790,7 @@ fn inline_box_offset(
 /// own geometry, and not a run of white space.
 fn item_is_ink(item: &LineItem) -> bool {
     match item {
-        LineItem::Text(run) => !run.text.trim().is_empty(),
+        LineItem::Text(run) => run.visible && !run.text.trim().is_empty(),
         LineItem::Image(_) => true,
         LineItem::InlineBox(_) => false,
     }
@@ -867,6 +873,11 @@ pub fn draw_shaped_lines(
         for item in &line.items {
             match item {
                 LineItem::Text(run) => {
+                    // html-to-pdf F209: a hidden run takes its advance and nothing else: no glyphs, no link rectangle, no
+                    // marked content, no `skip_run` warning for a face it never needed.
+                    if !run.visible {
+                        continue;
+                    }
                     if let Some(tracker) = run_region.as_mut() {
                         tracker.transition_to(canvas, link_span_ptr(run.link.as_ref()));
                     }
@@ -1371,6 +1382,99 @@ mod tests {
             .collect()
     }
 
+    /// The link rectangles `draw_shaped_lines` records for one line holding one linked text run (real face, two glyphs).
+    fn link_rects_of_text_run(visible: bool) -> usize {
+        const NOTO_SANS: &[u8] = include_bytes!("../../../examples/.fonts/NotoSans-Regular.ttf");
+        let glyph = |id: u32, at: usize| ShapedGlyph {
+            id,
+            x_advance: 0.6,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            text_range: at..at + 1,
+        };
+        let mut line = text_line(16.0, 12.0);
+        line.items.push(LineItem::Text(ShapedGlyphRun {
+            font_data: Arc::new(NOTO_SANS.to_vec()),
+            font_index: 0,
+            font_size: 12.0_f32.as_pt(),
+            color: [0, 0, 0, 255],
+            decoration: TextDecoration::default(),
+            glyphs: vec![glyph(36, 0), glyph(37, 1)],
+            text: Arc::from("AB"),
+            x_offset: crate::units::Pt::ZERO,
+            link: Some(Arc::new(LinkSpan {
+                target: LinkTarget::External(Arc::new("https://example.com".into())),
+                alt_text: None,
+            })),
+            visible,
+        }));
+        let mut lc = crate::draw_primitives::LinkCollector::new();
+        {
+            let mut doc = krilla::Document::new();
+            let settings =
+                krilla::page::PageSettings::from_wh(200.0, 200.0).expect("valid page size");
+            let mut page = doc.start_page_with(settings);
+            let mut surface = page.surface();
+            let mut canvas = Canvas {
+                surface: &mut surface,
+                bookmark_collector: None,
+                link_collector: Some(&mut lc),
+                tag_collector: None,
+                link_run_node_id: None,
+                in_marked_content: false,
+                images: Default::default(),
+                fonts: &mut Default::default(),
+                paint_extent: Default::default(),
+                clip_band: Default::default(),
+                slice_window: None,
+            };
+            draw_shaped_lines(&mut canvas, &[line], 0.0_f32.as_pt(), 0.0_f32.as_pt(), None);
+        }
+        lc.take_page(0).iter().map(|o| o.quads.len()).sum()
+    }
+
+    #[test]
+    fn a_hidden_run_writes_no_link_rectangle() {
+        // html-to-pdf F209: the visible run records its rectangle (the control), the hidden one nothing.
+        assert_eq!(link_rects_of_text_run(true), 1);
+        assert_eq!(link_rects_of_text_run(false), 0);
+    }
+
+    #[test]
+    fn a_hidden_run_is_not_ink_and_does_not_widen_the_paragraph() {
+        let run = |visible: bool| {
+            let mut line = text_line(16.0, 12.0);
+            line.items.push(LineItem::Text(ShapedGlyphRun {
+                font_data: Arc::new(Vec::new()),
+                font_index: 0,
+                font_size: 12.0_f32.as_pt(),
+                color: [0, 0, 0, 255],
+                decoration: TextDecoration::default(),
+                glyphs: vec![ShapedGlyph {
+                    id: 36,
+                    x_advance: 0.6,
+                    x_offset: 0.0,
+                    y_offset: 0.0,
+                    text_range: 0..2,
+                }],
+                text: Arc::from("AB"),
+                x_offset: crate::units::Pt::ZERO,
+                link: None,
+                visible,
+            }));
+            line
+        };
+        let (shown, hidden) = (run(true), run(false));
+        assert!(item_is_ink(&shown.items[0]));
+        assert!(!item_is_ink(&hidden.items[0]));
+        assert!(lines_right_edge(&[shown], 0.0_f32.as_pt()) > 0.0_f32.as_pt());
+        assert_eq!(
+            lines_right_edge(&[hidden], 0.0_f32.as_pt()),
+            0.0_f32.as_pt(),
+            "a hidden run does not widen the paragraph"
+        );
+    }
+
     fn band(top: f32, bottom: f32) -> crate::draw_primitives::ClipBand {
         crate::draw_primitives::ClipBand::Band(top.as_pt(), bottom.as_pt())
     }
@@ -1836,6 +1940,7 @@ mod tests {
             text: Arc::from("hi"),
             x_offset: crate::units::Pt::ZERO,
             link: None,
+            visible: true,
         };
         let text = LineItem::Text(glyph_run);
         assert!(format!("{:?}", text).contains("Text"));
@@ -1877,6 +1982,7 @@ mod tests {
             text: Arc::from(""),
             x_offset: crate::units::Pt::ZERO,
             link: None,
+            visible: true,
         };
         let mut line = text_line(16.0, 12.0);
         line.items.push(LineItem::Text(run));
@@ -2090,6 +2196,7 @@ mod link_span_tests {
             text: Arc::from(""),
             x_offset: crate::units::Pt::ZERO,
             link: None,
+            visible: true,
         };
         assert!(run.link.is_none());
     }

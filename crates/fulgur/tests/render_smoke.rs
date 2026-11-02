@@ -9879,3 +9879,32 @@ fn render_smoke_body_level_paragraph_starts_below_a_spacer_and_splits() {
     assert_eq!(page_count(&pdf), 2);
     assert!(text_items_of(&pdf, "s.pdf") >= 61);
 }
+
+#[test]
+fn render_smoke_hidden_inline_text_is_not_written_and_keeps_its_advance() {
+    // html-to-pdf F209, CSS 2.1 §11.2: `visibility: hidden` on an inline element and on a pseudo-element writes no glyphs
+    // (so the words are not in the text layer) but takes its space; a `visibility: visible` descendant of a hidden inline
+    // root is written; the title of a tagged heading holds only the visible words, once.
+    let html = |hidden: &str| {
+        format!(
+            "<!DOCTYPE html><html><head><style>p{{margin:0}}.s::after{{content:' SPACER';{hidden}}}</style></head><body>\
+             <p>alpha <span class=\"s\" style=\"{hidden}\">HIDDEN</span> omega</p>\
+             <p style=\"{hidden}\">ROOT <span style=\"visibility:visible\">SHOWN</span></p>\
+             <h2>Faktura <span style=\"{hidden}\">KONCEPT</span></h2></body></html>"
+        )
+    };
+    let engine = noto_engine();
+    let shown = extract_pdf_text(&engine.render(&html("")).unwrap()).expect("pdftotext");
+    assert!(shown.contains("HIDDEN") && shown.contains("SPACER") && shown.contains("KONCEPT"));
+    let pdf = engine.render(&html("visibility:hidden")).unwrap();
+    let text = extract_pdf_text(&pdf).expect("pdftotext");
+    for word in ["HIDDEN", "SPACER", "ROOT", "KONCEPT"] {
+        assert!(!text.contains(word), "`{word}` is hidden: {text}");
+    }
+    for word in ["alpha", "omega", "Faktura"] {
+        assert!(text.contains(word), "`{word}` is visible: {text}");
+    }
+    let tagged = tagged_render_with_noto(&html("visibility:hidden"));
+    let tagged_text = extract_pdf_text(&tagged).expect("pdftotext");
+    assert!(!tagged_text.contains("KONCEPT"), "{tagged_text}");
+}

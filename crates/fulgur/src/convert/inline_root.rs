@@ -503,6 +503,7 @@ pub(super) fn extract_paragraph(
                     let color = get_text_color(doc, brush.id);
                     let decoration = get_text_decoration(doc, brush.id);
                     let link = ctx.link_cache.lookup(doc, brush.id);
+                    let visible = super::node_is_visible(doc, brush.id);
 
                     // Advance or reset the per-Run offset counter.
                     let run_key = run.cluster_range().start;
@@ -573,6 +574,7 @@ pub(super) fn extract_paragraph(
                             text: run_text,
                             x_offset: run_x_offset,
                             link,
+                            visible,
                         }));
                     }
                 }
@@ -814,6 +816,7 @@ mod tests {
             text: Arc::from(""),
             x_offset: crate::units::Pt::ZERO,
             link: None,
+            visible: true,
         })
     }
 
@@ -1135,6 +1138,24 @@ mod tests {
 
         assert!(m.ascent != DEF_ASCENT, "expected real font, got default");
         assert!(m.ascent > 0.0, "ascent={}", m.ascent);
+    }
+
+    /// html-to-pdf F209: a hidden run stays in the line, so the metrics that place inline images still see its face (dropping
+    /// the run at convert time would have changed them).
+    #[test]
+    fn metrics_from_line_reads_a_hidden_first_run() {
+        const NOTO_SANS: &[u8] = include_bytes!("../../../../examples/.fonts/NotoSans-Regular.ttf");
+        let mut shown = text_line(16.0, 12.0);
+        shown.items.push(make_text_run(NOTO_SANS.to_vec()));
+        let mut hidden = text_line(16.0, 12.0);
+        let mut run = make_text_run(NOTO_SANS.to_vec());
+        if let LineItem::Text(r) = &mut run {
+            r.visible = false;
+        }
+        hidden.items.push(run);
+        let (a, b) = (metrics_from_line(&shown), metrics_from_line(&hidden));
+        assert!(a.ascent != DEF_ASCENT, "the face was read");
+        assert!(approx(a.ascent, b.ascent) && approx(a.descent, b.descent));
     }
 
     // ── recalculate_paragraph_line_boxes: divergent new_y_acc ─────────────

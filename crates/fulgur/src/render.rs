@@ -1523,7 +1523,7 @@ fn paint_inline_box_continuation(
 fn para_has_link_runs(entry: &crate::drawables::ParagraphEntry) -> bool {
     entry.lines.iter().any(|line| {
         line.items.iter().any(|item| match item {
-            crate::paragraph::LineItem::Text(run) => run.link.is_some(),
+            crate::paragraph::LineItem::Text(run) => run.visible && run.link.is_some(),
             crate::paragraph::LineItem::Image(img) => img.link.is_some(),
             crate::paragraph::LineItem::InlineBox(_) => false,
         })
@@ -1558,18 +1558,47 @@ fn run_tag_target(
 
 /// Collect the plain-text title from a paragraph's shaped lines.
 ///
-/// Returns the concatenated text of all `Text` run items across all lines.
-/// Used to populate the `/T` (Title) attribute on heading tags required by
-/// PDF/UA-1.
+/// The text of the *visible* `Text` runs, each as the span of the source text its glyphs cover. A run's `text` field is the
+/// whole paragraph (the same in every run of it), so concatenating it repeated the heading once per run and let the words of a
+/// hidden span into the title (html-to-pdf F209, F209a). Whitespace between two runs that no run covers (a space at a line break) is
+/// kept as one space. Used to populate the `/T` (Title) attribute on heading tags required by PDF/UA-1.
 fn extract_heading_title(para: &crate::drawables::ParagraphEntry) -> String {
-    para.lines
+    let mut title = String::new();
+    // The end of the text written last, in the paragraph's text.
+    let mut prev_end: Option<usize> = None;
+    for run in para
+        .lines
         .iter()
         .flat_map(|line| line.items.iter())
         .filter_map(|item| match item {
-            crate::paragraph::LineItem::Text(run) => Some(run.text.as_ref()),
+            crate::paragraph::LineItem::Text(run) if run.visible => Some(run),
             _ => None,
         })
-        .collect()
+    {
+        let (Some(start), Some(end)) = (
+            run.glyphs.iter().map(|g| g.text_range.start).min(),
+            run.glyphs.iter().map(|g| g.text_range.end).max(),
+        ) else {
+            continue;
+        };
+        let Some(text) = run.text.get(start..end) else {
+            continue;
+        };
+        if let Some(prev) = prev_end
+            && start > prev
+            && !title.ends_with(char::is_whitespace)
+            && run
+                .text
+                .get(prev..start)
+                .is_some_and(|gap| gap.chars().all(char::is_whitespace))
+            && !text.starts_with(char::is_whitespace)
+        {
+            title.push(' ');
+        }
+        title.push_str(text);
+        prev_end = Some(end);
+    }
+    title
 }
 
 /// Compute the `/T` (Title) attribute value for a heading tag, honouring
@@ -6208,10 +6237,21 @@ mod tests {
             font_size: 12.0_f32.as_pt(),
             color: [0, 0, 0, 255],
             decoration: crate::paragraph::TextDecoration::default(),
-            glyphs: vec![],
+            // One glyph per character, each with its byte range in `text` (the heading title reads the ranges).
+            glyphs: text
+                .char_indices()
+                .map(|(i, c)| crate::paragraph::ShapedGlyph {
+                    id: 0,
+                    x_advance: 0.5,
+                    x_offset: 0.0,
+                    y_offset: 0.0,
+                    text_range: i..i + c.len_utf8(),
+                })
+                .collect(),
             text: std::sync::Arc::from(text),
             x_offset: crate::units::Pt::ZERO,
             link,
+            visible: true,
         }
     }
 
@@ -6563,6 +6603,79 @@ mod tests {
         ]);
         let para = make_para(vec![line]);
         assert_eq!(extract_heading_title(&para), "text");
+    }
+
+    #[test]
+    fn extract_heading_title_reads_the_glyph_ranges_not_the_paragraph_text() {
+        // html-to-pdf F209a: every run of a paragraph carries the whole paragraph text, so the title repeated it once per run.
+        let whole: std::sync::Arc<str> = std::sync::Arc::from("Faktura č. 42 za rok");
+        let run = |range: std::ops::Range<usize>, visible: bool| {
+            let mut r = make_glyph_run("", None);
+            r.text = std::sync::Arc::clone(&whole);
+            r.glyphs = vec![crate::paragraph::ShapedGlyph {
+                id: 0,
+                x_advance: 0.5,
+                x_offset: 0.0,
+                y_offset: 0.0,
+                text_range: range,
+            }];
+            r.visible = visible;
+            crate::paragraph::LineItem::Text(r)
+        };
+        // "Faktura " | "č. 42" | " za rok" (bytes: č is two).
+        let line = make_shaped_line(vec![run(0..8, true), run(8..14, true), run(14..21, true)]);
+        assert_eq!(
+            extract_heading_title(&make_para(vec![line])),
+            "Faktura č. 42 za rok"
+        );
+        // A hidden run's words are not in the title.
+        let line = make_shaped_line(vec![run(0..8, true), run(8..14, false), run(14..21, true)]);
+        assert_eq!(
+            extract_heading_title(&make_para(vec![line])),
+            "Faktura  za rok"
+        );
+        // Only hidden runs: no title.
+        let line = make_shaped_line(vec![run(0..8, false)]);
+        assert_eq!(heading_title_of(&make_para(vec![line])), None);
+    }
+
+    #[test]
+    fn extract_heading_title_keeps_the_space_at_a_line_break() {
+        // "Faktura" on one line and "42" on the next: the space between them belongs to no run.
+        let whole: std::sync::Arc<str> = std::sync::Arc::from("Faktura 42");
+        let run = |range: std::ops::Range<usize>| {
+            let mut r = make_glyph_run("", None);
+            r.text = std::sync::Arc::clone(&whole);
+            r.glyphs = vec![crate::paragraph::ShapedGlyph {
+                id: 0,
+                x_advance: 0.5,
+                x_offset: 0.0,
+                y_offset: 0.0,
+                text_range: range,
+            }];
+            crate::paragraph::LineItem::Text(r)
+        };
+        let lines = vec![
+            make_shaped_line(vec![run(0..7)]),
+            make_shaped_line(vec![run(8..10)]),
+        ];
+        assert_eq!(extract_heading_title(&make_para(lines)), "Faktura 42");
+    }
+
+    #[test]
+    fn para_has_link_runs_ignores_a_hidden_linked_run() {
+        let link = std::sync::Arc::new(crate::paragraph::LinkSpan {
+            target: crate::paragraph::LinkTarget::External(std::sync::Arc::new(
+                "https://e.cz".into(),
+            )),
+            alt_text: None,
+        });
+        let mut run = make_glyph_run("x", Some(link));
+        run.visible = false;
+        let para = make_para(vec![make_shaped_line(vec![
+            crate::paragraph::LineItem::Text(run),
+        ])]);
+        assert!(!para_has_link_runs(&para));
     }
 
     // --- heading_title_of ---

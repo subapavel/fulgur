@@ -406,6 +406,7 @@ mod tests {
             text: Arc::from("a"),
             x_offset: 3.0_f32.as_pt(),
             link: None,
+            visible: true,
         };
         let mut lines = vec![ShapedLine {
             height: 16.0_f32.as_pt(),
@@ -516,6 +517,7 @@ mod tests {
             text: Arc::from("ab"),
             x_offset: 2.0_f32.as_pt(),
             link: None,
+            visible: true,
         };
         let mut lines = vec![ShapedLine {
             height: 16.0_f32.as_pt(),
