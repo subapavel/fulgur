@@ -1450,15 +1450,7 @@ fn paint_inline_box_continuation(
     if !note_continuation_painted(ib_id, page_index) {
         return false;
     }
-    // The carrier skips a box that is not visible, with everything in it.
-    let hidden = drawables
-        .block_styles
-        .get(&ib_id)
-        .is_some_and(|b| !b.visible)
-        || drawables.paragraphs.get(&ib_id).is_some_and(|p| !p.visible);
-    if hidden {
-        return false;
-    }
+    // The carrier does not skip a hidden box any more (html-to-pdf F209): the entries inside it gate themselves.
     let (body_x, body_y) = (
         drawables.body_offset_pt.0.to_f32(),
         drawables.body_offset_pt.1.to_f32(),
@@ -7179,7 +7171,8 @@ mod tests {
         assert!(paint(7, 1, &d));
         assert!(!paint(7, 1, &d));
         check_continuations_painted(1, &geometry, &d);
-        // A box that is not visible is skipped with everything in it, as its carrier does.
+        // A box that is not visible is still reached, as its carrier does (html-to-pdf F209): the entries inside it gate
+        // themselves, so a `visibility: visible` child of a hidden inline-block shows and the box's own background does not.
         let mut hidden = Drawables::new();
         hidden.inline_box_subtree_descendants.insert(7, vec![8]);
         hidden.block_styles.insert(
@@ -7194,7 +7187,7 @@ mod tests {
                 opacity_descendants: vec![],
             },
         );
-        assert!(!paint(7, 2, &hidden));
+        assert!(paint(7, 2, &hidden));
         check_continuations_painted(2, &geometry, &hidden);
     }
 

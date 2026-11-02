@@ -1007,10 +1007,10 @@ pub fn draw_shaped_lines(
                         tracker.close(canvas);
                     }
                     let saved_link_run_node_id = canvas.link_run_node_id.take();
-                    if !ib.visible {
-                        canvas.link_run_node_id = saved_link_run_node_id;
-                        continue;
-                    }
+                    // html-to-pdf F209: a hidden box is not skipped with everything in it. Its content is dispatched and
+                    // every entry of it gates itself on its own visibility (a block's background and border, a paragraph's
+                    // runs, an image, an SVG, a table), so a `visibility: visible` child of a hidden inline-block shows
+                    // (CSS 2.1 §11.2). `ib.visible` gates only the box's own link rectangle below.
                     let ox = x + ib.x_offset;
                     let oy = line_top_abs + ib.computed_y;
 
@@ -1099,7 +1099,9 @@ pub fn draw_shaped_lines(
 
                     // Link rect built after the opacity block ends, so link
                     // hit-areas remain intact even for opacity<1.0 boxes.
-                    if let Some(link_span) = ib.link.as_ref() {
+                    if let Some(link_span) = ib.link.as_ref()
+                        && ib.visible
+                    {
                         let rect = crate::draw_primitives::Rect {
                             x: ox,
                             y: oy,

@@ -9890,7 +9890,9 @@ fn render_smoke_hidden_inline_text_is_not_written_and_keeps_its_advance() {
             "<!DOCTYPE html><html><head><style>p{{margin:0}}.s::after{{content:' SPACER';{hidden}}}</style></head><body>\
              <p>alpha <span class=\"s\" style=\"{hidden}\">HIDDEN</span> omega</p>\
              <p style=\"{hidden}\">ROOT <span style=\"visibility:visible\">SHOWN</span></p>\
-             <h2>Faktura <span style=\"{hidden}\">KONCEPT</span></h2></body></html>"
+             <h2>Faktura <span style=\"{hidden}\">KONCEPT</span></h2>\
+             <p>x <span style=\"{hidden}\"><span style=\"display:inline-block;border:1px solid\">BOXTEXT \
+             <span style=\"visibility:visible\">CHILD</span></span></span> y</p></body></html>"
         )
     };
     let engine = noto_engine();
@@ -9898,10 +9900,10 @@ fn render_smoke_hidden_inline_text_is_not_written_and_keeps_its_advance() {
     assert!(shown.contains("HIDDEN") && shown.contains("SPACER") && shown.contains("KONCEPT"));
     let pdf = engine.render(&html("visibility:hidden")).unwrap();
     let text = extract_pdf_text(&pdf).expect("pdftotext");
-    for word in ["HIDDEN", "SPACER", "ROOT", "KONCEPT"] {
+    for word in ["HIDDEN", "SPACER", "ROOT", "KONCEPT", "BOXTEXT"] {
         assert!(!text.contains(word), "`{word}` is hidden: {text}");
     }
-    for word in ["alpha", "omega", "SHOWN", "Faktura"] {
+    for word in ["alpha", "omega", "SHOWN", "Faktura", "CHILD"] {
         assert!(text.contains(word), "`{word}` is visible: {text}");
     }
     let tagged = tagged_render_with_noto(&html("visibility:hidden"));
