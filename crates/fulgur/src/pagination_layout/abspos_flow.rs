@@ -9,7 +9,7 @@
 //! the start of the box (CSS 2.1 §10.1 / §10.6.4: against the padding box of its containing block as if that were not
 //! fragmented, css-position-3), decides whether today's geometry is complete ([`Disposition::Keep`]), whether the box
 //! only needs to be put down ([`Disposition::Place`]), or whether it has to be fragmented from its start with the
-//! fragmenters of the normal flow ([`Disposition::Flow`]: between line boxes, orphans and widows 2, css-break-3 §4.1,
+//! fragmenters of the normal flow ([`Disposition::Flow`]: between line boxes, the paragraph's `orphans` and `widows`, initially 2, css-break-3 §4.1,
 //! §4.4). `position: fixed` boxes are repeated whole per page (CSS 2.1 §9.6.1) and are not touched.
 //!
 //! Coordinates are the fragmenter's own: `y` is body coordinates on page 0 and page coordinates after it ([`PageStrips`]),
@@ -906,7 +906,7 @@ fn flow_box(
     };
     let w = node.final_layout.size.width;
     let (mut page, mut y) = start;
-    if let Some(split) = abspos_line_split(node) {
+    if let Some(split) = abspos_line_split(doc, node) {
         // A first line that does not fit below the start goes to the next page whole (a line box is monolithic).
         let first = split.lines[0].1 - split.lines[0].0;
         if y + split.inset_top + first > strips.bottom(page) + 0.5 {
@@ -1837,10 +1837,10 @@ mod tests {
             lines_20px(3)
         )));
         let node = |c: &str| doc.get_node(by_class(&doc, c)).unwrap();
-        assert!(abspos_line_split(node("two")).is_some());
-        assert!(abspos_line_split(node("one")).is_none());
-        assert!(abspos_line_split(node("fl")).is_none());
-        assert!(abspos_line_split(node("ov")).is_none());
+        assert!(abspos_line_split(&doc, node("two")).is_some());
+        assert!(abspos_line_split(&doc, node("one")).is_none());
+        assert!(abspos_line_split(&doc, node("fl")).is_none());
+        assert!(abspos_line_split(&doc, node("ov")).is_none());
     }
 
     /// Thousands of boxes without insets must not make the sibling search quadratic: 15 000 of them are searched

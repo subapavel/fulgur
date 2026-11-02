@@ -9910,3 +9910,58 @@ fn render_smoke_hidden_inline_text_is_not_written_and_keeps_its_advance() {
     let tagged_text = extract_pdf_text(&tagged).expect("pdftotext");
     assert!(!tagged_text.contains("KONCEPT"), "{tagged_text}");
 }
+
+#[test]
+fn render_smoke_author_orphans_and_widows_move_the_break() {
+    // html-to-pdf F30c-o, css-break-3 §3.3 / §4.4: a paragraph with room for four of its lines starts there when `orphans`
+    // is 2 (the initial value) and moves to the next page when the author asks for five; `widows: 4` pulls two more lines
+    // to the next page. The declarations come from a `<style>` block, inherited from `body` or set on the paragraph.
+    let html = |css: &str, attrs: &str| {
+        let lines: Vec<String> = (0..12).map(|i| format!("Line{i:02}")).collect();
+        format!(
+            "<!DOCTYPE html><html><head><style>@page{{size:300px 200px;margin:0}}\
+             body{{margin:0;font-size:14px;line-height:20px}}p{{margin:0}}{css}</style></head>\
+             <body><div style=\"height:120px\"></div><p{attrs}>{}</p></body></html>",
+            lines.join("<br>")
+        )
+    };
+    let page_one = |pdf: &[u8]| -> String {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("p.pdf");
+        std::fs::write(&path, pdf).expect("write pdf");
+        let out = match std::process::Command::new("pdftotext")
+            .args(["-f", "1", "-l", "1", "-raw"])
+            .arg(&path)
+            .arg("-")
+            .output()
+        {
+            Ok(out) => out,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return String::new(),
+            Err(err) => panic!("pdftotext: {err}"),
+        };
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    if extract_pdf_text(&[]).is_none() {
+        eprintln!("pdftotext not installed; skipping");
+        return;
+    }
+    let engine = noto_engine();
+    let lines_on_page_one = |css: &str, attrs: &str| -> usize {
+        page_one(&engine.render(&html(css, attrs)).unwrap())
+            .matches("Line")
+            .count()
+    };
+    assert_eq!(lines_on_page_one("", ""), 4, "room for four lines");
+    assert_eq!(lines_on_page_one("p{orphans:4}", ""), 4);
+    assert_eq!(lines_on_page_one("p{orphans:5}", ""), 0, "five do not fit");
+    assert_eq!(lines_on_page_one("body{orphans:5}", ""), 0, "inherited");
+    assert_eq!(
+        lines_on_page_one("", " style=\"orphans:5\""),
+        0,
+        "style attribute"
+    );
+    assert_eq!(lines_on_page_one("p{orphans:5}", " style=\"orphans:3\""), 4);
+    assert_eq!(lines_on_page_one("p{orphans:0}", ""), 4, "invalid, ignored");
+    // A break that already leaves enough lines for the next page is not moved by `widows`.
+    assert_eq!(lines_on_page_one("p{widows:4}", ""), 4);
+}

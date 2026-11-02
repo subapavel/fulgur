@@ -3544,7 +3544,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 // point) for a paragraph that has no allowed break on this strip.
                 //
                 // html-to-pdf F30c: it fired whenever the whole paragraph did not fit, also when an allowed break exists.
-                // A paragraph whose first `ORPHANS` lines fit the room starts where it is and `fragment_inline_root`
+                // A paragraph whose first `orphans` lines fit the room starts where it is and `fragment_inline_root`
                 // breaks it between lines (css-break-3 §4.1, §4.4: a break between line boxes is as good as one between
                 // blocks; Chrome starts it below what is above it and fills the page). That holds for one taller than a
                 // page too. Not for a box with insets or extra height (the splitter does not know them: F30f-d, F30f-h),
@@ -3555,6 +3555,8 @@ impl<'a> PaginationLayoutTree<'a> {
                     .last()
                     .map(|l| l.1 - line_metrics[0].0)
                     .unwrap_or(child_h);
+                // html-to-pdf F30c-o: the paragraph's own `orphans` / `widows`.
+                let rules = line_rules(self.doc, child);
                 let start_here = !avoid_inside
                     && !is_float
                     && insets == 0.0
@@ -3563,7 +3565,12 @@ impl<'a> PaginationLayoutTree<'a> {
                     && !crate::blitz_adapter::is_multicol_container(child)
                     && !block_size_constrained(child)
                     && child_h <= para_total_h + LINE_BOX_SLACK
-                    && starts_in_place(&line_metrics, cursor_y, self.strips.bottom(page_index));
+                    && starts_in_place(
+                        &line_metrics,
+                        cursor_y,
+                        self.strips.bottom(page_index),
+                        rules,
+                    );
                 if cursor_y > 0.0
                     && cursor_y + para_total_h > self.strips.bottom(page_index) + clip_end_slack
                     && !start_here
@@ -3583,6 +3590,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     page_index,
                     self.strips,
                     &line_metrics,
+                    rules,
                 );
                 // Atomic inlines and images in the paragraph get their fragments on the page that
                 // holds their line. Without them the paragraph's `InlineBox` items find no geometry
@@ -4452,7 +4460,7 @@ fn would_split_block_subtree(
 ///
 /// - A paragraph taller than a page (`page_height_px`) in plain block flow is
 ///   split between its line boxes (F30), so it counts its top inset and its first
-///   [`ORPHANS`] lines, not its height.
+///   `orphans` lines (the paragraph's own value, F30c-o), not its height.
 ///
 /// - F83b: a first-row child in block flow whose `break-inside: avoid` holds
 ///   ([`avoid_inside_holds`]) is kept whole by the fragmenter, so it counts the piece of it before its first forced
@@ -4532,7 +4540,7 @@ fn leading_block_size(
                 // the bottom of a page asked for the text and the image, did not fit, and moved whole where Chrome
                 // keeps its first two lines (html-to-pdf F183, plan 7.7).
                 if node.flags.is_inline_root()
-                    && let Some(split) = abspos_line_split(node)
+                    && let Some(split) = abspos_line_split(doc, node)
                 {
                     return split.leading().min(own_h);
                 }
@@ -4557,7 +4565,7 @@ fn leading_block_size(
             Some(_) => {}
         }
         // F30: a paragraph taller than a page is split between its line boxes,
-        // so only its inset and ORPHANS lines have to fit, not all of it.
+        // so only its inset and `orphans` lines have to fit, not all of it.
         // F30f-b: so is a paragraph that a clip box cuts (`hidden_tail`): the lines it hides are not placed, and the
         // clip box that holds it is fragmented in place.
         let child_leading = match line_split_candidate(doc, node, child) {
@@ -5784,7 +5792,7 @@ fn fragment_block_subtree(
         let first_break_h = if relaxed_start {
             strips.fresh()
         } else if let Some(split) = &line_split {
-            // The inset above the first line and ORPHANS lines must fit; a
+            // The inset above the first line and `orphans` lines must fit; a
             // paragraph that cannot even start here moves to the next page.
             let leading = split.leading();
             // Of a flex / grid row only the first item decides, as for an
@@ -6783,13 +6791,26 @@ fn collect_inline_line_metrics(node: &blitz_dom::Node) -> Vec<(f32, f32)> {
         .collect()
 }
 
-/// CSS 3 Fragmentation default for `orphans`: lines kept at the bottom of a
-/// page before a break between line boxes (css-break-3 §4.4). The properties
-/// themselves are not read.
-const ORPHANS: usize = 2;
-/// CSS 3 Fragmentation default for `widows`: lines carried to the top of the
-/// next page after a break between line boxes.
-const WIDOWS: usize = 2;
+/// html-to-pdf F30c-o: the `orphans` and `widows` of one block container (css-break-3 §3.3): the fewest lines it keeps
+/// before a break between its line boxes and the fewest it carries after it (§4.4). Initially 2 and 2.
+///
+/// Stylo 0.8.0 has no longhand for either property in its servo build, so the values come from the reader of
+/// `column_css` (the `break-*` family has the same source) through [`LineRulesScope`] and [`line_rules`]. A paragraph
+/// that declares nothing, and a document in which nothing does, gets [`LineRules::INITIAL`] and the decisions of
+/// before F30c-o.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LineRules {
+    pub orphans: usize,
+    pub widows: usize,
+}
+
+impl LineRules {
+    /// css-break-3 §3.3: the initial value of both properties.
+    pub(crate) const INITIAL: LineRules = LineRules {
+        orphans: 2,
+        widows: 2,
+    };
+}
 
 /// F30: where to break the lines of an inline root that spans pages, as
 /// half-open line index ranges, one per page strip.
@@ -6802,10 +6823,11 @@ const WIDOWS: usize = 2;
 /// Greedy, like the body-level splitter: each strip takes as many lines as fit.
 /// A strip always takes at least one line (a line box is monolithic, css-break-3
 /// §4.1), even when it overflows. When the greedy break would leave fewer than
-/// [`WIDOWS`] lines for the next strip, lines are pulled back to the next strip so
-/// it gets [`WIDOWS`], unless that would leave this strip with fewer than
-/// [`ORPHANS`] — then the constraint is relaxed (css-break-3 §4.4 allows it when
-/// no break avoids a violation).
+/// `rules.widows` lines for the next strip, lines are pulled back to the next strip
+/// so it gets them, unless that would leave this strip with fewer than
+/// `rules.orphans` — then the constraint is relaxed (css-break-3 §4.4 allows it when
+/// no break avoids a violation). `rules` are the paragraph's `orphans` / `widows`
+/// (html-to-pdf F30c-o).
 ///
 /// `last_extra` is block-size that has to fit below the last line of the last
 /// range (the paragraph's bottom padding and border, and what the boxes around it
@@ -6819,6 +6841,7 @@ fn plan_line_breaks(
     page_room: f32,
     last_extra: f32,
     max_strips: usize,
+    rules: LineRules,
 ) -> Vec<std::ops::Range<usize>> {
     /// Rounding slack when a run of lines is compared with a room.
     const EPS: f32 = 0.01;
@@ -6841,9 +6864,9 @@ fn plan_line_breaks(
         if end == n && n - start > 1 && lines[n - 1].1 - lines[start].0 + last_extra > room + EPS {
             end = n - 1;
         }
-        if end < n && n - end < WIDOWS {
-            let pulled = n - WIDOWS;
-            if pulled >= start + ORPHANS {
+        if end < n && n - end < rules.widows {
+            let pulled = n.saturating_sub(rules.widows);
+            if pulled >= start + rules.orphans {
                 end = pulled;
             }
         }
@@ -6878,6 +6901,8 @@ struct LineSplit {
     /// the top of the page, without `inset_top`. `false` keeps the geometry of the nested splitter (the insets of
     /// the frame reserved on every strip, F30).
     slice: bool,
+    /// html-to-pdf F30c-o: the `orphans` and `widows` of the paragraph (the block container whose lines these are).
+    rules: LineRules,
 }
 
 /// F30f-b: a line whose top is less than this far (px) inside the clip does not show. The writer's slack is 0.5 pt
@@ -6907,9 +6932,10 @@ impl LineSplit {
     }
 
     /// How much of the paragraph has to fit below its placement for starting it
-    /// there to make progress: its inset and [`ORPHANS`] lines.
+    /// there to make progress: its inset and `rules.orphans` lines (F30c-o: the paragraph's own value, 2 unless the author
+    /// says otherwise).
     fn leading(&self) -> f32 {
-        let keep = ORPHANS.min(self.lines.len());
+        let keep = self.rules.orphans.min(self.lines.len());
         match keep.checked_sub(1).and_then(|i| self.lines.get(i)) {
             Some(last) => self.inset_top + last.1 - self.lines[0].0,
             None => 0.0,
@@ -7153,6 +7179,106 @@ impl Drop for BreakAvoidScope {
 
 fn avoids_break_inside(node_id: usize) -> bool {
     AVOID_NODES.with(|a| a.borrow().contains(&node_id))
+}
+
+/// What the author declared per element: `(orphans, widows)`, keyed like the [`ColumnStyleTable`] they come from.
+type DeclaredLineCounts = BTreeMap<
+    usize,
+    (
+        Option<crate::column_css::LineCount>,
+        Option<crate::column_css::LineCount>,
+    ),
+>;
+
+thread_local! {
+    /// html-to-pdf F30c-o: the elements that declare `orphans` or `widows` in the document being rendered, for
+    /// [`line_rules`]. Read from the stylesheets by `column_css` like `break-inside` ([`AVOID_NODES`]): the free functions
+    /// of the fragmenter see only the DOM, so the engine opens a [`LineRulesScope`]. Without a scope (unit tests that call
+    /// the fragmenter directly) and in a document that declares nothing, the set is empty and every paragraph has
+    /// [`LineRules::INITIAL`] at the cost of one `is_empty` test.
+    static LINE_COUNT_NODES: std::cell::RefCell<std::rc::Rc<DeclaredLineCounts>> =
+        std::cell::RefCell::new(std::rc::Rc::new(DeclaredLineCounts::new()));
+}
+
+/// html-to-pdf F30c-o: the engine opens this once per render next to [`BreakAvoidScope`], after the side table of
+/// `column_css` is built and before the fragmenter runs. Dropping it restores the previous set. Pagination runs on the
+/// render thread (as does [`BreakAvoidScope`]'s consumer), so a thread-local is enough.
+pub(crate) struct LineRulesScope {
+    previous: std::rc::Rc<DeclaredLineCounts>,
+}
+
+impl LineRulesScope {
+    pub(crate) fn enter(column_styles: &crate::column_css::ColumnStyleTable) -> Self {
+        let declared: DeclaredLineCounts = column_styles
+            .iter()
+            .filter(|(_, p)| p.orphans.is_some() || p.widows.is_some())
+            .map(|(&id, p)| (id, (p.orphans, p.widows)))
+            .collect();
+        let previous = LINE_COUNT_NODES.with(|a| a.replace(std::rc::Rc::new(declared)));
+        Self { previous }
+    }
+}
+
+impl Drop for LineRulesScope {
+    fn drop(&mut self) {
+        LINE_COUNT_NODES.with(|a| {
+            a.replace(std::rc::Rc::clone(&self.previous));
+        });
+    }
+}
+
+/// html-to-pdf F30c-o: the `orphans` and `widows` of the block container `node` (css-break-3 §3.3: both are inherited).
+/// Each is the value of the nearest element, `node` itself first, up the parent chain that declares a number or `initial`;
+/// `inherit` (and `unset`, `revert`) and an element that declares nothing pass the question on to the parent, and the
+/// root gives 2. The chain is walked through `Node::parent`, which Blitz also sets on the anonymous blocks and the
+/// pseudo-element boxes it makes, so those take the value of the box they hang from (CSS 2.1 §9.2.1.1; css-pseudo-4).
+pub(crate) fn line_rules(doc: &BaseDocument, node: &blitz_dom::Node) -> LineRules {
+    LINE_COUNT_NODES.with(|declared| {
+        let declared = declared.borrow();
+        if declared.is_empty() {
+            return LineRules::INITIAL;
+        }
+        let mut orphans = None;
+        let mut widows = None;
+        let mut current = Some(node);
+        let mut depth = 0;
+        while let Some(n) = current {
+            if let Some((o, w)) = declared.get(&n.id) {
+                if orphans.is_none() {
+                    orphans = resolved_line_count(*o, LineRules::INITIAL.orphans);
+                }
+                if widows.is_none() {
+                    widows = resolved_line_count(*w, LineRules::INITIAL.widows);
+                }
+                if orphans.is_some() && widows.is_some() {
+                    break;
+                }
+            }
+            depth += 1;
+            if depth >= crate::MAX_DOM_DEPTH {
+                break;
+            }
+            current = n.parent.and_then(|p| doc.get_node(p));
+        }
+        LineRules {
+            orphans: orphans.unwrap_or(LineRules::INITIAL.orphans),
+            widows: widows.unwrap_or(LineRules::INITIAL.widows),
+        }
+    })
+}
+
+/// The number a declaration settles, `None` when it leaves the question to the parent; `initial` is the property's
+/// initial value.
+fn resolved_line_count(
+    declared: Option<crate::column_css::LineCount>,
+    initial: usize,
+) -> Option<usize> {
+    use crate::column_css::LineCount;
+    match declared? {
+        LineCount::Value(n) => Some(n as usize),
+        LineCount::Initial => Some(initial),
+        LineCount::Inherit => None,
+    }
 }
 
 /// F30f-b: whether the clip semantics of this change (a clip box is fragmented by its own block size, its lines are cut
@@ -7572,7 +7698,7 @@ fn line_split_candidate(
     child: &blitz_dom::Node,
 ) -> Option<LineSplit> {
     // Cheap exit first: a paragraph of one line has nothing to split.
-    let split = inline_root_lines(child)?;
+    let split = inline_root_lines(doc, child)?;
     // F30f-b: in block flow a clip box that hides content is fragmented by its own block size, and the lines it hides
     // get no place on any page: the barrier of the clip boxes is lifted and the lines are cut at the tightest clip.
     let through_clips = is_block_flow_container(doc, parent);
@@ -7601,15 +7727,15 @@ fn line_split_candidate(
 ///
 /// The parent-side checks of [`line_split_candidate`] are about the formatting context the child takes part in (flex /
 /// grid / table parents, orthogonal flows); an absolutely positioned box takes part in none, so it asks only this.
-fn abspos_line_split(child: &blitz_dom::Node) -> Option<LineSplit> {
-    let split = inline_root_lines(child)?;
+fn abspos_line_split(doc: &BaseDocument, child: &blitz_dom::Node) -> Option<LineSplit> {
+    let split = inline_root_lines(doc, child)?;
     (!crate::blitz_adapter::is_atomic_inline_container_node(child) && !clips_overflow(child))
         .then_some(split)
 }
 
 /// F30f: `child` as an inline root of at least two lines that is not multicol, floating or transformed, with its
 /// lines. What [`abspos_line_split`] and [`line_split_candidate`] share; the atomic and clipping checks differ.
-fn inline_root_lines(child: &blitz_dom::Node) -> Option<LineSplit> {
+fn inline_root_lines(doc: &BaseDocument, child: &blitz_dom::Node) -> Option<LineSplit> {
     let lines = collect_inline_line_metrics(child);
     if lines.len() < 2
         || crate::blitz_adapter::is_multicol_container(child)
@@ -7628,6 +7754,7 @@ fn inline_root_lines(child: &blitz_dom::Node) -> Option<LineSplit> {
         hidden_tail: 0,
         own_box_height: None,
         slice: false,
+        rules: line_rules(doc, child),
     })
 }
 
@@ -7835,6 +7962,7 @@ fn fragment_nested_inline_root(
         strips.fresh() - top_floor - continuation_inset,
         last_extra,
         max_strips,
+        split.rules,
     );
     let mut placements: Vec<(u32, f32, f32)> = Vec::with_capacity(ranges.len());
     let mut cursor_y = y_in;
@@ -8087,25 +8215,60 @@ fn warn_unprinted_inline_lines(
     }
 }
 
-/// The break that leaves the next fragment `WIDOWS` lines when the natural break before line `i` would leave fewer:
-/// `Some(j)` with `start + ORPHANS <= j < i`, or `None` when no such break exists (the first fragment would be left with
-/// fewer than `ORPHANS` lines). `start` is the first line of the current fragment and `total` the number of lines of the
-/// paragraph (html-to-pdf F30f-l; CSS Fragmentation §4.4: a break needs at least `orphans` lines before it and `widows`
-/// after it).
-fn widow_safe_break(start: usize, i: usize, total: usize) -> Option<usize> {
-    let j = total.checked_sub(WIDOWS)?;
-    (j >= start + ORPHANS && j < i).then_some(j)
+/// The break that leaves the next fragment `rules.widows` lines when the natural break before line `i` would leave fewer:
+/// `Some(j)` with `start + rules.orphans <= j < i`, or `None` when no such break exists (the first fragment would be left
+/// with fewer than `rules.orphans` lines). `start` is the first line of the current fragment and `total` the number of
+/// lines of the paragraph (html-to-pdf F30f-l; CSS Fragmentation §4.4: a break needs at least `orphans` lines before it
+/// and `widows` after it; F30c-o: the paragraph's own values).
+fn widow_safe_break(start: usize, i: usize, total: usize, rules: LineRules) -> Option<usize> {
+    let j = total.checked_sub(rules.widows)?;
+    (j >= start + rules.orphans && j < i).then_some(j)
+}
+
+/// html-to-pdf F30c-o: the break at line `i`, the first one that does not fit, as the fragmenter takes it when it honours
+/// `rules` (css-break-3 §4.4): `Some(i)` when `i - start` lines stay and `total - i` go on, both at least the minimum;
+/// `Some(j)` with `j < i` when the lines after `i` are too few and [`widow_safe_break`] pulls the break back; `None` when
+/// no break honours the rules (fewer than `rules.orphans` lines fit, or pulling back would leave fewer than that).
+fn line_break_at(start: usize, i: usize, total: usize, rules: LineRules) -> Option<usize> {
+    let first_size = i - start;
+    let remaining_size = total - i;
+    if first_size < rules.orphans {
+        None
+    } else if remaining_size < rules.widows {
+        widow_safe_break(start, i, total, rules)
+    } else {
+        Some(i)
+    }
+}
+
+/// html-to-pdf F30c-o: what Chrome does when `widows` cannot be honoured without breaking `orphans`: it keeps the
+/// orphans and gives up the widows, breaking after the `rules.orphans` first lines of the fragment (probes `sw_*` of plan
+/// 8.1: `orphans: 30; widows: 30` on 100 lines gives 48 / 30 / 22). Only for the paragraph's author-declared values: with
+/// the initial 2 / 2 a fragment that keeps accumulating lines is today's behaviour (F30c-w).
+///
+/// `Some(start + rules.orphans)` when at least `rules.orphans` lines fit (`i - start`), the lines after `i` are fewer than
+/// `rules.widows` and pulling the break back to `total - widows` would leave the fragment fewer lines than `rules.orphans`
+/// but still some (`total - widows > start`); `None` otherwise. With nothing left of the fragment after the pull-back
+/// (`widows` is at least as large as the rest) Chrome keeps the natural break.
+fn keep_orphans_break(start: usize, i: usize, total: usize, rules: LineRules) -> Option<usize> {
+    if rules == LineRules::INITIAL || i - start < rules.orphans || total - i >= rules.widows {
+        return None;
+    }
+    let j = total.checked_sub(rules.widows)?;
+    (j > start && j < start + rules.orphans).then_some(start + rules.orphans)
 }
 
 /// html-to-pdf F30c: whether a paragraph with these `lines` (`(top, bottom)` in paragraph-local px) placed with its top at
-/// `top` on a strip that ends at `bottom` has an allowed break there: its first `ORPHANS` lines fit and a break after
-/// them can leave `WIDOWS` lines (`lines.len() >= ORPHANS + WIDOWS`). The fit is the comparison `fragment_inline_root`
+/// `top` on a strip that ends at `bottom` has an allowed break there: its first `rules.orphans` lines fit and a break after
+/// them can leave `rules.widows` lines (`lines.len() >= orphans + widows`). The fit is the comparison `fragment_inline_root`
 /// makes at the first line that does not fit (same operands, same order, so the two never disagree by a rounding), and
-/// the length rule is what makes that function always find a break on this strip: `i >= ORPHANS`, and either `WIDOWS`
-/// lines remain after `i` or `widow_safe_break` returns `n - WIDOWS >= ORPHANS`. A paragraph without such a break is
-/// placed at the top of the next page (css-break-3 §4.4: the class A break before it is the allowed one).
-fn starts_in_place(lines: &[(f32, f32)], top: f32, bottom: f32) -> bool {
-    lines.len() >= ORPHANS + WIDOWS && top + (lines[ORPHANS - 1].1 - lines[0].0) <= bottom
+/// the length rule is what makes that function always find a break on this strip: `i >= orphans`, and either `widows`
+/// lines remain after `i` or `widow_safe_break` returns `n - widows >= orphans`. A paragraph without such a break is
+/// placed at the top of the next page (css-break-3 §4.4: the class A break before it is the allowed one). With the author's
+/// values (F30c-o) it is the same argument, the paragraph's own `rules` for the constants.
+fn starts_in_place(lines: &[(f32, f32)], top: f32, bottom: f32, rules: LineRules) -> bool {
+    lines.len() >= rules.orphans + rules.widows
+        && top + (lines[rules.orphans - 1].1 - lines[0].0) <= bottom
 }
 
 /// fulgur-p55h: split a multi-line inline root across page boundaries
@@ -8118,24 +8281,25 @@ fn starts_in_place(lines: &[(f32, f32)], top: f32, bottom: f32) -> bool {
 /// `strips.bottom(page) - paragraph_top_in_body`.
 ///
 /// fulgur-s67g Phase 2.1 (widow / orphan): each split point must leave
-/// the **first** fragment with `>= ORPHANS_MIN` lines and the
-/// **remainder** of the paragraph with `>= WIDOWS_MIN` lines
+/// the **first** fragment with `>= rules.orphans` lines and the
+/// **remainder** of the paragraph with `>= rules.widows` lines
 /// (CSS Fragmentation §4.4). When the natural break before the first
-/// line that does not fit would leave fewer than `WIDOWS_MIN` lines, the
-/// break is pulled back to `total - WIDOWS_MIN` (html-to-pdf F30f-l; see
+/// line that does not fit would leave fewer than `rules.widows` lines, the
+/// break is pulled back to `total - rules.widows` (html-to-pdf F30f-l; see
 /// `widow_safe_break`): the lines after it move to the next page and the
 /// lines between the pulled break and the natural one are examined again
 /// against that page. Only when no break honours both minimums (the
-/// pulled break would leave fewer than `ORPHANS_MIN` lines before it) is
-/// the split skipped — subsequent lines accumulate into the current
-/// fragment (overflow-tolerant) until a valid split is found or the
-/// paragraph ends, in which case the paragraph emits whole (oversized or
-/// pushed to a fresh page by sibling-driven flow). The rules are relaxed
-/// only then (§4.4: "if the above doesn't provide enough break points to
+/// pulled break would leave fewer than `rules.orphans` lines before it) are
+/// the rules relaxed (§4.4: "if the above doesn't provide enough break points to
 /// keep fragmented content from overflowing the fragmentainer").
 ///
-/// CSS `orphans` / `widows` properties are not parsed today, so the
-/// fragmenter uses the CSS 3 Fragmentation defaults (`2` for both).
+/// html-to-pdf F30c-o: `rules` are the paragraph's `orphans` / `widows` (the reader of `column_css`; 2 / 2 unless the
+/// author declares them). A value the page cannot keep (`orphans: 60`) must not lose lines, so the relaxation has steps:
+/// (1) Chrome's: when the widows cannot be had without breaking the orphans, keep the orphans ([`keep_orphans_break`]);
+/// (2) the initial 2 / 2 ([`line_break_at`] with [`LineRules::INITIAL`]); (3) as before F30c-o, skip the split —
+/// subsequent lines accumulate into the current fragment (overflow-tolerant) until a valid split is found or the
+/// paragraph ends, in which case the paragraph emits whole (oversized or pushed to a fresh page by sibling-driven
+/// flow). With `rules` equal to `INITIAL` steps 1 and 2 are empty and the decisions are those of before.
 ///
 /// Output:
 ///
@@ -8146,7 +8310,7 @@ fn starts_in_place(lines: &[(f32, f32)], top: f32, bottom: f32) -> bool {
 ///   final `cursor_y` is the height consumed on the last page (lines
 ///   ending on a partial page leave room for a following sibling).
 /// - On a paragraph with too few lines to honour orphans+widows
-///   simultaneously (`< ORPHANS_MIN + WIDOWS_MIN` lines total), no
+///   simultaneously (`< rules.orphans + rules.widows` lines total), no
 ///   split is taken — the paragraph emits as one fragment, possibly
 ///   oversized.
 ///
@@ -8166,11 +8330,8 @@ pub(crate) fn fragment_inline_root(
     initial_page_index: u32,
     strips: PageStrips,
     line_metrics: &[(f32, f32)],
+    rules: LineRules,
 ) -> (u32, f32, usize, Vec<(u32, f32, f32)>) {
-    // CSS 3 Fragmentation defaults for `orphans` and `widows` (`ORPHANS`, `WIDOWS`).
-    const ORPHANS_MIN: usize = ORPHANS;
-    const WIDOWS_MIN: usize = WIDOWS;
-
     if line_metrics.is_empty() {
         return (initial_page_index, initial_cursor_y, 0, Vec::new());
     }
@@ -8192,19 +8353,19 @@ pub(crate) fn fragment_inline_root(
         let projected_bottom_in_body = paragraph_top_in_body + (line_bottom_local - frag_top_local);
 
         if projected_bottom_in_body > strips.bottom(page_index) && i > fragment_start_idx {
-            // fulgur-s67g Phase 2.1: honour widow / orphan minimums.
-            let first_size = i - fragment_start_idx;
-            let remaining_size = total_lines - i;
-            let break_at = if first_size < ORPHANS_MIN {
-                None
-            } else if remaining_size < WIDOWS_MIN {
-                // html-to-pdf F30f-l: the natural break would leave a widow; pull it back.
-                widow_safe_break(fragment_start_idx, i, total_lines)
-            } else {
-                Some(i)
-            };
+            // fulgur-s67g Phase 2.1: honour widow / orphan minimums (F30f-l: a natural break that would leave a widow
+            // is pulled back; F30c-o: the paragraph's own minimums, relaxed in steps when the page cannot keep them).
+            let break_at = line_break_at(fragment_start_idx, i, total_lines, rules)
+                .or_else(|| keep_orphans_break(fragment_start_idx, i, total_lines, rules))
+                .or_else(|| {
+                    (rules != LineRules::INITIAL)
+                        .then(|| {
+                            line_break_at(fragment_start_idx, i, total_lines, LineRules::INITIAL)
+                        })
+                        .flatten()
+                });
             let Some(break_at) = break_at else {
-                // No break honours both minimums here: skip, keep accumulating into the current
+                // No break honours the minimums here: skip, keep accumulating into the current
                 // fragment (CSS Fragmentation §4.4: the minimums are relaxed only when no break
                 // keeps the content inside the fragmentainer).
                 i += 1;
@@ -12721,6 +12882,7 @@ h2 { string-set: chapter-title content(text); }
             /*initial_page_index=*/ 0,
             /*strips=*/ PageStrips::new(200.0, 0.0),
             &lines,
+            LineRules::INITIAL,
         );
         assert_eq!(emitted, 1, "widow violation → single oversized fragment");
         assert_eq!(new_page, 0);
@@ -12767,6 +12929,7 @@ h2 { string-set: chapter-title content(text); }
             0,
             PageStrips::new(1009.13, 0.0),
             &lines,
+            LineRules::INITIAL,
         );
         assert_eq!(emitted, 2);
         assert_eq!(page, 1);
@@ -12805,6 +12968,7 @@ h2 { string-set: chapter-title content(text); }
                 0,
                 PageStrips::new(1009.13, 0.0),
                 &lines,
+                LineRules::INITIAL,
             );
             assert_eq!(fragment_ranges(&geom), expect, "{n} lines");
         }
@@ -12825,6 +12989,7 @@ h2 { string-set: chapter-title content(text); }
             0,
             PageStrips::new(1009.13, 0.0),
             &lines,
+            LineRules::INITIAL,
         );
         assert_eq!((page, emitted), (2, 3));
         assert_eq!(
@@ -12850,6 +13015,7 @@ h2 { string-set: chapter-title content(text); }
             0,
             PageStrips::new(1009.13, 0.0),
             &lines,
+            LineRules::INITIAL,
         );
         // The last line (43) ends at 100 + 44 * 21 = 1024 > 1009.13 while line 42 ends at 1003: a widow of one,
         // pulled back to 42 / 2.
@@ -12871,6 +13037,7 @@ h2 { string-set: chapter-title content(text); }
             0,
             PageStrips::new(50.0, 0.0),
             &lines,
+            LineRules::INITIAL,
         );
         assert_eq!(fragment_ranges(&geom), vec![(0, 0, 3)]);
     }
@@ -12878,17 +13045,26 @@ h2 { string-set: chapter-title content(text); }
     #[test]
     fn widow_safe_break_pulls_back_to_leave_the_widows() {
         // 49 lines, natural break before line 48: the break before line 47 leaves two.
-        assert_eq!(super::widow_safe_break(0, 48, 49), Some(47));
+        assert_eq!(
+            super::widow_safe_break(0, 48, 49, LineRules::INITIAL),
+            Some(47)
+        );
         // The first fragment must keep ORPHANS lines: start 45 allows 47, start 46 does not.
-        assert_eq!(super::widow_safe_break(45, 48, 49), Some(47));
-        assert_eq!(super::widow_safe_break(46, 48, 49), None);
+        assert_eq!(
+            super::widow_safe_break(45, 48, 49, LineRules::INITIAL),
+            Some(47)
+        );
+        assert_eq!(
+            super::widow_safe_break(46, 48, 49, LineRules::INITIAL),
+            None
+        );
         // Fewer lines than orphans + widows: no break.
-        assert_eq!(super::widow_safe_break(0, 2, 3), None);
-        assert_eq!(super::widow_safe_break(0, 1, 1), None);
+        assert_eq!(super::widow_safe_break(0, 2, 3, LineRules::INITIAL), None);
+        assert_eq!(super::widow_safe_break(0, 1, 1, LineRules::INITIAL), None);
         // The pulled break must be before the natural one.
-        assert_eq!(super::widow_safe_break(0, 47, 49), None);
+        assert_eq!(super::widow_safe_break(0, 47, 49, LineRules::INITIAL), None);
         // A paragraph shorter than the widows minimum cannot underflow.
-        assert_eq!(super::widow_safe_break(0, 0, 1), None);
+        assert_eq!(super::widow_safe_break(0, 0, 1, LineRules::INITIAL), None);
     }
 
     /// html-to-pdf F30c: a paragraph starts where it is when its first two lines fit and it has four lines or more.
@@ -12896,22 +13072,72 @@ h2 { string-set: chapter-title content(text); }
     fn starts_in_place_needs_two_fitting_lines_and_four_lines() {
         let four = lines_of_21px(4);
         // Fewer than ORPHANS + WIDOWS lines: no allowed break inside, the break before is the one.
-        assert!(!super::starts_in_place(&lines_of_21px(3), 0.0, 1000.0));
-        assert!(!super::starts_in_place(&lines_of_21px(1), 0.0, 1000.0));
-        assert!(!super::starts_in_place(&[], 0.0, 1000.0));
+        assert!(!super::starts_in_place(
+            &lines_of_21px(3),
+            0.0,
+            1000.0,
+            LineRules::INITIAL
+        ));
+        assert!(!super::starts_in_place(
+            &lines_of_21px(1),
+            0.0,
+            1000.0,
+            LineRules::INITIAL
+        ));
+        assert!(!super::starts_in_place(
+            &[],
+            0.0,
+            1000.0,
+            LineRules::INITIAL
+        ));
         // Two lines fit: 100 + 42 <= 142 (an exact fit counts, as in `fragment_inline_root`).
-        assert!(super::starts_in_place(&four, 100.0, 142.0));
-        assert!(super::starts_in_place(&four, 100.0, 200.0));
+        assert!(super::starts_in_place(
+            &four,
+            100.0,
+            142.0,
+            LineRules::INITIAL
+        ));
+        assert!(super::starts_in_place(
+            &four,
+            100.0,
+            200.0,
+            LineRules::INITIAL
+        ));
         // One line fits, or none, or the room is negative.
-        assert!(!super::starts_in_place(&four, 100.0, 141.9));
-        assert!(!super::starts_in_place(&four, 100.0, 121.0));
-        assert!(!super::starts_in_place(&four, 100.0, 90.0));
-        assert!(!super::starts_in_place(&four, 100.0, -5.0));
+        assert!(!super::starts_in_place(
+            &four,
+            100.0,
+            141.9,
+            LineRules::INITIAL
+        ));
+        assert!(!super::starts_in_place(
+            &four,
+            100.0,
+            121.0,
+            LineRules::INITIAL
+        ));
+        assert!(!super::starts_in_place(
+            &four,
+            100.0,
+            90.0,
+            LineRules::INITIAL
+        ));
+        assert!(!super::starts_in_place(
+            &four,
+            100.0,
+            -5.0,
+            LineRules::INITIAL
+        ));
         // The first line's top is the origin (a paragraph whose lines start below its top).
         let shifted: Vec<(f32, f32)> = (0..4)
             .map(|i| (10.0 + i as f32 * 21.0, 10.0 + (i + 1) as f32 * 21.0))
             .collect();
-        assert!(super::starts_in_place(&shifted, 100.0, 142.0));
+        assert!(super::starts_in_place(
+            &shifted,
+            100.0,
+            142.0,
+            LineRules::INITIAL
+        ));
     }
 
     /// fulgur-s67g Phase 2.1: a 4-line paragraph splittable at line 2
@@ -12933,6 +13159,7 @@ h2 { string-set: chapter-title content(text); }
             0,
             PageStrips::new(200.0, 0.0),
             &lines,
+            LineRules::INITIAL,
         );
         assert_eq!(emitted, 2, "valid split → 2 fragments");
         assert_eq!(new_page, 1);
@@ -12968,6 +13195,7 @@ h2 { string-set: chapter-title content(text); }
             0,
             PageStrips::new(100.0, 0.0),
             &lines,
+            LineRules::INITIAL,
         );
         assert_eq!(emitted, 1, "orphan violation → single oversized fragment");
         assert_eq!(new_page, 0);
@@ -13002,6 +13230,7 @@ h2 { string-set: chapter-title content(text); }
             0,
             PageStrips::new(1000.0, 0.0),
             &lines,
+            LineRules::INITIAL,
         );
         assert!(emitted > 50, "about 60 pages, got {emitted}");
         assert_eq!(last_page as usize, emitted - 1);
@@ -15773,10 +16002,17 @@ h2 { string-set: chapter-title content(text); }
     }
 
     fn ranges_of(n: usize, first_room: f32, page_room: f32) -> Vec<(usize, usize)> {
-        plan_line_breaks(&uniform_lines(n), first_room, page_room, 0.0, usize::MAX)
-            .into_iter()
-            .map(|r| (r.start, r.end))
-            .collect()
+        plan_line_breaks(
+            &uniform_lines(n),
+            first_room,
+            page_room,
+            0.0,
+            usize::MAX,
+            LineRules::INITIAL,
+        )
+        .into_iter()
+        .map(|r| (r.start, r.end))
+        .collect()
     }
 
     #[test]
@@ -15820,7 +16056,7 @@ h2 { string-set: chapter-title content(text); }
     fn plan_line_breaks_uses_line_coordinates_not_counts() {
         // A tall line (60px) among 20px lines: strips are measured, not counted.
         let lines = vec![(0.0, 20.0), (20.0, 80.0), (80.0, 100.0), (100.0, 120.0)];
-        let r: Vec<_> = plan_line_breaks(&lines, 90.0, 90.0, 0.0, usize::MAX)
+        let r: Vec<_> = plan_line_breaks(&lines, 90.0, 90.0, 0.0, usize::MAX, LineRules::INITIAL)
             .into_iter()
             .map(|r| (r.start, r.end))
             .collect();
@@ -15829,10 +16065,10 @@ h2 { string-set: chapter-title content(text); }
 
     #[test]
     fn plan_line_breaks_stops_at_max_strips() {
-        let r = plan_line_breaks(&uniform_lines(100), 20.0, 20.0, 0.0, 3);
+        let r = plan_line_breaks(&uniform_lines(100), 20.0, 20.0, 0.0, 3, LineRules::INITIAL);
         assert_eq!(r.len(), 3);
         assert_eq!(r.last().unwrap().end, 100, "the last strip takes the rest");
-        let r = plan_line_breaks(&uniform_lines(5), 20.0, 20.0, 0.0, 0);
+        let r = plan_line_breaks(&uniform_lines(5), 20.0, 20.0, 0.0, 0, LineRules::INITIAL);
         assert_eq!(r, vec![0..5]);
     }
 
@@ -16652,6 +16888,7 @@ h2 { string-set: chapter-title content(text); }
             hidden_tail: 0,
             own_box_height: None,
             slice: false,
+            rules: LineRules::INITIAL,
         };
         // 100px: lines at 0..80 show, the one at 100 does not.
         let clipped = split(0.0).clip_to(100.0);
@@ -17476,7 +17713,7 @@ h2 { string-set: chapter-title content(text); }
 
     #[test]
     fn an_inline_block_moved_to_the_next_page_takes_its_carrier_line_along() {
-        // 170px of padding leave one line on page 0: ORPHANS moves the box to page 1. The carrier has a fragment
+        // 170px of padding leave one line on page 0: the orphans move the box to page 1. The carrier has a fragment
         // on page 0 (its padding) with no line, and its line is on page 1 with the box.
         let (doc, table) = nested_geometry(
             &format!(
@@ -18402,15 +18639,29 @@ h2 { string-set: chapter-title content(text); }
     fn plan_line_breaks_leaves_room_below_the_last_line() {
         // 5 lines fit; the last strip also needs 10px below its last line: a line moves on
         // (and a widow is avoided by taking two).
-        let r: Vec<_> = plan_line_breaks(&uniform_lines(10), 100.0, 100.0, 10.0, usize::MAX)
-            .into_iter()
-            .map(|r| (r.start, r.end))
-            .collect();
+        let r: Vec<_> = plan_line_breaks(
+            &uniform_lines(10),
+            100.0,
+            100.0,
+            10.0,
+            usize::MAX,
+            LineRules::INITIAL,
+        )
+        .into_iter()
+        .map(|r| (r.start, r.end))
+        .collect();
         assert_eq!(r, vec![(0, 5), (5, 8), (8, 10)]);
         // Without the extra, the same lines end exactly on the strip.
         assert_eq!(ranges_of(10, 100.0, 100.0), vec![(0, 5), (5, 10)]);
         // A single line cannot move: it overflows rather than vanish.
-        let r = plan_line_breaks(&uniform_lines(1), 20.0, 20.0, 10.0, usize::MAX);
+        let r = plan_line_breaks(
+            &uniform_lines(1),
+            20.0,
+            20.0,
+            10.0,
+            usize::MAX,
+            LineRules::INITIAL,
+        );
         assert_eq!(r, vec![0..1]);
     }
 
@@ -20752,5 +21003,302 @@ h2 { string-set: chapter-title content(text); }
                 );
             }
         }
+    }
+
+    // ───────── html-to-pdf F30c-o: author `orphans` / `widows` ─────────
+
+    fn rules(orphans: usize, widows: usize) -> LineRules {
+        LineRules { orphans, widows }
+    }
+
+    /// `line_rules` of the node with `id` in `html` with the scope of the document's own declarations open.
+    fn declared_rules(body: &str, id: &str) -> LineRules {
+        let doc = laid_out(body);
+        let table = crate::blitz_adapter::extract_column_style_table(&doc);
+        let _scope = LineRulesScope::enter(&table);
+        line_rules(doc.deref(), node_of(&doc, id))
+    }
+
+    #[test]
+    fn line_rules_without_a_scope_or_a_declaration_are_the_initial_ones() {
+        let body = "<p id=\"p\" style=\"orphans:5;widows:6\">a<br>b</p>";
+        let doc = laid_out(body);
+        // Declared, but no scope open: the free functions of the fragmenter know nothing of it.
+        assert_eq!(
+            line_rules(doc.deref(), node_of(&doc, "p")),
+            LineRules::INITIAL
+        );
+        assert_eq!(
+            declared_rules("<p id=\"p\">a<br>b</p>", "p"),
+            LineRules::INITIAL
+        );
+        // The scope restores the previous set when it is dropped.
+        assert_eq!(declared_rules(body, "p"), rules(5, 6));
+        assert_eq!(
+            line_rules(doc.deref(), node_of(&doc, "p")),
+            LineRules::INITIAL
+        );
+    }
+
+    #[test]
+    fn line_rules_are_inherited_per_property() {
+        // From `body` (and `html`), through a wrapper.
+        assert_eq!(
+            declared_rules(
+                "<style>body{orphans:3}html{widows:4}</style><div><p id=\"p\">a<br>b</p></div>",
+                "p"
+            ),
+            rules(3, 4)
+        );
+        // The nearest declaration wins, per property.
+        assert_eq!(
+            declared_rules(
+                "<div style=\"orphans:3;widows:5\"><div style=\"orphans:6\"><p id=\"p\">a<br>b</p></div></div>",
+                "p"
+            ),
+            rules(6, 5)
+        );
+    }
+
+    #[test]
+    fn line_rules_keywords() {
+        let wrap = |p_style: &str| {
+            format!(
+                "<div style=\"orphans:4;widows:5\"><p id=\"p\" style=\"{p_style}\">a<br>b</p></div>"
+            )
+        };
+        assert_eq!(declared_rules(&wrap("orphans:initial"), "p"), rules(2, 5));
+        assert_eq!(declared_rules(&wrap("orphans:inherit"), "p"), rules(4, 5));
+        assert_eq!(declared_rules(&wrap("widows:unset"), "p"), rules(4, 5));
+        assert_eq!(declared_rules(&wrap("widows:revert"), "p"), rules(4, 5));
+        // `initial` in between cuts the inheritance chain.
+        assert_eq!(
+            declared_rules(
+                "<div style=\"orphans:4\"><div style=\"orphans:initial\"><p id=\"p\">a<br>b</p></div></div>",
+                "p"
+            ),
+            rules(2, 2)
+        );
+        // An invalid value is dropped: the parent's applies.
+        assert_eq!(
+            declared_rules(&wrap("orphans:0;widows:2.5"), "p"),
+            rules(4, 5)
+        );
+    }
+
+    #[test]
+    fn line_rules_of_a_cell_reach_its_paragraphs() {
+        assert_eq!(
+            declared_rules(
+                "<table><tr><td style=\"orphans:4;widows:5\"><p id=\"p\">a<br>b</p></td></tr></table>",
+                "p"
+            ),
+            rules(4, 5)
+        );
+        assert_eq!(
+            declared_rules(
+                "<style>td{orphans:4}</style><table><tr><td id=\"c\">a<br>b</td></tr></table>",
+                "c"
+            ),
+            rules(4, 2)
+        );
+    }
+
+    #[test]
+    fn line_rules_reach_anonymous_blocks_and_pseudo_element_boxes() {
+        // Text beside a block child sits in an anonymous block of the `div`; Blitz must hang it from the `div`.
+        let doc = laid_out(
+            "<div id=\"d\" style=\"orphans:3;widows:4\">text<p>x</p></div>\
+             <style>#e::before{content:\"b\";display:block}</style>\
+             <div id=\"e\" style=\"orphans:5\"><p>x</p></div>",
+        );
+        let table = crate::blitz_adapter::extract_column_style_table(&doc);
+        let _scope = LineRulesScope::enter(&table);
+        let d = node_of(&doc, "d");
+        let anon = d
+            .children
+            .iter()
+            .chain(d.layout_children.borrow().iter().flatten())
+            .filter_map(|&c| doc.deref().get_node(c))
+            .find(|n| n.is_anonymous())
+            .expect("an anonymous block in the div");
+        assert_eq!(line_rules(doc.deref(), anon), rules(3, 4));
+        let e = node_of(&doc, "e");
+        let before = doc
+            .deref()
+            .get_node(e.before.expect("a ::before node"))
+            .unwrap();
+        assert_eq!(line_rules(doc.deref(), before), rules(5, 2));
+    }
+
+    #[test]
+    fn starts_in_place_takes_the_paragraphs_own_minimums() {
+        let nine = lines_of_21px(9);
+        let r33 = rules(3, 3);
+        // Three lines (63 px) must fit, not two.
+        assert!(!starts_in_place(&nine, 0.0, 62.9, r33));
+        assert!(starts_in_place(&nine, 0.0, 63.0, r33));
+        assert!(starts_in_place(&nine, 0.0, 62.9, LineRules::INITIAL));
+        // Fewer than orphans + widows lines: no allowed break inside.
+        assert!(!starts_in_place(&lines_of_21px(5), 0.0, 1000.0, r33));
+        assert!(starts_in_place(&lines_of_21px(6), 0.0, 1000.0, r33));
+        assert!(starts_in_place(&lines_of_21px(2), 0.0, 1000.0, rules(1, 1)));
+        assert!(!starts_in_place(
+            &lines_of_21px(1),
+            0.0,
+            1000.0,
+            rules(1, 1)
+        ));
+    }
+
+    #[test]
+    fn widow_safe_break_pulls_back_to_the_paragraphs_widows() {
+        assert_eq!(widow_safe_break(0, 48, 49, rules(2, 3)), Some(46));
+        assert_eq!(
+            widow_safe_break(0, 48, 49, rules(2, 1)),
+            None,
+            "j = 48 is not before i"
+        );
+        assert_eq!(widow_safe_break(0, 48, 50, rules(2, 3)), Some(47));
+        // The first fragment keeps `orphans` lines: start 43 allows 46 with 3, not with 4.
+        assert_eq!(widow_safe_break(43, 48, 49, rules(3, 3)), Some(46));
+        assert_eq!(widow_safe_break(43, 48, 49, rules(4, 3)), None);
+        assert_eq!(widow_safe_break(0, 2, 3, rules(1, 2)), Some(1));
+    }
+
+    #[test]
+    fn line_break_at_honours_the_rules_or_says_none() {
+        let o3w3 = rules(3, 3);
+        // Both satisfied: the natural break.
+        assert_eq!(line_break_at(0, 48, 100, o3w3), Some(48));
+        // Too few lines before it: none.
+        assert_eq!(line_break_at(0, 2, 100, o3w3), None);
+        // Too few after it: pulled back (50 lines: 47 / 3).
+        assert_eq!(line_break_at(0, 48, 50, o3w3), Some(47));
+        // Pulling back would leave fewer than `orphans`: none.
+        assert_eq!(line_break_at(0, 4, 5, o3w3), None);
+        // The initial values are the decision of before F30c-o.
+        assert_eq!(line_break_at(0, 48, 49, LineRules::INITIAL), Some(47));
+        assert_eq!(line_break_at(0, 1, 3, LineRules::INITIAL), None);
+    }
+
+    #[test]
+    fn keep_orphans_break_gives_up_the_widows_only_for_author_values() {
+        // Chrome: `orphans: 30; widows: 30` on 100 lines, 48 per page: 48 / 30 / 22.
+        assert_eq!(keep_orphans_break(48, 96, 100, rules(30, 30)), Some(78));
+        // The pulled-back break leaves nothing of the fragment (j == start): the natural break stays.
+        assert_eq!(keep_orphans_break(40, 88, 100, rules(2, 60)), None);
+        // The orphans cannot be kept at all: not this step.
+        assert_eq!(keep_orphans_break(0, 48, 100, rules(60, 2)), None);
+        // Widows satisfied: nothing to give up.
+        assert_eq!(keep_orphans_break(0, 48, 100, rules(30, 30)), None);
+        // Pulling back honours the orphans: `line_break_at` already found it.
+        assert_eq!(keep_orphans_break(0, 48, 52, rules(2, 10)), None);
+        // The initial values never give up the widows here (F30c-w keeps its own behaviour).
+        assert_eq!(keep_orphans_break(0, 2, 3, LineRules::INITIAL), None);
+    }
+
+    /// Lines per fragment, in order, of `n` lines of 20 px on a `page`-px page with the paragraph starting at `top`.
+    fn fragment_sizes(n: usize, top: f32, page: f32, rules: LineRules) -> Vec<u32> {
+        let mut geom = PaginationGeometryTable::new();
+        let lines: Vec<(f32, f32)> = (0..n)
+            .map(|i| (20.0 * i as f32, 20.0 * (i + 1) as f32))
+            .collect();
+        let (_, _, _, _) = fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            top,
+            0,
+            PageStrips::new(page, 0.0),
+            &lines,
+            rules,
+        );
+        let entry = geom.get(&1).unwrap();
+        // Every fragment fits its page (a value no break can keep must not overflow).
+        for (k, frag) in entry.fragments.iter().enumerate() {
+            let y = if k == 0 { top } else { 0.0 };
+            assert!(
+                y + frag.height.to_f32() <= page + 0.01,
+                "fragment {k} ends at {} on a {page} px page",
+                y + frag.height.to_f32()
+            );
+        }
+        assert!(line_slices_tile(&entry.line_slices, n));
+        entry.line_slices.iter().map(|s| s.end - s.first).collect()
+    }
+
+    #[test]
+    fn fragment_inline_root_honours_author_orphans_and_widows() {
+        // 50 lines, 200 px (10 lines) per page.
+        assert_eq!(fragment_sizes(24, 0.0, 200.0, rules(2, 2)), [10, 10, 4]);
+        // widows 3: the last page gets three (10 / 10 / 4 stays; 22 lines: 10 / 9 / 3).
+        assert_eq!(fragment_sizes(22, 0.0, 200.0, rules(2, 3)), [10, 9, 3]);
+        assert_eq!(fragment_sizes(22, 0.0, 200.0, rules(2, 2)), [10, 10, 2]);
+        // widows 1 allows a single line on the last page.
+        assert_eq!(fragment_sizes(21, 0.0, 200.0, rules(2, 1)), [10, 10, 1]);
+        assert_eq!(fragment_sizes(21, 0.0, 200.0, rules(2, 2)), [10, 9, 2]);
+    }
+
+    #[test]
+    fn fragment_inline_root_relaxes_values_the_page_cannot_keep() {
+        // orphans 60 on 100 lines of 20 px, a 200 px page: no break keeps 60 lines, so the page takes what fits (the
+        // initial rules); nothing is lost and nothing is taller than the page.
+        assert_eq!(
+            fragment_sizes(100, 0.0, 200.0, rules(60, 2)),
+            [10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
+        );
+        // widows 30 with 100 lines: pulled back (page 9 leaves 30): 10 x 7, then 10 / 10 / 10 stays: 70 + 30.
+        let sizes = fragment_sizes(100, 0.0, 200.0, rules(2, 30));
+        assert_eq!(sizes.iter().sum::<u32>(), 100);
+        // The same with the paragraph starting 60 px down the first page.
+        let sizes = fragment_sizes(100, 60.0, 200.0, rules(60, 60));
+        assert_eq!(sizes.iter().sum::<u32>(), 100);
+        let sizes = fragment_sizes(100, 60.0, 200.0, rules(30, 30));
+        assert_eq!(sizes.iter().sum::<u32>(), 100);
+        // Chrome's 48-line page: orphans 30, widows 30 on 100 lines of 20 px: 48 / 30 / 22 (the widows give way).
+        let sizes = fragment_sizes(100, 0.0, 960.0, rules(30, 30));
+        assert_eq!(sizes, [48, 30, 22]);
+        // widows 30 alone: 48 / 22 / 30.
+        assert_eq!(fragment_sizes(100, 0.0, 960.0, rules(2, 30)), [48, 22, 30]);
+    }
+
+    #[test]
+    fn plan_line_breaks_uses_the_paragraphs_widows() {
+        let plan = |n: usize, rules: LineRules| -> Vec<(usize, usize)> {
+            plan_line_breaks(&uniform_lines(n), 100.0, 100.0, 0.0, usize::MAX, rules)
+                .into_iter()
+                .map(|r| (r.start, r.end))
+                .collect()
+        };
+        // 11 lines on 5-line strips: greedy is 5 / 5 / 1, widows 2 pulls to 5 / 4 / 2, widows 3 to 5 / 3 / 3.
+        assert_eq!(plan(11, LineRules::INITIAL), [(0, 5), (5, 9), (9, 11)]);
+        assert_eq!(plan(11, rules(2, 3)), [(0, 5), (5, 8), (8, 11)]);
+        assert_eq!(plan(11, rules(2, 1)), [(0, 5), (5, 10), (10, 11)]);
+        // Pulling back would leave the strip fewer than `orphans`: relaxed to the greedy break.
+        assert_eq!(plan(11, rules(5, 4)), [(0, 5), (5, 10), (10, 11)]);
+    }
+
+    #[test]
+    fn leading_counts_the_paragraphs_orphans() {
+        let split = |rules: LineRules| LineSplit {
+            lines: (0..10)
+                .map(|k| (20.0 * k as f32, 20.0 * (k + 1) as f32))
+                .collect(),
+            inset_top: 5.0,
+            inset_bottom: 0.0,
+            hidden_tail: 0,
+            own_box_height: None,
+            slice: false,
+            rules,
+        };
+        assert_eq!(split(LineRules::INITIAL).leading(), 45.0);
+        assert_eq!(split(rules(3, 2)).leading(), 65.0);
+        assert_eq!(
+            split(rules(30, 2)).leading(),
+            205.0,
+            "at most all the lines"
+        );
     }
 }

@@ -116,6 +116,24 @@ pub enum PageName {
     Named(String),
 }
 
+/// `orphans` / `widows` value as the author wrote it (css-break-3 §3.3; html-to-pdf F30c-o). Stylo 0.8.0 has no longhand for
+/// either property in its servo build, so the value is read here with the `break-*` family. The grammar is
+/// `<integer [1,∞]>`: zero, negatives, numbers with a fraction or exponent (`2.0`, `1e0`), lengths, `calc()` and other
+/// identifiers drop the declaration.
+///
+/// Both properties are inherited, so `unset` and `revert` (there is no user-agent declaration to roll back to) act as
+/// `inherit`; the consumer treats [`LineCount::Inherit`] like an element that does not declare the property and asks the
+/// parent. It is kept in the table, not dropped, so that it overrides an earlier declaration of the same cascade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineCount {
+    /// An explicit `<integer [1,∞]>`.
+    Value(u32),
+    /// `inherit`, `unset`, `revert`: the parent's computed value.
+    Inherit,
+    /// `initial`: 2.
+    Initial,
+}
+
 /// Resolved properties for a single element. Fields remain `None` when the
 /// author did not set them, so the consumer can tell "absent" from "set to
 /// default" (important for the cascade — a later rule overrides only the
@@ -139,6 +157,11 @@ pub struct ColumnStyleProps {
     /// resolution happens later in `compute_used_page_names`, this field
     /// stores only the author's declared value.
     pub page: Option<PageName>,
+    /// `orphans` (css-break-3 §3.3): the minimum number of lines of a block container left before a break. `None`: the
+    /// author did not declare it for this element.
+    pub orphans: Option<LineCount>,
+    /// `widows` (css-break-3 §3.3): the minimum number of lines left after a break.
+    pub widows: Option<LineCount>,
 }
 
 impl ColumnStyleProps {
@@ -163,6 +186,12 @@ impl ColumnStyleProps {
         if other.page.is_some() {
             self.page = other.page;
         }
+        if other.orphans.is_some() {
+            self.orphans = other.orphans;
+        }
+        if other.widows.is_some() {
+            self.widows = other.widows;
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -172,6 +201,8 @@ impl ColumnStyleProps {
             && self.break_after.is_none()
             && self.break_before.is_none()
             && self.page.is_none()
+            && self.orphans.is_none()
+            && self.widows.is_none()
     }
 }
 
@@ -456,6 +487,25 @@ fn parse_column_fill_value<'i>(
         Ok(ColumnFill::Balance)
     } else {
         Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid))
+    }
+}
+
+/// Parse the value side of `orphans` / `widows`: `<integer [1,∞]>` or one of the CSS-wide keywords (html-to-pdf F30c-o).
+/// `cssparser` sets `int_value` only for a number written without a fraction or exponent, so `2.0` and `1e0` are not
+/// integers here, as in Chrome. A value no break can keep (`orphans: 60`) is relaxed by the fragmenter, not here.
+fn parse_line_count_value<'i>(input: &mut Parser<'i, '_>) -> Result<LineCount, ParseError<'i, ()>> {
+    if let Ok(n) = input.try_parse(|i| i.expect_integer()) {
+        return if n >= 1 {
+            Ok(LineCount::Value(n as u32))
+        } else {
+            Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid))
+        };
+    }
+    let ident = input.expect_ident()?.clone();
+    match ident.as_ref().to_ascii_lowercase().as_str() {
+        "initial" => Ok(LineCount::Initial),
+        "inherit" | "unset" | "revert" => Ok(LineCount::Inherit),
+        _ => Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid)),
     }
 }
 
@@ -745,6 +795,14 @@ fn parse_value_into(props: &mut ColumnStyleProps, name: &str, input: &mut Parser
     } else if name.eq_ignore_ascii_case("page") {
         if let Ok(v) = input.parse_entirely(parse_page_value) {
             props.page = Some(v);
+        }
+    } else if name.eq_ignore_ascii_case("orphans") {
+        if let Ok(v) = input.parse_entirely(parse_line_count_value) {
+            props.orphans = Some(v);
+        }
+    } else if name.eq_ignore_ascii_case("widows") {
+        if let Ok(v) = input.parse_entirely(parse_line_count_value) {
+            props.widows = Some(v);
         }
     } else {
         // Unknown property — discard its value tokens silently.
@@ -2951,6 +3009,115 @@ mod tests {
         assert_eq!(
             break_inside_of("body .k, .zz{break-inside:auto}.k{break-inside:avoid}", ""),
             Some(Auto)
+        );
+    }
+
+    // -------- orphans / widows (html-to-pdf F30c-o) --------
+
+    #[test]
+    fn orphans_and_widows_take_a_positive_integer() {
+        let props = parse_declaration_block("orphans: 3; widows: 4");
+        assert_eq!(props.orphans, Some(LineCount::Value(3)));
+        assert_eq!(props.widows, Some(LineCount::Value(4)));
+        let props = parse_declaration_block("ORPHANS: +1; Widows:  60 ");
+        assert_eq!(props.orphans, Some(LineCount::Value(1)));
+        assert_eq!(props.widows, Some(LineCount::Value(60)));
+        assert!(!props.is_empty());
+    }
+
+    #[test]
+    fn orphans_and_widows_keywords() {
+        let props = parse_declaration_block("orphans: initial; widows: inherit");
+        assert_eq!(props.orphans, Some(LineCount::Initial));
+        assert_eq!(props.widows, Some(LineCount::Inherit));
+        // `unset` and `revert` act as `inherit` on an inherited property with no user-agent declaration.
+        let props = parse_declaration_block("orphans: UNSET; widows: revert");
+        assert_eq!(props.orphans, Some(LineCount::Inherit));
+        assert_eq!(props.widows, Some(LineCount::Inherit));
+    }
+
+    #[test]
+    fn orphans_and_widows_invalid_values_are_dropped() {
+        for v in [
+            "0", "-1", "-3", "2.5", "2.0", "1e0", "foo", "3px", "50%", "auto", "none", "1 2",
+            "calc(3)", "",
+        ] {
+            let props = parse_declaration_block(&format!("orphans: {v}; widows: {v}"));
+            assert_eq!(props.orphans, None, "orphans: {v}");
+            assert_eq!(props.widows, None, "widows: {v}");
+        }
+        // An invalid declaration does not remove an earlier valid one, and siblings still apply.
+        let props =
+            parse_declaration_block("orphans: 3; orphans: 0; widows: x; break-inside: avoid");
+        assert_eq!(props.orphans, Some(LineCount::Value(3)));
+        assert_eq!(props.widows, None);
+        assert_eq!(props.break_inside, Some(BreakInside::Avoid));
+    }
+
+    #[test]
+    fn orphans_important_is_kept_apart() {
+        let declared = parse_declarations("orphans: 3 !important; widows: 4");
+        assert_eq!(declared.important.orphans, Some(LineCount::Value(3)));
+        assert_eq!(declared.normal.orphans, None);
+        assert_eq!(declared.normal.widows, Some(LineCount::Value(4)));
+    }
+
+    /// `(orphans, widows)` the cascade gives the element `id="k"` of `<p id="k" class="k" style="{inline}">`.
+    fn line_counts_of(css: &str, inline: &str) -> (Option<LineCount>, Option<LineCount>) {
+        let html =
+            format!(r#"<html><body><p id="k" class="k" style="{inline}">x</p></body></html>"#);
+        let doc = build_doc(&html);
+        let table = build_column_style_table(&doc, &parse_stylesheet(css));
+        let id = find_node_with(&doc, |n| {
+            n.element_data()
+                .and_then(|e| crate::blitz_adapter::get_attr(e, "id"))
+                == Some("k")
+        })
+        .expect("k");
+        table
+            .get(&id)
+            .map_or((None, None), |p| (p.orphans, p.widows))
+    }
+
+    #[test]
+    fn orphans_and_widows_follow_the_cascade() {
+        use LineCount::Value;
+        assert_eq!(line_counts_of("p{orphans:3}", ""), (Some(Value(3)), None));
+        assert_eq!(
+            line_counts_of("@layer a{p{orphans:3;widows:5}}", ""),
+            (Some(Value(3)), Some(Value(5)))
+        );
+        // Unlayered beats layered, the later rule beats the earlier, the style attribute beats the sheet.
+        assert_eq!(
+            line_counts_of("@layer a{.k{orphans:3}}p{orphans:4}", ""),
+            (Some(Value(4)), None)
+        );
+        assert_eq!(
+            line_counts_of("p{orphans:3}p{orphans:4}", ""),
+            (Some(Value(4)), None)
+        );
+        assert_eq!(
+            line_counts_of("p{orphans:3}", "orphans:5"),
+            (Some(Value(5)), None)
+        );
+        // `!important` in the sheet beats a plain style attribute; the attribute's own `!important` beats the sheet's.
+        assert_eq!(
+            line_counts_of("p{orphans:3 !important}", "orphans:5"),
+            (Some(Value(3)), None)
+        );
+        assert_eq!(
+            line_counts_of("p{orphans:3 !important}", "orphans:5 !important"),
+            (Some(Value(5)), None)
+        );
+        // `inherit` overrides an earlier value of the same element: the consumer then asks the parent.
+        assert_eq!(
+            line_counts_of("p{orphans:3}.k{orphans:inherit}", ""),
+            (Some(LineCount::Inherit), None)
+        );
+        // `@media print` is read as the block Stylo applies (`READER_MEDIA_TYPE`).
+        assert_eq!(
+            line_counts_of("@media screen{p{orphans:3}}", ""),
+            (Some(Value(3)), None)
         );
     }
 }
