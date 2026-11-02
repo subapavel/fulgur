@@ -6911,13 +6911,15 @@ fn plan_line_breaks(
         // html-to-pdf F30c-o3: the break the body-level splitter takes at this line ([`choose_line_break`]); `None`
         // keeps the greedy break (this splitter never overflows a strip by more than the one line it must take).
         if end < n {
-            let page_top = start > 0;
-            let capacity = if rules != LineRules::INITIAL && page_top {
+            let continuation = start > 0;
+            let at_top = continuation || first_room >= page_room - 0.01;
+            let capacity = if rules != LineRules::INITIAL && continuation {
                 page_capacity(lines, start, page_room)
             } else {
                 usize::MAX
             };
-            end = choose_line_break(start, end, n, rules, capacity, page_top).unwrap_or(end);
+            end = choose_line_break(start, end, n, rules, capacity, continuation, at_top)
+                .unwrap_or(end);
         }
         ranges.push(start..end);
         start = end;
@@ -8583,21 +8585,29 @@ fn keep_orphans_break(start: usize, i: usize, total: usize, rules: LineRules) ->
 /// are empty, and the result is the break of before F30c-o. [`fragment_inline_root`] keeps accumulating lines on `None`
 /// (F30c-w); [`plan_line_breaks`] keeps its greedy break.
 ///
-/// `capacity` is the number of lines a full page holds from `start` on, `page_top` whether the fragment is a continuation (it
-/// starts at the top of a page). There a `widows` larger than that capacity cannot be had by any pull-back, and Chrome ignores
-/// it: 100 lines, `orphans: 10; widows: 47` give 48 / 10 / 42 and `widows: 49` gives 48 / 48 / 4 (probes
-/// `out/scratch/f30co3/wid`, F30c-o2). The widows count as 1 there. Not for a first fragment: Chrome's numbers for a 60-line
-/// paragraph at the top of a page are irregular (`widows: 49` 48 / 12 but `50` 10 / 48 / 2 and, with `orphans: 30`, 30 / 30),
-/// and the pull-back and keep-the-orphans of before are right for most of them; the rest stays F30c-o2.
+/// `capacity` is the number of lines a full page holds from `start` on; `continuation` says the fragment is not the first
+/// (it starts at the top of a page) and `at_top` that it starts at the top of a page (every continuation, and a first fragment
+/// that has the whole page). Chrome's numbers (probes `out/scratch/f30co3/wid`, `swc`; F30c-o2):
+///
+/// - in a continuation a `widows` larger than the page's lines cannot be had by any pull-back and is ignored: 100 lines,
+///   `orphans: 10; widows: 47` give 48 / 10 / 42 and `widows: 49` gives 48 / 48 / 4. The widows count as 1;
+/// - a `widows` as large as the whole paragraph is ignored at the top of a page (52 lines, `widows: 60`, `orphans: 24`, room
+///   for 17 lines: the paragraph moves and breaks naturally, 48 / 4) and not in the middle of one, where the orphans are kept
+///   ([`keep_orphans_break`]: 1 / 48 / 3).
+///
+/// A first fragment with a `widows` smaller than the paragraph keeps its pull-back whatever its page: Chrome's numbers for a
+/// 60-line paragraph at the top of a page are irregular (`widows: 49` 48 / 12 but `50` 10 / 48 / 2 and, with `orphans: 30`,
+/// 30 / 30), and the rest stays F30c-o2.
 fn choose_line_break(
     start: usize,
     i: usize,
     total: usize,
     rules: LineRules,
     capacity: usize,
-    page_top: bool,
+    continuation: bool,
+    at_top: bool,
 ) -> Option<usize> {
-    let rules = if page_top && rules.widows > capacity {
+    let rules = if (continuation && rules.widows > capacity) || (at_top && rules.widows >= total) {
         LineRules { widows: 1, ..rules }
     } else {
         rules
@@ -8753,8 +8763,10 @@ pub(crate) fn fragment_inline_root(
         if projected_bottom_in_body > strips.bottom(page_index) && i > fragment_start_idx {
             // fulgur-s67g Phase 2.1: honour widow / orphan minimums (F30f-l: a natural break that would leave a widow
             // is pulled back; F30c-o: the paragraph's own minimums, relaxed in steps when the page cannot keep them).
-            let page_top = fragment_start_idx > 0;
-            let capacity = if rules != LineRules::INITIAL && page_top {
+            let continuation = fragment_start_idx > 0;
+            let at_top = continuation
+                || strips.bottom(page_index) - paragraph_top_in_body >= strips.fresh() - 0.01;
+            let capacity = if rules != LineRules::INITIAL && continuation {
                 page_capacity(line_metrics, fragment_start_idx, strips.fresh())
             } else {
                 usize::MAX
@@ -8765,7 +8777,8 @@ pub(crate) fn fragment_inline_root(
                 total_lines,
                 rules,
                 capacity,
-                page_top,
+                continuation,
+                at_top,
             ) else {
                 // No break honours the minimums here: skip, keep accumulating into the current
                 // fragment (CSS Fragmentation §4.4: the minimums are relaxed only when no break
@@ -22233,7 +22246,7 @@ h2 { string-set: chapter-title content(text); }
                 for start in 0..total {
                     for i in start + 1..total {
                         assert_eq!(
-                            choose_line_break(start, i, total, rules, usize::MAX, false),
+                            choose_line_break(start, i, total, rules, usize::MAX, false, false),
                             old_chain(start, i, total, rules),
                             "start {start}, i {i}, total {total}, {rules:?}"
                         );
@@ -22243,20 +22256,23 @@ h2 { string-set: chapter-title content(text); }
         }
         // Chrome: orphans 30 / widows 30 on 100 lines, the second page (start 48, 48 lines fit): keep the 30.
         assert_eq!(
-            choose_line_break(48, 96, 100, rules(30, 30), 48, true),
+            choose_line_break(48, 96, 100, rules(30, 30), 48, true, true),
             Some(78)
         );
         // Orphans no page can keep: the initial 2 / 2.
         assert_eq!(
-            choose_line_break(0, 48, 100, rules(60, 2), 48, true),
+            choose_line_break(0, 48, 100, rules(60, 2), 48, true, true),
             Some(48)
         );
         assert_eq!(
-            choose_line_break(0, 48, 100, rules(49, 2), 48, true),
+            choose_line_break(0, 48, 100, rules(49, 2), 48, true, true),
             Some(48)
         );
         // Not even the initial rules have a break: one line fits.
-        assert_eq!(choose_line_break(0, 1, 100, rules(60, 2), 48, true), None);
+        assert_eq!(
+            choose_line_break(0, 1, 100, rules(60, 2), 48, true, true),
+            None
+        );
     }
 
     #[test]
@@ -22265,32 +22281,37 @@ h2 { string-set: chapter-title content(text); }
         // the natural break (48 / 48 / 4). The first fragment pulls back whatever the widows.
         for (w, want) in [(47, 58), (48, 58), (49, 96), (50, 96)] {
             assert_eq!(
-                choose_line_break(48, 96, 100, rules(10, w), 48, true),
+                choose_line_break(48, 96, 100, rules(10, w), 48, true, true),
                 Some(want),
                 "widows {w}"
             );
         }
         assert_eq!(
-            choose_line_break(0, 40, 60, rules(10, 49), 48, false),
+            choose_line_break(0, 40, 60, rules(10, 49), 48, false, false),
             Some(11)
         );
         assert_eq!(
-            choose_line_break(0, 40, 60, rules(30, 49), 48, false),
+            choose_line_break(0, 40, 60, rules(30, 49), 48, false, false),
             Some(30)
         );
         // `orphans: 1; widows: 50` on the second fragment: natural, not the pull-back to line 50.
         assert_eq!(
-            choose_line_break(48, 96, 100, rules(1, 50), 48, true),
+            choose_line_break(48, 96, 100, rules(1, 50), 48, true, true),
             Some(96)
         );
-        // A first fragment at the top of a page ignores them too: 60 lines, widows 49: 48 / 12 (Chrome), not 11 / 49.
+        // `widows` as large as the paragraph: ignored at the top of a page (natural 48), the orphans kept mid-page.
         assert_eq!(
-            choose_line_break(0, 48, 60, rules(10, 49), 48, true),
+            choose_line_break(0, 48, 52, rules(24, 60), 48, false, true),
             Some(48)
         );
         assert_eq!(
-            choose_line_break(0, 48, 60, rules(30, 49), 48, true),
-            Some(48)
+            choose_line_break(0, 33, 52, rules(24, 60), 48, false, false),
+            Some(24)
+        );
+        // A first fragment with `widows` below the paragraph keeps pulling back (Chrome 10 / 48 / 2 for widows 50, orphans 10).
+        assert_eq!(
+            choose_line_break(0, 48, 60, rules(10, 50), 48, false, true),
+            Some(10)
         );
     }
 
