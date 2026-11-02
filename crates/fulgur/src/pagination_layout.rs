@@ -7434,9 +7434,17 @@ fn has_own_block_size_above(
             .as_deref()
             .filter(|v| !v.is_empty())
             .unwrap_or(&parent.children);
+        // A multicol container's height in the layout is not the block size the fragmenter gives it (the columns are
+        // laid out by the fragmenter), so the box above it cannot be measured: `b200-mixed` units end in a two-column
+        // terms block.
+        let measurable = !children
+            .iter()
+            .filter_map(|&id| doc.get_node(id))
+            .any(crate::blitz_adapter::is_multicol_container);
         let content_bottom = children
             .iter()
             .filter_map(|&id| doc.get_node(id))
+            .filter(|c| !crate::blitz_adapter::node_is_floating(c))
             .filter(|c| !is_out_of_flow_positioned(c) && !is_offset_positioned(c))
             .filter(|c| c.text_data().is_none() && c.final_layout.size.height.is_finite())
             .map(|c| {
@@ -7447,7 +7455,8 @@ fn has_own_block_size_above(
             .fold(None, |acc: Option<f32>, b| {
                 Some(acc.map_or(b, |a| a.max(b)))
             });
-        if let Some(bottom) = content_bottom
+        if measurable
+            && let Some(bottom) = content_bottom
             && layout.size.height - layout.padding.bottom - layout.border.bottom > bottom + 1.0
         {
             return true;
@@ -21969,6 +21978,20 @@ h2 { string-set: chapter-title content(text); }
                     "<section><p id=\"x\" style=\"position:relative;top:-5px\">{l}</p></section>"
                 ),
                 false,
+            ),
+            (
+                "a multicol sibling cannot be measured",
+                format!(
+                    "<section style=\"height:600px\"><p id=\"x\">{l}</p><div style=\"columns:2\">a b c d</div></section>"
+                ),
+                false,
+            ),
+            (
+                "a float sibling is not in the flow",
+                format!(
+                    "<section style=\"height:600px\"><p id=\"x\">{l}</p><div style=\"float:left;height:600px\"></div></section>"
+                ),
+                true,
             ),
             (
                 "the paragraph's own bottom padding",
