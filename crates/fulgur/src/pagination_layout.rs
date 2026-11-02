@@ -9006,7 +9006,7 @@ fn has_allowed_break(n: usize, taller_than_a_page: bool, rules: LineRules) -> bo
 /// against that page. Only when no break honours both minimums (the
 /// pulled break would leave fewer than `rules.orphans` lines before it) are
 /// the rules relaxed (§4.4: "if the above doesn't provide enough break points to
-/// keep fragmented content from overflowing the fragmentainer").
+/// keep content from overflowing the fragmentainer").
 ///
 /// html-to-pdf F30c-o: `rules` are the paragraph's `orphans` / `widows` (the reader of `column_css`; 2 / 2 unless the
 /// author declares them). A value the page cannot keep (`orphans: 60`) must not lose lines, so the relaxation has steps:
