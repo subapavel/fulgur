@@ -23679,4 +23679,36 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(pages.iter().filter(|&&p| p == 0).count(), 48);
         assert_eq!(pages.iter().filter(|&&p| p == 1).count(), 12);
     }
+
+    #[test]
+    fn a_head_at_the_page_top_relaxes_the_orphans_of_a_long_paragraph() {
+        // The head leaves room for one line: the two lines the paragraph needs do not fit, no earlier break helps (the head is
+        // first), so Rule 3 gives way and the paragraph starts with one line (Chrome 1 / 29).
+        for nested in [false, true] {
+            let (open, close) = if nested {
+                ("<section>", "</section>")
+            } else {
+                ("", "")
+            };
+            let (doc, table) = ruled_geometry(
+                &format!(
+                    "{open}<p id=\"h\" style=\"break-after:avoid;height:180px\">H</p><p id=\"p\">{}</p>{close}",
+                    br_lines(30)
+                ),
+                200.0,
+            );
+            let sizes = page_sizes(&table, &doc, "p");
+            assert_eq!(first_page(&table, &doc, "h"), 0, "nested {nested}");
+            assert_eq!(sizes[..2], [(0, 1), (1, 10)], "nested {nested}: {sizes:?}");
+            // no room for a line: the head stays alone and the paragraph starts the next page
+            let (doc, table) = ruled_geometry(
+                &format!(
+                    "{open}<p id=\"h\" style=\"break-after:avoid;height:200px\">H</p><p id=\"p\">{}</p>{close}",
+                    br_lines(30)
+                ),
+                200.0,
+            );
+            assert_eq!(page_sizes(&table, &doc, "p")[0].0, 1, "nested {nested}");
+        }
+    }
 }

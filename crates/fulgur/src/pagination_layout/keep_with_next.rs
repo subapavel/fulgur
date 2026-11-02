@@ -347,14 +347,18 @@ pub(super) fn first_fragment_extent(
     leading_block_size(doc, node_id, Some(env.styles), 0.0, 0, fresh)
 }
 
-/// The first line of a multi-line paragraph that has no allowed break and that the chain cannot avoid relaxing: the part
-/// of it that has to fit where it starts when Rule 3 is dropped (css-break-3 §4.4). `None` for any other box.
+/// The first line of a multi-line paragraph that the chain cannot avoid relaxing: the part of it that has to fit where it
+/// starts when Rule 3 is dropped (css-break-3 §4.4). `None` for any other box. With `no_allowed_break` only a paragraph
+/// without an allowed break counts (a member of a chain a page boundary falls in); without it also one that has an allowed
+/// break whose first `orphans` lines do not fit next to the head (a heading first on its page: Chrome 1 / 29 for a 30-line
+/// paragraph with room for one line).
 fn relaxable_first_line(
     doc: &BaseDocument,
     parent: &blitz_dom::Node,
     node_id: usize,
     env: KeepEnv<'_>,
     fresh: f32,
+    no_allowed_break: bool,
 ) -> Option<f32> {
     let node = doc.get_node(node_id)?;
     if !node.flags.is_inline_root() {
@@ -371,7 +375,7 @@ fn relaxable_first_line(
         return None;
     }
     let rules = line_rules(doc, node);
-    if has_allowed_break(lines.len(), extent > fresh + 1.0, rules) {
+    if no_allowed_break && has_allowed_break(lines.len(), extent > fresh + 1.0, rules) {
         return None;
     }
     let is_float = crate::blitz_adapter::node_is_floating(node);
@@ -449,7 +453,7 @@ pub(super) fn keep_with_next_extent(
         let delta = next_top - head_top;
         let candidate = delta + first_fragment_extent(doc, parent, next_id, env, fresh);
         if candidate > fresh {
-            if let Some(line) = relaxable_first_line(doc, parent, next_id, env, fresh)
+            if let Some(line) = relaxable_first_line(doc, parent, next_id, env, fresh, false)
                 && delta + line <= fresh
             {
                 size = Some(delta + line);
@@ -516,7 +520,7 @@ pub(super) fn member_relaxation(
     let Some(node) = doc.get_node(id) else {
         return MemberRelax::No;
     };
-    let Some(first_line) = relaxable_first_line(doc, parent, id, env, fresh) else {
+    let Some(first_line) = relaxable_first_line(doc, parent, id, env, fresh, true) else {
         return MemberRelax::No;
     };
     let lines = collect_inline_line_metrics(node);
@@ -545,7 +549,7 @@ pub(super) fn member_relaxation(
     // What has to fit below this member for the next box to start on the page: its first line when it is a paragraph that
     // starts in place with Rule 3 dropped (it is relaxed itself then, and splits where the page ends: a later break than
     // one inside this member), its first fragment otherwise.
-    let after = relaxable_first_line(doc, parent, next_id, env, fresh)
+    let after = relaxable_first_line(doc, parent, next_id, env, fresh, true)
         .unwrap_or_else(|| first_fragment_extent(doc, parent, next_id, env, fresh));
     let need = next.final_layout.location.y - node.final_layout.location.y + after;
     if need > room {
