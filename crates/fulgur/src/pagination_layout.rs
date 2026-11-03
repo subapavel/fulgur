@@ -2830,6 +2830,27 @@ impl PageStrips {
     pub(crate) fn chrome_bottom(self, page: u32) -> f32 {
         self.bottom(page).ceil()
     }
+
+    /// html-to-pdf F213e: page 0 starts `first_offset` below the top of the page area (the body's margin, a margin
+    /// collapsed through it, `html` padding or border), so something precedes the first box there (css-break-3 §5.2 keeps
+    /// that margin at the start of the fragmentation context).
+    pub(crate) fn offset_above(self, page: u32) -> bool {
+        page == 0 && self.first_offset > 0.0
+    }
+
+    /// html-to-pdf F213e: whether the first box of the body, a box of `size` px that starts at `cursor` on `page`, is moved
+    /// to the next page whole although nothing precedes it (`cursor <= 0`): page 0 has an offset
+    /// ([`offset_above`](Self::offset_above)), the box does not fit what is left of it and does fit a fresh page. Only for a
+    /// monolithic box, which has no break point inside it. The room is [`chrome_bottom`](Self::chrome_bottom), as Chrome's
+    /// fragmentainer has it (F30f-b): a box that ends within it stays (measured, m153: an image of 1002 px stays under
+    /// `body { margin: 8px }`, one of 1003 px moves). With no offset, or past the first box, it is `false`, so every
+    /// document without an offset keeps its placement byte for byte.
+    pub(crate) fn first_box_overflows(self, page: u32, cursor: f32, size: f32) -> bool {
+        self.offset_above(page)
+            && cursor <= 0.0
+            && size <= self.fresh() + 1.0
+            && cursor + size > self.chrome_bottom(page)
+    }
 }
 
 /// F37: the border box of `<body>` on each page it spans (css-break-3 section 5.4, `box-decoration-break: slice`): a
@@ -4223,7 +4244,14 @@ impl<'a> PaginationLayoutTree<'a> {
             // F83b: a kept-whole avoid box that a forced break inside makes the
             // gate enter counts the piece before the first forced break; the
             // break itself wins, what follows it starts a page of its own.
-            if needs_recursion && cursor_y > 0.0 {
+            // html-to-pdf F213e: also a wrapper that is the first box of the body under an offset on page 0 when its first row is
+            // a monolithic box (a carrier line, an image): the break in front of the wrapper is the only one that avoids the
+            // overflow. Not for any other first row (Chrome splits those in place).
+            let offset_first = needs_recursion
+                && cursor_y <= 0.0
+                && strips.offset_above(page_index)
+                && first_row_is_monolithic(self.doc, child_id, page_height_px, 0);
+            if needs_recursion && (cursor_y > 0.0 || offset_first) {
                 let leading = if keeps_whole {
                     avoid_piece_size(self.doc, child_id, self.column_styles, 0).min(child_h)
                 } else {
@@ -4241,7 +4269,12 @@ impl<'a> PaginationLayoutTree<'a> {
                         keep_env.filter(|_| content_above),
                     )
                 };
-                if leading <= page_height_px && cursor_y + leading > strips.bottom(page_index) {
+                let room_bottom = if cursor_y > 0.0 {
+                    strips.bottom(page_index)
+                } else {
+                    strips.chrome_bottom(page_index)
+                };
+                if leading <= page_height_px && cursor_y + leading > room_bottom {
                     page_index += 1;
                     cursor_y = 0.0;
                     content_above = false;
@@ -4309,8 +4342,15 @@ impl<'a> PaginationLayoutTree<'a> {
             // taller box without lines is cut into strips below.
             // html-to-pdf F215: a head with an `avoid` break after it moves for the box it keeps with (`keep_size`, 0 for
             // any other child and where nothing precedes it).
-            if cursor_y > 0.0
-                && cursor_y + child_h.max(keep_size) > strips.bottom(page_index) + clip_end_slack
+            // html-to-pdf F213e: the first monolithic box of the body does not fit page 0, which starts below the content top
+            // (`body { margin-top }`, a collapsed child margin, `html` padding): nothing precedes it, but the offset does, so
+            // the break in front of it is taken as well (css-break-3 §4.4; Chrome moves it, an image of 1002 px stays under
+            // an 8 px margin, 1003 px moves).
+            let first_monolithic_moves = strips.first_box_overflows(page_index, cursor_y, child_h)
+                && child_node.is_some_and(|n| monolithic_box(self.doc, n, page_height_px));
+            if (cursor_y > 0.0
+                && cursor_y + child_h.max(keep_size) > strips.bottom(page_index) + clip_end_slack)
+                || first_monolithic_moves
             {
                 page_index += 1;
                 cursor_y = 0.0;
@@ -8591,6 +8631,75 @@ fn monolithic_line_carrier(doc: &BaseDocument, node: &blitz_dom::Node, fresh: f3
     has_box
 }
 
+/// html-to-pdf F213e: whether `node` is a monolithic box the fragmenter may move whole in front of its first row: a one-line
+/// carrier of a box that shares its line ([`monolithic_line_carrier`]), a replaced element (`<img>`, `<svg>`, `<canvas>`,
+/// `<video>`: the replaced content has no break point) or an atomic inline / `<button>` ([`is_monolithic_box`]).
+fn monolithic_box(doc: &BaseDocument, node: &blitz_dom::Node, fresh: f32) -> bool {
+    monolithic_line_carrier(doc, node, fresh)
+        || is_monolithic_box(node)
+        || node.element_data().is_some_and(|e| {
+            matches!(
+                e.name.local.as_ref(),
+                "img" | "svg" | "canvas" | "video" | "object" | "embed"
+            )
+        })
+}
+
+/// html-to-pdf F213e: whether the first row of `node_id` is a monolithic box ([`monolithic_box`]): the chain of first in-flow
+/// children with no gap between a box's content edge and its first child (a margin or a Class C gap is a break point, so
+/// the walk of [`leading_block_size`] stops there). Walks like [`leading_block_size_with`]: `layout_children` first,
+/// whitespace, out-of-flow and empty children skipped. A box that is not one (a paragraph, a table, a plain block with
+/// nothing but text) is `false`: Chrome splits those in place.
+fn first_row_is_monolithic(doc: &BaseDocument, node_id: usize, fresh: f32, depth: usize) -> bool {
+    let Some(node) = doc.get_node(node_id) else {
+        return false;
+    };
+    if monolithic_box(doc, node, fresh) {
+        return true;
+    }
+    if depth >= crate::MAX_DOM_DEPTH
+        || node.flags.is_inline_root()
+        || crate::blitz_adapter::is_multicol_container(node)
+    {
+        return false;
+    }
+    let layout_children = node.layout_children.borrow();
+    let children: &[usize] = layout_children
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .unwrap_or(&node.children);
+    let content_top = node.final_layout.border.top + node.final_layout.padding.top;
+    for &child_id in children {
+        let Some(child) = doc.get_node(child_id) else {
+            continue;
+        };
+        if let Some(text) = child.text_data()
+            && text.content.chars().all(char::is_whitespace)
+        {
+            continue;
+        }
+        {
+            use ::style::properties::longhands::position::computed_value::T as Pos;
+            if child
+                .primary_styles()
+                .is_some_and(|s| matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed))
+            {
+                continue;
+            }
+        }
+        let layout = child.final_layout;
+        if !layout.size.height.is_finite() || layout.size.height <= 0.0 {
+            continue;
+        }
+        // A gap in front of the first child is a break point of its own.
+        if layout.location.y - content_top > 0.5 {
+            return false;
+        }
+        return first_row_is_monolithic(doc, child_id, fresh, depth + 1);
+    }
+    false
+}
+
 /// F30f: the barrier a box puts up on its own, whether it is the parent or the child of the paragraph: an atomic
 /// inline that is not an `inline-block` alone on its line ([`alone_on_its_line`]), or a clipping box that hides
 /// content ([`clip_hides_nothing`]).
@@ -11375,6 +11484,26 @@ mod tests {
         assert_eq!(strips.bottom(1), 1000.0);
         assert_eq!(strips.bottom(7), 1000.0);
         assert_eq!(strips.fresh(), 1000.0);
+    }
+
+    /// html-to-pdf F213e: only page 0 under an offset has something above its first box, and the first box moves when it
+    /// overflows Chrome's room (`chrome_bottom`, a whole px more than ours) and fits a fresh page.
+    #[test]
+    fn page_strips_offset_above_and_first_box_overflows() {
+        let strips = PageStrips::new(1000.0, 40.5);
+        assert!(strips.offset_above(0));
+        assert!(!strips.offset_above(1));
+        assert!(!PageStrips::new(1000.0, 0.0).offset_above(0));
+        assert!(!PageStrips::new(1000.0, -3.0).offset_above(0));
+        // bottom(0) = 959.5, chrome_bottom(0) = 960: a box of 960 stays, 961 moves, 1001 (past fresh + 1) stays.
+        assert!(!strips.first_box_overflows(0, 0.0, 960.0));
+        assert!(strips.first_box_overflows(0, 0.0, 961.0));
+        assert!(strips.first_box_overflows(0, 0.0, 1001.0));
+        assert!(!strips.first_box_overflows(0, 0.0, 1001.5));
+        // Not past the first box, not on another page, not without an offset.
+        assert!(!strips.first_box_overflows(0, 5.0, 961.0));
+        assert!(!strips.first_box_overflows(1, 0.0, 961.0));
+        assert!(!PageStrips::new(1000.0, 0.0).first_box_overflows(0, 0.0, 999.0));
     }
 
     /// F29: an offset that is absent, negative, not finite, or leaves no room
@@ -20574,6 +20703,104 @@ h2 { string-set: chapter-title content(text); }
             .map(|f| (f.page_index, f.height.to_f32().round() as i32))
             .collect();
         assert_eq!(slices, vec![(0, 960), (1, 540)], "{f:?}");
+    }
+
+    // ---- F213e: the first monolithic box of the body under an offset ------------------------------------------------
+
+    /// A 40 px offset on 200 px pages: 160 px are left on page 0.
+    const BOX_RIGHT: &str = "<span style=\"display:inline-block;width:50px;height:170px\">a</span>";
+
+    #[test]
+    fn a_first_monolithic_block_under_a_body_margin_moves_to_page_one() {
+        // A carrier line with a 170 px box (the line is about 174 px, 160 are left) and a block `<img>` of 170 px: both
+        // fit a fresh page and not page 0; nothing precedes them, the 40 px offset does. Chrome moves both.
+        let body = format!(
+            "<p id=\"c\">Hi {BOX_RIGHT} end</p>\
+             <img id=\"i\" style=\"display:block;width:50px;height:170px\"><p id=\"after\">x</p>"
+        );
+        let (doc, table) = offset_geometry("body{margin:40px}", &body, 200.0);
+        let c = &fragments_of(&doc, &table, "c")[0];
+        assert_eq!(c.page_index, 1, "{c:?}");
+        assert!(c.y.to_f32().abs() < 0.5, "{c:?}");
+        // The image follows the carrier: it does not fit page 1 below it either.
+        let i = &fragments_of(&doc, &table, "i")[0];
+        assert!(i.page_index >= 1, "{i:?}");
+        // The same image alone is moved too.
+        let (doc, table) = offset_geometry(
+            "body{margin:40px}",
+            "<img id=\"i\" style=\"display:block;width:50px;height:170px\"><p>x</p>",
+            200.0,
+        );
+        let i = &fragments_of(&doc, &table, "i")[0];
+        assert_eq!(i.page_index, 1, "{i:?}");
+        assert!(i.y.to_f32().abs() < 0.5, "{i:?}");
+        // Without an offset it fits page 0 where it is.
+        let (doc, table) = offset_geometry(
+            "body{margin:0}",
+            "<img id=\"i\" style=\"display:block;width:50px;height:170px\"><p>x</p>",
+            200.0,
+        );
+        assert_eq!(fragments_of(&doc, &table, "i")[0].page_index, 0);
+    }
+
+    #[test]
+    fn a_first_monolithic_block_within_chromes_room_stays_on_page_zero() {
+        // 200.5 px pages, offset 40 (Taffy rounds the body's position to whole px): 160.5 px are left, Chrome's
+        // fragmentainer has 161 (`chrome_bottom`): a 161 px image stays, 162 moves.
+        for (h, page) in [(161, 0), (162, 1)] {
+            let (doc, table) = offset_geometry(
+                "body{margin:40px 0 0}",
+                &format!("<img id=\"i\" style=\"display:block;width:50px;height:{h}px\"><p>x</p>"),
+                200.5,
+            );
+            let i = &fragments_of(&doc, &table, "i")[0];
+            assert_eq!(i.page_index, page, "height {h}: {i:?}");
+        }
+    }
+
+    #[test]
+    fn a_first_wrapper_whose_first_row_is_a_monolithic_line_moves() {
+        // `<section><p>Hi [170 px box] end</p></section>`: the section is entered by the gate, its first row is the carrier
+        // line that does not fit: the break in front of the section is taken (it was left on page 0 hanging past the box).
+        let body =
+            format!("<section id=\"s\"><p id=\"c\">Hi {BOX_RIGHT} end</p></section><p>x</p>");
+        let (doc, table) = offset_geometry("body{margin:40px}", &body, 200.0);
+        let c = &fragments_of(&doc, &table, "c")[0];
+        assert_eq!(c.page_index, 1, "{c:?}");
+        assert!(c.y.to_f32().abs() < 0.5, "{c:?}");
+    }
+
+    #[test]
+    fn a_first_avoid_box_under_a_body_margin_is_not_moved() {
+        // Chrome splits a first `break-inside: avoid` box in place (nothing precedes it: no break point in front of it,
+        // css-break-3 §4.1): 9 lines of 20 px under a 40 px offset on 200 px pages leave 8 on page 0.
+        let rows: String = (0..9).map(|i| format!("<p id=\"r{i}\">row</p>")).collect();
+        let body = format!("<div style=\"break-inside:avoid\">{rows}</div>");
+        let (doc, table) = offset_geometry("body{margin:40px}", &body, 200.0);
+        assert_eq!(fragments_of(&doc, &table, "r0")[0].page_index, 0);
+        assert_eq!(fragments_of(&doc, &table, "r8")[0].page_index, 1);
+    }
+
+    #[test]
+    fn a_first_box_taller_than_a_page_stays_on_page_zero() {
+        // 250 px does not fit a fresh 200 px page either (F213b, F29b): the first slice starts on page 0.
+        let (doc, table) = offset_geometry(
+            "body{margin:40px}",
+            "<img id=\"i\" style=\"display:block;width:50px;height:250px\"><p>x</p>",
+            200.0,
+        );
+        assert_eq!(fragments_of(&doc, &table, "i")[0].page_index, 0);
+    }
+
+    #[test]
+    fn a_forced_break_before_the_first_child_stays_collapsed() {
+        // No blank page: the break is at the start of the document (Chrome: one page, C7).
+        let (doc, table) = offset_geometry(
+            "body{margin:40px}",
+            "<p id=\"p\" style=\"break-before:page\">x</p>",
+            200.0,
+        );
+        assert_eq!(fragments_of(&doc, &table, "p")[0].page_index, 0);
     }
 
     #[test]
