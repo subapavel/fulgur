@@ -7800,6 +7800,19 @@ fn clip_hides_nothing(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
 /// overflow would stay behind; a box whose content ends inside is one box of its own block size, which fits a page or
 /// does not. Output-neutral for the clip caller.
 fn content_ends_inside(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
+    content_ends_inside_with(doc, node, true)
+}
+
+/// [`content_ends_inside`] with the choice of whether the margin below the last in-flow child counts as content
+/// (html-to-pdf F213d, validator MEDIUM-1). For a clip box it does (the box's height includes it, and the clip would hide
+/// it). For the box of an `inline-block` alone on its line it must not: Blitz's auto height omits the last child's
+/// bottom margin (`ul`, `p { margin: 0 0 16px }`), so a margin of one pixel made an auto-height box look as if its content
+/// overflowed it, and the box was split where Chrome moves it whole. A margin is blank space: nothing is lost by it.
+fn content_ends_inside_with(
+    doc: &BaseDocument,
+    node: &blitz_dom::Node,
+    trailing_margin_counts: bool,
+) -> bool {
     let layout = &node.final_layout;
     let height = layout.size.height;
     if !height.is_finite() {
@@ -7847,8 +7860,12 @@ fn content_ends_inside(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
     let Some(last) = last else {
         return true;
     };
-    bottom + trailing_margin(doc, last, 0)
-        <= height - layout.border.bottom - layout.padding.bottom + 0.5
+    let margin = if trailing_margin_counts {
+        trailing_margin(doc, last, 0)
+    } else {
+        0.0
+    };
+    bottom + margin <= height - layout.border.bottom - layout.padding.bottom + 0.5
 }
 
 /// html-to-pdf F30f-b: whether `node` is `<html>` or `<body>`, whose `overflow` is the viewport's (CSS Overflow 3 §3.5),
@@ -8582,13 +8599,39 @@ fn monolithic_line_carrier(doc: &BaseDocument, node: &blitz_dom::Node, fresh: f3
             };
             // F213d: a box alone on its line is monolithic too when its content ends inside it (a box that fits a fresh
             // page is moved whole, css-break-3 section 4.4); one whose content overflows it keeps the F30f split.
-            if alone_on_its_line(doc, inline_node) && !content_ends_inside(doc, inline_node) {
+            //
+            // F213d (validator HIGH-1): and only when it fits the page as the placement can hold it. The `+ 1.0` above is
+            // the strip slicer's slack for a line; a box in that last pixel does not fit a page, and a wrapper (`section`,
+            // grid, flex, a cell) then places the moved carrier whole and paints its lines below the page edge, where F30f's
+            // split used to print every one. So no slack here, and the page is the one the ancestors' padding and borders
+            // leave ([`ancestor_insets`]: a cell's padding moves the window down by the same amount).
+            if alone_on_its_line(doc, inline_node)
+                && (!content_ends_inside_with(doc, inline_node, false)
+                    || height > fresh - ancestor_insets(doc, node))
+            {
                 return false;
             }
             has_box = true;
         }
     }
     has_box
+}
+
+/// html-to-pdf F213d: the block-axis padding and border of every ancestor of `node`, the room a page loses to them when
+/// `node` is the only thing in its wrappers (a card's frame, a cell's padding). The sum counts both ends, so it
+/// never promises more room than the placement has; a box that would fit only without it keeps the F30f split.
+fn ancestor_insets(doc: &BaseDocument, node: &blitz_dom::Node) -> f32 {
+    let mut sum = 0.0;
+    let mut current = node.layout_parent.get();
+    for _ in 0..crate::MAX_DOM_DEPTH {
+        let Some(parent) = current.and_then(|id| doc.get_node(id)) else {
+            break;
+        };
+        let l = &parent.final_layout;
+        sum += l.border.top + l.border.bottom + l.padding.top + l.padding.bottom;
+        current = parent.layout_parent.get();
+    }
+    sum
 }
 
 /// F30f: the barrier a box puts up on its own, whether it is the parent or the child of the paragraph: an atomic
@@ -19570,6 +19613,113 @@ h2 { string-set: chapter-title content(text); }
             ib[0].page_index, 0,
             "its first lines stay on page 0: {ib:?}"
         );
+    }
+
+    /// An alone box of `h` px outer height with block children of 20 px each (ends inside the box), in `wrapper` (`{}` is the
+    /// paragraph with the box), after 170 px of room-making block on pages `page` px tall. Taffy rounds a box's layout size to
+    /// whole px, so a page of a fractional height is what makes a box a fraction of a pixel too tall.
+    fn alone_box_in(
+        wrapper: &str,
+        outer: f32,
+        page: f32,
+    ) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        let lines: String = (1..=9)
+            .map(|i| format!("<span style=\"display:block\">L{i}</span>"))
+            .collect();
+        let ib = format!(
+            "<span id=\"ib\" style=\"display:inline-block;width:150px;border:1px solid #000;height:{}px\">{lines}</span>",
+            outer - 2.0
+        );
+        let para = format!("<p id=\"p\">{ib}</p>");
+        nested_geometry(
+            &format!(
+                "<div style=\"height:170px\"></div>{}<p id=\"a\">AFTER</p>",
+                wrapper.replace("{}", &para)
+            ),
+            page,
+        )
+    }
+
+    const ALONE_WRAPPERS: [(&str, &str); 5] = [
+        ("body", "{}"),
+        ("section", "<section>{}</section>"),
+        ("flex", "<div style=\"display:flex\"><div>{}</div></div>"),
+        ("grid", "<div style=\"display:grid\"><div>{}</div></div>"),
+        ("td", "<table><tr><td>{}</td></tr></table>"),
+    ];
+
+    #[test]
+    fn an_alone_box_in_the_last_pixel_of_a_page_keeps_the_f30f_split() {
+        // F213d, validator HIGH-1: a box 0.4 or 1.1 px taller than the page does not fit a fresh page. The slack of one pixel
+        // in `monolithic_line_carrier` called it monolithic, the carrier was moved, and the wrapper placed it whole on page 1:
+        // its lines below the page edge, printed nowhere, where the F30f split printed every one.
+        for (name, wrapper) in ALONE_WRAPPERS {
+            // (page, outer height of the box): 0.4 and 1.1 px over the page.
+            for (page, outer) in [(199.6, 200.0), (199.9, 201.0)] {
+                let (doc, table) = alone_box_in(wrapper, outer, page);
+                let ib = fragments_of(&doc, &table, "ib");
+                assert!(
+                    ib.len() >= 2,
+                    "{name}, box {outer} on a page of {page}: the box is split between its lines: {ib:?}"
+                );
+                assert_eq!(
+                    ib[0].page_index, 0,
+                    "{name}, box {outer} on a page of {page}: it starts where the room is: {ib:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_alone_box_that_fits_the_page_as_its_wrapper_holds_it_moves_whole() {
+        // 1 px under the page: whole on page 1 in a body, a section, a flex item and a grid item. A cell's padding and
+        // spacing take room off the page, so the box that fits a page only without them is split there, not placed whole.
+        for (name, wrapper) in &ALONE_WRAPPERS[..4] {
+            let (doc, table) = alone_box_in(wrapper, 199.0, 200.0);
+            assert_whole_on(&doc, &table, "ib", 1);
+            let _ = name;
+        }
+        let (doc, table) = alone_box_in(ALONE_WRAPPERS[4].1, 199.0, 200.0);
+        let ib = fragments_of(&doc, &table, "ib");
+        assert!(ib.len() >= 2, "td: a cell holds less than a page: {ib:?}");
+    }
+
+    #[test]
+    fn an_alone_box_in_a_padded_card_that_does_not_fit_its_page_keeps_the_f30f_split() {
+        // F213d-c: a box that fits a page but not the page a card with `border + padding` leaves (here 9 px each end).
+        let (doc, table) = alone_box_in(
+            "<div style=\"border:1px solid #ccc;padding:8px\">{}</div>",
+            195.0,
+            200.0,
+        );
+        let ib = fragments_of(&doc, &table, "ib");
+        assert!(ib.len() >= 2, "the box is split: {ib:?}");
+    }
+
+    #[test]
+    fn an_alone_box_whose_last_child_has_a_bottom_margin_is_monolithic() {
+        // F213d, validator MEDIUM-1: Blitz's auto height omits the margin below the last child, so it looked as if the
+        // content overflowed the box and the box was split where Chrome moves it whole.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:140px\"></div><p id=\"p\"><span id=\"ib\" style=\"display:inline-block;width:150px\">{}</span></p><p id=\"a\">AFTER</p>",
+                (1..=5)
+                    .map(|i| format!(
+                        "<span style=\"display:block;margin-bottom:10px\">L{i}</span>"
+                    ))
+                    .collect::<String>()
+            ),
+            200.0,
+        );
+        for id in ["p", "ib"] {
+            assert_whole_on(&doc, &table, id, 1);
+        }
+        // The same without the margin: the same decision.
+        let doc = laid_out(
+            "<p><span id=\"x\" style=\"display:inline-block;width:150px\"><span style=\"display:block;margin-bottom:10px\">a</span></span></p>",
+        );
+        let node = node_of(&doc, "x");
+        assert!(content_ends_inside_with(doc.deref(), node, false));
     }
 
     #[test]
