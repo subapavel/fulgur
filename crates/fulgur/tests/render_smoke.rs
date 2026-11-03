@@ -10163,6 +10163,28 @@ fn test_render_tall_inline_block_line_moves_whole_smoke() {
 }
 
 #[test]
+fn test_render_fixed_height_inline_block_alone_moves_whole_smoke() {
+    // html-to-pdf F213d: an inline-block alone on its line, with a short block child, taller than the room left on the
+    // page and shorter than a page, moves to the next page whole (css-break-3 section 4.4). It used to be left on page 1:
+    // its first row fits, the carrier was entered in place and the box, seated on its baseline, was painted below the
+    // page edge, printed nowhere and reported nowhere. Room: 100 px; box: 152 px.
+    let html = "<!DOCTYPE html><html><head><style>@page { size: 400px 300px; margin: 0 } body { margin: 0; line-height: 20px } \
+         p { margin: 0 }</style></head><body><div style=\"height:200px\"></div>\
+         <p><span style=\"display:inline-block;width:100px;height:150px;border:1px solid #000\">\
+         <span style=\"display:block\">BOXTOP</span></span></p><p>AFTER</p></body></html>";
+    let pdf = noto_engine().render(html).unwrap();
+    assert_eq!(page_count(&pdf), 2);
+    let Some(text) = extract_pdf_text(&pdf) else {
+        eprintln!("pdftotext not installed; skipping the text check");
+        return;
+    };
+    // pdftotext drops text painted outside the page: a word it finds is on a page.
+    for word in ["BOXTOP", "AFTER"] {
+        assert!(text.contains(word), "`{word}` is printed: {text:?}");
+    }
+}
+
+#[test]
 fn render_v2_smoke_multicol_card_with_shifted_children_negative_margins_and_tall_lines_prints_every_word_once()
  {
     // html-to-pdf F198j: a card taller than a page in two columns whose children are shifted (`position: relative`
