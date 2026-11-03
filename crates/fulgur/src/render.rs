@@ -2756,7 +2756,14 @@ fn draw_under_clip(
         // F198b: the piece's border box, for the slices of the paragraphs in it.
         let outer_slice_window = canvas.slice_window;
         if pieces {
-            canvas.slice_window = Some([x_pt, y_pt, x_pt + total_width, y_pt + total_height]);
+            // html-to-pdf F198j: widened by how far a relative offset paints something inside from its static place.
+            let [slack_x, slack_y] = geom.piece_slack.map(|p| p.in_pt().to_f32());
+            canvas.slice_window = Some([
+                x_pt - slack_x,
+                y_pt - slack_y,
+                x_pt + total_width + slack_x,
+                y_pt + total_height + slack_y,
+            ]);
         }
         // A box whose block size the author does not constrain hides nothing: it gets no band.
         if clip_pushed
@@ -9593,6 +9600,44 @@ mod tests {
         assert_eq!(
             a, b,
             "each slice is painted once under the clip as without it"
+        );
+    }
+
+    #[test]
+    fn draw_under_clip_paints_a_slice_shifted_above_its_piece_once() {
+        // html-to-pdf F198j: the paragraphs of a cut clip card are drawn 12 px up (`position: relative; top: -12px`). The
+        // first line of a piece that starts a column is then above the piece's top: it still belongs to the piece
+        // (`PaginationGeometry::piece_slack` widens the window of what the piece paints), so the text-show operators are
+        // those of the same card without the clip, where every slice is painted once. Without the slack the lines above the
+        // top of each continuation piece are dropped.
+        let words = |from: usize, n: usize| -> String {
+            (from..from + n)
+                .map(|i| format!("w{i:04}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let doc = |clip: &str| {
+            let p = |from: usize| {
+                format!(
+                    "<p style=\"padding:4px 8px;position:relative;top:-12px;left:-3px\">{}</p>",
+                    words(from, 500)
+                )
+            };
+            format!(
+                "<!doctype html><html><body style=\"margin:0\"><div style=\"column-count:2;column-gap:20px\">\
+                 <div style=\"padding:16px;border:1px solid #888;{clip}\">{}{}{}</div></div></body></html>",
+                p(0),
+                p(500),
+                p(1000)
+            )
+        };
+        let plain = render_html(&doc(""));
+        let clipped = render_html(&doc("overflow:hidden;border-radius:6px"));
+        let (a, b) = (text_show_operators(&plain), text_show_operators(&clipped));
+        assert!(a > 100, "the card has lines: {a} text-show operators");
+        assert_eq!(
+            a, b,
+            "each shifted slice is painted once under the clip as without it"
         );
     }
 

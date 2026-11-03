@@ -280,11 +280,19 @@ pub(crate) struct McBox {
     /// left there); never less than the bottom border and padding.
     bottom: f32,
     items: Vec<McBoxItem>,
+    /// html-to-pdf F198j: the largest distance (CSS px, per axis) any thing inside this box is painted from where the layout
+    /// put it, relative to the box: the sum of the relative offsets down the chain, at most. A clip piece of the box widens
+    /// the window of what it paints by this ([`PaginationGeometry::piece_slack`]). Zero when nothing inside is shifted.
+    slack: [f32; 2],
 }
 
 /// One child of an [`McBox`], in source order. `lead` is the gap above it in the unbroken box: from the previous
-/// item's bottom edge, or from the top of the box's content box for the first item (margins, mostly). `x` is the
-/// distance of the item's left edge from the content box of the box that holds it.
+/// item's bottom edge, or from the top of the box's content box for the first item (margins, mostly); it is negative when
+/// a negative margin pulls the item over the one before it (html-to-pdf F198j). `x` is the distance of the item's left edge
+/// from the content box of the box that holds it. `lead` and `x` are the item's *static* place: a relative offset does not
+/// move the boxes after it (CSS 2.1 §9.4.3), so `rel`, the offset Taffy added to the item's position (CSS px, `[0, 0]` when
+/// no inset is set), is left out of them and painted as a shift at the piece (F198j). It is on the item and not inside
+/// its own [`McBox`], so the lines of a framed inline root get it once, through the chain of frames.
 #[derive(Clone, Debug, PartialEq)]
 enum McBoxItem {
     /// An inline root cut between its lines: `source` is shaped at its own width (Blitz's layout of it), `advances` the
@@ -296,6 +304,7 @@ enum McBoxItem {
         inline_boxes: bool,
         lead: f32,
         x: f32,
+        rel: [f32; 2],
     },
     /// A box that cannot be described but fits a page: placed whole, like a [`FlowItem::Block`](crate::multicol_layout::FlowItem::Block).
     Leaf {
@@ -303,6 +312,7 @@ enum McBoxItem {
         h: f32,
         lead: f32,
         x: f32,
+        rel: [f32; 2],
     },
     /// A box with a frame of its own (border, padding, background) that holds items itself.
     Box {
@@ -310,6 +320,7 @@ enum McBoxItem {
         inner: McBox,
         lead: f32,
         x: f32,
+        rel: [f32; 2],
     },
 }
 
@@ -325,6 +336,9 @@ struct McFrame {
     gap: f32,
     /// The distance of the box's left edge from the left edge of the column.
     x: f32,
+    /// html-to-pdf F198j: how far the box is painted from where the layout put it, CSS px: the relative offsets of the boxes
+    /// around it and its own. Added to its piece's position; nothing that is laid out after it moves.
+    shift: [f32; 2],
 }
 
 /// F198: the frames of a flattened flow and, for every one, the chain of boxes around it (outermost first).
@@ -351,6 +365,9 @@ struct AtomCtx {
     gap: f32,
     /// The distance of the atom's left edge (the content edge of a paragraph) from the column's left edge.
     x: f32,
+    /// html-to-pdf F198j: how far the atom is painted from where it is planned (the relative offsets of the boxes around it
+    /// and its own), CSS px. Added to its piece's position only.
+    shift: [f32; 2],
 }
 
 impl AtomCtx {
@@ -360,6 +377,7 @@ impl AtomCtx {
         closes: 0,
         gap: 0.0,
         x: 0.0,
+        shift: [0.0, 0.0],
     };
 }
 
@@ -448,7 +466,7 @@ struct McFlat {
 }
 
 impl McFlat {
-    fn ctx(&mut self, chain: u32, gap: f32, x: f32) -> AtomCtx {
+    fn ctx(&mut self, chain: u32, gap: f32, x: f32, shift: [f32; 2]) -> AtomCtx {
         let len = self.frames.chains[chain as usize].len() as u32;
         AtomCtx {
             chain,
@@ -456,12 +474,23 @@ impl McFlat {
             closes: len,
             gap,
             x,
+            shift,
         }
     }
 
     /// The atoms of `b`, the content of `node`, whose left edge is `x` from the column's and which sits `gap` below
-    /// what is above it. `parent` is the chain of the box around it.
-    fn push_box(&mut self, node: usize, b: &McBox, parent: Option<u32>, x: f32, gap: f32) {
+    /// what is above it. `parent` is the chain of the box around it. `shift` is how far `node` is painted from its static
+    /// place (the relative offsets of the boxes around it and its own): everything inside gets it, and the planned
+    /// positions stay static.
+    fn push_box(
+        &mut self,
+        node: usize,
+        b: &McBox,
+        parent: Option<u32>,
+        x: f32,
+        gap: f32,
+        shift: [f32; 2],
+    ) {
         let frame = self.frames.frames.len() as u32;
         self.frames.frames.push(McFrame {
             node,
@@ -469,6 +498,7 @@ impl McFlat {
             bottom: b.bottom,
             gap,
             x,
+            shift,
         });
         let mut chain = parent
             .map(|c| self.frames.chains[c as usize].clone())
@@ -487,6 +517,7 @@ impl McFlat {
                     advances,
                     lead,
                     x: ix,
+                    rel,
                     ..
                 } => {
                     for (index, h) in advances.iter().enumerate() {
@@ -494,6 +525,7 @@ impl McFlat {
                             chain_id,
                             if index == 0 { *lead } else { 0.0 },
                             content_x + ix,
+                            add_shift(shift, *rel),
                         );
                         self.atoms.push(McAtom::Line {
                             source: *source,
@@ -508,8 +540,9 @@ impl McFlat {
                     h,
                     lead,
                     x: ix,
+                    rel,
                 } => {
-                    let ctx = self.ctx(chain_id, *lead, content_x + ix);
+                    let ctx = self.ctx(chain_id, *lead, content_x + ix, add_shift(shift, *rel));
                     self.atoms.push(McAtom::Block {
                         node: *node,
                         h: h.max(0.0),
@@ -521,7 +554,15 @@ impl McFlat {
                     inner,
                     lead,
                     x: ix,
-                } => self.push_box(*node, inner, Some(chain_id), content_x + ix, *lead),
+                    rel,
+                } => self.push_box(
+                    *node,
+                    inner,
+                    Some(chain_id),
+                    content_x + ix,
+                    *lead,
+                    add_shift(shift, *rel),
+                ),
             }
         }
         // The last atom of the box closes it (and every box that ends with it).
@@ -531,6 +572,17 @@ impl McFlat {
             ctx.closes = ctx.closes.min(depth);
         }
     }
+}
+
+/// html-to-pdf F198j: two shifts added. A zero shift stays `[0, 0]` bit for bit.
+fn add_shift(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
+    [shifted(a[0], b[0]), shifted(a[1], b[1])]
+}
+
+/// html-to-pdf F198j: `v` moved by `shift`, and `v` itself, `-0.0` included, when the shift is zero: every plan of a box
+/// that has no relative offset keeps its bits.
+fn shifted(v: f32, shift: f32) -> f32 {
+    if shift == 0.0 { v } else { v + shift }
 }
 
 /// The first unit of an expanded box (F28): its frame's top, the gaps down to the first thing and that thing's first
@@ -545,6 +597,20 @@ fn mc_box_first_unit(b: &McBox) -> f32 {
             Some(McBoxItem::Box { inner, lead, .. }) => lead + mc_box_first_unit(inner),
             None => 0.0,
         }
+}
+
+/// html-to-pdf F198j: the block-size of the last unit of an item, from the top of its last atom down to the item's bottom
+/// edge (a last line, a leaf, or, for a box, the last unit of its last item and what is below it): the mirror of
+/// [`mc_box_first_unit`]. A child pulled up over the item by a negative margin may not start above it
+/// ([`mc_box_at`]), so the planner's cursor never goes above an atom already placed in the column.
+fn mc_item_last_unit(item: &McBoxItem) -> f32 {
+    match item {
+        McBoxItem::Lines { advances, .. } => advances.last().map_or(0.0, |h| h.to_f32()),
+        McBoxItem::Leaf { h, .. } => *h,
+        McBoxItem::Box { inner, .. } => {
+            inner.bottom + inner.items.last().map_or(0.0, mc_item_last_unit)
+        }
+    }
 }
 
 /// One page of columns filled greedily by [`fill_multicol_columns`].
@@ -605,10 +671,11 @@ fn fill_multicol_columns(
     // The frames still open in column `col` end here, at `y`, and go on in the next column or page.
     let flush = |columns: &mut Vec<Vec<McPiece>>, open: &mut Vec<OpenFrame>, col: usize, y: f32| {
         for st in open.drain(..) {
+            let f = &frames.frames[st.frame as usize];
             columns[col].push(McPiece::Frame {
-                node: frames.frames[st.frame as usize].node,
-                x: frames.frames[st.frame as usize].x.as_px(),
-                y: st.y0.as_px(),
+                node: f.node,
+                x: shifted(f.x, f.shift[0]).as_px(),
+                y: shifted(st.y0, f.shift[1]).as_px(),
                 height: (y - st.y0).max(0.0).as_px(),
                 open_top: st.open_top,
                 open_bottom: true,
@@ -666,6 +733,12 @@ fn fill_multicol_columns(
             }
         }
         let y = cursor.as_px();
+        // html-to-pdf F198j: where an atom with a relative offset is painted; `used`, `cursor` and the frames' heights stay
+        // static (the offset moves nothing after it, CSS 2.1 §9.4.3).
+        let (paint_x, paint_y) = (
+            shifted(ctx.x, ctx.shift[0]).as_px(),
+            shifted(cursor, ctx.shift[1]).as_px(),
+        );
         let mut band = 0.0f32;
         if let McAtom::Row { table, .. } = &atoms[at]
             && columns[col].is_empty()
@@ -680,14 +753,12 @@ fn fill_multicol_columns(
             McAtom::Block { node, ctx, .. } if ctx.chain == NO_CHAIN => {
                 columns[col].push(McPiece::Block { node: *node, y })
             }
-            McAtom::Block { node, ctx, .. } => columns[col].push(McPiece::Leaf {
+            McAtom::Block { node, .. } => columns[col].push(McPiece::Leaf {
                 node: *node,
-                x: ctx.x.as_px(),
-                y,
+                x: paint_x,
+                y: paint_y,
             }),
-            McAtom::Line {
-                source, index, ctx, ..
-            } => match columns[col].last_mut() {
+            McAtom::Line { source, index, .. } => match columns[col].last_mut() {
                 Some(McPiece::Lines {
                     source: s, end: e, ..
                 }) if *s == *source && *e == *index => *e += 1,
@@ -695,8 +766,8 @@ fn fill_multicol_columns(
                     source: *source,
                     first: *index,
                     end: *index + 1,
-                    y,
-                    x: ctx.x.as_px(),
+                    y: paint_y,
+                    x: paint_x,
                 }),
             },
             McAtom::Row {
@@ -724,10 +795,11 @@ fn fill_multicol_columns(
                 bottom += frames.frames[f as usize].bottom;
                 if let Some(st) = open.pop() {
                     debug_assert_eq!(st.frame, f, "the box that closes is the innermost open one");
+                    let fr = &frames.frames[f as usize];
                     columns[col].push(McPiece::Frame {
-                        node: frames.frames[f as usize].node,
-                        x: frames.frames[f as usize].x.as_px(),
-                        y: st.y0.as_px(),
+                        node: fr.node,
+                        x: shifted(fr.x, fr.shift[0]).as_px(),
+                        y: shifted(st.y0, fr.shift[1]).as_px(),
                         height: (bottom - st.y0).max(0.0).as_px(),
                         open_top: st.open_top,
                         open_bottom: false,
@@ -781,10 +853,10 @@ pub(crate) fn plan_multicol_pages(
     for item in flow {
         match item {
             FlowItem::Block { node, .. } if boxes.contains_key(node) => {
-                flat.push_box(*node, &boxes[node], None, 0.0, 0.0)
+                flat.push_box(*node, &boxes[node], None, 0.0, 0.0, [0.0, 0.0])
             }
             FlowItem::Lines { source, .. } if boxes.contains_key(source) => {
-                flat.push_box(*source, &boxes[source], None, 0.0, 0.0)
+                flat.push_box(*source, &boxes[source], None, 0.0, 0.0, [0.0, 0.0])
             }
             FlowItem::Block { node, height } => match tables.get(node) {
                 Some(table) => {
@@ -1224,17 +1296,16 @@ fn mc_has_frame(node: &blitz_dom::Node) -> bool {
 }
 
 /// F198 / F198b: the heights of the lines of the inline root `node`, and whether its lines hold inline boxes, or `None`
-/// when the planner cannot cut it: a line taller than a page (`fresh`) stays one atom that overflows (an inline box taller
-/// than the page: ADR-0004's shape, F198g). A layout of glyph runs only has no such line; one with inline boxes can: an
-/// image or an inline-block makes its line as tall as itself. One px of slack, as everywhere else.
-fn mc_line_advances(node: &blitz_dom::Node, fresh: f32) -> Option<(Vec<crate::units::Px>, bool)> {
+/// when it has no lines. A layout of glyph runs only has lines of one height; one with inline boxes can have a line as tall
+/// as an image or an inline-block, even taller than a page. html-to-pdf F198j: such a line is one atom like any other; the
+/// planner places an atom taller than a column alone at the top of one ([`fill_multicol_columns`]) and
+/// [`record_multicol_row`] warns that what is below the page edge is not printed. The line is not sliced (ADR-0004); it used
+/// to keep the whole box on the old path, which lost everything after the line.
+fn mc_line_advances(node: &blitz_dom::Node) -> Option<(Vec<crate::units::Px>, bool)> {
     use crate::units::F32Units;
     let layout = &node.element_data()?.inline_layout_data.as_ref()?.layout;
     let inline_boxes = !crate::multicol_layout::parley_layout_is_glyph_run_only(layout);
     let heights = crate::blitz_adapter::parley_line_heights(layout);
-    if inline_boxes && heights.iter().any(|h| *h > fresh + 1.0) {
-        return None;
-    }
     let advances: Vec<crate::units::Px> = heights.into_iter().map(F32Units::as_px).collect();
     (!advances.is_empty()).then_some((advances, inline_boxes))
 }
@@ -1325,6 +1396,40 @@ fn mc_box_eligible(
         && !mc_box_wrapped(doc, node)
 }
 
+/// html-to-pdf F198j: Taffy's relative offset of an in-flow block child (`taffy::compute::block`, `inset_offset`), CSS px: the
+/// shift it added to the child's `final_layout.location`. `left` wins over `-right` against the parent's content-box width,
+/// `top` over `-bottom` against 0 (Taffy resolves the vertical insets of a block child against a zero basis, so a `%`
+/// `top` is 0); `[0, 0]` when every inset is `auto`. Stylo gives the computed insets, a length or a percentage; the other
+/// values (`auto`, anchor functions) count as unset. `stylo_taffy` passes the insets of a `position: static` box too, so
+/// Blitz shifts it like a relative one and so does this (Chrome ignores them there); `sticky` the same. Absolute and fixed
+/// children never get here (`mc_box_at` refuses them).
+fn mc_relative_offset(doc: &BaseDocument, node: &blitz_dom::Node) -> [f32; 2] {
+    use ::style::values::computed::Length;
+    use ::style::values::generics::position::GenericInset;
+
+    fn resolve(inset: &::style::values::computed::position::Inset, basis_px: f32) -> Option<f32> {
+        match inset {
+            GenericInset::LengthPercentage(lp) => Some(lp.resolve(Length::new(basis_px)).px()),
+            _ => None,
+        }
+    }
+
+    let Some(styles) = node.primary_styles() else {
+        return [0.0, 0.0];
+    };
+    let pos = styles.get_position();
+    let width = node.parent.and_then(|p| doc.get_node(p)).map_or(0.0, |p| {
+        let l = &p.final_layout;
+        l.size.width - l.padding.left - l.padding.right - l.border.left - l.border.right
+    });
+    let (left, right) = (resolve(&pos.left, width), resolve(&pos.right, width));
+    let (top, bottom) = (resolve(&pos.top, 0.0), resolve(&pos.bottom, 0.0));
+    [
+        left.or(right.map(|x| -x)).unwrap_or(0.0),
+        top.or(bottom.map(|x| -x)).unwrap_or(0.0),
+    ]
+}
+
 /// F198: the content of the box `node_id`, a child of a multi-column container (or of a box inside one) that is taller
 /// than a page, described so that the planner can cut it between its lines ([`McBox`]); `None` leaves the box a single
 /// atom placed whole in its column, which overflows the page and loses what is below its edge (the warning of
@@ -1368,7 +1473,7 @@ fn mc_box_at(
     let left = l.border.left + l.padding.left;
     let inset_bottom = l.border.bottom + l.padding.bottom;
     if node.flags.is_inline_root() {
-        let (advances, inline_boxes) = mc_line_advances(node, fresh)?;
+        let (advances, inline_boxes) = mc_line_advances(node)?;
         return Some(McBox {
             top,
             left,
@@ -1379,7 +1484,9 @@ fn mc_box_at(
                 inline_boxes,
                 lead: 0.0,
                 x: 0.0,
+                rel: [0.0, 0.0],
             }],
+            slack: [0.0, 0.0],
         });
     }
     let layout_children = node.layout_children.borrow();
@@ -1407,18 +1514,39 @@ fn mc_box_at(
         if crate::blitz_adapter::node_is_floating(child) || is_out_of_flow_positioned(child) {
             return None;
         }
+        // html-to-pdf F198j: the child's static place. Taffy put its relative offset into `final_layout.location`, which
+        // moves the child and not the boxes after it (CSS 2.1 §9.4.3), so the gap above it and its `x` are measured without it
+        // and the offset is painted as a shift at the piece (`McBoxItem::rel`).
+        let rel = mc_relative_offset(doc, child);
         let cl = &child.final_layout;
-        let (cy, ch, cx) = (cl.location.y, cl.size.height, cl.location.x - left);
+        let (cy, ch, cx) = (
+            cl.location.y - rel[1],
+            cl.size.height,
+            cl.location.x - rel[0] - left,
+        );
         let lead = cy - prev_bottom;
-        // Blitz rounds every position and size to a whole px on its own, so a box can start 1 px above the bottom of the
-        // one before it (the gap is then 0); more than that is a real overlap (a negative margin) this path cannot cut.
-        if !(cy.is_finite() && ch.is_finite() && cx.is_finite()) || lead < -1.5 || cx < -0.5 {
+        if !(cy.is_finite() && ch.is_finite() && cx.is_finite()) {
             return None;
         }
-        let (lead, x) = (lead.max(0.0), cx.max(0.0));
+        // Blitz rounds every position and size to a whole px on its own, so a box can start 1 px above the bottom of the
+        // one before it (the gap is then 0) or 1 px left of the content box: those are rounding. A real overlap (a negative
+        // margin) is kept as a negative `lead` or `x`: the box is painted over the one before it, as the unbroken box is.
+        // It may not start above the top of the last unit of what is before it (the first child: above the box's own top),
+        // so the planner's cursor never goes above an atom already placed in the column or above the column's top, and it
+        // may not stick out past the box's own border on the left, so every item starts inside its box's border box and the
+        // clip pieces of a box on one page do not overlap (F198b).
+        let above_previous = match items.last() {
+            Some(prev) => cy < prev_bottom - mc_item_last_unit(prev) - 0.5,
+            None => cy < -0.5,
+        };
+        if above_previous || cx < -left - 0.5 {
+            return None;
+        }
+        let lead = if lead >= -1.5 { lead.max(0.0) } else { lead };
+        let x = if cx >= -0.5 { cx.max(0.0) } else { cx };
         let described = if mc_box_eligible(doc, child, column_styles, fresh) {
             if child.flags.is_inline_root() {
-                match mc_line_advances(child, fresh) {
+                match mc_line_advances(child) {
                     Some((advances, inline_boxes)) if !mc_has_frame(child) => {
                         Some(McBoxItem::Lines {
                             source: id,
@@ -1426,6 +1554,7 @@ fn mc_box_at(
                             inline_boxes,
                             lead,
                             x,
+                            rel,
                         })
                     }
                     Some(_) => mc_box_at(doc, id, column_styles, fresh, depth + 1).map(|inner| {
@@ -1434,6 +1563,7 @@ fn mc_box_at(
                             inner,
                             lead,
                             x,
+                            rel,
                         }
                     }),
                     None => None,
@@ -1444,6 +1574,7 @@ fn mc_box_at(
                     inner,
                     lead,
                     x,
+                    rel,
                 })
             }
         } else {
@@ -1457,6 +1588,7 @@ fn mc_box_at(
                 h: ch.max(0.0),
                 lead,
                 x,
+                rel,
             },
             None => return None,
         };
@@ -1466,11 +1598,23 @@ fn mc_box_at(
     if items.is_empty() {
         return None;
     }
+    // The largest distance anything inside is painted from its static place (the sum down the chain, an upper bound).
+    let slack = items.iter().fold([0.0f32; 2], |acc, item| {
+        let (rel, inner) = match item {
+            McBoxItem::Lines { rel, .. } | McBoxItem::Leaf { rel, .. } => (*rel, [0.0, 0.0]),
+            McBoxItem::Box { rel, inner, .. } => (*rel, inner.slack),
+        };
+        [
+            acc[0].max(rel[0].abs() + inner[0]),
+            acc[1].max(rel[1].abs() + inner[1]),
+        ]
+    });
     Some(McBox {
         top,
         left,
         bottom: (l.size.height - prev_bottom).max(inset_bottom),
         items,
+        slack,
     })
 }
 
@@ -2094,6 +2238,21 @@ fn record_multicol_row(
     for b in boxes.values() {
         box_advances(b, &mut advances, &mut inline_sources);
     }
+    // F198j: how far the content of every box is painted from its static place, for the window of its clip pieces.
+    fn box_slacks(node: usize, b: &McBox, out: &mut BTreeMap<usize, [f32; 2]>) {
+        if b.slack != [0.0, 0.0] {
+            out.insert(node, b.slack);
+        }
+        for item in &b.items {
+            if let McBoxItem::Box { node, inner, .. } = item {
+                box_slacks(*node, inner, out);
+            }
+        }
+    }
+    let mut slacks: BTreeMap<usize, [f32; 2]> = BTreeMap::new();
+    for (node, b) in boxes {
+        box_slacks(*node, b, &mut slacks);
+    }
     // F198: the paragraphs that are boxes of their own: their pieces are the fragments of the frames.
     let framed: BTreeSet<usize> = row
         .columns
@@ -2143,6 +2302,19 @@ fn record_multicol_row(
                     y: piece_y,
                     x: piece_x,
                 } => {
+                    // F198j: a line taller than a page stands alone at the top of a column and runs past the page: what is
+                    // below the page edge is not printed (a line is not sliced, ADR-0004).
+                    if let Some(tall) = advances.get(source).and_then(|a| {
+                        a[*first as usize..*end_line as usize]
+                            .iter()
+                            .map(|h| h.to_f32())
+                            .find(|h| *h > strips.fresh() + 1.0)
+                    }) {
+                        log::warn!(
+                            "pagination: a line {tall}px tall inside a multi-column container is taller than a page; \
+                             it is placed alone at the top of a column and what is below the page edge is not printed"
+                        );
+                    }
                     // F198b: the inline boxes of these lines (an image, an `<svg>`, an inline-block) are painted by the
                     // paragraph at its piece; they need a fragment on this page, whichever piece of the paragraph it is.
                     if inline_sources.contains(source) {
@@ -2238,6 +2410,10 @@ fn record_multicol_row(
                         top_open: *open_top,
                         bottom_open: *open_bottom,
                     });
+                    if let Some([sx, sy]) = slacks.get(node) {
+                        // Under half the gap: the windows of the box's pieces in two columns do not meet.
+                        entry.piece_slack = [sx.min(group.gap.to_f32() / 2.0).as_px(), sy.as_px()];
+                    }
                 }
                 McPiece::Rows {
                     table,
@@ -2459,6 +2635,11 @@ pub struct PaginationGeometry {
     /// (no border, padding or radius there, [`crate::render::frame_fragment`]). `false` for every other box, whose frame is
     /// closed on every page.
     pub block_slice: bool,
+    /// html-to-pdf F198j: for a clip box that a multicol container cut between its lines ([`McPiece::Frame`]), how far (CSS
+    /// px, x then y) anything inside it is painted from its static place by a relative offset: the renderer widens the window of
+    /// what a piece paints by it, so a line shifted above the piece's top (or past its side) is still the piece's. The
+    /// horizontal part is less than half the column gap, so the windows of two columns stay apart. Zero for every other box.
+    pub piece_slack: [crate::units::Px; 2],
 }
 
 impl PaginationGeometry {
@@ -20809,6 +20990,7 @@ h2 { string-set: chapter-title content(text); }
             left,
             bottom,
             items,
+            slack: [0.0, 0.0],
         }
     }
 
@@ -20819,6 +21001,7 @@ h2 { string-set: chapter-title content(text); }
             inline_boxes: false,
             lead,
             x,
+            rel: [0.0, 0.0],
         }
     }
 
@@ -20943,6 +21126,105 @@ h2 { string-set: chapter-title content(text); }
     }
 
     #[test]
+    fn plan_paints_a_shifted_atom_at_its_offset_and_plans_it_at_its_static_place() {
+        // html-to-pdf F198j: a relative offset moves the atom's piece and the frame of its box, and nothing planned after it:
+        // `used`, the cursor and the frames' heights are the static ones (CSS 2.1 section 9.4.3).
+        let shifted_lines = |source: usize, count: usize, rel: [f32; 2]| McBoxItem::Lines {
+            source,
+            advances: vec![10.0.as_px(); count],
+            inline_boxes: false,
+            lead: 0.0,
+            x: 0.0,
+            rel,
+        };
+        let build = |rel: [f32; 2]| {
+            let mut boxes = BTreeMap::new();
+            boxes.insert(
+                7,
+                mcbox(
+                    10.0,
+                    10.0,
+                    10.0,
+                    vec![
+                        box_lines(5, 3, 10.0, 0.0, 0.0),
+                        shifted_lines(6, 2, rel),
+                        box_lines(8, 2, 10.0, 0.0, 0.0),
+                    ],
+                ),
+            );
+            plan_boxes(&[block(7, 90.0)], 1, 200.0, ColumnFill::Auto, 0.0, &boxes)
+        };
+        let flat = build([0.0, 0.0]);
+        let moved = build([4.0, -12.0]);
+        assert_eq!(lines_in(&flat[0], 0, 6), vec![(0, 2, 40.0, 10.0)]);
+        // Painted 12 px up and 4 px right; the line after it and the frame are where they were.
+        assert_eq!(lines_in(&moved[0], 0, 6), vec![(0, 2, 28.0, 14.0)]);
+        assert_eq!(lines_in(&moved[0], 0, 5), lines_in(&flat[0], 0, 5));
+        assert_eq!(lines_in(&moved[0], 0, 8), lines_in(&flat[0], 0, 8));
+        assert_eq!(frames_in(&moved[0], 0), frames_in(&flat[0], 0));
+        assert_eq!(moved[0].height, flat[0].height);
+        // A nested box with an offset moves its frame and everything in it, once.
+        let mut inner = mcbox(2.0, 2.0, 2.0, vec![box_lines(2, 2, 10.0, 0.0, 0.0)]);
+        inner.slack = [0.0, 0.0];
+        let mut boxes = BTreeMap::new();
+        boxes.insert(
+            7,
+            mcbox(
+                10.0,
+                10.0,
+                10.0,
+                vec![
+                    box_lines(5, 2, 10.0, 0.0, 0.0),
+                    McBoxItem::Box {
+                        node: 8,
+                        inner,
+                        lead: 0.0,
+                        x: 4.0,
+                        rel: [3.0, 5.0],
+                    },
+                ],
+            ),
+        );
+        let pages = plan_boxes(&[block(7, 70.0)], 1, 200.0, ColumnFill::Auto, 0.0, &boxes);
+        let frames = frames_in(&pages[0], 0);
+        // The outer frame at 0, the nested one at 10 + 20 (static) + 5, as tall as unshifted: 2 + 20 + 2; the outer one 10 + 20 + 24 + 10.
+        assert_eq!(
+            frames.iter().find(|f| f.0 == 8).map(|f| (f.1, f.2)),
+            Some((35.0, 24.0))
+        );
+        assert_eq!(
+            frames.iter().find(|f| f.0 == 7).map(|f| (f.1, f.2)),
+            Some((0.0, 64.0))
+        );
+        // Its lines: static y 10 + 20 + 2 = 32, x 10 + 4 + 2 = 16, painted 5 down and 3 right.
+        assert_eq!(lines_in(&pages[0], 0, 2), vec![(0, 2, 37.0, 19.0)]);
+    }
+
+    #[test]
+    fn plan_places_a_line_taller_than_the_column_alone_at_the_top_of_one() {
+        // html-to-pdf F198j: a box whose lines hold one 130 px line in 100 px columns: the line stands alone at the top of
+        // column 2 and the lines after it go on below it, in column 2 or the next page; none is dropped.
+        let mut boxes = BTreeMap::new();
+        let tall = McBoxItem::Lines {
+            source: 5,
+            advances: [vec![10.0; 5], vec![130.0], vec![10.0; 12]]
+                .concat()
+                .into_iter()
+                .map(F32Units::as_px)
+                .collect(),
+            inline_boxes: true,
+            lead: 0.0,
+            x: 0.0,
+            rel: [0.0, 0.0],
+        };
+        boxes.insert(7, mcbox(0.0, 0.0, 0.0, vec![tall]));
+        let pages = plan_boxes(&[block(7, 300.0)], 2, 100.0, ColumnFill::Auto, 0.0, &boxes);
+        assert_eq!(lines_in(&pages[0], 0, 5), vec![(0, 5, 0.0, 0.0)]);
+        assert_eq!(lines_in(&pages[0], 1, 5), vec![(5, 6, 0.0, 0.0)]);
+        assert_lines_tile_of(&pages, 5, 18);
+    }
+
+    #[test]
     fn plan_lead_and_trail_stay_with_the_first_and_last_line() {
         // The top inset is part of the first line: a first line that does not fit under the inset goes to the
         // next column with it. 95 px of room, 10 px inset, lines of 10: the 8th line would end at 90 + 10.
@@ -21023,6 +21305,7 @@ h2 { string-set: chapter-title content(text); }
                         inner,
                         lead: 0.0,
                         x: 4.0,
+                        rel: [0.0, 0.0],
                     },
                 ],
             ),
@@ -21118,6 +21401,7 @@ h2 { string-set: chapter-title content(text); }
                         h: 30.0,
                         lead: 6.0,
                         x: 3.0,
+                        rel: [0.0, 0.0],
                     },
                 ],
             ),
@@ -21192,6 +21476,7 @@ h2 { string-set: chapter-title content(text); }
                 inline_boxes,
                 lead,
                 x,
+                ..
             },
         ] = b.items.as_slice()
         else {
@@ -21370,15 +21655,163 @@ h2 { string-set: chapter-title content(text); }
                 ..
             }]
         ));
-        // A line taller than a page cannot be cut: the box stays as it was (ADR-0004's shape, F198g).
+        // A line taller than a page is one atom the planner places alone (html-to-pdf F198j; it used to keep the box whole,
+        // ADR-0004's shape): one advance for the line with the image, as tall as the image, the rest as before.
         let (doc, t) = box_doc(&format!(
             "<div class=\"t\">{} <img width=10 height=300> {}</div>",
             text(20),
             text(20)
         ));
-        assert!(mc_box(&doc, t, None, 200.0).is_none());
-        // An image that fits does not stop the cut.
+        let b = mc_box(&doc, t, None, 200.0).expect("a line taller than a page is described");
+        let [McBoxItem::Lines { advances, .. }] = b.items.as_slice() else {
+            panic!("one run of lines: {:?}", b.items);
+        };
+        assert_eq!(
+            advances.iter().filter(|h| h.to_f32() > 200.0).count(),
+            1,
+            "one line taller than the page: {advances:?}"
+        );
+        // An image that fits is the same box.
         assert!(mc_box(&doc, t, None, 400.0).is_some());
+    }
+
+    #[test]
+    fn mc_relative_offset_is_the_offset_taffy_adds_to_a_block_child() {
+        // html-to-pdf F198j. The parent's content box is 200 px wide (`width:200px; padding:10px; border:2px`): `left`
+        // wins over `-right`, `top` over `-bottom`, a percentage `left` is of 200 px, a percentage `top` is 0 (Taffy's basis for
+        // the vertical insets of a block child), and `position: static` is shifted as well (`stylo_taffy` passes its insets).
+        for (style, want) in [
+            ("position:relative", [0.0, 0.0]),
+            ("position:relative;top:3px", [0.0, 3.0]),
+            ("position:relative;bottom:3px", [0.0, -3.0]),
+            ("position:relative;top:2px;bottom:9px", [0.0, 2.0]),
+            ("position:relative;left:5px", [5.0, 0.0]),
+            ("position:relative;right:4px", [-4.0, 0.0]),
+            ("position:relative;left:6px;right:20px", [6.0, 0.0]),
+            ("position:relative;left:5%", [10.0, 0.0]),
+            ("position:relative;top:10%", [0.0, 0.0]),
+            ("position:relative;top:-12px;left:-8px", [-8.0, -12.0]),
+            ("top:3px", [0.0, 3.0]),
+        ] {
+            let (doc, t) = box_doc(&format!(
+                "<div style=\"width:200px;padding:10px;border:2px solid\"><p class=\"t\" style=\"{style}\">x</p></div>"
+            ));
+            let got = mc_relative_offset(&doc, doc.get_node(t).unwrap());
+            assert_eq!(got, want, "{style}");
+        }
+    }
+
+    #[test]
+    fn mc_box_measures_a_shifted_child_at_its_static_place() {
+        // html-to-pdf F198j. A strip nudged 3 px down (`position: relative; top: 3px`) is at 3 px in `final_layout`, so the
+        // paragraph after it starts 3 px above the strip's shifted bottom. Both are described at their static place
+        // (gap 0, x 0), the strip carries its offset, and the card holds a shift of 3 px for the clip window.
+        let (doc, t) = box_doc(&format!(
+            "<div class=\"t\" style=\"padding:10px\"><div style=\"position:relative;top:3px;height:40px\">strip</div>\
+             <p>{}</p></div>",
+            text(100)
+        ));
+        let b = mc_box(&doc, t, None, 100.0).expect("a card with a shifted strip");
+        let McBoxItem::Leaf {
+            lead, x, rel, h, ..
+        } = &b.items[0]
+        else {
+            panic!("the strip is a leaf: {:?}", b.items[0]);
+        };
+        assert_eq!((*lead, *x, *rel, *h), (0.0, 0.0, [0.0, 3.0], 40.0));
+        let McBoxItem::Lines { lead, rel, .. } = &b.items[1] else {
+            panic!("the paragraph is a run of lines: {:?}", b.items[1]);
+        };
+        assert_eq!((*lead, *rel), (0.0, [0.0, 0.0]));
+        assert_eq!(b.slack, [0.0, 3.0]);
+        // A paragraph drawn 12 px up and 8 px left: static lead and x, and its (framed) lines inherit the offset through it,
+        // not twice.
+        let (doc, t) = box_doc(&format!(
+            "<div class=\"t\" style=\"padding:10px\"><p style=\"padding:4px;position:relative;top:-12px;left:-8px\">{}</p></div>",
+            text(100)
+        ));
+        let b = mc_box(&doc, t, None, 100.0).expect("a card with a shifted paragraph");
+        let [
+            McBoxItem::Box {
+                inner,
+                lead,
+                x,
+                rel,
+                ..
+            },
+        ] = b.items.as_slice()
+        else {
+            panic!("one framed paragraph: {:?}", b.items);
+        };
+        assert_eq!((*lead, *x, *rel), (0.0, 0.0, [-8.0, -12.0]));
+        assert_eq!(inner.slack, [0.0, 0.0]);
+        assert!(matches!(
+            inner.items.as_slice(),
+            [McBoxItem::Lines {
+                rel: [0.0, 0.0],
+                ..
+            }]
+        ));
+        assert_eq!(b.slack, [8.0, 12.0]);
+    }
+
+    #[test]
+    fn mc_box_describes_a_full_bleed_first_child_and_a_child_pulled_over_the_one_before() {
+        // html-to-pdf F198j. Tailwind's `-mx-4 -mt-4` header: the first child of a card with 16 px of padding starts at the
+        // border (gap -16, x -16), the paragraph after it 12 px below it.
+        let (doc, t) = box_doc(&format!(
+            "<div class=\"t\" style=\"padding:16px;border:1px solid\"><div style=\"margin:-16px -16px 12px;padding:8px 16px\">head</div>\
+             <p>{}</p></div>",
+            text(100)
+        ));
+        let b = mc_box(&doc, t, None, 100.0).expect("a card with a full-bleed header");
+        let McBoxItem::Box { lead, x, .. } = &b.items[0] else {
+            panic!("the header is a framed box: {:?}", b.items[0]);
+        };
+        assert_eq!((*lead, *x), (-16.0, -16.0));
+        let McBoxItem::Lines { lead, .. } = &b.items[1] else {
+            panic!("{:?}", b.items[1]);
+        };
+        assert_eq!(*lead, 12.0);
+        // A paragraph pulled up over the last line of the one before it (20 px) by 15 px is described with that gap; by 50
+        // px, above the top of that line, it is not: the planner's cursor would go above an atom already placed.
+        for (pull, described) in [(15, true), (20, true), (50, false)] {
+            let (doc, t) = box_doc(&format!(
+                "<div class=\"t\"><p>{}</p><p style=\"margin-top:-{pull}px\">{}</p></div>",
+                text(40),
+                text(40)
+            ));
+            let b = mc_box(&doc, t, None, 100.0);
+            assert_eq!(b.is_some(), described, "pulled up {pull} px");
+            if let Some(b) = b {
+                let McBoxItem::Lines { lead, .. } = &b.items[1] else {
+                    panic!("{:?}", b.items[1]);
+                };
+                assert_eq!(*lead, -(pull as f32), "pulled up {pull} px");
+            }
+        }
+        // A first child above the box's own top is refused (a margin of -20 in a card with a border, which the margin does
+        // not collapse through), and one that sticks out past the box's own border on the left too (-30 px in 10 px of
+        // padding); -10 px is the border edge.
+        let (doc, t) = box_doc(&format!(
+            "<div class=\"t\" style=\"border:1px solid\"><p style=\"margin-top:-20px\">{}</p></div>",
+            text(40)
+        ));
+        assert!(mc_box(&doc, t, None, 100.0).is_none());
+        for (pull, described) in [(10, true), (30, false)] {
+            let (doc, t) = box_doc(&format!(
+                "<div class=\"t\" style=\"padding:10px\"><p style=\"margin-left:-{pull}px\">{}</p></div>",
+                text(40)
+            ));
+            let b = mc_box(&doc, t, None, 100.0);
+            assert_eq!(b.is_some(), described, "left margin -{pull} px");
+            if let Some(b) = b {
+                let McBoxItem::Lines { x, .. } = &b.items[0] else {
+                    panic!("{:?}", b.items[0]);
+                };
+                assert_eq!(*x, -(pull as f32));
+            }
+        }
     }
 
     #[test]

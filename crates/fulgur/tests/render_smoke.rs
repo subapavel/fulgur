@@ -10161,3 +10161,73 @@ fn test_render_tall_inline_block_line_moves_whole_smoke() {
         assert!(text.contains(word), "`{word}` is printed: {text:?}");
     }
 }
+
+#[test]
+fn render_v2_smoke_multicol_card_with_shifted_children_negative_margins_and_tall_lines_prints_every_word_once()
+ {
+    // html-to-pdf F198j: a card taller than a page in two columns whose children are shifted (`position: relative`
+    // with an inset), pulled over the one before (negative margins) or hold a line taller than a page. Each used to keep
+    // the card whole in one column and lose what is below the page edge. A relative offset is painted, it moves
+    // nothing: the words are those of the card without it. A line taller than a page loses the words on its baseline
+    // (it is not sliced), at most a few.
+    let words = |from: usize, n: usize| -> String {
+        (from..from + n)
+            .map(|i| format!("w{i:04}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let card = |strip: &str, p: &str, count: usize, n: usize| -> String {
+        let mut body = String::new();
+        for i in 0..count {
+            body.push_str(&format!(
+                "<div style=\"background:#38f;padding:6px 12px;{strip}\">S{i:02}</div><p style=\"padding:4px 12px;{p}\">{}</p>",
+                words(i * n, n)
+            ));
+        }
+        format!(
+            "<!doctype html><html><body style=\"margin:0\"><div style=\"column-count:2\">\
+             <div style=\"border:1px solid #888;border-radius:12px;overflow:hidden\">{body}</div></div>\
+             <p>AFTER</p></body></html>"
+        )
+    };
+    let printed = |html: &str| -> Vec<String> {
+        let pdf = noto_engine().render(html).expect("render");
+        extract_pdf_text(&pdf)
+            .expect("pdftotext")
+            .split_whitespace()
+            .filter(|w| w.len() == 5 && w.starts_with('w'))
+            .map(str::to_string)
+            .collect()
+    };
+    let total = 25 * 84;
+    for (what, strip, p) in [
+        ("strips top:3px", "position:relative;top:3px;", ""),
+        ("paragraphs top:-12px", "", "position:relative;top:-12px;"),
+        ("paragraphs left:-8px", "", "position:relative;left:-8px;"),
+        ("negative margin", "", "margin-top:-6px;"),
+    ] {
+        let mut got = printed(&card(strip, p, 25, 84));
+        assert_eq!(got.len(), total, "{what}: every word printed");
+        got.sort_unstable();
+        got.dedup();
+        assert_eq!(got.len(), total, "{what}: no word twice");
+    }
+    // Six images 1200 px tall in the text of a card: the lines with an image are taller than a page.
+    let img = "<img src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQAAAAA3bvkkAAAAB0lEQVR42mNgAAAAAgABc3UBGAAAAABJRU5ErkJggg==\" \
+               style=\"width:60px;height:1200px\">";
+    let text: String = (0..6)
+        .map(|k| format!("{} {img} ", words(k * 300, 300)))
+        .collect();
+    let html = format!(
+        "<!doctype html><html><body style=\"margin:0\"><div style=\"column-count:2\">\
+         <div style=\"padding:16px;border:1px solid #888\">{text}</div></div><p>AFTER</p></body></html>"
+    );
+    let mut got = printed(&html);
+    got.sort_unstable();
+    got.dedup();
+    assert!(
+        got.len() >= 1800 - 6 * 6 && got.len() <= 1800,
+        "tall lines: {} of 1800 words printed (6 lines, a few words each on the baseline are not)",
+        got.len()
+    );
+}
