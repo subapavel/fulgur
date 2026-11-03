@@ -10140,3 +10140,24 @@ fn test_render_sliced_block_card_smoke() {
     assert!(!pdf.is_empty());
     assert_eq!(page_count(&pdf), 3);
 }
+
+#[test]
+fn test_render_tall_inline_block_line_moves_whole_smoke() {
+    // html-to-pdf F213: a one-line paragraph of text, an inline-block taller than the room left on the page and more text
+    // moves to the next page whole. It used to stay on page 1 with its baseline (the bottom of the box) below the page
+    // edge, so its words were printed on no page.
+    let html = "<!DOCTYPE html><html><head><style>@page { size: 400px 300px; margin: 0 } body { margin: 0; line-height: 20px } \
+         p { margin: 0 }</style></head><body><div style=\"height:200px\"></div>\
+         <p>START <span style=\"display:inline-block;width:100px;height:150px;border:1px solid #000\">\
+         <span style=\"display:block\">BOXTOP</span></span> TAIL</p></body></html>";
+    let pdf = noto_engine().render(html).unwrap();
+    assert_eq!(page_count(&pdf), 2);
+    let Some(text) = extract_pdf_text(&pdf) else {
+        eprintln!("pdftotext not installed; skipping the text check");
+        return;
+    };
+    // pdftotext drops text painted outside the page: a word it finds is on a page.
+    for word in ["START", "BOXTOP", "TAIL"] {
+        assert!(text.contains(word), "`{word}` is printed: {text:?}");
+    }
+}

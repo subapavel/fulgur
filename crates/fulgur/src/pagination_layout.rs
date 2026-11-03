@@ -3899,7 +3899,10 @@ impl<'a> PaginationLayoutTree<'a> {
                                 available_strip,
                                 page_height_px,
                                 0,
-                            )))
+                            )
+                            // html-to-pdf F213: a one-line carrier of a box that shares its line is not entered.
+                            && !child_node
+                                .is_some_and(|n| monolithic_line_carrier(doc, n, page_height_px))))
             };
             let mut keeps_whole = keeps_whole_at(page_index, cursor_y, content_above);
             // F30f-b: a clip box that fits the room is not entered (its content past the clip is hidden); one that does
@@ -4661,6 +4664,12 @@ fn leading_block_size_with(
         0.0
     };
     if depth >= crate::MAX_DOM_DEPTH || crate::blitz_adapter::is_multicol_container(node) {
+        return own_h;
+    }
+    // html-to-pdf F213: the first place the fragmenter can break in a one-line carrier of a box that shares its line is
+    // in front of it, so a wrapper whose first child is such a line moves with it (the cut below cannot move a flush
+    // first child).
+    if monolithic_line_carrier(doc, node, page_height_px) {
         return own_h;
     }
     let layout_children_borrow = node.layout_children.borrow();
@@ -6016,7 +6025,9 @@ fn fragment_block_subtree(
                             available_strip,
                             strips.fresh(),
                             0,
-                        )))
+                        )
+                        // html-to-pdf F213: a one-line carrier of a box that shares its line is not entered.
+                        && !monolithic_line_carrier(doc, child, strips.fresh())))
         };
         // F30: a paragraph that does not fit any page whole is split between
         // its line boxes instead of being placed as one oversized leaf (the
@@ -8194,6 +8205,56 @@ fn alone_on_its_line(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
         }
     }
     found
+}
+
+/// html-to-pdf F213: whether `node` is an inline root of exactly one line that holds an atomic inline box (an
+/// `inline-block`, `inline-table`, `inline-flex`, `<img>`, inline `<svg>`) which shares the line with something else
+/// (text, another box), and whose block size fits a fresh page (`fresh`, with the one pixel of slack the strip slicer
+/// has). Such a line is monolithic: css-break-3 §4.1 has no break point inside a line box, and lets a UA treat an
+/// inline-level box that establishes a formatting context as monolithic, so the block walk must not enter the carrier
+/// to cut the box it holds. The only break the line has is the Class A one in front of its paragraph, which the
+/// move-whole code takes when the line does not fit the room.
+///
+/// Entering it cut the box between its block children (or, for a box with one block child, left the carrier where it
+/// was because the child's first row fits) and the line's baseline, at the bottom of the box, was painted below the
+/// page edge: its words were printed on no page.
+///
+/// Not for a box that is alone on its line ([`alone_on_its_line`]): ADR-0004 splits those between the box's own line
+/// boxes (F30f), and the carrier must still be entered. Not for a line taller than a page (the strip slicer cuts the
+/// carrier, as before; F213b), and not for a carrier of two lines or more (F213c).
+///
+/// Reads the Parley lines without allocating: the walk asks it of every inline root that reaches a gate.
+fn monolithic_line_carrier(doc: &BaseDocument, node: &blitz_dom::Node, fresh: f32) -> bool {
+    if !node.flags.is_inline_root() {
+        return false;
+    }
+    let height = node.final_layout.size.height;
+    if !height.is_finite() || height > fresh + 1.0 {
+        return false;
+    }
+    let Some(text_layout) = node
+        .element_data()
+        .and_then(|e| e.inline_layout_data.as_deref())
+    else {
+        return false;
+    };
+    let mut lines = text_layout.layout.lines();
+    let (Some(line), None) = (lines.next(), lines.next()) else {
+        return false;
+    };
+    let mut has_box = false;
+    for item in line.items() {
+        if let parley::PositionedLayoutItem::InlineBox(b) = item {
+            let Some(inline_node) = doc.get_node(b.id as usize) else {
+                return false;
+            };
+            if alone_on_its_line(doc, inline_node) {
+                return false;
+            }
+            has_box = true;
+        }
+    }
+    has_box
 }
 
 /// F30f: the barrier a box puts up on its own, whether it is the parent or the child of the paragraph: an atomic
@@ -18917,6 +18978,168 @@ h2 { string-set: chapter-title content(text); }
                 "{what}"
             );
         }
+    }
+
+    // --- html-to-pdf F213: a line that holds an atomic inline taller than the room moves whole ---------------------
+
+    #[test]
+    fn monolithic_line_carrier_wants_one_line_with_a_box_that_shares_it_and_fits_a_page() {
+        let cases: [(&str, &str, bool); 10] = [
+            (
+                "text and a box",
+                "<p id=\"x\">Hi <span style=\"display:inline-block;width:50px;height:30px\">a</span> end</p>",
+                true,
+            ),
+            (
+                "text and an inline-flex box",
+                "<p id=\"x\">Hi <span style=\"display:inline-flex;width:50px;height:30px\">a</span> end</p>",
+                true,
+            ),
+            (
+                "text and an inline-table box",
+                "<p id=\"x\">Hi <span style=\"display:inline-table\">a</span> end</p>",
+                true,
+            ),
+            (
+                "a box and a box",
+                "<p id=\"x\"><span style=\"display:inline-block\">a</span><span style=\"display:inline-block\">b</span></p>",
+                true,
+            ),
+            (
+                "a box alone on its line stays on the F30f path",
+                "<div id=\"x\"><span style=\"display:inline-block\">a</span></div>",
+                false,
+            ),
+            (
+                "two lines",
+                "<p id=\"x\">Hi <span style=\"display:inline-block\">a</span><br>second</p>",
+                false,
+            ),
+            ("a line with no box", "<p id=\"x\">Hi there</p>", false),
+            (
+                "a box taller than a page",
+                "<p id=\"x\">Hi <span style=\"display:inline-block;height:300px\">a</span> end</p>",
+                false,
+            ),
+            (
+                "a block, not an inline root",
+                "<div id=\"x\"><div>a</div></div>",
+                false,
+            ),
+            (
+                "a block child of the box is not a carrier",
+                "<p>Hi <span style=\"display:inline-block\"><span id=\"x\" style=\"display:block\">a</span></span></p>",
+                false,
+            ),
+        ];
+        for (what, markup, expected) in cases {
+            let doc = laid_out(markup);
+            assert_eq!(
+                monolithic_line_carrier(doc.deref(), node_of(&doc, "x"), 200.0),
+                expected,
+                "{what}"
+            );
+        }
+    }
+
+    /// The first (and only) fragment of `id` is on page `page`.
+    fn assert_whole_on(
+        doc: &blitz_html::HtmlDocument,
+        table: &PaginationGeometryTable,
+        id: &str,
+        page: u32,
+    ) {
+        let f = fragments_of(doc, table, id);
+        assert_eq!(f.len(), 1, "{id}: one fragment: {f:?}");
+        assert_eq!(f[0].page_index, page, "{id}: {f:?}");
+    }
+
+    /// 150 px of room-making block on 200 px pages leave 50 px; the box is 62 px tall, its first row 20 px.
+    const F213_ROOM: &str = "<div style=\"height:150px\"></div>";
+    const F213_BOX: &str = "<span id=\"ib\" style=\"display:inline-block;width:150px;height:60px;border:1px solid #000\">\
+        <span id=\"blk\" style=\"display:block\">BOXTOP</span></span>";
+
+    #[test]
+    fn a_one_line_carrier_taller_than_the_room_moves_whole() {
+        // The gate used to enter the carrier because the box is taller than the room; the box's first row fits, F28 did
+        // not move the carrier, and the line (its baseline is at the box's bottom) was painted below the page edge.
+        let (doc, table) = nested_geometry(
+            &format!("{F213_ROOM}<p id=\"p\">START {F213_BOX} TAIL</p><p id=\"a\">AFTER</p>"),
+            200.0,
+        );
+        assert_whole_on(&doc, &table, "p", 1);
+        assert_whole_on(&doc, &table, "ib", 1);
+        assert_whole_on(&doc, &table, "blk", 1);
+        assert_whole_on(&doc, &table, "a", 1);
+        let p = geometry_of(&doc, &table, "p").unwrap();
+        assert!(
+            p.fragments[0].y.to_f32().abs() < 0.6,
+            "at the top of page 1: {p:?}"
+        );
+    }
+
+    #[test]
+    fn a_one_line_carrier_whose_box_has_several_blocks_moves_whole() {
+        // The box is cut in front of its later blocks when it is entered: the label stayed on page 0, the rest went on.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "{F213_ROOM}<p id=\"p\">START <span id=\"ib\" style=\"display:inline-block;width:150px\">\
+                 <span id=\"l\" style=\"display:block\">LABEL</span>\
+                 <span id=\"q\" style=\"display:block;height:100px\"></span>\
+                 <span id=\"m\" style=\"display:block\">AMOUNT</span></span> TAIL</p>"
+            ),
+            200.0,
+        );
+        for id in ["p", "ib", "l", "q", "m"] {
+            assert_whole_on(&doc, &table, id, 1);
+        }
+    }
+
+    #[test]
+    fn a_one_line_carrier_in_a_wrapper_moves_the_wrapper() {
+        // The carrier is the flush first child of a `<section>`: the cut cannot move it, the wrapper has to (F28).
+        let (doc, table) = nested_geometry(
+            &format!(
+                "{F213_ROOM}<section id=\"w\"><p id=\"p\">START {F213_BOX} TAIL</p></section><p id=\"a\">AFTER</p>"
+            ),
+            200.0,
+        );
+        assert_whole_on(&doc, &table, "p", 1);
+        assert_whole_on(&doc, &table, "ib", 1);
+        assert_whole_on(&doc, &table, "a", 1);
+        let w = fragments_of(&doc, &table, "w");
+        assert!(
+            w.iter().all(|f| f.page_index == 1),
+            "the wrapper starts page 1: {w:?}"
+        );
+    }
+
+    #[test]
+    fn a_one_line_carrier_below_a_paragraph_in_a_wrapper_moves_alone() {
+        // The cut moves a child that has content above it: `x` stays on page 0, the line goes to page 1.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "{F213_ROOM}<section id=\"w\"><p id=\"x\">x</p><p id=\"p\">START {F213_BOX} TAIL</p></section>"
+            ),
+            200.0,
+        );
+        assert_whole_on(&doc, &table, "x", 0);
+        assert_whole_on(&doc, &table, "p", 1);
+        assert_whole_on(&doc, &table, "ib", 1);
+        assert_whole_on(&doc, &table, "blk", 1);
+    }
+
+    #[test]
+    fn a_one_line_carrier_that_fits_the_room_stays() {
+        // A guard: nothing moves when the line fits (the box is 62 px, the room 150).
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:50px\"></div><p id=\"p\">START {F213_BOX} TAIL</p><p id=\"a\">AFTER</p>"
+            ),
+            200.0,
+        );
+        assert_whole_on(&doc, &table, "p", 0);
+        assert_whole_on(&doc, &table, "ib", 0);
     }
 
     #[test]
