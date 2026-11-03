@@ -5005,76 +5005,6 @@ fn has_page_name_change_below(
     false
 }
 
-/// fulgur-g9e3.1: split a block element across pages by walking its DOM
-/// children and emitting per-page fragments for both the block itself
-/// and its children.
-///
-/// For each in-flow child, if it does not fit in the remaining strip,
-/// advance the page boundary and continue placing on a fresh strip.
-/// Children with their own DOM children that are taller than a full page
-/// recurse so the split walks all the way down to where overflow actually
-/// resolves.
-///
-/// Per-page parent fragments capture the height consumed by children on
-/// each page (`cursor - page_start_y`). The downstream collectors
-/// (`collect_string_set_states` / `collect_counter_states` /
-/// `collect_bookmark_entries`) consume the per-page snapshots produced
-/// here.
-///
-/// fulgur-a36m (Phase 3.1.5b): also honours `break-before: page` /
-/// `break-after: page` on direct children, and recurses into children
-/// whose subtrees declare a forced break (`has_forced_break_below`)
-/// so deeper nested breaks land on the right page.
-///
-/// In-place mid-element split (`cursor_y + child_h > page_h` with
-/// `child_h <= page_h` and a CSS-set parent height that diverges from
-/// children sum) still falls back to the pre-3.1 push-to-next-page
-/// behaviour — that's `fulgur-7hf5` (Phase 3.1.5c).
-///
-/// Skips OOF / whitespace-text children, same convention as
-/// `fragment_pagination_root`. Bails at [`crate::MAX_DOM_DEPTH`] —
-/// any nodes below that depth go unrecorded (matches
-/// `record_subtree_descendants`).
-///
-/// ## Known gaps deferred to `fulgur-a9qf` (Phase 3.1.5)
-///
-/// `fragment_block_subtree` does **not** mirror `fragment_pagination_root`
-/// in three respects. None of these surface in the current test corpus
-/// (`cargo test -p fulgur` 1111 / 0); each is tracked as a regression
-/// scope-add on `fulgur-a9qf` (notes §5a / §5b / §5c) so they close
-/// alongside in-place mid-element split:
-///
-/// - **Nested `position: running()` markers are not skipped here.** The
-///   helper has no access to `running_store`, so a running marker that
-///   sits inside an oversized subtree is treated as in-flow and
-///   over-advances `cursor_y`. Body-level filtering is intact; only the
-///   recursion path is affected.
-/// - **Nested inline roots are not split at line edges.** When a tall
-///   `<p>` (multi-line inline root) lives inside an oversized ancestor,
-///   the recursion falls back to DOM-child block split rather than
-///   calling `collect_inline_line_metrics` / `fragment_inline_root` like
-///   the body-level walker does.
-/// - **Multi-page recursive traversal does not emit per-page parent
-///   fragments for intermediate pages.** When the recursive call
-///   advances more than one page, only the first and last page get a
-///   parent-`parent_id` fragment via the pre-recursion overflow close
-///   and the trailing close at the end of this function. Counter /
-///   string-set / bookmark ops attached to `parent_id` itself would
-///   then miss the intermediate pages — the existing tests attach ops
-///   to leaf children, so this stays masked until 3.1.5.
-///
-/// `top_floor` is the block-size reserved at the top of every continuation page
-/// this call starts (F30 / F12: the repeated header of the table whose cell
-/// `parent_id` is, so a cell that spans pages leaves room for it).
-///
-/// `tail_below` is the block-size the boxes around `parent_id` need below
-/// it (F30: so that a paragraph split between lines leaves room for their
-/// bottom padding and border on its last page).
-///
-/// Returns `(final_page_index, final_cursor_y, lines_split_below)`: the page
-/// and y where the parent's last child finished, and whether a paragraph
-/// below was split between lines (then the cursor is below the parent's
-/// frame). The caller resumes its outer cursor from these values.
 /// html-to-pdf F96: whether `node` paints anything a slice would cut: a border or padding on any side, a background colour
 /// or image, or a box shadow.
 fn paints_box(node: &blitz_dom::Node, styles: &::style::properties::ComputedValues) -> bool {
@@ -5236,6 +5166,76 @@ fn slice_block_frames(entry: &mut PaginationGeometry, first: usize, strips: Page
     entry.block_slice = true;
 }
 
+/// fulgur-g9e3.1: split a block element across pages by walking its DOM
+/// children and emitting per-page fragments for both the block itself
+/// and its children.
+///
+/// For each in-flow child, if it does not fit in the remaining strip,
+/// advance the page boundary and continue placing on a fresh strip.
+/// Children with their own DOM children that are taller than a full page
+/// recurse so the split walks all the way down to where overflow actually
+/// resolves.
+///
+/// Per-page parent fragments capture the height consumed by children on
+/// each page (`cursor - page_start_y`). The downstream collectors
+/// (`collect_string_set_states` / `collect_counter_states` /
+/// `collect_bookmark_entries`) consume the per-page snapshots produced
+/// here.
+///
+/// fulgur-a36m (Phase 3.1.5b): also honours `break-before: page` /
+/// `break-after: page` on direct children, and recurses into children
+/// whose subtrees declare a forced break (`has_forced_break_below`)
+/// so deeper nested breaks land on the right page.
+///
+/// In-place mid-element split (`cursor_y + child_h > page_h` with
+/// `child_h <= page_h` and a CSS-set parent height that diverges from
+/// children sum) still falls back to the pre-3.1 push-to-next-page
+/// behaviour — that's `fulgur-7hf5` (Phase 3.1.5c).
+///
+/// Skips OOF / whitespace-text children, same convention as
+/// `fragment_pagination_root`. Bails at [`crate::MAX_DOM_DEPTH`] —
+/// any nodes below that depth go unrecorded (matches
+/// `record_subtree_descendants`).
+///
+/// ## Known gaps deferred to `fulgur-a9qf` (Phase 3.1.5)
+///
+/// `fragment_block_subtree` does **not** mirror `fragment_pagination_root`
+/// in three respects. None of these surface in the current test corpus
+/// (`cargo test -p fulgur` 1111 / 0); each is tracked as a regression
+/// scope-add on `fulgur-a9qf` (notes §5a / §5b / §5c) so they close
+/// alongside in-place mid-element split:
+///
+/// - **Nested `position: running()` markers are not skipped here.** The
+///   helper has no access to `running_store`, so a running marker that
+///   sits inside an oversized subtree is treated as in-flow and
+///   over-advances `cursor_y`. Body-level filtering is intact; only the
+///   recursion path is affected.
+/// - **Nested inline roots are not split at line edges.** When a tall
+///   `<p>` (multi-line inline root) lives inside an oversized ancestor,
+///   the recursion falls back to DOM-child block split rather than
+///   calling `collect_inline_line_metrics` / `fragment_inline_root` like
+///   the body-level walker does.
+/// - **Multi-page recursive traversal does not emit per-page parent
+///   fragments for intermediate pages.** When the recursive call
+///   advances more than one page, only the first and last page get a
+///   parent-`parent_id` fragment via the pre-recursion overflow close
+///   and the trailing close at the end of this function. Counter /
+///   string-set / bookmark ops attached to `parent_id` itself would
+///   then miss the intermediate pages — the existing tests attach ops
+///   to leaf children, so this stays masked until 3.1.5.
+///
+/// `top_floor` is the block-size reserved at the top of every continuation page
+/// this call starts (F30 / F12: the repeated header of the table whose cell
+/// `parent_id` is, so a cell that spans pages leaves room for it).
+///
+/// `tail_below` is the block-size the boxes around `parent_id` need below
+/// it (F30: so that a paragraph split between lines leaves room for their
+/// bottom padding and border on its last page).
+///
+/// Returns `(final_page_index, final_cursor_y, lines_split_below)`: the page
+/// and y where the parent's last child finished, and whether a paragraph
+/// below was split between lines (then the cursor is below the parent's
+/// frame). The caller resumes its outer cursor from these values.
 /// Row-level state for grid/flex parallel-sibling co-split (fulgur-ysms).
 ///
 /// Saved once at the first cell of each row; subsequent cells in the same
