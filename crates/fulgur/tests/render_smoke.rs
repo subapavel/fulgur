@@ -10123,3 +10123,20 @@ fn a_heading_with_break_after_avoid_moves_to_the_next_page_with_its_paragraph() 
         "without the avoid it stays at the bottom of page 1"
     );
 }
+
+#[test]
+fn test_render_sliced_block_card_smoke() {
+    // html-to-pdf F96: a bordered, filled, rounded block box that is cut between its children over three pages is sliced at
+    // its breaks (the frame, background and shadow paint paths of a box with open edges).
+    let children: String = (0..45)
+        .map(|_| "<div style=\"height:40px;margin-bottom:10px\"></div>")
+        .collect();
+    let html = format!(
+        "<!DOCTYPE html><html><head><style>@page {{ size: A4; margin: 20mm }} body {{ margin: 0 }}</style></head><body>\
+         <section style=\"border:2px solid #c00;padding:12px;border-radius:16px;background:#eef;box-shadow:0 4px 12px rgba(0,0,0,.6)\">{children}</section>\
+         </body></html>"
+    );
+    let pdf = Engine::builder().build().render(&html).unwrap();
+    assert!(!pdf.is_empty());
+    assert_eq!(page_count(&pdf), 3);
+}

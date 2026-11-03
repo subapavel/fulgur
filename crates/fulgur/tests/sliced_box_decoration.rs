@@ -4,6 +4,8 @@
 //! - The border keeps the radius of the corners that are not cut off (css-backgrounds-3 section 5.5), the same curves the
 //!   background has; there is no radius at a cut edge.
 //! - A `box-shadow` is not painted beyond a cut edge (the box is "rendered with no breaks present, and then sliced").
+//!
+//! html-to-pdf F96: the same for a block box that is split between its children (`block_card`), not only for a paragraph.
 mod support;
 use support::content_stream::count_ops;
 
@@ -158,4 +160,64 @@ fn a_sliced_box_shadow_stops_at_the_open_edges() {
     // ...and the first page keeps the shadow above its top edge.
     let top_rows_white = (30..55).all(|y| row_is_white(&page1, w1, y));
     assert!(!top_rows_white, "page 1 lost the shadow above its top edge");
+}
+
+/// html-to-pdf F96: a bordered, padded, rounded block box of 45 blank children of 40px with a 10px margin (three A4 pages
+/// with a 20mm margin), sliced at both breaks. It has no lines of its own: the children move whole.
+fn block_card(extra_style: &str) -> String {
+    let children: String = (0..45)
+        .map(|_| "<div style=\"height:40px;margin-bottom:10px\"></div>")
+        .collect();
+    format!(
+        "<!DOCTYPE html><html><head><style>@page {{ size: A4; margin: 20mm }} body {{ margin: 0 }}</style></head><body>\
+         <section style=\"border:2px solid #c00;padding:12px;border-radius:16px;{extra_style}\">{children}</section>\
+         </body></html>"
+    )
+}
+
+#[test]
+fn a_sliced_block_border_has_curves_at_the_unbroken_corners_only() {
+    // F96: page 1 has the top corners, the last page the bottom ones, the page between none: four curves in the border of
+    // a block box that is cut between its children, as for the paragraph above. Before F96 every page had a closed frame
+    // with its four corners: twelve.
+    let pdf = engine().render(&block_card("")).expect("render");
+    assert_eq!(page_count(&pdf), 3);
+    let Some(counts) = count_ops(&pdf) else {
+        eprintln!("qpdf not installed - skipping");
+        return;
+    };
+    assert_eq!(
+        counts.c, 4,
+        "curves in the border of a 3-page sliced block box"
+    );
+}
+
+#[test]
+fn a_sliced_block_box_shadow_stops_at_the_open_edges() {
+    let pdf = engine()
+        .render(&block_card("box-shadow:0 4px 12px rgba(0,0,0,.6)"))
+        .expect("render");
+    assert_eq!(page_count(&pdf), 3);
+    let Some((w1, _, page1)) = grey_page(&pdf, 1) else {
+        eprintln!("pdftoppm not installed - skipping");
+        return;
+    };
+    for y in 787..842 {
+        assert!(
+            row_is_white(&page1, w1, y),
+            "page 1, row {y}: shadow below the bottom edge of a box that goes on"
+        );
+    }
+    let (w2, _, page2) = grey_page(&pdf, 2).expect("page 2");
+    for y in 0..56 {
+        assert!(
+            row_is_white(&page2, w2, y),
+            "page 2, row {y}: shadow above the top edge of a continuation"
+        );
+    }
+    // The middle page's frame runs to the content bottom (785.3 px): its side border is dark there.
+    assert!(
+        page2[780 * w2 + 56] < 200 || page2[780 * w2 + 57] < 200,
+        "page 2: the side border of the open frame runs to the content bottom"
+    );
 }

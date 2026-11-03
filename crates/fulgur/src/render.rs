@@ -3796,6 +3796,22 @@ pub(crate) fn frame_fragment(
             } else {
                 crate::units::Px::ZERO
             };
+    } else if geom.block_slice && geom.is_split() {
+        // html-to-pdf F96: a block box sliced at its breaks. Its fragments already are its frame (the fragmenter ran every
+        // one but the last to the page's content bottom and added the bottom inset to the last), so only the edges are
+        // open: the top at every fragment but the first, the bottom at every one but the last.
+        let is_first = geom
+            .fragments
+            .first()
+            .is_some_and(|first| first.page_index == frag.page_index);
+        let is_last = geom
+            .fragments
+            .last()
+            .is_some_and(|last| last.page_index == frag.page_index);
+        edges = FrameEdges {
+            top_open: !is_first,
+            bottom_open: !is_last,
+        };
     }
     (frame, edges)
 }
@@ -6797,6 +6813,40 @@ mod tests {
                 (45.0, true, false)
             ]
         );
+    }
+
+    #[test]
+    fn frame_fragment_of_a_sliced_block_opens_the_broken_edges() {
+        // html-to-pdf F96: a block box sliced at its breaks (`block_slice`): its fragments already are its frames (the
+        // fragmenter ran the first two to the page bottom and added the bottom inset to the last), so the frame keeps its
+        // size and only the edges change: the first fragment has the top and an open bottom, a middle one is open on both
+        // sides, the last has an open top and the bottom.
+        let mut geom = geometry_of(&[83.0, 100.0, 62.0], None);
+        geom.block_slice = true;
+        let got: Vec<(f32, bool, bool)> = geom
+            .fragments
+            .iter()
+            .map(|f| {
+                let (frame, edges) = frame_fragment(&geom, f);
+                (frame.height.to_f32(), edges.top_open, edges.bottom_open)
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (83.0, false, true),
+                (100.0, true, true),
+                (62.0, true, false)
+            ]
+        );
+        // One fragment (the box did not break) is a closed frame, and so is every box without the flag.
+        let mut one = geometry_of(&[83.0], None);
+        one.block_slice = true;
+        assert!(!frame_fragment(&one, &one.fragments[0]).1.any());
+        let plain = geometry_of(&[83.0, 100.0, 62.0], None);
+        for f in &plain.fragments {
+            assert!(!frame_fragment(&plain, f).1.any());
+        }
     }
 
     #[test]

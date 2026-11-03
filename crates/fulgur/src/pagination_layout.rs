@@ -2452,6 +2452,13 @@ pub struct PaginationGeometry {
     /// Two pieces of one box can share a page (its columns), so the page does not say which piece is first or last. Empty
     /// for everything else, whose edges come from the page ([`crate::render::frame_fragment`]).
     pub piece_edges: Vec<crate::draw_primitives::FrameEdges>,
+    /// html-to-pdf F96: a block box (not an inline root: that is `line_split_slice`) that [`fragment_block_subtree`] split
+    /// between its children or around a split paragraph is sliced at its breaks (`box-decoration-break: slice`, css-break-3
+    /// §5.4). Its fragments are its frames: every one but the last runs to the page's content bottom
+    /// ([`slice_block_frames`]) and the last includes the bottom padding and border. The renderer opens the edges at a break
+    /// (no border, padding or radius there, [`crate::render::frame_fragment`]). `false` for every other box, whose frame is
+    /// closed on every page.
+    pub block_slice: bool,
 }
 
 impl PaginationGeometry {
@@ -5068,6 +5075,167 @@ fn has_page_name_change_below(
 /// and y where the parent's last child finished, and whether a paragraph
 /// below was split between lines (then the cursor is below the parent's
 /// frame). The caller resumes its outer cursor from these values.
+/// html-to-pdf F96: whether `node` paints anything a slice would cut: a border or padding on any side, a background colour
+/// or image, or a box shadow.
+fn paints_box(node: &blitz_dom::Node, styles: &::style::properties::ComputedValues) -> bool {
+    let l = &node.final_layout;
+    if l.border.top
+        + l.border.right
+        + l.border.bottom
+        + l.border.left
+        + l.padding.top
+        + l.padding.right
+        + l.padding.bottom
+        + l.padding.left
+        > 0.0
+    {
+        return true;
+    }
+    let current = styles.clone_color();
+    styles
+        .clone_background_color()
+        .resolve_to_absolute(&current)
+        .alpha
+        > 0.0
+        || styles
+            .clone_background_image()
+            .0
+            .iter()
+            .any(|i| !matches!(i, ::style::values::computed::image::Image::None))
+        || !styles.clone_box_shadow().0.is_empty()
+}
+
+/// html-to-pdf F96: whether the author gave the box a `min-height` that is not zero (a length or a percentage). Such a box
+/// can be taller than its content, so the room under its last child is not its bottom inset: it keeps its closed frames
+/// with `height` and `max-height` (F96b).
+fn has_min_height(styles: &::style::properties::ComputedValues) -> bool {
+    use ::style::values::generics::length::GenericSize;
+    matches!(
+        styles.clone_min_height(),
+        GenericSize::LengthPercentage(lp) if !lp.0.is_definitely_zero()
+    )
+}
+
+/// html-to-pdf F96: whether block box `node`, fragmented by [`fragment_block_subtree`], is painted sliced at its page breaks
+/// (`box-decoration-break: slice`, css-break-3 §5.4: no border, padding or radius at a break; the sides and the background
+/// of a fragment that is not the last run to the page's content bottom, css-break-3 §5.3). `closes_like_block` is the
+/// fragmenter's flag for a flex or grid container whose items stack (a one-column grid card, closed below like a block).
+///
+/// Only the boxes the renderer paints as a frame of their own in block flow, and whose fragments the fragmenter lays out as
+/// that frame:
+/// - an element that is neither `<html>` nor `<body>` (F37 slices `<body>` itself), is not an inline root (F30f-d's
+///   `line_split_slice` covers those) and paints something ([`paints_box`]: a box without a frame keeps its bytes);
+/// - `display` `flow` or `flow-root`, or a flex / grid container whose items stack; not a table part or a cell, not a
+///   multicol container, not an atomic inline (ADR-0004), not orthogonal to its parent;
+/// - without a block size of its own (`height`, `min-height`, `max-height`: F96b; this also leaves F30f-i's clip boxes
+///   alone);
+/// - not a float, not transformed, not positioned out of flow (F96c, F96g);
+/// - with no ancestor up to `<body>` that is out of flow, a multicol container (F198's `piece_edges`), an atomic inline or a
+///   table part (F96d).
+fn block_slices_at_breaks(
+    doc: &BaseDocument,
+    node: &blitz_dom::Node,
+    closes_like_block: bool,
+) -> bool {
+    use ::style::properties::longhands::position::computed_value::T as Pos;
+    use ::style::values::specified::box_::DisplayInside;
+    if is_root_or_body(node) {
+        return false;
+    }
+    let Some(element) = node.element_data() else {
+        return false;
+    };
+    if element.inline_layout_data.is_some() {
+        return false;
+    }
+    let Some(styles) = node.primary_styles() else {
+        return false;
+    };
+    if !paints_box(node, &styles) {
+        return false;
+    }
+    let inside = styles.clone_display().inside();
+    let kind_ok = match inside {
+        DisplayInside::Flow | DisplayInside::FlowRoot => true,
+        DisplayInside::Flex | DisplayInside::Grid => closes_like_block,
+        _ => false,
+    };
+    if !kind_ok
+        || crate::blitz_adapter::is_atomic_inline_container_node(node)
+        || crate::blitz_adapter::is_multicol_container(node)
+        || crate::blitz_adapter::node_is_floating(node)
+        || block_size_constrained(node)
+        || has_min_height(&styles)
+        || !styles.get_box().transform.0.is_empty()
+        || matches!(
+            styles.get_box().clone_position(),
+            Pos::Absolute | Pos::Fixed
+        )
+    {
+        return false;
+    }
+    let parent = node.parent.and_then(|id| doc.get_node(id));
+    if let Some(parent) = parent
+        && (is_cell_of_table(parent, node)
+            || parent
+                .parent
+                .and_then(|gp| doc.get_node(gp))
+                .is_some_and(|gp| crate::blitz_adapter::is_orthogonal_to_parent(gp, parent)))
+    {
+        return false;
+    }
+    // The walk up runs only for a box that crossed a page (the caller's check comes first).
+    let mut up = parent;
+    let mut hops = 0;
+    while let Some(ancestor) = up {
+        if is_root_or_body(ancestor) {
+            break;
+        }
+        hops += 1;
+        if hops > crate::MAX_DOM_DEPTH
+            || is_out_of_flow_positioned(ancestor)
+            || crate::blitz_adapter::is_multicol_container(ancestor)
+            || crate::blitz_adapter::is_atomic_inline_container_node(ancestor)
+            || ancestor.primary_styles().is_some_and(|s| {
+                matches!(
+                    s.clone_display().inside(),
+                    DisplayInside::Table
+                        | DisplayInside::TableRowGroup
+                        | DisplayInside::TableHeaderGroup
+                        | DisplayInside::TableFooterGroup
+                        | DisplayInside::TableRow
+                        | DisplayInside::TableCell
+                )
+            })
+        {
+            return false;
+        }
+        up = ancestor.parent.and_then(|id| doc.get_node(id));
+    }
+    true
+}
+
+/// html-to-pdf F96: the frames of a sliced box: every fragment of `entry` from index `first` on, except the last, runs to the
+/// page's content bottom ([`PageStrips::chrome_bottom`], as F30f-d's sliced paragraphs, so that nested sliced frames end on
+/// the same row): css-break-3 §5.3, a box that breaks fills the fragmentainer. This replaces both the short frame of a box
+/// that split where a child moved whole and the frame of the first page that the oc51 push gave the height `fresh()` (into
+/// the bottom margin). Sets `block_slice` when there is a break to slice.
+fn slice_block_frames(entry: &mut PaginationGeometry, first: usize, strips: PageStrips) {
+    let n = entry.fragments.len().saturating_sub(first);
+    if n < 2 {
+        return;
+    }
+    for fragment in &mut entry.fragments[first..first + n - 1] {
+        let room = strips.chrome_bottom(fragment.page_index) - fragment.y.to_f32();
+        fragment.height = room.max(0.0).as_px();
+    }
+    debug_assert!(
+        entry.line_split_insets.is_none(),
+        "a sliced block box is never an inline root split between lines"
+    );
+    entry.block_slice = true;
+}
+
 /// Row-level state for grid/flex parallel-sibling co-split (fulgur-ysms).
 ///
 /// Saved once at the first cell of each row; subsequent cells in the same
@@ -5254,6 +5422,8 @@ fn fragment_block_subtree(
 
     let mut page_index = page_in;
     let mut cursor_y = cursor_in;
+    // html-to-pdf F96: where this call's fragments of `parent_id` start in its geometry entry.
+    let own_first = geometry.get(&parent_id).map_or(0, |g| g.fragments.len());
     // Y on `page_index` where the parent's current-page fragment
     // starts. We close one parent fragment and start a new one each
     // time we cross a page boundary.
@@ -6421,7 +6591,10 @@ fn fragment_block_subtree(
                     }
                 }
                 origin_pending_target_y = Some(cursor_y);
-                origin_pending_prev_bottom = split_below.then_some(this_top_in_parent + child_h);
+                // html-to-pdf F96: below a sliced box too, the gap Taffy left (its margin) is kept.
+                let child_sliced = geometry.get(&child_id).is_some_and(|g| g.block_slice);
+                origin_pending_prev_bottom =
+                    (split_below || child_sliced).then_some(this_top_in_parent + child_h);
                 let row_top = this_top_in_parent;
                 let row_bottom = row_top + child_h;
                 origin_pending_same_row =
@@ -6615,7 +6788,11 @@ fn fragment_block_subtree(
     // the child): the last fragment of the frame includes them, and the cursor
     // handed back is below the frame so the next sibling does not start inside
     // it. Other splits keep closing at the last child, as before.
-    let closing = if lines_split_below && closes_like_block {
+    // html-to-pdf F96: a sliced box is closed below its last child on its last page as well when it split between whole
+    // children (css-break-3 §5.4: the bottom padding and border are on the last fragment, and what follows starts below
+    // them).
+    let sliced = page_index > page_in && block_slices_at_breaks(doc, parent, closes_like_block);
+    let closing = if (lines_split_below || sliced) && closes_like_block {
         let parent_h = parent.final_layout.size.height;
         if parent_h.is_finite() {
             (parent_h - children_bottom).max(0.0)
@@ -6673,6 +6850,11 @@ fn fragment_block_subtree(
             }
             .as_px(),
         });
+
+    // html-to-pdf F96: the frames of a sliced box fill the page on every fragment but the last.
+    if sliced && let Some(entry) = geometry.get_mut(&parent_id) {
+        slice_block_frames(entry, own_first, strips);
+    }
 
     // F30f: an `inline-block` alone on this box's line now spans several pages: the box's one line is painted where
     // the inline-block starts.
@@ -23710,5 +23892,283 @@ h2 { string-set: chapter-title content(text); }
             );
             assert_eq!(page_sizes(&table, &doc, "p")[0].0, 1, "nested {nested}");
         }
+    }
+
+    // ───────── html-to-pdf F96: a block box split across pages is sliced at its breaks ─────────
+
+    /// `n` blank 40px children with a 10px margin below, ids `c1`..`cn`.
+    fn blocks(n: usize) -> String {
+        (1..=n)
+            .map(|i| format!("<div id=\"c{i}\" style=\"height:40px;margin-bottom:10px\"></div>"))
+            .collect()
+    }
+
+    fn sliced(doc: &blitz_html::HtmlDocument, table: &PaginationGeometryTable, id: &str) -> bool {
+        geometry_of(doc, table, id).is_some_and(|g| g.block_slice)
+    }
+
+    /// The card of the plan on 200px pages: a 60px spacer, then a bordered, padded box (border 1 + padding 9 = 10px
+    /// above and below) with five children of 40px and a 10px margin below each, then `AFTER`. The third child does not
+    /// fit under the first two (170 + 40 > 200) and moves whole; the first page holds two children and then room.
+    fn card_between_children() -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        nested_geometry(
+            &format!(
+                "<div style=\"height:60px\"></div><section id=\"b\" style=\"border:1px solid #000;padding:9px;margin-bottom:10px\">{}</section><p id=\"a\">AFTER</p>",
+                blocks(5)
+            ),
+            200.0,
+        )
+    }
+
+    #[test]
+    fn a_bordered_block_split_between_its_children_is_sliced() {
+        // css-break-3 §5.3 / §5.4: the box's frame on page 0 runs to the content bottom (140px from its top at 60, not to
+        // the end of its second child at 160), the frame of page 1 starts at the top of the page, where its first child is
+        // (the box reserves no top inset on a continuation page), and the last frame holds the bottom inset: the last
+        // child ends at 140, then its 10px margin, the padding and the border.
+        let (doc, table) = card_between_children();
+        let geom = geometry_of(&doc, &table, "b").expect("geometry");
+        assert!(geom.block_slice, "sliced");
+        assert_eq!(geom.line_split_insets, None);
+        assert_frames(
+            frames_of(&doc, &table, "b"),
+            &[(0, 60.0, 140.0), (1, 0.0, 160.0)],
+            "the box",
+        );
+        // The first child on page 1 is at the top of the page (green on main as well).
+        assert_frames(
+            frames_of(&doc, &table, "c3"),
+            &[(1, 0.0, 40.0)],
+            "the child that moved whole",
+        );
+    }
+
+    #[test]
+    fn what_follows_a_box_split_between_children_starts_below_its_bottom_inset() {
+        // Defect (c): `closing` was computed only when a paragraph below was split between lines, so a box split between
+        // whole children ended its last frame at its last child (140) and `AFTER` started at 150 (that end plus the 10px
+        // margin), 20px too high: the frame ends at 160 (the child's 10px margin, the padding and the border below it).
+        let (doc, table) = card_between_children();
+        assert_frames(
+            frames_of(&doc, &table, "a"),
+            &[(1, 170.0, 20.0)],
+            "AFTER starts below the last frame (160) and the box's 10px margin",
+        );
+    }
+
+    #[test]
+    fn a_bordered_block_around_a_split_paragraph_is_sliced() {
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<section id=\"b\" style=\"border:1px solid #000;padding:9px;margin-bottom:10px\"><p id=\"p\">{}</p></section><p id=\"a\">AFTER</p>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let geom = geometry_of(&doc, &table, "b").expect("geometry");
+        assert!(geom.block_slice, "sliced");
+        let frames = frames_of(&doc, &table, "b");
+        let last = frames.len() - 1;
+        assert!(last >= 2, "{frames:?}");
+        for (k, f) in frames.iter().enumerate() {
+            assert_eq!(f.0, k as u32, "{frames:?}");
+            assert_eq!(
+                f.1, 0.0,
+                "every frame is at the top of its page: {frames:?}"
+            );
+            if k < last {
+                assert!(
+                    (f.1 + f.2 - 200.0).abs() < 0.6,
+                    "runs to the page bottom: {frames:?}"
+                );
+            }
+        }
+        // The last frame is the paragraph's last strip and the bottom padding and border.
+        let p_last = frames_of(&doc, &table, "p")[last];
+        assert!(
+            (frames[last].2 - (p_last.2 + 10.0)).abs() < 0.6,
+            "{frames:?} vs {p_last:?}"
+        );
+        // What follows starts below the frame and the margin.
+        assert_frames(
+            frames_of(&doc, &table, "a"),
+            &[(last as u32, frames[last].2 + 10.0, 20.0)],
+            "AFTER",
+        );
+    }
+
+    #[test]
+    fn nested_bordered_blocks_are_both_sliced() {
+        // The inner box (border 1 + padding 9, 5px margin below) starts at 70 on page 0 and holds four children; the third
+        // does not fit and moves. Both boxes run to the page bottom on page 0 and end on page 1 below their insets; the
+        // outer one ends below the inner one's margin and its own insets, and `AFTER` below that.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:60px\"></div><section id=\"o\" style=\"border:1px solid #000;padding:9px;margin-bottom:10px\"><div id=\"i\" style=\"border:1px solid #000;padding:9px;margin-bottom:5px\">{}</div></section><p id=\"a\">AFTER</p>",
+                blocks(4)
+            ),
+            200.0,
+        );
+        assert!(sliced(&doc, &table, "o"));
+        assert!(sliced(&doc, &table, "i"));
+        assert_frames(
+            frames_of(&doc, &table, "i"),
+            &[(0, 70.0, 130.0), (1, 0.0, 110.0)],
+            "the inner box",
+        );
+        assert_frames(
+            frames_of(&doc, &table, "o"),
+            &[(0, 60.0, 140.0), (1, 0.0, 125.0)],
+            "the outer box",
+        );
+        assert_frames(frames_of(&doc, &table, "a"), &[(1, 135.0, 20.0)], "AFTER");
+    }
+
+    #[test]
+    fn a_one_column_grid_card_is_sliced() {
+        // The same card as a `display: grid` box (one column, 10px gap): its items stack, it is closed like a block.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:60px\"></div><section id=\"b\" style=\"display:grid;gap:10px;border:1px solid #000;padding:9px;margin-bottom:10px\">{}</section><p id=\"a\">AFTER</p>",
+                blocks(5).replace(";margin-bottom:10px", "")
+            ),
+            200.0,
+        );
+        assert!(sliced(&doc, &table, "b"));
+        // The first frame runs to the page bottom; the last holds the bottom inset (border + padding, 10px) below the last
+        // item, wherever the grid put it (the 10px gap above the first item of a continuation page is lost today, a
+        // grid-row matter that this change leaves alone).
+        let frames = frames_of(&doc, &table, "b");
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert_frames(frames[..1].to_vec(), &[(0, 60.0, 140.0)], "the first frame");
+        let c5 = frames_of(&doc, &table, "c5")[0];
+        assert_eq!(c5.0, 1);
+        assert!(
+            (frames[1].1 + frames[1].2 - (c5.1 + c5.2 + 10.0)).abs() < 0.6,
+            "{frames:?} vs {c5:?}"
+        );
+        assert_frames(
+            frames_of(&doc, &table, "a"),
+            &[(1, frames[1].2 + 10.0, 20.0)],
+            "AFTER",
+        );
+        // Two columns: its items are level with each other and it keeps the closed frames.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:60px\"></div><section id=\"b\" style=\"display:grid;grid-template-columns:1fr 1fr;gap:10px;border:1px solid #000;padding:9px\">{}</section>",
+                blocks(8).replace(";margin-bottom:10px", "")
+            ),
+            200.0,
+        );
+        assert!(!sliced(&doc, &table, "b"), "a row of items is not a stack");
+    }
+
+    #[test]
+    fn boxes_outside_f96_keep_their_frames() {
+        // A bordered, padded box with eight 40px children (400px on 200px pages): nothing here is sliced. `<body>` is
+        // sliced by F37 (`box_slices`), an inline root by F30f-d (`line_split_slice`).
+        let card = "border:1px solid #000;padding:9px";
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "frameless box",
+                format!("<section id=\"b\">{}</section>", blocks(8)),
+            ),
+            (
+                "height",
+                format!(
+                    "<section id=\"b\" style=\"{card};height:420px\">{}</section>",
+                    blocks(8)
+                ),
+            ),
+            (
+                "min-height",
+                format!(
+                    "<section id=\"b\" style=\"{card};min-height:420px\">{}</section>",
+                    blocks(8)
+                ),
+            ),
+            (
+                "max-height",
+                format!(
+                    "<section id=\"b\" style=\"{card};max-height:380px\">{}</section>",
+                    blocks(8)
+                ),
+            ),
+            (
+                "clip box with a block size",
+                format!(
+                    "<section id=\"b\" style=\"{card};overflow:hidden;height:420px\">{}</section>",
+                    blocks(8)
+                ),
+            ),
+            (
+                "float",
+                format!(
+                    "<section id=\"b\" style=\"{card};float:left;width:300px\">{}</section>",
+                    blocks(8)
+                ),
+            ),
+            (
+                "transform",
+                format!(
+                    "<section id=\"b\" style=\"{card};transform:translateX(5px)\">{}</section>",
+                    blocks(8)
+                ),
+            ),
+            (
+                "absolutely positioned box and the card in it",
+                format!(
+                    "<section id=\"b\" style=\"{card};position:absolute;top:0;left:0;width:300px\"><section id=\"in\" style=\"{card}\">{}</section></section>",
+                    blocks(8)
+                ),
+            ),
+            (
+                "multicol container and a card in it",
+                format!(
+                    "<section id=\"b\" style=\"{card};columns:2\"><section id=\"in\" style=\"{card}\">{}</section></section>",
+                    blocks(8)
+                ),
+            ),
+            (
+                "table cell",
+                format!(
+                    "<table><tr><td id=\"b\" style=\"{card}\">{}</td></tr></table>",
+                    blocks(8)
+                ),
+            ),
+            (
+                "card in a table cell",
+                format!(
+                    "<table><tr><td><section id=\"b\" style=\"{card}\">{}</section></td></tr></table>",
+                    blocks(8)
+                ),
+            ),
+            (
+                "inline-block",
+                format!(
+                    "<section id=\"b\" style=\"{card};display:inline-block;width:300px\">{}</section>",
+                    blocks(8)
+                ),
+            ),
+        ];
+        for (what, html) in cases {
+            let (_doc, table) = nested_geometry(&html, 200.0);
+            for (id, geom) in &table {
+                assert!(
+                    !geom.block_slice,
+                    "{what}: node {id} is sliced ({:?})",
+                    geom.fragments
+                );
+            }
+        }
+        // The same box without the constraint is sliced: the cases above differ from the card of the plan in one thing.
+        let (doc, table) = nested_geometry(
+            &format!("<section id=\"b\" style=\"{card}\">{}</section>", blocks(8)),
+            200.0,
+        );
+        assert!(
+            sliced(&doc, &table, "b"),
+            "the plain card of eight children"
+        );
     }
 }
