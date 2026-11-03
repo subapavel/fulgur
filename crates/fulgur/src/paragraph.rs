@@ -1068,6 +1068,13 @@ pub fn draw_shaped_lines(
                                 lc.push_transform(link_affine);
                             }
                             canvas.surface.push_transform(&transform);
+                            // html-to-pdf F213d: the box's content is painted under a translate, where the extent records
+                            // nothing, so a box that sits below the page edge was silent. The box's bottom is a page
+                            // coordinate here (`oy` is the line's top plus the box's offset): note it first.
+                            canvas
+                                .paint_extent
+                                .note_bottom(oy.to_f32() + content_frag.height.in_pt().to_f32());
+                            crate::render::note_inline_box_painted(content_id);
                             canvas.paint_extent.enter_local();
                             // Not page coordinates under the translate: no band (F30f-b).
                             let saved_band = std::mem::replace(

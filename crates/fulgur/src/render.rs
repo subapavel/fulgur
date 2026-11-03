@@ -40,6 +40,7 @@ pub fn render_v2(
     anchor_map: Option<&AnchorMap>,
     implicit_href_by_page: &BTreeMap<usize, String>,
 ) -> Result<(Vec<u8>, Vec<crate::convert::DroppedText>)> {
+    reset_painted_ledger();
     let mut document = if config.effective_tagging() {
         let configuration = if config.pdf_ua {
             Configuration::new_with_validator(Validator::UA1)
@@ -498,6 +499,8 @@ pub fn render_v2(
             link_annot_ids.entry(ptr).or_default().push(id);
         }
     }
+
+    report_unpainted(geometry, drawables);
 
     if let Some(tc) = tag_collector {
         let mut tree = TagTree::new().with_lang(config.lang.clone());
@@ -1354,6 +1357,184 @@ fn check_continuations_painted(
     }
 }
 
+// html-to-pdf F213d: the ledger of what the renderer painted, for the safety net `report_unpainted`. The fragmenter places
+// every line of a paragraph and every inline box on some page; the renderer paints a paragraph's lines at the one call
+// site of `paragraph_line_range_for_page` and an inline box where its carrier line is painted (`paragraph.rs`, the
+// `InlineBox` arm) or as a continuation (`paint_inline_box_continuation`). A line or a box that none of them painted is
+// printed on no page. Per-document and single-threaded like `CONTINUATIONS_PAINTED`; cleared at the start of
+// `render_v2`. Repeats (`position: fixed`, `thead`) only need to be painted once.
+thread_local! {
+    static PAINTED_LINES: std::cell::RefCell<BTreeMap<usize, Vec<std::ops::Range<usize>>>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+    static PAINTED_BOXES: std::cell::RefCell<std::collections::BTreeSet<usize>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+/// The most "painted on no page" warnings of one render; the rest are counted in one more line (like the dropped-text
+/// warnings of `Engine`).
+const MAX_UNPAINTED_WARNINGS: usize = 20;
+
+fn reset_painted_ledger() {
+    PAINTED_LINES.with(|m| m.borrow_mut().clear());
+    PAINTED_BOXES.with(|m| m.borrow_mut().clear());
+}
+
+/// Records that the paragraph `node_id` painted its lines `range` on some page.
+fn note_lines_painted(node_id: usize, range: std::ops::Range<usize>) {
+    PAINTED_LINES.with(|m| m.borrow_mut().entry(node_id).or_default().push(range));
+}
+
+/// Records that the content of the inline box `ib_id` was painted on some page.
+pub(crate) fn note_inline_box_painted(ib_id: usize) {
+    PAINTED_BOXES.with(|m| m.borrow_mut().insert(ib_id));
+}
+
+/// How many of the first `expected` lines of paragraph `node_id` no page painted.
+fn unpainted_line_count(node_id: usize, expected: usize) -> usize {
+    PAINTED_LINES.with(|m| {
+        let m = m.borrow();
+        let mut ranges: Vec<std::ops::Range<usize>> = m.get(&node_id).cloned().unwrap_or_default();
+        ranges.sort_by_key(|r| r.start);
+        let (mut covered, mut upto) = (0usize, 0usize);
+        for r in ranges {
+            let (start, end) = (r.start.max(upto), r.end.min(expected));
+            if end > start {
+                covered += end - start;
+            }
+            upto = upto.max(r.end);
+        }
+        expected - covered.min(expected)
+    })
+}
+
+/// The number of lines of `para` that a fragmenter's plan has pages paint: all of them, except the hidden tail of a clip
+/// box (`line_slices` has one slice more than `fragments`: ADR-0009, the lines the clip hides are painted on no page by
+/// design).
+fn expected_painted_lines(
+    para: &crate::drawables::ParagraphEntry,
+    geom: &crate::pagination_layout::PaginationGeometry,
+) -> usize {
+    let n = para.lines.len();
+    if geom.is_split() && geom.line_slices.len() == geom.fragments.len() + 1 {
+        return (geom.line_slices[geom.fragments.len() - 1].end as usize).min(n);
+    }
+    n
+}
+
+/// The warnings of the safety net: paragraphs with lines painted on no page, and inline boxes painted on no page.
+///
+/// Excluded, each with its reason: a paragraph that is not visible (F209: it paints nothing by design) or has opacity 0
+/// or sits in a block that does (`draw_with_opacity` skips it); the hidden tail of a clip box (ADR-0009); a paragraph
+/// the multicol plan paints (`paragraph_slices`, F198b, not through the line ranges); a node without geometry (running
+/// elements; F95 b) or with no fragment.
+fn unpainted_report(
+    geometry: &crate::pagination_layout::PaginationGeometryTable,
+    drawables: &Drawables,
+) -> Vec<String> {
+    use crate::paragraph::LineItem;
+    // Nodes whose paint is skipped by an opacity of 0.
+    let mut hidden: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for (&id, b) in drawables.block_styles.iter() {
+        if b.opacity == 0.0 {
+            hidden.insert(id);
+            hidden.extend(b.opacity_descendants.iter().copied());
+            hidden.extend(b.clip_descendants.iter().copied());
+        }
+    }
+    for (&id, para) in drawables.paragraphs.iter() {
+        if para.opacity == 0.0 {
+            hidden.insert(id);
+        }
+        for item in para.lines.iter().flat_map(|l| l.items.iter()) {
+            if let LineItem::InlineBox(ib) = item
+                && ib.opacity == 0.0
+                && let Some(box_id) = ib.node_id
+            {
+                hidden.insert(box_id);
+                if let Some(d) = drawables.inline_box_subtree_descendants.get(&box_id) {
+                    hidden.extend(d.iter().copied());
+                }
+            }
+        }
+    }
+    let planned = |id: usize| {
+        geometry
+            .get(&id)
+            .filter(|g| !g.fragments.is_empty())
+            .filter(|_| !drawables.paragraph_slices.contains_key(&id) && !hidden.contains(&id))
+    };
+    let mut out = Vec::new();
+    for (&id, para) in drawables.paragraphs.iter() {
+        if !para.visible || para.lines.is_empty() {
+            continue;
+        }
+        let Some(geom) = planned(id) else { continue };
+        let expected = expected_painted_lines(para, geom);
+        let missing = unpainted_line_count(id, expected);
+        if missing > 0 {
+            out.push(format!(
+                "{missing} of {expected} lines of paragraph \"{}\" are painted on no page and are not printed",
+                paragraph_start(&para.lines)
+            ));
+        }
+    }
+    let painted_boxes = PAINTED_BOXES.with(|m| m.borrow().clone());
+    for &id in drawables.inline_box_subtree_descendants.keys() {
+        if painted_boxes.contains(&id) || planned(id).is_none() {
+            continue;
+        }
+        // Its carrier paints it: a carrier that is not visible, is not planned or hides a tail does not (see above).
+        let Some(carrier) = drawables
+            .inline_box_carrier
+            .get(&id)
+            .and_then(|c| drawables.paragraphs.get(c).map(|p| (*c, p)))
+        else {
+            continue;
+        };
+        let (carrier_id, carrier_para) = carrier;
+        let Some(carrier_geom) = planned(carrier_id) else {
+            continue;
+        };
+        if !carrier_para.visible
+            || expected_painted_lines(carrier_para, carrier_geom) < carrier_para.lines.len()
+        {
+            continue;
+        }
+        let name = std::iter::once(&id)
+            .chain(
+                drawables
+                    .inline_box_subtree_descendants
+                    .get(&id)
+                    .map_or(&[][..], Vec::as_slice),
+            )
+            .find_map(|n| drawables.paragraphs.get(n))
+            .map(|p| paragraph_start(&p.lines))
+            .unwrap_or_default();
+        out.push(format!(
+            "an inline box \"{name}\" is painted on no page and is not printed"
+        ));
+    }
+    out
+}
+
+/// Warns about what [`unpainted_report`] found (html-to-pdf F213d), in node-id order, at most `MAX_UNPAINTED_WARNINGS`.
+/// Warnings only: strict mode has no switch for pagination losses (the F111 bottom-edge warning is a warning too).
+fn report_unpainted(
+    geometry: &crate::pagination_layout::PaginationGeometryTable,
+    drawables: &Drawables,
+) {
+    let found = unpainted_report(geometry, drawables);
+    for m in found.iter().take(MAX_UNPAINTED_WARNINGS) {
+        log::warn!("{m}");
+    }
+    if found.len() > MAX_UNPAINTED_WARNINGS {
+        log::warn!(
+            "{} more paragraphs or inline boxes are painted on no page",
+            found.len() - MAX_UNPAINTED_WARNINGS
+        );
+    }
+}
+
 /// The inline boxes carried by the paragraphs of the inline box `ib_id` and of its descendants: the boxes nested in
 /// it. They are not in its descendant list (their own subtrees are recorded under their own keys), and the carrier
 /// that would paint their first fragment has no line on a continuation page.
@@ -1494,6 +1675,7 @@ fn paint_inline_box_continuation(
             }
         },
     );
+    note_inline_box_painted(ib_id);
     // The boxes nested in this one: their carrier is a descendant that has no line on this page.
     for nested in nested_inline_boxes(ib_id, drawables) {
         paint_inline_box_continuation(
@@ -1842,6 +2024,7 @@ pub(crate) fn dispatch_fragment(
             };
             draw_block_with_inner_content(
                 canvas,
+                node_id,
                 block,
                 para_for_block,
                 img_for_block,
@@ -1945,6 +2128,7 @@ fn draw_paragraph_dispatch(
     };
     draw_paragraph_v2(
         canvas,
+        node_id,
         para,
         x_pt,
         y_pt,
@@ -2801,6 +2985,7 @@ fn draw_under_clip(
             };
             draw_paragraph_inner_paint(
                 canvas,
+                node_id,
                 p,
                 inner_x,
                 inner_y,
@@ -3235,6 +3420,7 @@ fn draw_under_opacity(
                 };
                 draw_paragraph_inner_paint(
                     canvas,
+                    node_id,
                     p,
                     inner_x,
                     inner_y,
@@ -4578,6 +4764,7 @@ fn draw_under_clip_table(
 #[allow(clippy::too_many_arguments)]
 fn draw_block_with_inner_content(
     canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
+    node_id: usize,
     block: &crate::drawables::BlockEntry,
     paragraph: Option<&crate::drawables::ParagraphEntry>,
     image: Option<&crate::drawables::ImageEntry>,
@@ -4613,6 +4800,7 @@ fn draw_block_with_inner_content(
         if let Some(p) = paragraph {
             draw_paragraph_inner_paint(
                 canvas,
+                node_id,
                 p,
                 inner_x,
                 inner_y,
@@ -4702,6 +4890,7 @@ fn draw_list_item_with_block(
             };
             draw_paragraph_inner_paint(
                 canvas,
+                node_id,
                 p,
                 inner_x,
                 inner_y,
@@ -4806,6 +4995,7 @@ fn draw_list_item_marker_tagged(
 #[allow(clippy::too_many_arguments)]
 fn draw_paragraph_v2(
     canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
+    node_id: usize,
     entry: &crate::drawables::ParagraphEntry,
     x: f32,
     y: f32,
@@ -4822,6 +5012,7 @@ fn draw_paragraph_v2(
     draw_with_opacity(canvas, entry.opacity, |canvas| {
         draw_paragraph_inner_paint(
             canvas,
+            node_id,
             entry,
             x,
             y,
@@ -4845,6 +5036,7 @@ fn draw_paragraph_v2(
 #[allow(clippy::too_many_arguments)]
 fn draw_paragraph_inner_paint(
     canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
+    node_id: usize,
     entry: &crate::drawables::ParagraphEntry,
     x: f32,
     y: f32,
@@ -4860,11 +5052,14 @@ fn draw_paragraph_inner_paint(
     if !entry.visible {
         return;
     }
-    let Some(slice) =
-        paragraph_lines_for_page(&entry.lines, fragments, line_slices, page_index, is_split)
+    let Some((range, rebase)) =
+        paragraph_line_range_for_page(&entry.lines, fragments, line_slices, page_index, is_split)
     else {
         return;
     };
+    // html-to-pdf F213d: the ledger of what was painted, checked after the last page (`report_unpainted`).
+    note_lines_painted(node_id, range.clone());
+    let slice = rebase_lines(&entry.lines[range], rebase);
     // PR 8g: build an InlineBoxRenderCtx so `draw_shaped_lines` can
     // dispatch any `LineItem::InlineBox` content through
     // `dispatch_inline_box_content` under a translate transform that
@@ -4902,6 +5097,7 @@ fn draw_paragraph_inner_paint(
 /// whole line is skipped or painted twice after a few dozen pages. Only
 /// fragments from some other emitter (no or non-matching slices) are still
 /// measured that way, with a warning.
+#[cfg(test)]
 fn paragraph_lines_for_page(
     all_lines: &[crate::paragraph::ShapedLine],
     fragments: &[crate::pagination_layout::Fragment],
@@ -4909,10 +5105,27 @@ fn paragraph_lines_for_page(
     page_index: u32,
     is_split: bool,
 ) -> Option<Vec<crate::paragraph::ShapedLine>> {
+    let (range, by) =
+        paragraph_line_range_for_page(all_lines, fragments, line_slices, page_index, is_split)?;
+    Some(rebase_lines(&all_lines[range], by))
+}
+
+/// The lines of a paragraph that page `page_index` paints, as a range of `all_lines`, and the offset to move them up
+/// by ([`rebase_lines`]; zero for a paragraph that is not split). `None` when the page paints none of them.
+///
+/// [`paragraph_lines_for_page`] is this plus the copy; the renderer calls this one so that it can record the range
+/// in the ledger of what was painted (html-to-pdf F213d, [`report_unpainted`]).
+fn paragraph_line_range_for_page(
+    all_lines: &[crate::paragraph::ShapedLine],
+    fragments: &[crate::pagination_layout::Fragment],
+    line_slices: &[crate::pagination_layout::LineSlice],
+    page_index: u32,
+    is_split: bool,
+) -> Option<(std::ops::Range<usize>, crate::units::Pt)> {
     let target_pos = fragments.iter().position(|f| f.page_index == page_index)?;
 
     if !is_split {
-        return Some(all_lines.to_vec());
+        return Some((0..all_lines.len(), crate::units::Pt::ZERO));
     }
 
     // The slices describe these lines: one per fragment, ending at the last line. F30f-b: a clip box that hides the
@@ -4927,7 +5140,7 @@ fn paragraph_lines_for_page(
         if first >= end || end > all_lines.len() {
             return None;
         }
-        return Some(rebase_lines(&all_lines[first..end], slice.offset.in_pt()));
+        return Some((first..end, slice.offset.in_pt()));
     }
 
     let target_h = fragments[target_pos].height.in_pt();
@@ -4980,7 +5193,7 @@ fn paragraph_lines_for_page(
         );
     }
 
-    Some(rebase_lines(&all_lines[start_idx..end_idx], consumed))
+    Some((start_idx..end_idx, consumed))
 }
 
 /// Whether a page whose lines `[start, end)` were measured from fragment heights holds only some of a paragraph of
@@ -7305,6 +7518,221 @@ mod tests {
             ));
         });
         check_continuations_painted(1, &geometry, &d);
+    }
+
+    #[test]
+    fn paragraph_line_range_for_page_matches_paragraph_lines_for_page() {
+        // The renderer paints the range and records it; the copy of `paragraph_lines_for_page` is the same lines.
+        let lines: Vec<_> = (0..5)
+            .map(|i| make_line(12.0, 9.0 + 12.0 * i as f32))
+            .collect();
+        let fragments = [
+            make_fragment(0, 32.0),
+            make_fragment(1, 32.0),
+            make_fragment(2, 8.0),
+        ];
+        let slices = [slice(0, 2), slice(2, 4), slice(4, 5)];
+        for (name, frs, sl, split, page) in [
+            ("not split", &fragments[..1], &[][..], false, 0),
+            ("slices, first page", &fragments[..], &slices[..], true, 0),
+            ("slices, middle page", &fragments[..], &slices[..], true, 1),
+            ("slices, last page", &fragments[..], &slices[..], true, 2),
+            (
+                "slices, a page without a fragment",
+                &fragments[..],
+                &slices[..],
+                true,
+                7,
+            ),
+            ("measured", &fragments[..], &[][..], true, 1),
+        ] {
+            let (range, by) = match paragraph_line_range_for_page(&lines, frs, sl, page, split) {
+                Some(x) => x,
+                None => {
+                    assert!(
+                        paragraph_lines_for_page(&lines, frs, sl, page, split).is_none(),
+                        "{name}"
+                    );
+                    continue;
+                }
+            };
+            let copy = paragraph_lines_for_page(&lines, frs, sl, page, split).expect(name);
+            assert_eq!(copy.len(), range.len(), "{name}");
+            for (c, l) in copy.iter().zip(rebase_lines(&lines[range.clone()], by)) {
+                assert_eq!(c.baseline, l.baseline, "{name}");
+            }
+            if !split {
+                assert_eq!(range, 0..lines.len(), "{name}: every line");
+                assert_eq!(by, crate::units::Pt::ZERO, "{name}: not moved");
+            }
+        }
+    }
+
+    #[test]
+    fn a_split_carrier_without_slices_is_reported() {
+        // F30f cause 6 / F213d H2: a carrier of one line with two fragments and no line slices. The line is taller than
+        // every fragment, so measuring gives it to no page: the ledger has no entry for it and the report names it.
+        let lines = vec![make_line(120.0, 90.0)];
+        let mut d = Drawables::new();
+        d.paragraphs.insert(5, make_para(lines.clone()));
+        let mut geometry = crate::pagination_layout::PaginationGeometryTable::new();
+        geometry.insert(
+            5,
+            crate::pagination_layout::PaginationGeometry {
+                fragments: vec![make_fragment(0, 16.0), make_fragment(1, 16.0)],
+                ..Default::default()
+            },
+        );
+        reset_painted_ledger();
+        let g = &geometry[&5];
+        for page in 0..2 {
+            if let Some((range, _)) = paragraph_line_range_for_page(
+                &lines,
+                &g.fragments,
+                &g.line_slices,
+                page,
+                g.is_split(),
+            ) {
+                note_lines_painted(5, range);
+            }
+        }
+        let found = unpainted_report(&geometry, &d);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("1 of 1 lines") && found[0].contains("painted on no page"),
+            "{found:?}"
+        );
+        // Painted on page 1: nothing to report. A repeat on another page does not matter.
+        note_lines_painted(5, 0..1);
+        note_lines_painted(5, 0..1);
+        assert!(unpainted_report(&geometry, &d).is_empty());
+        reset_painted_ledger();
+    }
+
+    #[test]
+    fn the_unpainted_report_leaves_out_what_is_not_painted_by_design() {
+        let lines = vec![
+            make_line(12.0, 9.0),
+            make_line(12.0, 21.0),
+            make_line(12.0, 33.0),
+        ];
+        let mut d = Drawables::new();
+        d.paragraphs.insert(1, make_hidden_para(lines.clone()));
+        let mut zero = make_para(lines.clone());
+        zero.opacity = 0.0;
+        d.paragraphs.insert(2, zero);
+        d.paragraphs.insert(3, make_para(lines.clone())); // no geometry: a running element
+        d.paragraphs.insert(4, make_para(lines.clone())); // the hidden tail of a clip box
+        let mut geometry = crate::pagination_layout::PaginationGeometryTable::new();
+        for id in [1, 2] {
+            geometry.insert(id, geometry_over_pages(&[0]));
+        }
+        geometry.insert(
+            4,
+            crate::pagination_layout::PaginationGeometry {
+                fragments: vec![make_fragment(0, 24.0), make_fragment(1, 8.0)],
+                line_slices: vec![slice(0, 1), slice(1, 2), slice(2, 3)],
+                ..Default::default()
+            },
+        );
+        reset_painted_ledger();
+        note_lines_painted(4, 0..1);
+        note_lines_painted(4, 1..2);
+        assert!(
+            unpainted_report(&geometry, &d).is_empty(),
+            "{:?}",
+            unpainted_report(&geometry, &d)
+        );
+        reset_painted_ledger();
+    }
+
+    #[test]
+    fn an_unpainted_inline_box_is_reported_once_painted_it_is_not() {
+        let mut d = Drawables::new();
+        d.paragraphs
+            .insert(1, make_para(vec![make_line(16.0, 12.0)]));
+        d.inline_box_subtree_descendants.insert(7, vec![]);
+        d.inline_box_carrier.insert(7, 1);
+        let mut geometry = crate::pagination_layout::PaginationGeometryTable::new();
+        geometry.insert(1, geometry_over_pages(&[0]));
+        geometry.insert(7, geometry_over_pages(&[0]));
+        reset_painted_ledger();
+        note_lines_painted(1, 0..1);
+        let found = unpainted_report(&geometry, &d);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("an inline box"), "{found:?}");
+        note_inline_box_painted(7);
+        assert!(unpainted_report(&geometry, &d).is_empty());
+        reset_painted_ledger();
+    }
+
+    #[test]
+    fn an_inline_box_painted_below_the_edge_extends_the_paint_extent() {
+        // F213d (a): the box's content is painted under a translate, where the paint extent records nothing, so a box
+        // below the page edge was silent. A box of 300 px (225 pt) whose line is at y = 700 pt on a page of 200 pt (the
+        // scratch canvas) is painted down to about 925 pt: the extent says so.
+        let mut d = Drawables::new();
+        d.block_styles.insert(
+            7,
+            crate::drawables::BlockEntry {
+                style: crate::draw_primitives::BlockStyle::default(),
+                opacity: 1.0,
+                visible: true,
+                id: None,
+                layout_size: None,
+                clip_descendants: vec![],
+                opacity_descendants: vec![],
+            },
+        );
+        d.inline_box_subtree_skip.insert(7);
+        d.inline_box_subtree_descendants.insert(7, vec![]);
+        let mut geometry = crate::pagination_layout::PaginationGeometryTable::new();
+        geometry.insert(
+            7,
+            crate::pagination_layout::PaginationGeometry {
+                fragments: vec![make_fragment(0, 300.0)],
+                ..Default::default()
+            },
+        );
+        let line = make_shaped_line(vec![crate::paragraph::LineItem::InlineBox(
+            crate::paragraph::InlineBoxItem {
+                node_id: Some(7),
+                width: 112.5_f32.as_pt(),
+                height: 225.0_f32.as_pt(),
+                x_offset: crate::units::Pt::ZERO,
+                computed_y: crate::units::Pt::ZERO,
+                link: None,
+                opacity: 1.0,
+                visible: true,
+            },
+        )]);
+        reset_painted_ledger();
+        let bottom = with_scratch_canvas(|canvas| {
+            let ctx = crate::paragraph::InlineBoxRenderCtx {
+                drawables: &d,
+                geometry: &geometry,
+                page_index: 0,
+                margin_left_pt: 0.0,
+                margin_top_pt: 0.0,
+            };
+            crate::paragraph::draw_shaped_lines(
+                canvas,
+                &[line],
+                0.0_f32.as_pt(),
+                700.0_f32.as_pt(),
+                Some(ctx),
+            );
+            canvas.paint_extent.bottom()
+        });
+        assert!(
+            (900.0..=950.0).contains(&bottom),
+            "painted down to {bottom} pt, the box ends near 925 pt"
+        );
+        assert!(
+            PAINTED_BOXES.with(|m| m.borrow().contains(&7)),
+            "the box is in the ledger"
+        );
+        reset_painted_ledger();
     }
 
     #[test]
