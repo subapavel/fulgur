@@ -8620,15 +8620,26 @@ fn monolithic_line_carrier(doc: &BaseDocument, node: &blitz_dom::Node, fresh: f3
 /// html-to-pdf F213d: the block-axis padding and border of every ancestor of `node`, the room a page loses to them when
 /// `node` is the only thing in its wrappers (a card's frame, a cell's padding). The sum counts both ends, so it
 /// never promises more room than the placement has; a box that would fit only without it keeps the F30f split.
+///
+/// Review round 2 (HIGH-1b): and the margins above the box, the carrier's own and every ancestor's top margin. On the first
+/// page a margin that collapses through the body is the body offset: the page's strip is that much smaller, and a box that
+/// fills a page cannot be moved off the first page (a blank page would come first), so it is placed whole at the top and its
+/// last lines are painted below the edge (`ul > li`, `blockquote > p`, a `div` or a paragraph with a top margin). On a later
+/// page the margins are kept too (the moved unit starts below them in this engine). Summing them rather than collapsing them
+/// again can only ask for more room than the unit takes; that keeps the F30f split, which prints every line.
 fn ancestor_insets(doc: &BaseDocument, node: &blitz_dom::Node) -> f32 {
-    let mut sum = 0.0;
+    let mut sum = node.final_layout.margin.top.max(0.0);
     let mut current = node.layout_parent.get();
     for _ in 0..crate::MAX_DOM_DEPTH {
         let Some(parent) = current.and_then(|id| doc.get_node(id)) else {
             break;
         };
         let l = &parent.final_layout;
-        sum += l.border.top + l.border.bottom + l.padding.top + l.padding.bottom;
+        sum += l.border.top
+            + l.border.bottom
+            + l.padding.top
+            + l.padding.bottom
+            + l.margin.top.max(0.0);
         current = parent.layout_parent.get();
     }
     sum
@@ -19694,6 +19705,61 @@ h2 { string-set: chapter-title content(text); }
         );
         let ib = fragments_of(&doc, &table, "ib");
         assert!(ib.len() >= 2, "the box is split: {ib:?}");
+    }
+
+    #[test]
+    fn an_alone_box_behind_a_margined_ancestor_at_the_page_top_keeps_the_f30f_split() {
+        // F213d review round 2 (HIGH-1b): an auto-height box one pixel under the page height, first on the page, behind
+        // `ul > li`, `blockquote > p`, a `div` with a margin or a paragraph with `margin-top`. The first page's strip is
+        // smaller by the margin that collapses through the body, and a box that fills a page cannot be moved off the first page
+        // (a blank page would come first): it was placed whole at the top and its last lines were painted below the edge. The
+        // F30f split prints every line. The box is eight blocks of 22 px and one of 21 px (199 px outer with its border), so
+        // its last blocks end below 184 px.
+        let lines: String = (1..=9)
+            .map(|i| {
+                let h = if i == 9 { 21 } else { 22 };
+                format!("<span style=\"display:block;height:{h}px\">L{i}</span>")
+            })
+            .collect();
+        let ib = format!(
+            "<span id=\"ib\" style=\"display:inline-block;width:150px;border:1px solid #000\">{lines}</span>"
+        );
+        let wrappers = [
+            (
+                "ul > li",
+                format!(
+                    "<ul style=\"margin:16px 0;padding:0;list-style:none\"><li><p id=\"p\">{ib}</p></li></ul>"
+                ),
+            ),
+            (
+                "blockquote > p",
+                format!("<blockquote style=\"margin:16px 0\"><p id=\"p\">{ib}</p></blockquote>"),
+            ),
+            (
+                "div with a margin",
+                format!("<div style=\"margin:16px 0\"><p id=\"p\">{ib}</p></div>"),
+            ),
+            (
+                "p with margin-top",
+                format!("<p id=\"p\" style=\"margin-top:24px\">{ib}</p>"),
+            ),
+        ];
+        for (name, markup) in wrappers {
+            let (doc, table) = nested_geometry(&format!("{markup}<p id=\"a\">AFTER</p>"), 200.0);
+            let ib = fragments_of(&doc, &table, "ib");
+            assert!(
+                ib.len() >= 2,
+                "{name}: the box is 1 px under the page and starts 16 to 24 px down: it is split between its lines: {ib:?}"
+            );
+        }
+        // Guard: with no margin the same box fits the page and is placed whole at its top.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<ul style=\"margin:0;padding:0;list-style:none\"><li><p id=\"p\">{ib}</p></li></ul><p id=\"a\">AFTER</p>"
+            ),
+            200.0,
+        );
+        assert_whole_on(&doc, &table, "ib", 0);
     }
 
     #[test]
