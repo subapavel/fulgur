@@ -8667,6 +8667,14 @@ fn monolithic_line_carrier(doc: &BaseDocument, node: &blitz_dom::Node, fresh: f3
 /// last lines are painted below the edge (`ul > li`, `blockquote > p`, a `div` or a paragraph with a top margin). On a later
 /// page the margins are kept too (the moved unit starts below them in this engine). Summing them rather than collapsing them
 /// again can only ask for more room than the unit takes; that keeps the F30f split, which prints every line.
+///
+/// html-to-pdf F213e amends it: the top margin, border and padding of `<html>` and `<body>` are not counted. They are page
+/// 0's offset (`first_offset`: the body's frame is sliced, and nothing of it repeats above the content on a later page), and a
+/// box that does not fit page 0 for it is moved to a fresh page by the first-box rule ([`PageStrips::first_box_overflows`]),
+/// as Chrome does (a monolithic box that fits a fresh page leaves page 1 empty). Counting the offset made an alone
+/// `inline-block` of 843 px under `body { margin-top: 70mm }` "not fit its page", so it kept the F30f split and hung. Their
+/// bottom border and padding stay in the sum. The margins and insets of every other ancestor and the carrier's own margin
+/// are counted as before: they are still above the moved unit on the page it moves to (a card's frame, a list's margin).
 fn ancestor_insets(doc: &BaseDocument, node: &blitz_dom::Node) -> f32 {
     let mut sum = node.final_layout.margin.top.max(0.0);
     let mut current = node.layout_parent.get();
@@ -8675,11 +8683,13 @@ fn ancestor_insets(doc: &BaseDocument, node: &blitz_dom::Node) -> f32 {
             break;
         };
         let l = &parent.final_layout;
-        sum += l.border.top
-            + l.border.bottom
-            + l.padding.top
-            + l.padding.bottom
-            + l.margin.top.max(0.0);
+        let page_offset = parent
+            .element_data()
+            .is_some_and(|e| matches!(e.name.local.as_ref(), "html" | "body"));
+        sum += l.border.bottom + l.padding.bottom;
+        if !page_offset {
+            sum += l.border.top + l.padding.top + l.margin.top.max(0.0);
+        }
         current = parent.layout_parent.get();
     }
     sum
@@ -19834,6 +19844,32 @@ h2 { string-set: chapter-title content(text); }
         );
         let ib = fragments_of(&doc, &table, "ib");
         assert!(ib.len() >= 2, "the box is split: {ib:?}");
+    }
+
+    #[test]
+    fn an_alone_box_under_a_body_offset_moves_whole_to_the_next_page() {
+        // html-to-pdf F213e: an inline-block alone on its line (a block child, 172 px with its border) as the first block of
+        // the body, under an offset of 40 px on 200 px pages: 160 px are left on page 0 and a fresh page holds it. The
+        // offset is page 0's, so `ancestor_insets` must not count it (172 + 40 > 200 made the box "not fit its page", it kept
+        // the F30f split and hung below the content box). Chrome moves it whole; the body's own margin and `html` padding are
+        // the same, and so is body padding (it is not repeated on page 1).
+        let ib = "<p><span id=\"ib\" style=\"display:inline-block;width:50px;height:170px;border:1px solid #000\">\
+                  <span style=\"display:block\">a</span></span></p><p id=\"a\">AFTER</p>";
+        for (name, css) in [
+            ("body margin", "body{margin:40px 0 0}"),
+            ("html padding", "html{padding-top:40px}"),
+            ("body padding", "body{margin:0;padding-top:40px}"),
+            ("body border", "body{margin:0;border-top:40px solid #ccc}"),
+        ] {
+            let (doc, table) = offset_geometry(css, ib, 200.0);
+            let f = fragments_of(&doc, &table, "ib");
+            assert_eq!(f.len(), 1, "{name}: moved whole, not split: {f:?}");
+            assert_eq!(f[0].page_index, 1, "{name}: {f:?}");
+            assert!(f[0].y.to_f32() < 5.0, "{name}: at the top of page 1: {f:?}");
+        }
+        // Without an offset the box fits page 0 where it is.
+        let (doc, table) = offset_geometry("body{margin:0}", ib, 200.0);
+        assert_eq!(fragments_of(&doc, &table, "ib")[0].page_index, 0);
     }
 
     #[test]
