@@ -846,6 +846,9 @@ fn fill_multicol_columns(
 /// F198: a box of `boxes` (keyed by node, whether a [`FlowItem::Block`](crate::multicol_layout::FlowItem::Block)
 /// or the source of a [`FlowItem::Lines`](crate::multicol_layout::FlowItem::Lines)) is expanded into the lines and
 /// leaf boxes it holds, each tied to the frames around it. An empty `boxes` reproduces the plans of before.
+/// The fragmenter calls [`plan_multicol_pages_checked`] (html-to-pdf F198j-f); this is the plan without its `lost` flag, which the
+/// unit tests of the planner use.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_multicol_pages(
     flow: &[crate::multicol_layout::FlowItem],
@@ -861,6 +864,15 @@ pub(crate) fn plan_multicol_pages(
         flow, n, first_room, page_room, fill, last_inset, tables, boxes,
     )
     .0
+}
+
+/// Whether `flow` holds `node`: a `Block` of that node or a `Lines` run whose source it is (html-to-pdf F198j-f).
+fn flow_holds(flow: &[crate::multicol_layout::FlowItem], node: usize) -> bool {
+    use crate::multicol_layout::FlowItem;
+    flow.iter().any(|item| match item {
+        FlowItem::Block { node: n, .. } => *n == node,
+        FlowItem::Lines { source, .. } => *source == node,
+    })
 }
 
 /// [`plan_multicol_pages`] and whether a relative offset paints something outside the sheet in the plan
@@ -1045,10 +1057,12 @@ struct McContainer<'a> {
     /// F198: the boxes of the flows that are taller than a page and are cut between their lines, by node ([`mc_box`]).
     boxes: BTreeMap<usize, McBox>,
     /// html-to-pdf F198j: of a box in `boxes` that holds a relative offset, the box as main described it: the offsets in the
-    /// flow, where Taffy put them (`None`: it was left whole). The fragmenter plans with it when painting the offsets
-    /// would put a line outside the sheet, where it is lost ([`McFill::lost`]): main printed every word of such a box,
-    /// 7 to 20 pt off Chrome's.
-    baked: BTreeMap<usize, Option<McBox>>,
+    /// flow, where Taffy put them. The fragmenter plans with it when painting the offsets would put a line outside the sheet,
+    /// where it is lost ([`McFill::lost`]): main printed every word of such a box, 7 to 20 pt off Chrome's. F198j-f: only the
+    /// boxes main described have an entry. A box main refused (the first child above it, a sibling above the line before it) has
+    /// none and keeps its painted plan; it used to be removed from `boxes` and placed whole, losing everything below the first
+    /// page edge.
+    baked: BTreeMap<usize, McBox>,
 }
 
 impl McContainer<'_> {
@@ -1166,7 +1180,7 @@ fn multicol_container<'a>(
     }
     // F198: the boxes taller than a page among the boxes of the flows, which are cut between their lines.
     let mut boxes: BTreeMap<usize, McBox> = BTreeMap::new();
-    let mut baked: BTreeMap<usize, Option<McBox>> = BTreeMap::new();
+    let mut baked: BTreeMap<usize, McBox> = BTreeMap::new();
     for group in &geometry.groups {
         for item in &group.flow {
             match item {
@@ -1175,7 +1189,9 @@ fn multicol_container<'a>(
                 {
                     if let Some(b) = mc_box(doc, *node, column_styles, fresh) {
                         if b.slack != [0.0, 0.0] {
-                            baked.insert(*node, mc_box_baked(doc, *node, column_styles, fresh));
+                            if let Some(a) = mc_box_baked(doc, *node, column_styles, fresh) {
+                                baked.insert(*node, a);
+                            }
                         }
                         boxes.insert(*node, b);
                     }
@@ -1187,7 +1203,9 @@ fn multicol_container<'a>(
                 {
                     if let Some(b) = mc_box(doc, *source, column_styles, fresh) {
                         if b.slack != [0.0, 0.0] {
-                            baked.insert(*source, mc_box_baked(doc, *source, column_styles, fresh));
+                            if let Some(a) = mc_box_baked(doc, *source, column_styles, fresh) {
+                                baked.insert(*source, a);
+                            }
                         }
                         boxes.insert(*source, b);
                     }
@@ -2113,7 +2131,7 @@ fn fragment_multicol_container(
                 };
                 let plan_room = (strips.bottom(frag.page) - frag.cursor()).max(0.0);
                 let plan_inset = if last { c.bottom_inset } else { 0.0 };
-                let (mut plan, lost) = plan_multicol_pages_checked(
+                let (mut plan, mut lost) = plan_multicol_pages_checked(
                     &group.flow,
                     group.n,
                     plan_room,
@@ -2124,35 +2142,42 @@ fn fragment_multicol_container(
                     &c.boxes,
                 );
                 // html-to-pdf F198j: a relative offset that would paint a line off the sheet loses its words: plan the boxes
-                // that hold one as main did, with the offsets in the flow (or whole, as main did when it refused them).
+                // of this group that main described with the offsets in the flow, as main did. F198j-f: box by box. A box main
+                // refused keeps its painted pieces (it loses the lines whose shift leaves the sheet, as before the fallback
+                // existed), instead of being placed whole.
                 let mut baked_boxes: Option<BTreeMap<usize, McBox>> = None;
-                if lost && !c.baked.is_empty() {
+                if lost {
                     let mut alt = c.boxes.clone();
+                    let mut swapped = false;
                     for (node, b) in &c.baked {
-                        match b {
-                            Some(b) => {
-                                alt.insert(*node, b.clone());
-                            }
-                            None => {
-                                alt.remove(node);
-                            }
+                        if flow_holds(&group.flow, *node) {
+                            alt.insert(*node, b.clone());
+                            swapped = true;
                         }
                     }
-                    log::warn!(
-                        "pagination: a relative offset inside a multi-column container would paint a line outside the page; \
-                         the offset is part of the flow there"
-                    );
-                    plan = plan_multicol_pages(
-                        &group.flow,
-                        group.n,
-                        plan_room,
-                        strips.fresh(),
-                        fill,
-                        plan_inset,
-                        &c.tables,
-                        &alt,
-                    );
-                    baked_boxes = Some(alt);
+                    if swapped {
+                        log::warn!(
+                            "pagination: a relative offset inside a multi-column container would paint a line outside the page; \
+                             the offset is part of the flow there"
+                        );
+                        (plan, lost) = plan_multicol_pages_checked(
+                            &group.flow,
+                            group.n,
+                            plan_room,
+                            strips.fresh(),
+                            fill,
+                            plan_inset,
+                            &c.tables,
+                            &alt,
+                        );
+                        baked_boxes = Some(alt);
+                    }
+                    if lost {
+                        log::warn!(
+                            "pagination: a relative offset inside a multi-column container paints a line past the edge of the page; \
+                             what is outside the page is cut or not printed"
+                        );
+                    }
                 }
                 let boxes_used = baked_boxes.as_ref().unwrap_or(&c.boxes);
                 let plan_len = plan.len();
@@ -22031,6 +22056,48 @@ h2 { string-set: chapter-title content(text); }
         assert!(shifted(-100.0), "above the top margin");
         assert!(!shifted(20.0));
         assert!(!shifted(0.0));
+    }
+
+    #[test]
+    fn multicol_container_keeps_an_in_flow_plan_only_for_a_box_it_can_cut() {
+        // html-to-pdf F198j-f. A 2-column container with a card of 25 paragraphs, on 300 px pages (the card is taller). The
+        // card holds a relative offset, so it has a painted description (`boxes`); the fallback of the sheet edge needs the
+        // other one, main's (`baked`), and only where `mc_box_baked` can give it. The shapes it refuses (the first child
+        // above its box, a sibling above the previous line) have no entry: the fragmenter must keep their painted plan
+        // instead of removing the box and placing it whole.
+        let has_entry = |style: &str, every: usize| -> bool {
+            let paragraphs: String = (0..25)
+                .map(|i| {
+                    let shift = if i % every == every / 2 { style } else { "" };
+                    format!("<p style=\"padding:4px 12px;{shift}\">{}</p>", text(100))
+                })
+                .collect();
+            let html = format!(
+                "<!doctype html><html><head><style>body{{margin:0;font-size:16px;line-height:20px}}p{{margin:0}}\
+                 .mc{{column-count:2;column-gap:20px}}</style></head><body><div class=\"mc\">\
+                 <div class=\"t\" style=\"border:1px solid #888\">{paragraphs}</div></div></body></html>"
+            );
+            let mut doc = parse(&html, 600.0);
+            let styles = blitz_adapter::extract_column_style_table(&doc);
+            let mc = crate::multicol_layout::run_pass(doc.deref_mut(), &styles);
+            let (mc_id, card) = (node_by_class(&doc, "mc"), node_by_class(&doc, "t"));
+            let container = multicol_container(&doc, Some(&mc), Some(&styles), mc_id, 300.0)
+                .expect("a container the fragmenter enters");
+            assert!(
+                container.boxes.contains_key(&card),
+                "{style}: the card is cut"
+            );
+            container.baked.contains_key(&card)
+        };
+        // 8 px up: the first paragraph is above the card's 1 px border.
+        assert!(!has_entry("position:relative;top:-8px;", 1), "top: -8px");
+        // 8 px down: less than a line, nothing is above the line before it.
+        assert!(has_entry("position:relative;top:8px;", 1), "top: 8px");
+        // 60 px down on every 5th paragraph: the paragraph after it is above its last line.
+        assert!(
+            !has_entry("position:relative;top:60px;", 5),
+            "top: 60px on every 5th"
+        );
     }
 
     #[test]

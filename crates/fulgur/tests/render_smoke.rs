@@ -10255,6 +10255,60 @@ fn render_v2_smoke_multicol_card_with_shifted_children_negative_margins_and_tall
 }
 
 #[test]
+fn render_v2_smoke_multicol_card_with_offsets_main_could_not_cut_keeps_its_shift() {
+    // html-to-pdf F198j-f: the fallback of the sheet edge bakes the offsets into the flow only for a box that has main's
+    // description. These do not (the first paragraph is above the card's border, or a paragraph is above the line before it),
+    // and the card was removed from the cut boxes and placed whole in its column: 2058 to 2316 of 2500 words lost. It keeps its
+    // painted pieces now, and every word is printed.
+    let words = |from: usize, n: usize| -> String {
+        (from..from + n)
+            .map(|i| format!("w{i:04}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for (what, page, style, every) in [
+        // The margin is 0: the first line of each page is painted above the sheet.
+        ("top -8px at margin 0", "size:A4;margin:0", "top:-8px", 1),
+        // A5 with 10 mm margins: 30 pt up is more than the margin.
+        ("top -40px on A5", "size:A5;margin:10mm", "top:-40px", 1),
+        // Every 5th paragraph 45 pt down, more than the 15 mm margin.
+        (
+            "top 60px on every 5th",
+            "size:A4;margin:15mm",
+            "top:60px",
+            5,
+        ),
+    ] {
+        let mut body = String::new();
+        for i in 0..25 {
+            let shift = if i % every == every / 2 {
+                format!("position:relative;{style}")
+            } else {
+                String::new()
+            };
+            body.push_str(&format!(
+                "<p style=\"padding:4px 12px;{shift}\">{}</p>",
+                words(i * 100, 100)
+            ));
+        }
+        let html = format!(
+            "<!doctype html><html><head><style>@page{{{page}}}</style></head><body style=\"margin:0\">\
+             <div style=\"column-count:2;column-gap:20px\"><div style=\"border:1px solid #888\">{body}</div></div>\
+             <p>AFTER</p></body></html>"
+        );
+        let pdf = noto_engine().render(&html).expect("render");
+        let printed = extract_pdf_text(&pdf).expect("pdftotext");
+        let mut got: Vec<&str> = printed
+            .split_whitespace()
+            .filter(|w| w.len() == 5 && w.starts_with('w'))
+            .collect();
+        got.sort_unstable();
+        got.dedup();
+        assert_eq!(got.len(), 2500, "{what}: every word printed");
+    }
+}
+
+#[test]
 fn render_v2_smoke_multicol_card_with_offsets_that_leave_the_sheet_keeps_every_word() {
     // html-to-pdf F198j: every paragraph of a tall card in two columns is `position: relative; top: 100px`. The lines at the
     // bottom of a column are painted 75 pt lower, past the 15 mm margin and off the sheet, where nothing is visible: the offsets
