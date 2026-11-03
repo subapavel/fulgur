@@ -619,6 +619,9 @@ struct McFill {
     height: f32,
     /// Index of the first atom that did not fit.
     next: usize,
+    /// html-to-pdf F198j: an atom with a relative offset is painted outside the sheet (past its bottom or top edge, where
+    /// nothing is visible), so what it holds would be lost ([`PageEdgesScope`]).
+    lost: bool,
 }
 
 /// Slack for the sum of line heights against a column budget (accumulated f32 error).
@@ -668,6 +671,8 @@ fn fill_multicol_columns(
     let mut height = 0.0f32;
     let mut at = start;
     let mut open: Vec<OpenFrame> = Vec::new();
+    let mut lost = false;
+    let [edge_top, edge_bottom] = page_edges();
     // The frames still open in column `col` end here, at `y`, and go on in the next column or page.
     let flush = |columns: &mut Vec<Vec<McPiece>>, open: &mut Vec<OpenFrame>, col: usize, y: f32| {
         for st in open.drain(..) {
@@ -739,6 +744,10 @@ fn fill_multicol_columns(
             shifted(ctx.x, ctx.shift[0]).as_px(),
             shifted(cursor, ctx.shift[1]).as_px(),
         );
+        if ctx.shift[1] != 0.0 {
+            let top = shifted(cursor, ctx.shift[1]);
+            lost |= top + h > head_limit + edge_bottom + MC_EPS || top < -edge_top - MC_EPS;
+        }
         let mut band = 0.0f32;
         if let McAtom::Row { table, .. } = &atoms[at]
             && columns[col].is_empty()
@@ -816,6 +825,7 @@ fn fill_multicol_columns(
         columns,
         height,
         next: at,
+        lost,
     }
 }
 
@@ -847,6 +857,26 @@ pub(crate) fn plan_multicol_pages(
     tables: &BTreeMap<usize, McTable>,
     boxes: &BTreeMap<usize, McBox>,
 ) -> Vec<McPage> {
+    plan_multicol_pages_checked(
+        flow, n, first_room, page_room, fill, last_inset, tables, boxes,
+    )
+    .0
+}
+
+/// [`plan_multicol_pages`] and whether a relative offset paints something outside the sheet in the plan
+/// ([`McFill::lost`]); the fragmenter then plans the boxes again with their offsets in the flow
+/// ([`McContainer::baked`]).
+#[allow(clippy::too_many_arguments)]
+fn plan_multicol_pages_checked(
+    flow: &[crate::multicol_layout::FlowItem],
+    n: u32,
+    first_room: f32,
+    page_room: f32,
+    fill: crate::column_css::ColumnFill,
+    last_inset: f32,
+    tables: &BTreeMap<usize, McTable>,
+    boxes: &BTreeMap<usize, McBox>,
+) -> (Vec<McPage>, bool) {
     use crate::multicol_layout::FlowItem;
     let n = n.max(1) as usize;
     let mut flat = McFlat::default();
@@ -896,6 +926,7 @@ pub(crate) fn plan_multicol_pages(
     }
     let McFlat { atoms, frames, .. } = flat;
     let mut pages: Vec<McPage> = Vec::new();
+    let mut lost = false;
     let mut at = 0usize;
     while at < atoms.len() {
         let fresh_page = !pages.is_empty() || first_room + MC_EPS >= page_room;
@@ -949,13 +980,14 @@ pub(crate) fn plan_multicol_pages(
             }
         };
         at = filled.next;
+        lost |= filled.lost;
         pages.push(McPage {
             height: filled.height.as_px(),
             columns: filled.columns,
             ..McPage::default()
         });
     }
-    pages
+    (pages, lost)
 }
 
 /// The fill of `atoms[start..]` in `n` columns with the smallest budget (at most `room`) in which all of
@@ -1012,6 +1044,11 @@ struct McContainer<'a> {
     tables: BTreeMap<usize, McTable>,
     /// F198: the boxes of the flows that are taller than a page and are cut between their lines, by node ([`mc_box`]).
     boxes: BTreeMap<usize, McBox>,
+    /// html-to-pdf F198j: of a box in `boxes` that holds a relative offset, the box as main described it: the offsets in the
+    /// flow, where Taffy put them (`None`: it was left whole). The fragmenter plans with it when painting the offsets
+    /// would put a line outside the sheet, where it is lost ([`McFill::lost`]): main printed every word of such a box,
+    /// 7 to 20 pt off Chrome's.
+    baked: BTreeMap<usize, Option<McBox>>,
 }
 
 impl McContainer<'_> {
@@ -1129,6 +1166,7 @@ fn multicol_container<'a>(
     }
     // F198: the boxes taller than a page among the boxes of the flows, which are cut between their lines.
     let mut boxes: BTreeMap<usize, McBox> = BTreeMap::new();
+    let mut baked: BTreeMap<usize, Option<McBox>> = BTreeMap::new();
     for group in &geometry.groups {
         for item in &group.flow {
             match item {
@@ -1136,6 +1174,9 @@ fn multicol_container<'a>(
                     if height.to_f32() > fresh + 1.0 && !tables.contains_key(node) =>
                 {
                     if let Some(b) = mc_box(doc, *node, column_styles, fresh) {
+                        if b.slack != [0.0, 0.0] {
+                            baked.insert(*node, mc_box_baked(doc, *node, column_styles, fresh));
+                        }
                         boxes.insert(*node, b);
                     }
                 }
@@ -1145,6 +1186,9 @@ fn multicol_container<'a>(
                         && doc.get_node(*source).is_some_and(mc_has_frame) =>
                 {
                     if let Some(b) = mc_box(doc, *source, column_styles, fresh) {
+                        if b.slack != [0.0, 0.0] {
+                            baked.insert(*source, mc_box_baked(doc, *source, column_styles, fresh));
+                        }
                         boxes.insert(*source, b);
                     }
                 }
@@ -1180,6 +1224,7 @@ fn multicol_container<'a>(
         first_unit,
         tables,
         boxes,
+        baked,
     })
 }
 
@@ -1400,9 +1445,9 @@ fn mc_box_eligible(
 /// shift it added to the child's `final_layout.location`. `left` wins over `-right` against the parent's content-box width,
 /// `top` over `-bottom` against 0 (Taffy resolves the vertical insets of a block child against a zero basis, so a `%`
 /// `top` is 0); `[0, 0]` when every inset is `auto`. Stylo gives the computed insets, a length or a percentage; the other
-/// values (`auto`, anchor functions) count as unset. `stylo_taffy` passes the insets of a `position: static` box too, so
-/// Blitz shifts it like a relative one and so does this (Chrome ignores them there); `sticky` the same. Absolute and fixed
-/// children never get here (`mc_box_at` refuses them).
+/// values (`auto`, anchor functions) count as unset. Zero unless the box is `position: relative`: `stylo_taffy` passes the
+/// insets of a `static` or `sticky` box too, so Blitz shifts those in the layout, which Chrome does not (F198j-c); the
+/// shift stays in the flow there. Absolute and fixed children never get here (`mc_box_at` refuses them).
 fn mc_relative_offset(doc: &BaseDocument, node: &blitz_dom::Node) -> [f32; 2] {
     use ::style::values::computed::Length;
     use ::style::values::generics::position::GenericInset;
@@ -1414,9 +1459,15 @@ fn mc_relative_offset(doc: &BaseDocument, node: &blitz_dom::Node) -> [f32; 2] {
         }
     }
 
+    use ::style::properties::longhands::position::computed_value::T as Pos;
     let Some(styles) = node.primary_styles() else {
         return [0.0, 0.0];
     };
+    // Only `position: relative` is a shift (css-position-3 §3). Blitz moves a `static` or `sticky` box by its insets as
+    // well, which Chrome does not (F198j-c); that stays in the flow, where the layout put it, as before F198j.
+    if !matches!(styles.get_box().clone_position(), Pos::Relative) {
+        return [0.0, 0.0];
+    }
     let pos = styles.get_position();
     let width = node.parent.and_then(|p| doc.get_node(p)).map_or(0.0, |p| {
         let l = &p.final_layout;
@@ -1454,7 +1505,19 @@ fn mc_box(
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
     fresh: f32,
 ) -> Option<McBox> {
-    mc_box_at(doc, node_id, column_styles, fresh, 0)
+    mc_box_at(doc, node_id, column_styles, fresh, 0, false)
+}
+
+/// html-to-pdf F198j: [`mc_box`] with the relative offsets left in the flow, where Taffy put them (every item measured at its
+/// shifted place, nothing painted as a shift): the description F198 and F198b gave, which prints every word of a box
+/// whose offsets would carry a line out of the sheet when they are painted ([`McContainer::baked`]).
+fn mc_box_baked(
+    doc: &BaseDocument,
+    node_id: usize,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    fresh: f32,
+) -> Option<McBox> {
+    mc_box_at(doc, node_id, column_styles, fresh, 0, true)
 }
 
 fn mc_box_at(
@@ -1463,6 +1526,7 @@ fn mc_box_at(
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
     fresh: f32,
     depth: usize,
+    baked: bool,
 ) -> Option<McBox> {
     let node = doc.get_node(node_id)?;
     if depth >= MC_BOX_DEPTH || !mc_box_eligible(doc, node, column_styles, fresh) {
@@ -1517,7 +1581,11 @@ fn mc_box_at(
         // html-to-pdf F198j: the child's static place. Taffy put its relative offset into `final_layout.location`, which
         // moves the child and not the boxes after it (CSS 2.1 §9.4.3), so the gap above it and its `x` are measured without it
         // and the offset is painted as a shift at the piece (`McBoxItem::rel`).
-        let rel = mc_relative_offset(doc, child);
+        let rel = if baked {
+            [0.0, 0.0]
+        } else {
+            mc_relative_offset(doc, child)
+        };
         let cl = &child.final_layout;
         let (cy, ch, cx) = (
             cl.location.y - rel[1],
@@ -1544,20 +1612,33 @@ fn mc_box_at(
         }
         let lead = if lead >= -1.5 { lead.max(0.0) } else { lead };
         let x = if cx >= -0.5 { cx.max(0.0) } else { cx };
-        let described = if mc_box_eligible(doc, child, column_styles, fresh) {
-            if child.flags.is_inline_root() {
-                match mc_line_advances(child) {
-                    Some((advances, inline_boxes)) if !mc_has_frame(child) => {
-                        Some(McBoxItem::Lines {
-                            source: id,
-                            advances,
-                            inline_boxes,
-                            lead,
-                            x,
-                            rel,
-                        })
+        let described =
+            if mc_box_eligible(doc, child, column_styles, fresh) {
+                if child.flags.is_inline_root() {
+                    match mc_line_advances(child) {
+                        Some((advances, inline_boxes)) if !mc_has_frame(child) => {
+                            Some(McBoxItem::Lines {
+                                source: id,
+                                advances,
+                                inline_boxes,
+                                lead,
+                                x,
+                                rel,
+                            })
+                        }
+                        Some(_) => mc_box_at(doc, id, column_styles, fresh, depth + 1, baked).map(
+                            |inner| McBoxItem::Box {
+                                node: id,
+                                inner,
+                                lead,
+                                x,
+                                rel,
+                            },
+                        ),
+                        None => None,
                     }
-                    Some(_) => mc_box_at(doc, id, column_styles, fresh, depth + 1).map(|inner| {
+                } else {
+                    mc_box_at(doc, id, column_styles, fresh, depth + 1, baked).map(|inner| {
                         McBoxItem::Box {
                             node: id,
                             inner,
@@ -1565,21 +1646,11 @@ fn mc_box_at(
                             x,
                             rel,
                         }
-                    }),
-                    None => None,
+                    })
                 }
             } else {
-                mc_box_at(doc, id, column_styles, fresh, depth + 1).map(|inner| McBoxItem::Box {
-                    node: id,
-                    inner,
-                    lead,
-                    x,
-                    rel,
-                })
-            }
-        } else {
-            None
-        };
+                None
+            };
         let item = match described {
             Some(item) => item,
             // Not a box the planner can cut: it goes in whole when it fits a page.
@@ -2040,16 +2111,50 @@ fn fragment_multicol_container(
                 } else {
                     crate::column_css::ColumnFill::Balance
                 };
-                let plan = plan_multicol_pages(
+                let plan_room = (strips.bottom(frag.page) - frag.cursor()).max(0.0);
+                let plan_inset = if last { c.bottom_inset } else { 0.0 };
+                let (mut plan, lost) = plan_multicol_pages_checked(
                     &group.flow,
                     group.n,
-                    (strips.bottom(frag.page) - frag.cursor()).max(0.0),
+                    plan_room,
                     strips.fresh(),
                     fill,
-                    if last { c.bottom_inset } else { 0.0 },
+                    plan_inset,
                     &c.tables,
                     &c.boxes,
                 );
+                // html-to-pdf F198j: a relative offset that would paint a line off the sheet loses its words: plan the boxes
+                // that hold one as main did, with the offsets in the flow (or whole, as main did when it refused them).
+                let mut baked_boxes: Option<BTreeMap<usize, McBox>> = None;
+                if lost && !c.baked.is_empty() {
+                    let mut alt = c.boxes.clone();
+                    for (node, b) in &c.baked {
+                        match b {
+                            Some(b) => {
+                                alt.insert(*node, b.clone());
+                            }
+                            None => {
+                                alt.remove(node);
+                            }
+                        }
+                    }
+                    log::warn!(
+                        "pagination: a relative offset inside a multi-column container would paint a line outside the page; \
+                         the offset is part of the flow there"
+                    );
+                    plan = plan_multicol_pages(
+                        &group.flow,
+                        group.n,
+                        plan_room,
+                        strips.fresh(),
+                        fill,
+                        plan_inset,
+                        &c.tables,
+                        &alt,
+                    );
+                    baked_boxes = Some(alt);
+                }
+                let boxes_used = baked_boxes.as_ref().unwrap_or(&c.boxes);
                 let plan_len = plan.len();
                 for (k, mut page) in plan.into_iter().enumerate() {
                     if k > 0 {
@@ -2069,7 +2174,7 @@ fn fragment_multicol_container(
                         container_id,
                         strips,
                         &c.tables,
-                        &c.boxes,
+                        boxes_used,
                     );
                     frag.used += page.height.to_f32();
                     frag.has_content = true;
@@ -7916,6 +8021,37 @@ impl Drop for LineRulesScope {
             a.replace(std::rc::Rc::clone(&self.previous));
         });
     }
+}
+
+thread_local! {
+    /// html-to-pdf F198j: the page's top and bottom margins, px (`[inf, inf]`: unknown, nothing is outside the sheet).
+    static PAGE_EDGES: std::cell::Cell<[f32; 2]> = const { std::cell::Cell::new([f32::INFINITY; 2]) };
+}
+
+/// html-to-pdf F198j: the engine opens this once per render next to [`LineRulesScope`], with the page's top and bottom
+/// margins in px. The planner of a multi-column container needs the sheet's edge, not the content box's, to tell a relative
+/// offset that paints a line in the margin (visible, as in Chrome) from one that paints it off the sheet (lost): the
+/// latter is planned as main did, with the offset in the flow ([`McContainer::baked`]). Without a scope (unit tests) the
+/// margins are unknown and no offset is lost.
+pub(crate) struct PageEdgesScope {
+    previous: [f32; 2],
+}
+
+impl PageEdgesScope {
+    pub(crate) fn enter(top_px: f32, bottom_px: f32) -> Self {
+        let previous = PAGE_EDGES.with(|c| c.replace([top_px.max(0.0), bottom_px.max(0.0)]));
+        Self { previous }
+    }
+}
+
+impl Drop for PageEdgesScope {
+    fn drop(&mut self) {
+        PAGE_EDGES.with(|c| c.set(self.previous));
+    }
+}
+
+fn page_edges() -> [f32; 2] {
+    PAGE_EDGES.with(|c| c.get())
 }
 
 /// html-to-pdf F30c-o: the `orphans` and `widows` of the block container `node` (css-break-3 §3.3: both are inherited).
@@ -21201,6 +21337,49 @@ h2 { string-set: chapter-title content(text); }
     }
 
     #[test]
+    fn plan_reports_an_offset_that_paints_a_line_off_the_sheet() {
+        // html-to-pdf F198j: with the sheet's margins known (`PageEdgesScope`), an atom shifted 100 px down at the bottom of a
+        // 100 px column paints below the margin (30 px): the plan says so, and does not when the margins are unknown or the shift
+        // stays in them (20 px).
+        let shifted = |dy: f32| {
+            let mut boxes = BTreeMap::new();
+            boxes.insert(
+                7,
+                mcbox(
+                    0.0,
+                    0.0,
+                    0.0,
+                    vec![McBoxItem::Lines {
+                        source: 5,
+                        advances: vec![10.0.as_px(); 20],
+                        inline_boxes: false,
+                        lead: 0.0,
+                        x: 0.0,
+                        rel: [0.0, dy],
+                    }],
+                ),
+            );
+            plan_multicol_pages_checked(
+                &[block(7, 200.0)],
+                2,
+                100.0,
+                100.0,
+                ColumnFill::Auto,
+                0.0,
+                &BTreeMap::new(),
+                &boxes,
+            )
+            .1
+        };
+        assert!(!shifted(100.0), "no scope: the margins are unknown");
+        let _scope = PageEdgesScope::enter(30.0, 30.0);
+        assert!(shifted(100.0));
+        assert!(shifted(-100.0), "above the top margin");
+        assert!(!shifted(20.0));
+        assert!(!shifted(0.0));
+    }
+
+    #[test]
     fn plan_places_a_line_taller_than_the_column_alone_at_the_top_of_one() {
         // html-to-pdf F198j: a box whose lines hold one 130 px line in 100 px columns: the line stands alone at the top of
         // column 2 and the lines after it go on below it, in column 2 or the next page; none is dropped.
@@ -21691,7 +21870,10 @@ h2 { string-set: chapter-title content(text); }
             ("position:relative;left:5%", [10.0, 0.0]),
             ("position:relative;top:10%", [0.0, 0.0]),
             ("position:relative;top:-12px;left:-8px", [-8.0, -12.0]),
-            ("top:3px", [0.0, 3.0]),
+            // Only `relative` is a shift: Blitz moves a `static` or `sticky` box by its insets in the layout and that stays in the
+            // flow (F198j-c).
+            ("top:3px", [0.0, 0.0]),
+            ("position:sticky;top:10px", [0.0, 0.0]),
         ] {
             let (doc, t) = box_doc(&format!(
                 "<div style=\"width:200px;padding:10px;border:2px solid\"><p class=\"t\" style=\"{style}\">x</p></div>"

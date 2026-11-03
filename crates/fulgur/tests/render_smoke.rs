@@ -10231,3 +10231,45 @@ fn render_v2_smoke_multicol_card_with_shifted_children_negative_margins_and_tall
         got.len()
     );
 }
+
+#[test]
+fn render_v2_smoke_multicol_card_with_offsets_that_leave_the_sheet_keeps_every_word() {
+    // html-to-pdf F198j: every paragraph of a tall card in two columns is `position: relative; top: 100px`. The lines at the
+    // bottom of a column are painted 75 pt lower, past the 15 mm margin and off the sheet, where nothing is visible: the offsets
+    // are painted as a shift only while they stay on the sheet, and otherwise stay in the flow, as before F198j, so no word is lost.
+    // `top: 20px` stays on the sheet and is painted as a shift.
+    let words = |from: usize, n: usize| -> String {
+        (from..from + n)
+            .map(|i| format!("w{i:04}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for (top, clip) in [
+        (20, ""),
+        (100, ""),
+        (300, ""),
+        (100, "overflow:hidden;border-radius:12px;"),
+    ] {
+        let mut body = String::new();
+        for i in 0..25 {
+            body.push_str(&format!(
+                "<p style=\"padding:4px 12px;position:relative;top:{top}px\">{}</p>",
+                words(i * 100, 100)
+            ));
+        }
+        let html = format!(
+            "<!doctype html><html><head><style>@page{{size:A4;margin:15mm}}</style></head><body style=\"margin:0\">\
+             <div style=\"column-count:2;column-gap:20px\"><div style=\"border:1px solid #888;{clip}\">{body}</div></div>\
+             <p>AFTER</p></body></html>"
+        );
+        let pdf = noto_engine().render(&html).expect("render");
+        let printed = extract_pdf_text(&pdf).expect("pdftotext");
+        let mut got: Vec<&str> = printed
+            .split_whitespace()
+            .filter(|w| w.len() == 5 && w.starts_with('w'))
+            .collect();
+        got.sort_unstable();
+        got.dedup();
+        assert_eq!(got.len(), 2500, "top {top}px {clip}: every word printed");
+    }
+}

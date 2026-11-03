@@ -506,6 +506,10 @@ impl Engine {
         let column_styles = crate::blitz_adapter::extract_column_style_table(&doc);
         let _avoid_scope = crate::pagination_layout::BreakAvoidScope::enter(&column_styles);
         let _line_rules_scope = crate::pagination_layout::LineRulesScope::enter(&column_styles);
+        let _page_edges_scope = crate::pagination_layout::PageEdgesScope::enter(
+            resolved_page_margin.top.as_pt().in_px().to_f32(),
+            resolved_page_margin.bottom.as_pt().in_px().to_f32(),
+        );
         // Blitz treats multicol containers as plain blocks; route them
         // through fulgur's Taffy hook so columns balance and siblings
         // shift in lockstep. The returned geometry table captures per-
@@ -1024,6 +1028,10 @@ impl Engine {
         let column_styles = crate::blitz_adapter::extract_column_style_table(&doc);
         let _avoid_scope = crate::pagination_layout::BreakAvoidScope::enter(&column_styles);
         let _line_rules_scope = crate::pagination_layout::LineRulesScope::enter(&column_styles);
+        let _page_edges_scope = crate::pagination_layout::PageEdgesScope::enter(
+            self.config.margin.top.as_pt().in_px().to_f32(),
+            self.config.margin.bottom.as_pt().in_px().to_f32(),
+        );
         let multicol_geometry = crate::multicol_layout::run_pass(doc.deref_mut(), &column_styles);
         let pagination_geometry = crate::pagination_layout::run_pass_with_multicol(
             doc.deref_mut(),
@@ -1105,6 +1113,10 @@ impl Engine {
         let column_styles = crate::blitz_adapter::extract_column_style_table(&doc);
         let _avoid_scope = crate::pagination_layout::BreakAvoidScope::enter(&column_styles);
         let _line_rules_scope = crate::pagination_layout::LineRulesScope::enter(&column_styles);
+        let _page_edges_scope = crate::pagination_layout::PageEdgesScope::enter(
+            self.config.margin.top.as_pt().in_px().to_f32(),
+            self.config.margin.bottom.as_pt().in_px().to_f32(),
+        );
         let multicol_geometry = crate::multicol_layout::run_pass(doc.deref_mut(), &column_styles);
         let mut pagination_geometry = crate::pagination_layout::run_pass_with_multicol(
             doc.deref_mut(),
