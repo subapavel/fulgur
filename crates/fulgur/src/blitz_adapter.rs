@@ -207,6 +207,8 @@ pub(crate) struct MarginDocEnv {
     /// text the bundled fonts (F152); a finding is logged when it is made, as the engine has reported by the time
     /// these documents exist.
     svg_checks: Arc<crate::svg_images::SvgImageChecks>,
+    /// The render's bundle: the images the margin-box documents' `<img>` elements name (F107). `None` without one.
+    assets: Option<Arc<crate::asset::AssetBundle>>,
     _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
@@ -216,6 +218,7 @@ impl MarginDocEnv {
         font_data: &[Arc<Vec<u8>>],
         system_fonts: bool,
         generics: &BTreeMap<String, String>,
+        assets: Option<Arc<crate::asset::AssetBundle>>,
     ) -> Self {
         let fonts = if font_data.is_empty() && system_fonts && generics.is_empty() {
             None
@@ -245,6 +248,7 @@ impl MarginDocEnv {
             svg_checks: crate::svg_images::SvgImageChecks::warning_immediately(
                 crate::svg_fonts::SvgFonts::new(font_data, generics),
             ),
+            assets,
             _not_sync: std::marker::PhantomData,
         };
         env.attach_author_sheet(margin_css);
@@ -280,6 +284,16 @@ impl MarginDocEnv {
         self.author_sheet_attached
     }
 
+    /// The bundle the margin-box documents read their images from (F107).
+    pub(crate) fn assets(&self) -> Option<&crate::asset::AssetBundle> {
+        self.assets.as_deref()
+    }
+
+    /// The checks the margin-box documents' SVGs are parsed with (bundled fonts, F152; F177).
+    pub(crate) fn svg_checks(&self) -> &Arc<crate::svg_images::SvgImageChecks> {
+        &self.svg_checks
+    }
+
     fn parse(&self, html: &str, viewport_width: u32, viewport_height: u32) -> HtmlDocument {
         let config = DocumentConfig {
             viewport: Some(Viewport::new(
@@ -311,6 +325,12 @@ pub(crate) fn parse_and_layout_margin_doc(
         viewport_width.to_f32() as u32,
         viewport_height.to_f32() as u32,
     );
+    // Bundled images are invisible to Blitz's layout until told (F9), in the margin boxes as in the body: the
+    // measure stages need the logo's width, the render stage its size (F107). The seed uses the environment's
+    // checks, so the text of an SVG logo gets the bundled fonts.
+    if let Some(assets) = env.assets() {
+        seed_image_natural_sizes(&mut doc, assets, Some(env.svg_checks()));
+    }
     resolve(&mut doc);
     relayout_position_fixed(&mut doc, viewport_width.to_f32(), viewport_height.to_f32());
     doc
@@ -8240,7 +8260,7 @@ mod seed_image_natural_size_tests {
     /// gets its own copy of the font template.
     #[test]
     fn margin_documents_of_one_env_share_sheets_and_lock() {
-        let env = MarginDocEnv::new(".c{color:red}", &noto(), false, &BTreeMap::new());
+        let env = MarginDocEnv::new(".c{color:red}", &noto(), false, &BTreeMap::new(), None);
         assert!(env.author_sheet_attached());
         let html = "<html><head></head><body><div class=\"c\">x</div></body></html>";
         let a = env.parse(html, 100, 100);
@@ -8298,9 +8318,9 @@ mod seed_image_natural_size_tests {
     /// font context, as `parse_inner` does.
     #[test]
     fn margin_env_without_fonts_uses_the_blitz_default_context() {
-        let env = MarginDocEnv::new("", &[], true, &BTreeMap::new());
+        let env = MarginDocEnv::new("", &[], true, &BTreeMap::new(), None);
         assert!(env.fonts.is_none());
-        let env = MarginDocEnv::new("", &[], false, &BTreeMap::new());
+        let env = MarginDocEnv::new("", &[], false, &BTreeMap::new(), None);
         assert!(
             env.fonts.is_some(),
             "system fonts off: an empty collection, as parse_inner builds"

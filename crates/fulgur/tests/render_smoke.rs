@@ -10349,3 +10349,48 @@ fn render_v2_smoke_multicol_card_with_offsets_that_leave_the_sheet_keeps_every_w
         assert_eq!(got.len(), 2500, "top {top}px {clip}: every word printed");
     }
 }
+
+#[test]
+fn running_header_with_bundled_png_and_svg() {
+    // F107: an `<img>` in a running element is painted in the margin box. The PNG has no size in its markup, the
+    // SVG is sized by itself; both are in the bundle. Without the bundle in the margin-box documents neither is
+    // drawn and the PDF has no image on any page.
+    let png = {
+        let img = image::RgbaImage::from_pixel(64, 32, image::Rgba([255, 0, 0, 255]));
+        let mut out = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    };
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="96" height="32"><rect width="96" height="32" fill="blue"/></svg>"#;
+    let html = r##"<!DOCTYPE html><html><head><style>
+        .hlavicka { position: running(hlavicka); }
+        .znacka { position: running(znacka); }
+        @page { size: A4; margin: 20mm;
+            @top-left { content: element(hlavicka); }
+            @top-right { content: element(znacka); } }
+        body { margin: 0; }
+        p { height: 900pt; }
+    </style></head><body>
+        <div class="hlavicka"><img src="logo.png" style="height:32px" alt=""></div>
+        <div class="znacka"><img src="mark.svg" alt=""></div>
+        <p>Page 1</p><p>Page 2</p>
+    </body></html>"##;
+    let render = |with_assets: bool| {
+        let mut bundle = AssetBundle::new();
+        if with_assets {
+            bundle.add_image("logo.png", png.clone());
+            bundle.add_image("mark.svg", svg.to_vec());
+        }
+        Engine::builder()
+            .assets(bundle)
+            .build()
+            .render(html)
+            .expect("render")
+    };
+    let with = render(true);
+    let without = render(false);
+    assert!(page_count(&with) >= 2);
+    assert_ne!(with, without, "the margin-box images change the output");
+    assert_eq!(with, render(true), "deterministic");
+}

@@ -33,6 +33,7 @@ pub fn render_v2(
     font_data: &[Arc<Vec<u8>>],
     system_fonts: bool,
     generics: &BTreeMap<String, String>,
+    assets: Option<&Arc<crate::asset::AssetBundle>>,
     string_set_by_node: &HashMap<usize, Vec<(String, String)>>,
     counter_ops_by_node: &BTreeMap<usize, Vec<crate::gcpm::CounterOp>>,
     html_title: Option<String>,
@@ -148,6 +149,7 @@ pub fn render_v2(
         font_data,
         system_fonts,
         generics,
+        assets,
         geometry,
         string_set_by_node,
         counter_ops_by_node,
@@ -5341,6 +5343,8 @@ pub(crate) struct MarginBoxRenderer<'a> {
     pub font_data: &'a [Arc<Vec<u8>>],
     pub system_fonts: bool,
     pub generics: &'a BTreeMap<String, String>,
+    /// The render's bundle, for the images of the margin-box documents (F107).
+    pub assets: Option<&'a Arc<crate::asset::AssetBundle>>,
     pub margin_css: String,
     pub string_set_states: Vec<BTreeMap<String, crate::pagination_layout::StringSetPageState>>,
     pub running_states: Vec<BTreeMap<String, crate::pagination_layout::PageRunningState>>,
@@ -5365,10 +5369,52 @@ fn margin_env<'e>(
     font_data: &[Arc<Vec<u8>>],
     system_fonts: bool,
     generics: &BTreeMap<String, String>,
+    assets: Option<&Arc<crate::asset::AssetBundle>>,
 ) -> &'e crate::blitz_adapter::MarginDocEnv {
     cell.get_or_init(|| {
-        crate::blitz_adapter::MarginDocEnv::new(margin_css, font_data, system_fonts, generics)
+        crate::blitz_adapter::MarginDocEnv::new(
+            margin_css,
+            font_data,
+            system_fonts,
+            generics,
+            assets.cloned(),
+        )
     })
+}
+
+/// Stage 3 of `MarginBoxRenderer::render_page` for one laid-out margin document: the paginated geometry of the
+/// document and the draw payloads converted from it. The environment's bundle and SVG checks reach the conversion,
+/// so an `<img>` of a margin box is drawn like one of the body (F107).
+fn margin_doc_drawables(
+    env: &crate::blitz_adapter::MarginDocEnv,
+    doc: &mut blitz_html::HtmlDocument,
+    height_px: crate::units::Px,
+    font_data: &[Arc<Vec<u8>>],
+) -> (
+    crate::drawables::Drawables,
+    crate::pagination_layout::PaginationGeometryTable,
+) {
+    let empty_column_styles = crate::column_css::ColumnStyleTable::new();
+    let geometry =
+        crate::pagination_layout::run_pass_with_break_styles(doc, height_px, &empty_column_styles);
+    let dummy_store = RunningElementStore::new();
+    let mut dummy_ctx = crate::convert::ConvertContext {
+        running_store: &dummy_store,
+        assets: env.assets(),
+        font_bytes: crate::convert::FontBytes::seeded(font_data),
+        string_set_by_node: HashMap::new(),
+        counter_ops_by_node: HashMap::new(),
+        bookmark_by_node: HashMap::new(),
+        column_styles: crate::column_css::ColumnStyleTable::new(),
+        multicol_geometry: crate::multicol_layout::MulticolGeometryTable::new(),
+        pagination_geometry: geometry,
+        link_cache: Default::default(),
+        dropped_text: Default::default(),
+        svg_checks: Some(Arc::clone(env.svg_checks())),
+        viewport_size_px: None,
+    };
+    let drawables = crate::convert::dom_to_drawables(doc, &mut dummy_ctx);
+    (drawables, dummy_ctx.pagination_geometry)
 }
 
 /// The `<style>` element a margin-box wrapper carries: none when the environment attaches the render's CSS.
@@ -5465,6 +5511,7 @@ impl<'a> MarginBoxRenderer<'a> {
         font_data: &'a [Arc<Vec<u8>>],
         system_fonts: bool,
         generics: &'a BTreeMap<String, String>,
+        assets: Option<&'a Arc<crate::asset::AssetBundle>>,
         pagination_geometry: &crate::pagination_layout::PaginationGeometryTable,
         string_set_by_node: &HashMap<usize, Vec<(String, String)>>,
         counter_ops_by_node: &BTreeMap<usize, Vec<crate::gcpm::CounterOp>>,
@@ -5503,6 +5550,7 @@ impl<'a> MarginBoxRenderer<'a> {
             font_data,
             system_fonts,
             generics,
+            assets,
             margin_css: strip_display_none(&gcpm.cleaned_css),
             string_set_states,
             running_states,
@@ -5647,6 +5695,7 @@ impl<'a> MarginBoxRenderer<'a> {
                     self.font_data,
                     self.system_fonts,
                     self.generics,
+                    self.assets,
                 );
                 let measure_html = format!(
                     "<html><head>{}</head><body style=\"margin:0;padding:0;\"><div style=\"display:inline-block\">{}</div></body></html>",
@@ -5690,6 +5739,7 @@ impl<'a> MarginBoxRenderer<'a> {
                     self.font_data,
                     self.system_fonts,
                     self.generics,
+                    self.assets,
                 );
                 let measure_html = format!(
                     "<html><head>{}</head><body style=\"margin:0;padding:0;\"><div>{}</div></body></html>",
@@ -5773,6 +5823,7 @@ impl<'a> MarginBoxRenderer<'a> {
                     self.font_data,
                     self.system_fonts,
                     self.generics,
+                    self.assets,
                 );
                 let render_html = format!(
                     "<html><head>{}</head><body style=\"margin:0;padding:0;\">{}</body></html>",
@@ -5785,30 +5836,8 @@ impl<'a> MarginBoxRenderer<'a> {
                     rect.width.in_px(),
                     rect.height.in_px(),
                 );
-                let empty_column_styles = crate::column_css::ColumnStyleTable::new();
-                let geometry = crate::pagination_layout::run_pass_with_break_styles(
-                    &mut render_doc,
-                    rect.height.in_px(),
-                    &empty_column_styles,
-                );
-                let dummy_store = RunningElementStore::new();
-                let mut dummy_ctx = crate::convert::ConvertContext {
-                    running_store: &dummy_store,
-                    assets: None,
-                    font_bytes: crate::convert::FontBytes::seeded(self.font_data),
-                    string_set_by_node: HashMap::new(),
-                    counter_ops_by_node: HashMap::new(),
-                    bookmark_by_node: HashMap::new(),
-                    column_styles: crate::column_css::ColumnStyleTable::new(),
-                    multicol_geometry: crate::multicol_layout::MulticolGeometryTable::new(),
-                    pagination_geometry: geometry,
-                    link_cache: Default::default(),
-                    dropped_text: Default::default(),
-                    svg_checks: None,
-                    viewport_size_px: None,
-                };
-                let drawables = crate::convert::dom_to_drawables(&render_doc, &mut dummy_ctx);
-                let geometry = dummy_ctx.pagination_geometry;
+                let (drawables, geometry) =
+                    margin_doc_drawables(env, &mut render_doc, rect.height.in_px(), self.font_data);
                 self.render_cache
                     .insert(cache_key.clone(), (drawables, geometry));
             }
@@ -8849,6 +8878,7 @@ mod tests {
             &[],
             false,
             &BTreeMap::new(),
+            None,
             &geom,
             &HashMap::new(),
             &BTreeMap::new(),
@@ -8877,6 +8907,7 @@ mod tests {
             &[],
             false,
             &BTreeMap::new(),
+            None,
             &geom,
             &HashMap::new(),
             &BTreeMap::new(),
@@ -8908,6 +8939,7 @@ mod tests {
             &[],
             false,
             &BTreeMap::new(),
+            None,
             &geom,
             &HashMap::new(),
             &BTreeMap::new(),
@@ -9133,7 +9165,7 @@ mod tests {
         let (w, h) = (300.0_f32.as_px(), 60.0_f32.as_px());
         let mut attached = 0;
         for css in sheets {
-            let env = crate::blitz_adapter::MarginDocEnv::new(css, &fonts, false, &generics);
+            let env = crate::blitz_adapter::MarginDocEnv::new(css, &fonts, false, &generics, None);
             attached += usize::from(env.author_sheet_attached());
             for body in contents {
                 for (what, body) in [
@@ -9191,6 +9223,7 @@ mod tests {
             &fonts,
             false,
             &noto_generics(),
+            None,
         );
         assert!(env.author_sheet_attached());
         assert_eq!(margin_wrapper_style(&env, ".c{font-size:30px}"), "");
@@ -9212,6 +9245,97 @@ mod tests {
             big > get_body_child_dimension(&plain, false),
             "the class rule of the render's CSS applies"
         );
+    }
+
+    /// A solid PNG of `w` x `h` pixels, for images that must not carry a size in their markup.
+    fn solid_png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([255, 0, 0, 255]));
+        let mut out = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .expect("encode png");
+        out
+    }
+
+    /// F107: the `<img>` elements of a margin box get their natural size and an `ImageEntry` / `SvgEntry`, like the
+    /// ones of the body. A PNG without `width` / `height` is scaled to `height: 32px`, an SVG is sized by itself.
+    #[test]
+    fn margin_box_img_is_seeded_and_converted() {
+        let fonts = noto_faces();
+        let mut bundle = crate::asset::AssetBundle::new();
+        bundle.add_image("logo.png", solid_png(64, 32));
+        bundle.add_image(
+            "mark.svg",
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="96" height="32"><rect width="96" height="32" fill="blue"/></svg>"#.to_vec(),
+        );
+        let env = crate::blitz_adapter::MarginDocEnv::new(
+            "",
+            &fonts,
+            false,
+            &noto_generics(),
+            Some(Arc::new(bundle)),
+        );
+        let content =
+            "<div><img src=\"logo.png\" style=\"height:32px\"><img src=\"mark.svg\"></div>";
+        let html = format!("<html><head></head><body style=\"margin:0\">{content}</body></html>");
+
+        // Stage 1a counts the images: the max-content width is both, 64 + 96 px.
+        let measure = format!(
+            "<html><head></head><body style=\"margin:0\"><div style=\"display:inline-block\">{content}</div></body></html>"
+        );
+        let measure_doc = crate::blitz_adapter::parse_and_layout_margin_doc(
+            &env,
+            &measure,
+            400.0_f32.as_px(),
+            60.0_f32.as_px(),
+        );
+        let width = get_body_child_dimension(&measure_doc, true).to_f32();
+        assert!(
+            (width - 120.0).abs() < 0.5,
+            "64 + 96 px = 120 pt, got {width}"
+        );
+
+        // Stage 3 draws them.
+        let mut doc = crate::blitz_adapter::parse_and_layout_margin_doc(
+            &env,
+            &html,
+            400.0_f32.as_px(),
+            60.0_f32.as_px(),
+        );
+        let (drawables, _) = margin_doc_drawables(&env, &mut doc, 60.0_f32.as_px(), &fonts);
+        let images: Vec<_> = drawables.images.values().collect();
+        assert_eq!(images.len(), 1, "one raster entry");
+        assert!(
+            (images[0].width.to_f32() - 48.0).abs() < 0.1,
+            "64 px = 48 pt"
+        );
+        assert!(
+            (images[0].height.to_f32() - 24.0).abs() < 0.1,
+            "32 px = 24 pt"
+        );
+        let svgs: Vec<_> = drawables.svgs.values().collect();
+        assert_eq!(svgs.len(), 1, "one SVG entry");
+        assert!((svgs[0].width.to_f32() - 72.0).abs() < 0.1, "96 px = 72 pt");
+        assert!(
+            (svgs[0].height.to_f32() - 24.0).abs() < 0.1,
+            "32 px = 24 pt"
+        );
+    }
+
+    /// Without a bundle the same document draws neither (today's behaviour for a render without assets).
+    #[test]
+    fn margin_box_img_without_bundle_is_not_converted() {
+        let fonts = noto_faces();
+        let env =
+            crate::blitz_adapter::MarginDocEnv::new("", &fonts, false, &noto_generics(), None);
+        let html = "<html><head></head><body style=\"margin:0\"><img src=\"logo.png\" style=\"height:32px\"></body></html>";
+        let mut doc = crate::blitz_adapter::parse_and_layout_margin_doc(
+            &env,
+            html,
+            400.0_f32.as_px(),
+            60.0_f32.as_px(),
+        );
+        let (drawables, _) = margin_doc_drawables(&env, &mut doc, 60.0_f32.as_px(), &fonts);
+        assert!(drawables.images.is_empty() && drawables.svgs.is_empty());
     }
 
     // ── Inline smoke tests: exercise rendering paths for --lib coverage ──────
