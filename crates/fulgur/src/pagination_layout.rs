@@ -2289,7 +2289,8 @@ fn fragment_multicol_container(
                     // html-to-pdf F198j-f: a box that is still painted with its offsets loses the lines they carry off the sheet.
                     // A card barely taller than a page and shifted by about its excess loses more of them than main's
                     // placement whole, which prints everything between the page's edges: per box, in flow order, the box
-                    // is placed whole when that loses fewer lines than painting it; a tie keeps the painted pieces.
+                    // is placed whole when that loses no more lines than painting it: a tie is main's placement, which prints every
+                    // word main printed, and the painted pieces stay only when they lose strictly fewer lines.
                     // Only a box placed whole as a block can be measured (a paragraph with a frame of its own is planned
                     // as lines without it, and stays painted).
                     let candidates: Vec<usize> = group
@@ -2319,7 +2320,7 @@ fn fragment_multicol_container(
                             continue;
                         };
                         let limit = if page == 0 { plan_room } else { strips.fresh() };
-                        if mc_whole_loss(node, b, y0, limit) < painted {
+                        if mc_whole_loss(node, b, y0, limit) <= painted {
                             alt = whole;
                             McPlanned {
                                 pages: plan,
@@ -22296,6 +22297,42 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(pieces(-1000), (true, false), "-1000px: placed whole");
         assert_eq!(pieces(-280), (false, true), "-280px: painted");
         assert_eq!(pieces(-20), (false, true), "-20px: painted");
+    }
+
+    #[test]
+    fn multicol_container_places_a_card_whole_when_its_shifts_lose_as_many_lines_as_that() {
+        // html-to-pdf F198j-f review round 2. 16 paragraphs on 300 px pages with 30 px margins, every paragraph
+        // `top: -320px`: painted, 525 lines lie wholly outside the sheet, and placed whole 525 lines do too (the same
+        // count for every shift from -328 to -318 px). On a tie the card is placed whole, which is main's path and
+        // prints every word main printed; the painted pieces keep the card only when they lose fewer lines.
+        let html = format!(
+            "<!doctype html><html><head><style>body{{margin:0;font-size:16px;line-height:20px}}p{{margin:0}}\
+             .mc{{column-count:2;column-gap:20px}}</style></head><body><div class=\"mc\">\
+             <div class=\"t\" style=\"border:1px solid #888\">{}</div></div></body></html>",
+            (0..16)
+                .map(|_| format!(
+                    "<p style=\"padding:4px 12px;position:relative;top:-320px\">{}</p>",
+                    text(100)
+                ))
+                .collect::<String>()
+        );
+        let _scope = PageEdgesScope::enter(30.0, 30.0);
+        let (doc, _mc, geom) = multicol_fragments(&html, 300.0);
+        let card = node_by_class(&doc, "t");
+        let g = &geom[&node_by_class(&doc, "mc")];
+        let all = || {
+            g.multicol_pages
+                .iter()
+                .flat_map(|(_, p)| p.columns.iter().flatten())
+        };
+        assert!(
+            all().any(|piece| matches!(piece, McPiece::Block { node, .. } if *node == card)),
+            "the card is placed whole"
+        );
+        assert!(
+            !all().any(|piece| matches!(piece, McPiece::Lines { .. })),
+            "no painted pieces"
+        );
     }
 
     #[test]
