@@ -622,6 +622,10 @@ struct McFill {
     /// html-to-pdf F198j: an atom with a relative offset is painted outside the sheet (past its bottom or top edge, where
     /// nothing is visible), so what it holds would be lost ([`PageEdgesScope`]).
     lost: bool,
+    /// html-to-pdf F198j-f: of the atoms with a relative offset (all of them in a whole placement, see [`mc_whole_loss`]), how many
+    /// lie wholly outside the sheet, per outermost box ([`McFrame::node`] of the first frame of the atom's chain). What is
+    /// wholly outside is not in the text of the PDF; an atom that only crosses the edge keeps its glyphs there.
+    outside: BTreeMap<usize, u32>,
 }
 
 /// Slack for the sum of line heights against a column budget (accumulated f32 error).
@@ -665,6 +669,37 @@ fn fill_multicol_columns(
     head_limit: f32,
     fresh_page: bool,
 ) -> McFill {
+    fill_multicol_columns_in(
+        atoms,
+        frames,
+        tables,
+        start,
+        n,
+        budget,
+        head_limit,
+        fresh_page,
+        page_edges(),
+        false,
+    )
+}
+
+/// [`fill_multicol_columns`] against the sheet's edges `edges` (the margins above and below the columns, px; infinite when
+/// unknown). `count_all` counts the atoms wholly outside the sheet whether they hold an offset or not
+/// ([`McFill::outside`]).
+#[allow(clippy::too_many_arguments)]
+fn fill_multicol_columns_in(
+    atoms: &[McAtom],
+    frames: &McFrames,
+    tables: &BTreeMap<usize, McTable>,
+    start: usize,
+    n: usize,
+    budget: f32,
+    head_limit: f32,
+    fresh_page: bool,
+    edges: [f32; 2],
+    count_all: bool,
+) -> McFill {
+    let mut outside: BTreeMap<usize, u32> = BTreeMap::new();
     let mut columns: Vec<Vec<McPiece>> = vec![Vec::new(); n];
     let mut col = 0usize;
     let mut used = 0.0f32;
@@ -672,7 +707,7 @@ fn fill_multicol_columns(
     let mut at = start;
     let mut open: Vec<OpenFrame> = Vec::new();
     let mut lost = false;
-    let [edge_top, edge_bottom] = page_edges();
+    let [edge_top, edge_bottom] = edges;
     // The frames still open in column `col` end here, at `y`, and go on in the next column or page.
     let flush = |columns: &mut Vec<Vec<McPiece>>, open: &mut Vec<OpenFrame>, col: usize, y: f32| {
         for st in open.drain(..) {
@@ -747,6 +782,13 @@ fn fill_multicol_columns(
         if ctx.shift[1] != 0.0 {
             let top = shifted(cursor, ctx.shift[1]);
             lost |= top + h > head_limit + edge_bottom + MC_EPS || top < -edge_top - MC_EPS;
+        }
+        if (ctx.shift[1] != 0.0 || count_all) && ctx.chain != NO_CHAIN {
+            let top = shifted(cursor, ctx.shift[1]);
+            if top + h <= -edge_top + MC_EPS || top >= head_limit + edge_bottom - MC_EPS {
+                let owner = frames.frames[frames.chains[ctx.chain as usize][0] as usize].node;
+                *outside.entry(owner).or_insert(0) += 1;
+            }
         }
         let mut band = 0.0f32;
         if let McAtom::Row { table, .. } = &atoms[at]
@@ -826,6 +868,7 @@ fn fill_multicol_columns(
         height,
         next: at,
         lost,
+        outside,
     }
 }
 
@@ -878,6 +921,7 @@ fn flow_holds(flow: &[crate::multicol_layout::FlowItem], node: usize) -> bool {
 /// [`plan_multicol_pages`] and whether a relative offset paints something outside the sheet in the plan
 /// ([`McFill::lost`]); the fragmenter then plans the boxes again with their offsets in the flow
 /// ([`McContainer::baked`]).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn plan_multicol_pages_checked(
     flow: &[crate::multicol_layout::FlowItem],
@@ -889,6 +933,32 @@ fn plan_multicol_pages_checked(
     tables: &BTreeMap<usize, McTable>,
     boxes: &BTreeMap<usize, McBox>,
 ) -> (Vec<McPage>, bool) {
+    let planned = plan_multicol_pages_full(
+        flow, n, first_room, page_room, fill, last_inset, tables, boxes,
+    );
+    (planned.pages, planned.lost)
+}
+
+/// A multi-column plan and what the sheet's edges do to it (html-to-pdf F198j, F198j-f).
+struct McPlanned {
+    pages: Vec<McPage>,
+    /// Some atom with a relative offset is painted partly or wholly outside the sheet ([`McFill::lost`]).
+    lost: bool,
+    /// Per outermost box, how many atoms with an offset are wholly outside the sheet ([`McFill::outside`]).
+    outside: BTreeMap<usize, u32>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_multicol_pages_full(
+    flow: &[crate::multicol_layout::FlowItem],
+    n: u32,
+    first_room: f32,
+    page_room: f32,
+    fill: crate::column_css::ColumnFill,
+    last_inset: f32,
+    tables: &BTreeMap<usize, McTable>,
+    boxes: &BTreeMap<usize, McBox>,
+) -> McPlanned {
     use crate::multicol_layout::FlowItem;
     let n = n.max(1) as usize;
     let mut flat = McFlat::default();
@@ -939,6 +1009,7 @@ fn plan_multicol_pages_checked(
     let McFlat { atoms, frames, .. } = flat;
     let mut pages: Vec<McPage> = Vec::new();
     let mut lost = false;
+    let mut outside: BTreeMap<usize, u32> = BTreeMap::new();
     let mut at = 0usize;
     while at < atoms.len() {
         let fresh_page = !pages.is_empty() || first_room + MC_EPS >= page_room;
@@ -993,13 +1064,54 @@ fn plan_multicol_pages_checked(
         };
         at = filled.next;
         lost |= filled.lost;
+        for (node, count) in &filled.outside {
+            *outside.entry(*node).or_insert(0) += count;
+        }
         pages.push(McPage {
             height: filled.height.as_px(),
             columns: filled.columns,
             ..McPage::default()
         });
     }
-    (pages, lost)
+    McPlanned {
+        pages,
+        lost,
+        outside,
+    }
+}
+
+/// html-to-pdf F198j-f: where the plan `pages` placed `node` whole: the page and the `y` of its piece in the column.
+fn mc_block_position(pages: &[McPage], node: usize) -> Option<(usize, f32)> {
+    pages.iter().enumerate().find_map(|(p, page)| {
+        page.columns.iter().flatten().find_map(|piece| match piece {
+            McPiece::Block { node: n, y } if *n == node => Some((p, y.to_f32())),
+            _ => None,
+        })
+    })
+}
+
+/// html-to-pdf F198j-f: how many atoms of the box `b` (as described with its offsets, so at the place Taffy puts them) lie
+/// wholly outside the sheet when `b` is placed whole, as main did, `y0` below the top of a column of a page whose columns are
+/// `limit` tall. Those are the lines a whole placement does not print: everything below the page's bottom edge, and what an
+/// offset carries above its top edge.
+fn mc_whole_loss(node: usize, b: &McBox, y0: f32, limit: f32) -> u32 {
+    let mut flat = McFlat::default();
+    flat.push_box(node, b, None, 0.0, 0.0, [0.0, 0.0]);
+    let McFlat { atoms, frames, .. } = flat;
+    let [edge_top, edge_bottom] = page_edges();
+    let fill = fill_multicol_columns_in(
+        &atoms,
+        &frames,
+        &BTreeMap::new(),
+        0,
+        1,
+        1.0e9,
+        limit - y0,
+        true,
+        [edge_top + y0, edge_bottom],
+        true,
+    );
+    fill.outside.get(&node).copied().unwrap_or(0)
 }
 
 /// The fill of `atoms[start..]` in `n` columns with the smallest budget (at most `room`) in which all of
@@ -2131,20 +2243,27 @@ fn fragment_multicol_container(
                 };
                 let plan_room = (strips.bottom(frag.page) - frag.cursor()).max(0.0);
                 let plan_inset = if last { c.bottom_inset } else { 0.0 };
-                let (mut plan, mut lost) = plan_multicol_pages_checked(
-                    &group.flow,
-                    group.n,
-                    plan_room,
-                    strips.fresh(),
-                    fill,
-                    plan_inset,
-                    &c.tables,
-                    &c.boxes,
-                );
+                let plan_group = |boxes: &BTreeMap<usize, McBox>| {
+                    plan_multicol_pages_full(
+                        &group.flow,
+                        group.n,
+                        plan_room,
+                        strips.fresh(),
+                        fill,
+                        plan_inset,
+                        &c.tables,
+                        boxes,
+                    )
+                };
+                let McPlanned {
+                    pages: mut plan,
+                    mut lost,
+                    mut outside,
+                } = plan_group(&c.boxes);
                 // html-to-pdf F198j: a relative offset that would paint a line off the sheet loses its words: plan the boxes
                 // of this group that main described with the offsets in the flow, as main did. F198j-f: box by box. A box main
                 // refused keeps its painted pieces (it loses the lines whose shift leaves the sheet, as before the fallback
-                // existed), instead of being placed whole.
+                // existed), instead of being placed whole, unless placing it whole loses fewer lines (below).
                 let mut baked_boxes: Option<BTreeMap<usize, McBox>> = None;
                 if lost {
                     let mut alt = c.boxes.clone();
@@ -2160,17 +2279,55 @@ fn fragment_multicol_container(
                             "pagination: a relative offset inside a multi-column container would paint a line outside the page; \
                              the offset is part of the flow there"
                         );
-                        (plan, lost) = plan_multicol_pages_checked(
-                            &group.flow,
-                            group.n,
-                            plan_room,
-                            strips.fresh(),
-                            fill,
-                            plan_inset,
-                            &c.tables,
-                            &alt,
-                        );
-                        baked_boxes = Some(alt);
+                        McPlanned {
+                            pages: plan,
+                            lost,
+                            outside,
+                        } = plan_group(&alt);
+                        baked_boxes = Some(alt.clone());
+                    }
+                    // html-to-pdf F198j-f: a box that is still painted with its offsets loses the lines they carry off the sheet.
+                    // A card barely taller than a page and shifted by about its excess loses more of them than main's
+                    // placement whole, which prints everything between the page's edges: per box, in flow order, the box
+                    // is placed whole when that loses fewer lines than painting it; a tie keeps the painted pieces.
+                    // Only a box placed whole as a block can be measured (a paragraph with a frame of its own is planned
+                    // as lines without it, and stays painted).
+                    let candidates: Vec<usize> = group
+                        .flow
+                        .iter()
+                        .filter_map(|item| match item {
+                            crate::multicol_layout::FlowItem::Block { node, .. }
+                                if outside.contains_key(node) =>
+                            {
+                                Some(*node)
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    for node in candidates {
+                        let painted = outside.get(&node).copied().unwrap_or(0);
+                        let Some(b) = c.boxes.get(&node) else {
+                            continue;
+                        };
+                        if painted == 0 || c.baked.contains_key(&node) {
+                            continue;
+                        }
+                        let mut whole = alt.clone();
+                        whole.remove(&node);
+                        let planned = plan_group(&whole);
+                        let Some((page, y0)) = mc_block_position(&planned.pages, node) else {
+                            continue;
+                        };
+                        let limit = if page == 0 { plan_room } else { strips.fresh() };
+                        if mc_whole_loss(node, b, y0, limit) < painted {
+                            alt = whole;
+                            McPlanned {
+                                pages: plan,
+                                lost,
+                                outside,
+                            } = planned;
+                            baked_boxes = Some(alt.clone());
+                        }
                     }
                     if lost {
                         log::warn!(
@@ -22098,6 +22255,47 @@ h2 { string-set: chapter-title content(text); }
             !has_entry("position:relative;top:60px;", 5),
             "top: 60px on every 5th"
         );
+    }
+
+    #[test]
+    fn multicol_container_places_a_card_whole_when_its_shifts_lose_more_lines_than_that() {
+        // html-to-pdf F198j-f. A card of 12 paragraphs on 300 px pages with 30 px margins, every paragraph `top: <top>px`.
+        // Painted, a line is lost when it lies wholly outside the sheet; placed whole (main's path) the card prints what
+        // lies between the page's edges. A shift of about a page carries every painted line of a column above the sheet
+        // (the card is 4900 px tall, so that is 17 columns of lines) while the card placed whole keeps the 18 lines that
+        // its shift brings into the sheet: it is placed whole. A shift of 280 px leaves 2 lines in each column, more
+        // than the 18: the pieces are painted. A shift of 20 px loses nothing.
+        let pieces = |top: i32| -> (bool, bool) {
+            let paragraphs: String = (0..12)
+                .map(|_| {
+                    format!(
+                        "<p style=\"padding:4px 12px;position:relative;top:{top}px\">{}</p>",
+                        text(100)
+                    )
+                })
+                .collect();
+            let html = format!(
+                "<!doctype html><html><head><style>body{{margin:0;font-size:16px;line-height:20px}}p{{margin:0}}\
+                 .mc{{column-count:2;column-gap:20px}}</style></head><body><div class=\"mc\">\
+                 <div class=\"t\" style=\"border:1px solid #888\">{paragraphs}</div></div></body></html>"
+            );
+            let _scope = PageEdgesScope::enter(30.0, 30.0);
+            let (doc, _mc, geom) = multicol_fragments(&html, 300.0);
+            let card = node_by_class(&doc, "t");
+            let g = &geom[&node_by_class(&doc, "mc")];
+            let all = || {
+                g.multicol_pages
+                    .iter()
+                    .flat_map(|(_, p)| p.columns.iter().flatten())
+            };
+            (
+                all().any(|piece| matches!(piece, McPiece::Block { node, .. } if *node == card)),
+                all().any(|piece| matches!(piece, McPiece::Lines { .. })),
+            )
+        };
+        assert_eq!(pieces(-1000), (true, false), "-1000px: placed whole");
+        assert_eq!(pieces(-280), (false, true), "-280px: painted");
+        assert_eq!(pieces(-20), (false, true), "-20px: painted");
     }
 
     #[test]
