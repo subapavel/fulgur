@@ -7422,7 +7422,8 @@ fn carrier_slices_ok(geom: &PaginationGeometry) -> bool {
 /// A carrier that is split over several fragments and has no slices is painted by measuring its line from the fragment
 /// heights ([`crate::render`]'s `paragraph_lines_for_page`): its one line is taller than every fragment, so it is
 /// painted on no page, and the box with it. With these slices the line (and so the box's first fragment, which the
-/// carrier paints under the baseline shift of CSS 2.1 §10.8.1) is drawn once, on the page where it always was.
+/// carrier paints at the position Parley gave it, the baseline of its last line box on the line's, CSS 2.1 §10.8.1) is drawn once,
+/// on the page where it always was.
 fn record_carrier_slices(
     geometry: &mut PaginationGeometryTable,
     carrier_id: usize,

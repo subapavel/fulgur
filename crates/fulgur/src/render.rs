@@ -945,9 +945,9 @@ fn dispatch_page_node(
         // dispatched explicitly by `paragraph::draw_shaped_lines`
         // under an offset transform. Skipping here avoids
         // double-rendering at the body-relative geometry position
-        // (which doesn't include the CSS 2.1 §10.8.1 baseline_shift
-        // that fulgur applies at convert time, see
-        // `convert/inline_root.rs:493`).
+        // (the position Parley gave the box, its baseline on the
+        // line's, CSS 2.1 §10.8.1, up to the rounding of the recorded
+        // layout).
         //
         // F30f: except the pages of a box fragmented over several pages after the one its carrier painted it on.
         paint_inline_box_continuation(
@@ -5067,8 +5067,8 @@ fn draw_paragraph_inner_paint(
     // `dispatch_inline_box_content` under a translate transform that
     // moves the body-relative geometry dispatch position to the
     // inline-flow position computed from `ib.x_offset` and
-    // `ib.computed_y` (the latter folds in the CSS 2.1 §10.8.1
-    // baseline_shift correction from `convert/inline_root.rs:493`).
+    // `ib.computed_y` (Parley's position of the box, whose baseline
+    // is on the line's, CSS 2.1 §10.8.1).
     let inline_box_ctx = Some(crate::paragraph::InlineBoxRenderCtx {
         drawables,
         geometry,

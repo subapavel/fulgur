@@ -313,91 +313,6 @@ pub(super) fn resolve_enclosing_anchor(
     None
 }
 
-/// CSS 2.1 §10.8.1: return the offset from an inline-block's top edge to
-/// the baseline used for `vertical-align: baseline` (the baseline of the
-/// *last* line box inside). Returns `None` when no in-flow baseline is
-/// available, in which case the caller falls back to the bottom margin
-/// edge (zero `baseline_shift`).
-///
-/// Drawables-aware baseline lookup. Inline-box content is represented by an
-/// `InlineBoxPlaceholder` carrying only `node_id`, so there is
-/// no trait tree to walk. Read the baseline from `out.paragraphs[node_id]`
-/// (the inline-root case) or recurse into the node's Taffy children
-/// (flex / grid / ordinary block) to find the last in-flow descendant that
-/// contributes a baseline.
-///
-/// Returns `None` when:
-/// - the inline-block has `overflow: clip|hidden|scroll|auto` (the spec
-///   fallback),
-/// - no descendant contributes a CSS line baseline (a leaf `<img>` /
-///   `<svg>` / `<canvas>` inline-box).
-pub(super) fn inline_box_baseline_offset_from_drawables(
-    doc: &BaseDocument,
-    out: &crate::drawables::Drawables,
-    node_id: usize,
-) -> Option<crate::units::Pt> {
-    if let Some(block) = out.block_styles.get(&node_id)
-        && block.style.has_overflow_clip()
-    {
-        return None;
-    }
-    pageable_last_baseline_from_drawables(doc, out, node_id, 0)
-}
-
-/// Recursive worker for `inline_box_baseline_offset_from_drawables`.
-/// Walks the block's child list in REVERSE, deriving children from
-/// `node.layout_children` / `node.children` (Taffy DOM). `top_inset` of
-/// each container adds its own `border-top + padding-top`; child layout
-/// `location.y` adds the child's offset within the container; the
-/// recursive call returns the inner baseline relative to the child's top
-/// edge.
-fn pageable_last_baseline_from_drawables(
-    doc: &BaseDocument,
-    out: &crate::drawables::Drawables,
-    node_id: usize,
-    depth: usize,
-) -> Option<crate::units::Pt> {
-    if depth >= MAX_DOM_DEPTH {
-        return None;
-    }
-    // 1) If this node has a paragraph entry (inline-root), use the last
-    //    line's baseline + the node's top_inset (border + padding).
-    if let Some(para) = out.paragraphs.get(&node_id) {
-        let top_inset = out
-            .block_styles
-            .get(&node_id)
-            .map(|b| b.style.border_widths[0] + b.style.padding[0])
-            .unwrap_or(crate::units::Pt::ZERO);
-        if let Some(line) = para.lines.last() {
-            return Some(top_inset + line.baseline);
-        }
-    }
-    // 2) Otherwise walk DOM children in REVERSE. Use Blitz's
-    //    `layout_children` when available so anonymous block wrappers
-    //    around inline-level siblings are visited correctly.
-    let node = doc.get_node(node_id)?;
-    let layout_children_borrow = node.layout_children.borrow();
-    // An explicit `Some([])` from Blitz means "no in-flow children" and is
-    // authoritative — fall back to `node.children` only when Blitz has not
-    // populated `layout_children` at all. Otherwise an inline-block whose
-    // only descendants are absolutely-positioned would walk those out-of-flow
-    // nodes here and report a bogus baseline.
-    let walk_children: &[usize] = layout_children_borrow.as_deref().unwrap_or(&node.children);
-    for &child_id in walk_children.iter().rev() {
-        let Some(child) = doc.get_node(child_id) else {
-            continue;
-        };
-        if let Some(inner) = pageable_last_baseline_from_drawables(doc, out, child_id, depth + 1) {
-            // Child y inside this container, in PDF pt. The child
-            // recursively returns its inner baseline relative to its
-            // own top edge; the container's own `top_inset` is folded
-            // in by branch (1) above.
-            return Some(child.final_layout.location.y.as_px().in_pt() + inner);
-        }
-    }
-    None
-}
-
 /// Recursively convert the Blitz node referenced by a Parley `InlineBox.id`.
 ///
 /// Returns `Some(node_id)` for normal inline boxes so that
@@ -627,15 +542,10 @@ pub(super) fn extract_paragraph(
 
                     let link = ctx.link_cache.lookup(doc, node_id);
                     let height = positioned.height.as_px().in_pt();
-                    // Read baseline from `out` (Drawables). The Drawables-aware
-                    // lookup queries `out.paragraphs[node_id]` (and
-                    // `block_styles[node_id]` for top-inset) directly.
-                    let baseline_shift =
-                        inline_box_baseline_offset_from_drawables(doc, out, node_id)
-                            .map(|bo| height - bo)
-                            .unwrap_or(crate::units::Pt::ZERO);
-                    let computed_y =
-                        positioned.y.as_px().in_pt() - accumulated_line_top + baseline_shift;
+                    // Parley placed the box with its alignment baseline on the line's baseline (`InlineBox::baseline`,
+                    // set by Blitz from the last line box inside it, CSS 2.1 §10.8.1), so `positioned.y` is already the
+                    // top of the margin box: no second shift here (html-to-pdf F183c).
+                    let computed_y = positioned.y.as_px().in_pt() - accumulated_line_top;
                     let visible = doc
                         .get_node(node_id)
                         .map(super::style::extract_opacity_visible)
@@ -1342,34 +1252,6 @@ mod tests {
             .unwrap_or_else(|| panic!("<{tag}> not found in document"))
     }
 
-    fn make_paragraph_entry(baselines: &[f32]) -> crate::drawables::ParagraphEntry {
-        crate::drawables::ParagraphEntry {
-            lines: baselines
-                .iter()
-                .map(|&b| ShapedLine {
-                    height: 16.0_f32.as_pt(),
-                    baseline: b.as_pt(),
-                    items: vec![],
-                })
-                .collect(),
-            opacity: 1.0,
-            visible: true,
-            id: None,
-        }
-    }
-
-    fn make_block_entry_plain() -> crate::drawables::BlockEntry {
-        crate::drawables::BlockEntry {
-            style: crate::draw_primitives::BlockStyle::default(),
-            opacity: 1.0,
-            visible: true,
-            id: None,
-            layout_size: None,
-            clip_descendants: vec![],
-            opacity_descendants: vec![],
-        }
-    }
-
     // ── resolve_enclosing_anchor ──────────────────────────────────────────────
 
     #[test]
@@ -1477,158 +1359,6 @@ mod tests {
         assert_eq!(
             returned_id, anchor_id,
             "returned id must be the <a> node's id, not the span's"
-        );
-    }
-
-    // ── inline_box_baseline_offset_from_drawables ─────────────────────────────
-
-    #[test]
-    fn inline_box_baseline_overflow_clip_x_returns_none() {
-        let doc = parse_doc("<html><body><div>x</div></body></html>");
-        let mut out = crate::drawables::Drawables::new();
-        let node_id = 9999;
-        let mut entry = make_block_entry_plain();
-        entry.style = crate::draw_primitives::BlockStyle {
-            overflow_x: crate::draw_primitives::Overflow::Clip,
-            ..Default::default()
-        };
-        out.block_styles.insert(node_id, entry);
-        let result = super::inline_box_baseline_offset_from_drawables(doc.deref(), &out, node_id);
-        assert!(
-            result.is_none(),
-            "overflow_x=Clip must short-circuit to None"
-        );
-    }
-
-    #[test]
-    fn inline_box_baseline_no_overflow_clip_delegates_to_pageable_last() {
-        // No block entry → overflow-clip guard skipped → pageable_last called.
-        // A paragraph entry for node_id means branch 1 fires and returns the baseline.
-        let doc = parse_doc("<html><body><div>x</div></body></html>");
-        let mut out = crate::drawables::Drawables::new();
-        let node_id = 9998;
-        out.paragraphs
-            .insert(node_id, make_paragraph_entry(&[12.0]));
-        let result = super::inline_box_baseline_offset_from_drawables(doc.deref(), &out, node_id);
-        assert_eq!(
-            result,
-            Some(12.0_f32.as_pt()),
-            "no overflow clip + paragraph entry → Some(baseline)"
-        );
-    }
-
-    #[test]
-    fn inline_box_baseline_overflow_visible_block_does_not_short_circuit() {
-        // Block entry with default (visible) overflow must NOT trigger the guard.
-        // With a paragraph also present the function should return Some.
-        let doc = parse_doc("<html><body><div>x</div></body></html>");
-        let mut out = crate::drawables::Drawables::new();
-        let node_id = 9997;
-        out.block_styles.insert(node_id, make_block_entry_plain()); // overflow Visible
-        out.paragraphs.insert(node_id, make_paragraph_entry(&[9.0]));
-        let result = super::inline_box_baseline_offset_from_drawables(doc.deref(), &out, node_id);
-        assert_eq!(
-            result,
-            Some(9.0_f32.as_pt()),
-            "visible overflow must not short-circuit"
-        );
-    }
-
-    // ── pageable_last_baseline_from_drawables ──────────────────────────────────
-
-    #[test]
-    fn pageable_last_baseline_returns_none_at_max_depth() {
-        let doc = parse_doc("<html><body><div>x</div></body></html>");
-        let out = crate::drawables::Drawables::new();
-        let result = super::pageable_last_baseline_from_drawables(
-            doc.deref(),
-            &out,
-            0,
-            crate::MAX_DOM_DEPTH,
-        );
-        assert!(
-            result.is_none(),
-            "at MAX_DOM_DEPTH must return None immediately"
-        );
-    }
-
-    #[test]
-    fn pageable_last_baseline_uses_last_line_of_multi_line_paragraph() {
-        // Multi-line paragraph: the function must return the LAST line's baseline,
-        // not the first.
-        let doc = parse_doc("<html><body><div>x</div></body></html>");
-        let mut out = crate::drawables::Drawables::new();
-        let node_id = 9997;
-        out.paragraphs
-            .insert(node_id, make_paragraph_entry(&[12.0, 26.0]));
-        let result = super::pageable_last_baseline_from_drawables(doc.deref(), &out, node_id, 0);
-        assert_eq!(
-            result,
-            Some(26.0_f32.as_pt()),
-            "must return last line baseline (26.0), not first (12.0)"
-        );
-    }
-
-    #[test]
-    fn pageable_last_baseline_adds_border_and_padding_top_inset() {
-        // Block entry with border-top=4pt and padding-top=2pt adds top_inset=6pt
-        // to the paragraph baseline.
-        let doc = parse_doc("<html><body><div>x</div></body></html>");
-        let mut out = crate::drawables::Drawables::new();
-        let node_id = 9996;
-        out.paragraphs
-            .insert(node_id, make_paragraph_entry(&[12.0]));
-        let mut entry = make_block_entry_plain();
-        entry.style.border_widths[0] = 4.0_f32.as_pt(); // top border
-        entry.style.padding[0] = 2.0_f32.as_pt(); // top padding
-        out.block_styles.insert(node_id, entry);
-        let result = super::pageable_last_baseline_from_drawables(doc.deref(), &out, node_id, 0);
-        // top_inset = 4 + 2 = 6; baseline = 12 → Some(18).
-        assert!(
-            result.is_some_and(|v| (v.to_f32() - 18.0).abs() < 0.001),
-            "expected Some(18.0), got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn pageable_last_baseline_empty_paragraph_lines_falls_through_to_dom_walk() {
-        // A paragraph entry with no lines causes `lines.last()` to return None,
-        // so branch 1 is not taken. The function then tries the DOM walk, but
-        // node_id 9995 does not exist in the Blitz doc, so `doc.get_node` fails
-        // and the function returns None.
-        let doc = parse_doc("<html><body><div>x</div></body></html>");
-        let mut out = crate::drawables::Drawables::new();
-        let node_id = 9995;
-        out.paragraphs.insert(node_id, make_paragraph_entry(&[])); // no lines
-        let result = super::pageable_last_baseline_from_drawables(doc.deref(), &out, node_id, 0);
-        assert!(
-            result.is_none(),
-            "empty lines + non-existent node must return None"
-        );
-    }
-
-    #[test]
-    fn pageable_last_baseline_walks_dom_children_in_reverse_to_find_paragraph() {
-        // Parse a doc with section→div(text). Insert a ParagraphEntry only for
-        // the div. Calling on section (no paragraph entry) must walk children in
-        // reverse, find the div's ParagraphEntry, and return its baseline plus
-        // the div's layout y-offset.
-        let doc = parse_doc("<html><body><section><div>text content</div></section></body></html>");
-        let section_id = find_tag(&doc, "section");
-        let div_id = find_tag(&doc, "div");
-        let mut out = crate::drawables::Drawables::new();
-        out.paragraphs.insert(div_id, make_paragraph_entry(&[12.0]));
-        let result = super::pageable_last_baseline_from_drawables(doc.deref(), &out, section_id, 0);
-        // section has no paragraph entry → DOM walk finds div → Some(y_offset + 12.0).
-        // y_offset >= 0, so result >= 12.0.
-        assert!(
-            result.is_some(),
-            "reverse DOM walk must find child's paragraph entry"
-        );
-        assert!(
-            result.unwrap().to_f32() >= 12.0,
-            "baseline must be at least the child paragraph's baseline"
         );
     }
 
@@ -1833,7 +1563,7 @@ mod tests {
         );
     }
 
-    // inline_box_baseline_from_drawables: the `make_engine_with_dot_png` helper
+    // The `make_engine_with_dot_png` helper
     // is used here to ensure the helper compiles and its asset bundle is wired.
     #[test]
     fn smoke_make_engine_with_dot_png_helper_compiles() {

@@ -770,9 +770,10 @@ fn lines_right_edge(lines: &[ShapedLine], x: crate::units::Pt) -> crate::units::
 ///
 /// F30f: a box fragmented over pages (`split`) is painted where the fragmenter put it on every page, which is
 /// `geo` less the body offset the dispatcher adds (`render::paint_inline_box_continuation` does the same on the later
-/// pages): the break between its line boxes was planned for that position, and the baseline shift of the inline flow
-/// (CSS 2.1 §10.8.1, folded into `computed_y`) would put the last line of its first page a few px below the content
-/// box, and past a frame's bottom padding.
+/// pages): the break between its line boxes was planned for that position, and the position of the inline flow
+/// (`computed_y`, Parley's, which seats the box by the baseline of its last line, CSS 2.1 §10.8.1) can differ from it
+/// by the rounding of the recorded geometry; the planned position wins so the last line of the first page cannot land
+/// below the content box, past a frame's bottom padding.
 fn inline_box_offset(
     split: bool,
     body_offset: (f32, f32),
@@ -1016,11 +1017,12 @@ pub fn draw_shaped_lines(
 
                     // PR 8g: dispatch via the v2 path under an offset
                     // transform. `ib.placeholder.node_id`'s geometry-recorded
-                    // position (Taffy/Parley body-relative) does not include
-                    // the CSS 2.1 §10.8.1 baseline_shift that `convert/
-                    // inline_root.rs:493` applies at convert time, so the
-                    // standard dispatcher would render the content at the
-                    // wrong y. Push a translate transform equal to the
+                    // position (Taffy/Parley body-relative) is the same
+                    // position Parley gave the box (its baseline on the
+                    // line's, CSS 2.1 §10.8.1, html-to-pdf F183c) up to the
+                    // rounding of the recorded layout, and it is body-relative
+                    // where `computed_y` is line-relative. Push a translate
+                    // transform equal to the
                     // difference between the inline-flow position
                     // `(ox, oy)` and the dispatcher's `(geo_x_pt, geo_y_pt)`
                     // before invoking `render::dispatch_fragment`.
