@@ -544,8 +544,14 @@ pub(super) fn extract_paragraph(
                     let height = positioned.height.as_px().in_pt();
                     // Parley placed the box with its alignment baseline on the line's baseline (`InlineBox::baseline`,
                     // set by Blitz from the last line box inside it, CSS 2.1 §10.8.1), so `positioned.y` is already the
-                    // top of the margin box: no second shift here (html-to-pdf F183c).
-                    let computed_y = positioned.y.as_px().in_pt() - accumulated_line_top;
+                    // top of the margin box. The content is painted from the border box, so the top margin (Blitz leaves it in
+                    // the layout of the box) is added; there is no second baseline shift here (html-to-pdf F183c).
+                    let margin_top = doc
+                        .get_node(node_id)
+                        .map(|n| n.unrounded_layout.margin.top.as_px().in_pt())
+                        .unwrap_or(crate::units::Pt::ZERO);
+                    let computed_y =
+                        positioned.y.as_px().in_pt() - accumulated_line_top + margin_top;
                     let visible = doc
                         .get_node(node_id)
                         .map(super::style::extract_opacity_visible)
@@ -1360,6 +1366,56 @@ mod tests {
             returned_id, anchor_id,
             "returned id must be the <a> node's id, not the span's"
         );
+    }
+
+    // ── the inline box is painted where Parley put it (html-to-pdf F183c) ─────
+
+    /// `computed_y` is Parley's `y` of the box (relative to its line) plus the top margin Blitz keeps in the layout: the line's
+    /// top plus `computed_y` is the position Blitz recorded for the box, with no second baseline shift on top.
+    #[test]
+    fn computed_y_is_the_position_blitz_recorded_for_the_box() {
+        for style in [
+            "display:inline-block;width:100px;height:60px",
+            "display:inline-block;width:100px;height:60px;margin-top:10px",
+            "display:inline-block;width:100px;height:60px;overflow:hidden",
+            "display:inline-block;width:100px;border:3px solid #000;padding-top:4px",
+        ] {
+            let html = format!(
+                "<!doctype html><html><body style=\"margin:0\"><p style=\"margin:0\">ab <span style=\"{style}\">x</span> cd</p></body></html>"
+            );
+            let engine = crate::engine::Engine::builder().build();
+            let (drawables, geometry) =
+                engine.build_drawables_and_geometry_for_testing_no_gcpm(&html);
+            let (root_id, entry) = drawables
+                .paragraphs
+                .iter()
+                .find(|(_, p)| {
+                    p.lines
+                        .iter()
+                        .any(|l| l.items.iter().any(|i| matches!(i, LineItem::InlineBox(_))))
+                })
+                .expect("the paragraph with the box");
+            let root_y = geometry.get(root_id).expect("root geometry").fragments[0].y;
+            let mut line_top = crate::units::Pt::ZERO;
+            let mut checked = false;
+            for line in &entry.lines {
+                for item in &line.items {
+                    if let LineItem::InlineBox(ib) = item {
+                        let id = ib.node_id.expect("box node");
+                        let recorded = geometry.get(&id).expect("box geometry").fragments[0].y;
+                        let painted = root_y.in_pt() + line_top + ib.computed_y;
+                        assert!(
+                            (painted.to_f32() - recorded.in_pt().to_f32()).abs() < 0.01,
+                            "{style}: painted at {painted:?} pt, recorded {:?} pt",
+                            recorded.in_pt()
+                        );
+                        checked = true;
+                    }
+                }
+                line_top += line.height;
+            }
+            assert!(checked, "{style}");
+        }
     }
 
     // ── smoke tests for try_convert code paths ────────────────────────────────
