@@ -7998,7 +7998,8 @@ enum LineBarrier {
     /// An `inline-block` or `inline-table` that is not alone on its line: the carrier's line holds more than the box,
     /// and one fragment of it would have to hold the rest (F30f-b).
     SharesItsLine,
-    /// An `inline-flex` or `inline-grid` box, or an `inline-block` or `inline-table` with no carrier line to find.
+    /// An `inline-flex` or `inline-grid` box that is not alone on its line (html-to-pdf F217: alone, it is split like an
+    /// `inline-block`), or an `inline-block` or `inline-table` with no carrier line to find.
     AtomicNotFlowRoot,
     /// A clipping box that hides some of its content in the block axis: fragmenting it would give it one frame per
     /// page, and the per-fragment clip would show what the clip hides today (and in Chrome).
@@ -8757,7 +8758,22 @@ fn is_inline_block_or_table(node: &blitz_dom::Node) -> bool {
     })
 }
 
-/// F30f: whether the `inline-block` (F30e: or `inline-table`) `node` is the only thing on its carrier's single line:
+/// html-to-pdf F217: whether `node` is an `inline-flex` or `inline-grid` box. Its items are block containers whose lines
+/// are break points (css-flexbox-1 §4, css-grid-2 §6), as the box of an `inline-block` is; alone on its line the box is
+/// split between its line boxes like an `inline-block` ([`alone_on_its_line`]). Kept whole, a paragraph in a box taller
+/// than a page was cut by the block walk without line ranges and the renderer measured its lines from the fragment
+/// heights: all but the first were painted on no page (a fixed-size box in a flex item's text made the `inline-flex`
+/// box that tall once Blitz measured it, F217; `inline-grid` with a tall paragraph lost the same words before).
+fn is_inline_flex_or_grid(node: &blitz_dom::Node) -> bool {
+    use ::style::values::specified::box_::{DisplayInside, DisplayOutside};
+    node.primary_styles().is_some_and(|s| {
+        let display = s.clone_display();
+        display.outside() == DisplayOutside::Inline
+            && matches!(display.inside(), DisplayInside::Flex | DisplayInside::Grid)
+    })
+}
+
+/// F30f: whether the `inline-block` (F30e: or `inline-table`; F217: or `inline-flex` / `inline-grid`, ADR-0004) `node` is the only thing on its carrier's single line:
 /// the box that holds it in the inline formatting context (its `layout_parent`) has exactly one Parley line, and that
 /// line holds this box and glyph runs of whitespace only.
 ///
@@ -8765,7 +8781,7 @@ fn is_inline_block_or_table(node: &blitz_dom::Node) -> bool {
 /// nothing else on the line needs the room a page break takes from it. css-break-3 §4.1 lets a UA treat such a box as
 /// monolithic; Chrome slices it, we split it between its line boxes (ADR-0004).
 fn alone_on_its_line(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
-    if !is_inline_block_or_table(node) {
+    if !is_inline_block_or_table(node) && !is_inline_flex_or_grid(node) {
         return false;
     }
     let Some(carrier) = node.layout_parent.get().and_then(|id| doc.get_node(id)) else {
@@ -19601,7 +19617,7 @@ h2 { string-set: chapter-title content(text); }
 
     #[test]
     fn paragraphs_that_are_not_in_plain_flow_stay_whole() {
-        // The exclusions of `line_split_candidate` that hold: an atomic inline that is not an `inline-block` alone on
+        // The exclusions of `line_split_candidate` that hold: an atomic inline that is not alone on
         // its line, and a clipping parent that hides content, place a paragraph as one unit. (A non-cell child of a
         // `display: table` box used to be one too; since F50 it sits in an anonymous cell and splits like any block,
         // see below. A content-sized clipping parent splits since F30f, see above.)
@@ -19614,9 +19630,9 @@ h2 { string-set: chapter-title content(text); }
                 ),
             ),
             (
-                "inline-flex",
+                "inline-flex sharing its line",
                 format!(
-                    "<div style=\"display:inline-flex\"><p id=\"x\">{}</p></div>",
+                    "<div>Hi <span style=\"display:inline-flex\"><p id=\"x\">{}</p></span></div>",
                     br_lines(30)
                 ),
             ),
@@ -19735,7 +19751,7 @@ h2 { string-set: chapter-title content(text); }
 
     #[test]
     fn alone_on_its_line_wants_one_line_with_only_the_box_on_it() {
-        let cases: [(&str, &str, bool); 10] = [
+        let cases: [(&str, &str, bool); 12] = [
             (
                 "alone",
                 "<div><div id=\"x\" style=\"display:inline-block\">a</div></div>",
@@ -19777,8 +19793,18 @@ h2 { string-set: chapter-title content(text); }
                 false,
             ),
             (
-                "inline-flex",
+                "inline-flex alone (F217)",
                 "<div><span id=\"x\" style=\"display:inline-flex\">a</span></div>",
+                true,
+            ),
+            (
+                "inline-grid alone (F217)",
+                "<div><span id=\"x\" style=\"display:inline-grid\">a</span></div>",
+                true,
+            ),
+            (
+                "inline-flex with text",
+                "<div>Hi <span id=\"x\" style=\"display:inline-flex\">a</span></div>",
                 false,
             ),
             ("a block", "<div><div id=\"x\">a</div></div>", false),
@@ -20333,9 +20359,27 @@ h2 { string-set: chapter-title content(text); }
                 Some(SharesItsLine),
             ),
             (
-                "inline-flex",
+                "inline-flex alone",
                 format!(
                     "<div><div id=\"p\" style=\"display:inline-flex\"><p id=\"c\">{two}</p></div></div>"
+                ),
+                "p",
+                "c",
+                None,
+            ),
+            (
+                "inline-grid alone",
+                format!(
+                    "<div><div id=\"p\" style=\"display:inline-grid\"><p id=\"c\">{two}</p></div></div>"
+                ),
+                "p",
+                "c",
+                None,
+            ),
+            (
+                "inline-flex sharing",
+                format!(
+                    "<div>Hi <span id=\"p\" style=\"display:inline-flex\"><p id=\"c\">{two}</p></span></div>"
                 ),
                 "p",
                 "c",
@@ -20642,6 +20686,39 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(got, vec![(0, 1), (1, 1), (1, 1)], "{carrier:?}");
         assert!(carrier_slices_ok(carrier));
         assert_eq!(fragments_of(&doc, &table, "it")[0].page_index, 0);
+    }
+
+    #[test]
+    fn an_inline_flex_or_grid_alone_on_its_line_is_split_with_its_carrier_line() {
+        // html-to-pdf F217: the paragraph in a box taller than a page was left without line slices, and the renderer
+        // painted only the lines that the fragment heights happened to hold.
+        for display in ["inline-flex", "inline-grid"] {
+            let (doc, table) = nested_geometry(
+                &format!(
+                    "<div id=\"c\"><div id=\"b\" style=\"display:{display};width:100%\"><p id=\"x\">{}</p></div></div>",
+                    br_lines(30)
+                ),
+                200.0,
+            );
+            assert_slices_tile(&table, find_by_id(doc.deref(), "x").unwrap(), 30, display);
+            let carrier = geometry_of(&doc, &table, "c").unwrap();
+            assert!(carrier_slices_ok(carrier), "{display}: {carrier:?}");
+        }
+    }
+
+    #[test]
+    fn an_inline_flex_sharing_its_line_keeps_its_paragraph_whole() {
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div>Hi <span id=\"b\" style=\"display:inline-flex\"><p id=\"x\">{}</p></span> end</div>",
+                br_lines(30)
+            ),
+            200.0,
+        );
+        let n = table
+            .get(&find_by_id(doc.deref(), "x").unwrap())
+            .map_or(0, |g| g.fragments.len());
+        assert!(n <= 1, "{n} fragments");
     }
 
     #[test]
