@@ -1346,10 +1346,7 @@ fn check_continuations_painted(
     });
     if cfg!(debug_assertions) {
         for &ib_id in drawables.inline_box_subtree_descendants.keys() {
-            if geometry
-                .get(&ib_id)
-                .is_some_and(|g| inline_box_continues_on(g, page_index))
-            {
+            if box_continues_on(geometry, drawables, ib_id, page_index) {
                 debug_assert!(
                     painted.contains(&ib_id),
                     "inline box {ib_id} continues on page {page_index} and no walk painted it"
@@ -1582,6 +1579,45 @@ fn inline_box_continues_on(
         && geom.fragments.iter().any(|f| f.page_index == page_index)
 }
 
+/// html-to-pdf F183c: the page on which the carrier of the inline box `ib_id` paints its one line, when the fragmenter
+/// recorded the carrier's slices ([`record_carrier_slices`](crate::pagination_layout)): the fragment with the slice
+/// `0..1`. For a box alone on its line it is the box's first page. Boxes that share a line and are fragmented one after
+/// the other have first pages of their own; the line is on the earliest, and a box that starts later is painted on the
+/// pages after the line's by [`box_continues_on`].
+fn carrier_line_page(
+    geometry: &crate::pagination_layout::PaginationGeometryTable,
+    drawables: &Drawables,
+    ib_id: usize,
+) -> Option<u32> {
+    let carrier = geometry.get(drawables.inline_box_carrier.get(&ib_id)?)?;
+    let pos = carrier
+        .line_slices
+        .iter()
+        .position(|s| (s.first, s.end) == (0, 1))?;
+    if carrier.line_slices.len() != carrier.fragments.len() {
+        return None;
+    }
+    carrier.fragments.get(pos).map(|f| f.page_index)
+}
+
+/// [`inline_box_continues_on`], and also a box whose first fragment is after the page its carrier's line is painted on
+/// (html-to-pdf F183c): the line paints the descendants that have a fragment on its page, so a box that starts on a later
+/// page has no one to paint its first fragment either. Every box that is not on such a carrier is as before.
+fn box_continues_on(
+    geometry: &crate::pagination_layout::PaginationGeometryTable,
+    drawables: &Drawables,
+    ib_id: usize,
+    page_index: u32,
+) -> bool {
+    let Some(geom) = geometry.get(&ib_id) else {
+        return false;
+    };
+    inline_box_continues_on(geom, page_index)
+        || (geom.fragments.iter().any(|f| f.page_index == page_index)
+            && carrier_line_page(geometry, drawables, ib_id)
+                .is_some_and(|line| line < page_index && !geom.is_repeat))
+}
+
 /// F30f: the opacity of the paragraph that carries the inline box `ib_id`, 1 when it has none.
 ///
 /// The carrier paints the box inside its paragraph's opacity group, which holds the opacity of the box that is the
@@ -1624,7 +1660,7 @@ fn paint_inline_box_continuation(
     let Some(geom) = geometry.get(&ib_id) else {
         return false;
     };
-    if !inline_box_continues_on(geom, page_index) {
+    if !box_continues_on(geometry, drawables, ib_id, page_index) {
         return false;
     }
     let Some(frag) = geom.fragments.iter().find(|f| f.page_index == page_index) else {
@@ -7416,6 +7452,39 @@ mod tests {
         let mut g = geometry_over_pages(&[0, 1, 2]);
         g.is_repeat = true;
         assert!(!inline_box_continues_on(&g, 1));
+    }
+
+    #[test]
+    fn a_box_that_starts_after_the_carrier_line_page_continues_from_its_first_page() {
+        // html-to-pdf F183c: two boxes on one line, fragmented one after the other: box 7 starts on page 0 and box 8 on
+        // page 1. The carrier's line is painted on page 0 (slices `0..1`, `1..1`, `1..1`), where box 8 has no fragment, so
+        // box 8 is painted on its first page by its continuation. A box with no such carrier is as before.
+        let mut table = crate::pagination_layout::PaginationGeometryTable::new();
+        let mut carrier = geometry_over_pages(&[0, 1, 2]);
+        carrier.line_slices = [(0, 1), (1, 1), (1, 1)]
+            .into_iter()
+            .map(|(first, end)| crate::pagination_layout::LineSlice {
+                first,
+                end,
+                offset: crate::units::Px::ZERO,
+            })
+            .collect();
+        table.insert(1, carrier);
+        table.insert(7, geometry_over_pages(&[0, 1]));
+        table.insert(8, geometry_over_pages(&[1, 2]));
+        table.insert(9, geometry_over_pages(&[1, 2]));
+        let mut d = Drawables::new();
+        d.inline_box_carrier.insert(7, 1);
+        d.inline_box_carrier.insert(8, 1);
+        assert_eq!(carrier_line_page(&table, &d, 8), Some(0));
+        assert_eq!(carrier_line_page(&table, &d, 9), None, "no carrier");
+        assert!(!box_continues_on(&table, &d, 7, 0));
+        assert!(box_continues_on(&table, &d, 7, 1));
+        assert!(box_continues_on(&table, &d, 8, 1), "its first page");
+        assert!(box_continues_on(&table, &d, 8, 2));
+        assert!(!box_continues_on(&table, &d, 8, 0), "no fragment there");
+        assert!(!box_continues_on(&table, &d, 9, 1), "no carrier: as before");
+        assert!(box_continues_on(&table, &d, 9, 2));
     }
 
     /// Runs `f` with a canvas on a scratch page.

@@ -7493,13 +7493,16 @@ fn record_carrier_slices_after(
             return;
         }
     }
-    // html-to-pdf F183c: a box that shares the carrier's one line and spans pages, because it is taller than a page (the
-    // walk enters the carrier, which is taller than a page too, and fragments the box between its lines). The line is
-    // painted once, on the page where the box starts, like the line of an alone box. Without slices the renderer measures
+    // html-to-pdf F183c: boxes that share the carrier's one line, one of them spanning pages because it is taller than a
+    // page (the walk enters the carrier, which is taller than a page too, and fragments the boxes between their lines,
+    // one after the other). The line is painted once, on the first page of any box on it, and every box that starts on a
+    // later page is painted there by its continuation (`render::carrier_line_page`). Without slices the renderer measures
     // the line from the fragment heights and paints it on no page when it is taller than the first fragment, which is
-    // what happens when a neighbour on the line hangs below the box's bottom (a `display: block; height: 9px` child ends
-    // the neighbour below its last line box, so the line is a pixel taller than the box and the box lost its first 50
-    // lines). Before the baseline walk the box and the line ended at the same pixel.
+    // what happens when a box on the line hangs below the fragment's end (a `display: block; height: 9px` child ends a
+    // box below its last line box, so the line is a pixel taller than the tall box, and the box lost its first 50
+    // lines). Before the baseline walk every box ended at the bottom of the line.
+    let mut line_page: Option<u32> = None;
+    let mut spans = false;
     for &id in walk_children {
         let Some(ib) = doc.get_node(id) else {
             continue;
@@ -7507,16 +7510,17 @@ fn record_carrier_slices_after(
         if !crate::blitz_adapter::is_atomic_inline_container_node(ib) {
             continue;
         }
-        let pages = geometry.get(&id).and_then(|g| {
+        let Some((first, last)) = geometry.get(&id).and_then(|g| {
             let (first, last) = (g.fragments.first()?, g.fragments.last()?);
             Some((first.page_index, last.page_index))
-        });
-        if let Some((first, last)) = pages
-            && last > first
-        {
-            record_carrier_slices(geometry, parent.id, first);
-            return;
-        }
+        }) else {
+            continue;
+        };
+        line_page = Some(line_page.map_or(first, |p| p.min(first)));
+        spans |= last > first;
+    }
+    if spans && let Some(page) = line_page {
+        record_carrier_slices(geometry, parent.id, page);
     }
 }
 
@@ -19516,6 +19520,44 @@ h2 { string-set: chapter-title content(text); }
         assert!(got[1..].iter().all(|s| *s == (1, 1)), "{carrier:?}");
         assert!(carrier_slices_ok(carrier));
         assert_eq!(fragments_of(&doc, &table, "a")[0].page_index, 0);
+    }
+
+    #[test]
+    fn the_carrier_line_of_two_tall_boxes_is_on_the_first_page_of_the_earlier_one() {
+        // html-to-pdf F183c (validator): both boxes are taller than a page and the walk fragments them one after the other:
+        // B starts where A ends. The line is painted on A's first page, B starts later and is painted there by its
+        // continuation (`render::box_continues_on`); the slices are recorded whichever box is first in the source.
+        let boxes = |first: &str, second: &str| {
+            let lines = |p: &str, n: usize| {
+                (0..n)
+                    .map(|i| format!("<div>{p}{i:02}</div>"))
+                    .collect::<String>()
+            };
+            format!(
+                "<div id=\"c\"><div id=\"a\" style=\"display:inline-block;width:40%\">{}</div> <div id=\"b\" style=\"display:inline-block;width:40%\">{}</div></div>",
+                lines(first, 28),
+                lines(second, 33)
+            )
+        };
+        for (pair, first, second) in [(boxes("A", "B"), "a", "b"), (boxes("B", "A"), "a", "b")] {
+            let (doc, table) = nested_geometry(&pair, 200.0);
+            let carrier = geometry_of(&doc, &table, "c").unwrap();
+            let (fa, fb) = (
+                fragments_of(&doc, &table, first),
+                fragments_of(&doc, &table, second),
+            );
+            assert_eq!(fa[0].page_index, 0);
+            assert!(fb[0].page_index > 0, "{fb:?}");
+            assert!(fb.last().unwrap().page_index > fb[0].page_index, "{fb:?}");
+            let got: Vec<(u32, u32)> = carrier
+                .line_slices
+                .iter()
+                .map(|s| (s.first, s.end))
+                .collect();
+            assert_eq!(got[0], (0, 1), "{carrier:?}");
+            assert!(got[1..].iter().all(|s| *s == (1, 1)), "{carrier:?}");
+            assert!(carrier_slices_ok(carrier));
+        }
     }
 
     #[test]
