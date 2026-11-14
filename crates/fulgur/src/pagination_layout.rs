@@ -3034,6 +3034,36 @@ impl PageStrips {
             && size <= self.fresh() + 1.0
             && cursor + size > self.chrome_bottom(page)
     }
+
+    /// html-to-pdf F213e-c: the class A break in front of a box of `size` px at the top of `page` (`cursor <= 0`) is taken
+    /// because a zero-height sibling precedes the box there (`sibling_on_page`, css-break-3 section 4.1: a break between
+    /// in-flow siblings is a class A point whatever their height). The cursor is still 0, so every `cursor > 0` guard read
+    /// "nothing precedes"; Chrome moves the box whole (css-break-3 section 4.4: an avoid box is held while a break that
+    /// avoids the overflow exists). The same bounds as [`first_box_overflows`](Self::first_box_overflows): only where the
+    /// offset of page 0 makes the box overflow it, and only for a box that fits a fresh page. Without a sibling, or without
+    /// an offset, it is `false`, so a document with neither keeps its placement byte for byte.
+    pub(crate) fn sibling_break_moves(
+        self,
+        page: u32,
+        cursor: f32,
+        size: f32,
+        sibling_on_page: bool,
+    ) -> bool {
+        sibling_on_page && self.first_box_overflows(page, cursor, size)
+    }
+}
+
+/// html-to-pdf F213e-c: whether a body child of height 0 is a sibling box for the break in front of the box after it
+/// (css-break-3 section 4.1). An element is, whatever its display type, so is the anonymous block around an inline element
+/// without a line box (`<span></span>`, measured, m153). Not a comment or other node without `element_data`, not
+/// `display: none` (CSS 2.1 section 9.2.4: no box), not a float (out of flow; a zero-height float does not count in
+/// Chrome either). Out-of-flow positioned boxes and running elements never get here.
+fn zero_height_child_is_sibling(child: &blitz_dom::Node) -> bool {
+    child.element_data().is_some()
+        && !child
+            .primary_styles()
+            .is_some_and(|s| s.clone_display().is_none())
+        && !crate::blitz_adapter::node_is_floating(child)
 }
 
 /// F37: the border box of `<body>` on each page it spans (css-break-3 section 5.4, `box-decoration-break: slice`): a
@@ -3614,6 +3644,9 @@ impl<'a> PaginationLayoutTree<'a> {
         // used page-name differs, we induce a forced break before it
         // (CSS Page 3 §5.3, "Using Named Pages").
         let mut prev_used_page: Option<Option<String>> = None;
+        // html-to-pdf F213e-c: the page of the last zero-height sibling box (`zero_height_child_is_sibling`). Its height
+        // leaves `cursor_y` at 0, so `cursor_y > 0.0` cannot say that a box precedes the next one; this record does.
+        let mut sibling_page: Option<u32> = None;
         // html-to-pdf F30f-b: a clip box that was fragmented by its own block size ended where Chrome's does, in a
         // fragmentainer that is a whole px taller than ours (`PageStrips::chrome_bottom`): the child that follows it
         // may reach that px below the content box without moving to the next page.
@@ -3787,6 +3820,9 @@ impl<'a> PaginationLayoutTree<'a> {
                 }
                 if !zero_is_float {
                     prev_used_page = Some(zero_used_end);
+                }
+                if zero_height_child_is_sibling(child) {
+                    sibling_page = Some(page_index);
                 }
                 if matches!(
                     zero_break_props.break_after,
@@ -4179,9 +4215,17 @@ impl<'a> PaginationLayoutTree<'a> {
                         && shape_ok
                         && cursor_y + (line_metrics[0].1 - line_metrics[0].0)
                             <= self.strips.bottom(page_index));
-                if cursor_y > 0.0
-                    && cursor_y + para_total_h.max(keep_size)
-                        > self.strips.bottom(page_index) + clip_end_slack
+                // html-to-pdf F213e-c: also at the top of page 0 under an offset, when a zero-height sibling precedes it.
+                let sibling_moves = self.strips.sibling_break_moves(
+                    page_index,
+                    cursor_y,
+                    para_total_h.max(keep_size),
+                    sibling_page == Some(page_index),
+                );
+                if (sibling_moves
+                    || (cursor_y > 0.0
+                        && cursor_y + para_total_h.max(keep_size)
+                            > self.strips.bottom(page_index) + clip_end_slack))
                     && !start_here
                 {
                     page_index += 1;
@@ -4394,7 +4438,15 @@ impl<'a> PaginationLayoutTree<'a> {
                             && !child_node
                                 .is_some_and(|n| monolithic_line_carrier(doc, n, page_height_px))))
             };
-            let mut keeps_whole = keeps_whole_at(page_index, cursor_y, content_above);
+            // html-to-pdf F213e-c: a zero-height sibling on page 0 under an offset is a break point in front of the box as
+            // well, so an avoid box is held whole there (and moved by the plain advance below). `content_above` itself, which
+            // the walk below the box reads, is unchanged.
+            let mut keeps_whole = keeps_whole_at(
+                page_index,
+                cursor_y,
+                content_above
+                    || (sibling_page == Some(page_index) && strips.offset_above(page_index)),
+            );
             // F30f-b: a clip box that fits the room is not entered (its content past the clip is hidden); one that does
             // not fit is entered, wherever its children are.
             let clip_enters = |page: u32, cursor: f32| -> Option<bool> {
@@ -4531,9 +4583,17 @@ impl<'a> PaginationLayoutTree<'a> {
             // an 8 px margin, 1003 px moves).
             let first_monolithic_moves = strips.first_box_overflows(page_index, cursor_y, child_h)
                 && child_node.is_some_and(|n| monolithic_box(self.doc, n, page_height_px));
+            // html-to-pdf F213e-c: and a box after a zero-height sibling, which leaves the cursor at 0 as well.
+            let sibling_moves = strips.sibling_break_moves(
+                page_index,
+                cursor_y,
+                child_h.max(keep_size),
+                sibling_page == Some(page_index),
+            );
             if (cursor_y > 0.0
                 && cursor_y + child_h.max(keep_size) > strips.bottom(page_index) + clip_end_slack)
                 || first_monolithic_moves
+                || sibling_moves
             {
                 page_index += 1;
                 cursor_y = 0.0;
