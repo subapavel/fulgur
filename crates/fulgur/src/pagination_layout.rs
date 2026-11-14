@@ -121,23 +121,37 @@ pub struct Fragment {
 /// the block starts, `0..0` before it and `1..1` after it ([`carrier_slices_ok`],
 /// [`record_carrier_slices`]). The line is painted once, on that page, and the later
 /// pages of the block are painted as continuations.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// html-to-pdf F213b: `lead` is how far above the fragment's line origin the slice's first line starts. It is 0 for
+/// every slice but the one that holds a line taller than a page, whose box is fragmented over the pages before it: the
+/// line is painted once, on the page that holds its baseline, and its top is `lead` above that page's fragment, so the
+/// renderer paints the slice at `fragment.y + inset - lead` ([`crate::render`]'s `paragraph_line_range_for_page`). The
+/// page of such a line has no fragment of its own at the line's top, which is why the lead is a field of the slice and
+/// not a negative `Fragment::y`: fragments also drive frames, link rectangles, tag boxes and the extent notes.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LineSlice {
     pub first: u32,
     pub end: u32,
     pub offset: crate::units::Px,
+    pub lead: crate::units::Px,
 }
 
-/// Whether `slices` are contiguous, start at line 0 and cover exactly `0..n`.
-fn line_slices_tile(slices: &[LineSlice], n: usize) -> bool {
+/// Whether `slices` are contiguous, start at line 0 and cover exactly `0..n`, where a slice may be empty
+/// (`k..k`: a page that a tall line crosses and that paints no line of the paragraph, html-to-pdf F213b).
+fn line_slices_tile_with_gaps(slices: &[LineSlice], n: usize) -> bool {
     let mut next = 0u32;
     for s in slices {
-        if s.first != next || s.end <= s.first {
+        if s.first != next || s.end < s.first {
             return false;
         }
         next = s.end;
     }
     next as usize == n
+}
+
+/// Whether `slices` are contiguous, start at line 0 and cover exactly `0..n`, each holding at least one line.
+fn line_slices_tile(slices: &[LineSlice], n: usize) -> bool {
+    line_slices_tile_with_gaps(slices, n) && slices.iter().all(|s| s.end > s.first)
 }
 
 /// F30d: what one column of a multicol container holds on one page.
@@ -7510,6 +7524,7 @@ fn record_carrier_slices(
                 first,
                 end,
                 offset: 0.0_f32.as_px(),
+                lead: crate::units::Px::ZERO,
             }
         })
         .collect();
@@ -9581,6 +9596,7 @@ fn fragment_nested_inline_root(
             first: range.start as u32,
             end: range.end as u32,
             offset: (top - split.lines[0].0).as_px(),
+            lead: crate::units::Px::ZERO,
         });
         // Where the lines of this strip start, so that a descendant can be
         // placed relative to the strip: `y + (local_y - top)`. A descendant's
@@ -9615,6 +9631,7 @@ fn fragment_nested_inline_root(
             first: split.lines.len() as u32,
             end: (split.lines.len() + split.hidden_tail) as u32,
             offset: 0.0_f32.as_px(),
+            lead: crate::units::Px::ZERO,
         });
     }
     // F30f-b: a paragraph that is itself the clip box that hid lines is as tall as its box over the pages: every frame
@@ -10144,6 +10161,7 @@ pub(crate) fn fragment_inline_root(
                 first: fragment_start_idx as u32,
                 end: break_at as u32,
                 offset: (frag_top_local - line_metrics[0].0).as_px(),
+                lead: crate::units::Px::ZERO,
             });
             placements.push((
                 page_index,
@@ -10179,6 +10197,7 @@ pub(crate) fn fragment_inline_root(
         first: fragment_start_idx as u32,
         end: total_lines as u32,
         offset: (frag_top_local - line_metrics[0].0).as_px(),
+        lead: crate::units::Px::ZERO,
     });
     debug_assert!(
         line_slices_tile(&entry.line_slices, total_lines),
@@ -15858,6 +15877,7 @@ h2 { string-set: chapter-title content(text); }
             first,
             end,
             offset: 0.0_f32.as_px(),
+            lead: crate::units::Px::ZERO,
         };
         assert!(super::line_slices_tile(&[s(0, 3), s(3, 5)], 5));
         assert!(!super::line_slices_tile(&[s(0, 3), s(4, 5)], 5), "gap");
@@ -15866,6 +15886,54 @@ h2 { string-set: chapter-title content(text); }
         assert!(!super::line_slices_tile(&[s(1, 5)], 5), "starts at 1");
         assert!(!super::line_slices_tile(&[s(0, 0), s(0, 5)], 5), "empty");
         assert!(!super::line_slices_tile(&[], 5), "nothing");
+    }
+
+    #[test]
+    fn line_slices_tile_with_gaps_accepts_empty_slices_where_a_tall_line_crosses_pages() {
+        // html-to-pdf F213b: a line taller than a page is on one page; the pages its box crosses before it hold no
+        // line of the paragraph (`k..k`). The lines still have to be contiguous and cover `0..n`.
+        let s = |first, end| super::LineSlice {
+            first,
+            end,
+            ..Default::default()
+        };
+        // Lines 0..2 on page 0, the tall line 2..3 on page 3, pages 1 and 2 hold none of the paragraph's lines.
+        let with_gaps = [s(0, 2), s(2, 2), s(2, 2), s(2, 3), s(3, 4)];
+        assert!(super::line_slices_tile_with_gaps(&with_gaps, 4));
+        assert!(
+            !super::line_slices_tile(&with_gaps, 4),
+            "the strict check still rejects an empty slice"
+        );
+        // An empty slice is no licence to skip or repeat lines, or to end early.
+        assert!(
+            !super::line_slices_tile_with_gaps(&[s(0, 2), s(3, 3), s(3, 4)], 4),
+            "gap"
+        );
+        assert!(
+            !super::line_slices_tile_with_gaps(&[s(0, 2), s(1, 1), s(1, 4)], 4),
+            "overlap"
+        );
+        assert!(
+            !super::line_slices_tile_with_gaps(&[s(0, 2), s(2, 2)], 4),
+            "short"
+        );
+        assert!(
+            !super::line_slices_tile_with_gaps(&[s(1, 1), s(1, 4)], 4),
+            "starts at 1"
+        );
+        assert!(
+            !super::line_slices_tile_with_gaps(&[s(0, 3), s(3, 2)], 4),
+            "reversed"
+        );
+        assert!(
+            super::line_slices_tile_with_gaps(&[s(0, 0), s(0, 4)], 4),
+            "leading empty"
+        );
+        assert!(!super::line_slices_tile_with_gaps(&[], 4), "nothing");
+        assert!(
+            super::line_slices_tile_with_gaps(&[], 0),
+            "no lines, no slices"
+        );
     }
 
     /// Node id of the element with `id="..."`.
@@ -20494,6 +20562,7 @@ h2 { string-set: chapter-title content(text); }
                     first,
                     end,
                     offset: 0.0_f32.as_px(),
+                    lead: crate::units::Px::ZERO,
                 })
                 .collect(),
             ..Default::default()

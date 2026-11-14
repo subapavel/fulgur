@@ -1600,9 +1600,14 @@ fn carrier_line_page(
     carrier.fragments.get(pos).map(|f| f.page_index)
 }
 
-/// [`inline_box_continues_on`], and also a box whose first fragment is after the page its carrier's line is painted on
-/// (html-to-pdf F183c): the line paints the descendants that have a fragment on its page, so a box that starts on a later
-/// page has no one to paint its first fragment either. Every box that is not on such a carrier is as before.
+/// Whether the inline box `ib_id` has a fragment on `page_index` that its carrier's line does not paint: any fragment
+/// on a page other than the one the line is painted on (`carrier_line_page`; for a box that has no such carrier, the
+/// box's first page, which is [`inline_box_continues_on`]). The line paints the descendants that have a fragment on its
+/// page, so a box that starts on a later page than the line (html-to-pdf F183c) has no one to paint its first
+/// fragment, and neither has a box with fragments on the pages *before* the line (html-to-pdf F213b: the line is
+/// painted where its baseline is, which for a box taller than a page is not the page where the box starts). A box
+/// repeated whole on every page is painted by its carrier each time. Every box that is not on such a carrier is as
+/// before.
 fn box_continues_on(
     geometry: &crate::pagination_layout::PaginationGeometryTable,
     drawables: &Drawables,
@@ -1612,10 +1617,13 @@ fn box_continues_on(
     let Some(geom) = geometry.get(&ib_id) else {
         return false;
     };
-    inline_box_continues_on(geom, page_index)
-        || (geom.fragments.iter().any(|f| f.page_index == page_index)
-            && carrier_line_page(geometry, drawables, ib_id)
-                .is_some_and(|line| line < page_index && !geom.is_repeat))
+    if !geom.fragments.iter().any(|f| f.page_index == page_index) {
+        return false;
+    }
+    match carrier_line_page(geometry, drawables, ib_id) {
+        Some(line) => !geom.is_repeat && line != page_index,
+        None => inline_box_continues_on(geom, page_index),
+    }
 }
 
 /// F30f: the opacity of the paragraph that carries the inline box `ib_id`, 1 when it has none.
@@ -5090,7 +5098,7 @@ fn draw_paragraph_inner_paint(
     if !entry.visible {
         return;
     }
-    let Some((range, rebase)) =
+    let Some((range, rebase, lead)) =
         paragraph_line_range_for_page(&entry.lines, fragments, line_slices, page_index, is_split)
     else {
         return;
@@ -5112,7 +5120,15 @@ fn draw_paragraph_inner_paint(
         margin_left_pt,
         margin_top_pt,
     });
-    crate::paragraph::draw_shaped_lines(canvas, &slice, x.as_pt(), y.as_pt(), inline_box_ctx);
+    // html-to-pdf F213b: the lead is how far above the fragment the first line of this slice starts (a line taller than a
+    // page is painted on the page of its baseline). It is 0 for every slice a fragmenter made before F213b.
+    crate::paragraph::draw_shaped_lines(
+        canvas,
+        &slice,
+        x.as_pt(),
+        y.as_pt() - lead,
+        inline_box_ctx,
+    );
 }
 
 /// Phase 4 PR 3 follow-up (PR #302 Devin): mirror
@@ -5143,13 +5159,16 @@ fn paragraph_lines_for_page(
     page_index: u32,
     is_split: bool,
 ) -> Option<Vec<crate::paragraph::ShapedLine>> {
-    let (range, by) =
+    let (range, by, _lead) =
         paragraph_line_range_for_page(all_lines, fragments, line_slices, page_index, is_split)?;
     Some(rebase_lines(&all_lines[range], by))
 }
 
-/// The lines of a paragraph that page `page_index` paints, as a range of `all_lines`, and the offset to move them up
-/// by ([`rebase_lines`]; zero for a paragraph that is not split). `None` when the page paints none of them.
+/// The lines of a paragraph that page `page_index` paints, as a range of `all_lines`, the offset to move them up
+/// by ([`rebase_lines`]; zero for a paragraph that is not split) and the lead: how far above the fragment the first
+/// of them starts (html-to-pdf F213b, [`crate::pagination_layout::LineSlice::lead`]; zero unless the lines are a line
+/// taller than a page, and zero for lines that were measured). The caller paints them at the fragment's line origin
+/// less the lead. `None` when the page paints none of them.
 ///
 /// [`paragraph_lines_for_page`] is this plus the copy; the renderer calls this one so that it can record the range
 /// in the ledger of what was painted (html-to-pdf F213d, [`report_unpainted`]).
@@ -5159,11 +5178,15 @@ fn paragraph_line_range_for_page(
     line_slices: &[crate::pagination_layout::LineSlice],
     page_index: u32,
     is_split: bool,
-) -> Option<(std::ops::Range<usize>, crate::units::Pt)> {
+) -> Option<(std::ops::Range<usize>, crate::units::Pt, crate::units::Pt)> {
     let target_pos = fragments.iter().position(|f| f.page_index == page_index)?;
 
     if !is_split {
-        return Some((0..all_lines.len(), crate::units::Pt::ZERO));
+        return Some((
+            0..all_lines.len(),
+            crate::units::Pt::ZERO,
+            crate::units::Pt::ZERO,
+        ));
     }
 
     // The slices describe these lines: one per fragment, ending at the last line. F30f-b: a clip box that hides the
@@ -5178,7 +5201,7 @@ fn paragraph_line_range_for_page(
         if first >= end || end > all_lines.len() {
             return None;
         }
-        return Some((first..end, slice.offset.in_pt()));
+        return Some((first..end, slice.offset.in_pt(), slice.lead.in_pt()));
     }
 
     let target_h = fragments[target_pos].height.in_pt();
@@ -5231,7 +5254,7 @@ fn paragraph_line_range_for_page(
         );
     }
 
-    Some((start_idx..end_idx, consumed))
+    Some((start_idx..end_idx, consumed, crate::units::Pt::ZERO))
 }
 
 /// Whether a page whose lines `[start, end)` were measured from fragment heights holds only some of a paragraph of
@@ -7400,6 +7423,7 @@ mod tests {
             first,
             end,
             offset: 0.0_f32.as_px(),
+            lead: crate::units::Px::ZERO,
         }
     }
 
@@ -7467,6 +7491,7 @@ mod tests {
                 first,
                 end,
                 offset: crate::units::Px::ZERO,
+                lead: crate::units::Px::ZERO,
             })
             .collect();
         table.insert(1, carrier);
@@ -7485,6 +7510,85 @@ mod tests {
         assert!(!box_continues_on(&table, &d, 8, 0), "no fragment there");
         assert!(!box_continues_on(&table, &d, 9, 1), "no carrier: as before");
         assert!(box_continues_on(&table, &d, 9, 2));
+    }
+
+    #[test]
+    fn a_box_with_fragments_before_the_carrier_line_page_continues_there() {
+        // html-to-pdf F213b: a box taller than a page shares the carrier's one line, and the line is painted on the page
+        // of the box's baseline (page 2), not where the box starts (page 0). The line paints the box's fragment on page 2;
+        // the fragments on the pages before it have no one to paint them but their continuation, and the ones after it
+        // continue as before.
+        let mut table = crate::pagination_layout::PaginationGeometryTable::new();
+        let mut carrier = geometry_over_pages(&[0, 1, 2, 3]);
+        carrier.line_slices = [(0, 0), (0, 0), (0, 1), (1, 1)]
+            .into_iter()
+            .map(|(first, end)| slice(first, end))
+            .collect();
+        table.insert(1, carrier);
+        table.insert(7, geometry_over_pages(&[0, 1, 2, 3]));
+        table.insert(8, geometry_over_pages(&[1]));
+        table.insert(9, geometry_over_pages(&[0, 1, 2, 3]));
+        let mut d = Drawables::new();
+        d.inline_box_carrier.insert(7, 1);
+        d.inline_box_carrier.insert(8, 1);
+        assert_eq!(carrier_line_page(&table, &d, 7), Some(2));
+        for (page, painted_by_continuation) in [(0, true), (1, true), (2, false), (3, true)] {
+            assert_eq!(
+                box_continues_on(&table, &d, 7, page),
+                painted_by_continuation,
+                "box 7, page {page}"
+            );
+        }
+        assert!(!box_continues_on(&table, &d, 7, 4), "no fragment on page 4");
+        assert!(
+            box_continues_on(&table, &d, 8, 1),
+            "a box with one fragment before the line page is painted there too"
+        );
+        // A box that has no such carrier: its first page is where it is painted, as before.
+        assert!(!box_continues_on(&table, &d, 9, 0));
+        assert!(box_continues_on(&table, &d, 9, 1));
+        // A box repeated whole on every page is painted by its carrier each time.
+        let mut repeated = geometry_over_pages(&[0, 1, 2, 3]);
+        repeated.is_repeat = true;
+        table.insert(10, repeated);
+        d.inline_box_carrier.insert(10, 1);
+        for page in 0..4 {
+            assert!(
+                !box_continues_on(&table, &d, 10, page),
+                "repeat, page {page}"
+            );
+        }
+    }
+
+    #[test]
+    fn paragraph_line_range_for_page_returns_the_lead_of_the_slice() {
+        // html-to-pdf F213b: the carrier's one line is painted on page 2, 300 px above that page's fragment (its box
+        // began two pages earlier); the pages before it hold an empty slice. Only that slice has a lead, and a page
+        // without a slice match (measured lines, a paragraph that is not split) has none.
+        let lines = vec![make_line(120.0, 90.0)];
+        let fragments = [
+            make_fragment(0, 16.0),
+            make_fragment(1, 16.0),
+            make_fragment(2, 16.0),
+            make_fragment(3, 16.0),
+        ];
+        let mut slices = [slice(0, 0), slice(0, 0), slice(0, 1), slice(1, 1)];
+        slices[2].lead = 300.0_f32.as_px();
+        for (page, expected) in [(0, None), (1, None), (2, Some(225.0)), (3, None)] {
+            let got = paragraph_line_range_for_page(&lines, &fragments, &slices, page, true);
+            match (got, expected) {
+                (None, None) => {}
+                (Some((range, by, lead)), Some(lead_pt)) => {
+                    assert_eq!(range, 0..1, "page {page}");
+                    assert_eq!(by, crate::units::Pt::ZERO, "page {page}");
+                    assert!(
+                        (lead.to_f32() - lead_pt).abs() < 0.001,
+                        "page {page}: {lead:?}"
+                    );
+                }
+                (got, expected) => panic!("page {page}: {got:?}, expected lead {expected:?}"),
+            }
+        }
     }
 
     /// Runs `f` with a canvas on a scratch page.
@@ -7644,21 +7748,23 @@ mod tests {
             ),
             ("measured", &fragments[..], &[][..], true, 1),
         ] {
-            let (range, by) = match paragraph_line_range_for_page(&lines, frs, sl, page, split) {
-                Some(x) => x,
-                None => {
-                    assert!(
-                        paragraph_lines_for_page(&lines, frs, sl, page, split).is_none(),
-                        "{name}"
-                    );
-                    continue;
-                }
-            };
+            let (range, by, lead) =
+                match paragraph_line_range_for_page(&lines, frs, sl, page, split) {
+                    Some(x) => x,
+                    None => {
+                        assert!(
+                            paragraph_lines_for_page(&lines, frs, sl, page, split).is_none(),
+                            "{name}"
+                        );
+                        continue;
+                    }
+                };
             let copy = paragraph_lines_for_page(&lines, frs, sl, page, split).expect(name);
             assert_eq!(copy.len(), range.len(), "{name}");
             for (c, l) in copy.iter().zip(rebase_lines(&lines[range.clone()], by)) {
                 assert_eq!(c.baseline, l.baseline, "{name}");
             }
+            assert_eq!(lead, crate::units::Pt::ZERO, "{name}: no slice has a lead");
             if !split {
                 assert_eq!(range, 0..lines.len(), "{name}: every line");
                 assert_eq!(by, crate::units::Pt::ZERO, "{name}: not moved");
@@ -7684,7 +7790,7 @@ mod tests {
         reset_painted_ledger();
         let g = &geometry[&5];
         for page in 0..2 {
-            if let Some((range, _)) = paragraph_line_range_for_page(
+            if let Some((range, _, _)) = paragraph_line_range_for_page(
                 &lines,
                 &g.fragments,
                 &g.line_slices,
@@ -7844,11 +7950,13 @@ mod tests {
                 first: 0,
                 end: 3,
                 offset: 0.0_f32.as_px(),
+                lead: crate::units::Px::ZERO,
             },
             crate::pagination_layout::LineSlice {
                 first: 3,
                 end: 5,
                 offset: 99.0_f32.as_px(),
+                lead: crate::units::Px::ZERO,
             },
         ];
         let page = paragraph_lines_for_page(&lines, &fragments, &stale, 1, true).expect("measured");
