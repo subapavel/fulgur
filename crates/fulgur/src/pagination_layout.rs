@@ -7498,10 +7498,15 @@ fn carrier_slices_ok(geom: &PaginationGeometry) -> bool {
 /// painted on no page, and the box with it. With these slices the line (and so the box's first fragment, which the
 /// carrier paints at the position Parley gave it, the baseline of its last line box on the line's, CSS 2.1 §10.8.1) is drawn once,
 /// on the page where it always was.
+///
+/// html-to-pdf F213b: `lead` is how far above the fragment on `line_page` the line starts, for a line that is painted on
+/// the page of its baseline and not on the page where its box starts ([`baseline_line_placement`]); 0 for a line painted
+/// where its box starts.
 fn record_carrier_slices(
     geometry: &mut PaginationGeometryTable,
     carrier_id: usize,
     line_page: u32,
+    lead: crate::units::Px,
 ) {
     let Some(entry) = geometry.get_mut(&carrier_id) else {
         return;
@@ -7524,7 +7529,11 @@ fn record_carrier_slices(
                 first,
                 end,
                 offset: 0.0_f32.as_px(),
-                lead: crate::units::Px::ZERO,
+                lead: if k == line {
+                    lead
+                } else {
+                    crate::units::Px::ZERO
+                },
             }
         })
         .collect();
@@ -7564,7 +7573,7 @@ fn record_carrier_slices_after(
         if let Some((first, last)) = pages
             && last > first
         {
-            record_carrier_slices(geometry, parent.id, first);
+            record_carrier_slices(geometry, parent.id, first, crate::units::Px::ZERO);
             return;
         }
     }
@@ -7576,8 +7585,15 @@ fn record_carrier_slices_after(
     // what happens when a box on the line hangs below the fragment's end (a `display: block; height: 9px` child ends a
     // box below its last line box, so the line is a pixel taller than the tall box, and the box lost its first 50
     // lines). Before the baseline walk every box ended at the bottom of the line.
+    //
+    // html-to-pdf F213b: the line is painted on the page that holds its baseline when that is a later page than the
+    // earliest first page. The baseline is the one of the tallest box on the line (the box that sets it): the last line
+    // box of an `inline-block` (CSS 2.1 section 10.8.1), the first baseline of an `inline-flex` (css-align-3 section 9.1).
+    // The text of the line sits on it, so it is printed with the slice that holds the baseline, and the line starts
+    // `lead` above that page's fragment ([`baseline_line_placement`]).
     let mut line_page: Option<u32> = None;
     let mut spans = false;
+    let mut tallest: Option<(usize, f32)> = None;
     for &id in walk_children {
         let Some(ib) = doc.get_node(id) else {
             continue;
@@ -7593,10 +7609,198 @@ fn record_carrier_slices_after(
         };
         line_page = Some(line_page.map_or(first, |p| p.min(first)));
         spans |= last > first;
+        let height = ib.final_layout.size.height;
+        if tallest.is_none_or(|(_, h)| height > h) {
+            tallest = Some((id, height));
+        }
     }
     if spans && let Some(page) = line_page {
-        record_carrier_slices(geometry, parent.id, page);
+        let (page, lead) = tallest
+            .and_then(|(id, _)| baseline_line_placement(geometry, doc, parent, id, page))
+            .unwrap_or((page, crate::units::Px::ZERO));
+        record_carrier_slices(geometry, parent.id, page, lead);
     }
+}
+
+/// html-to-pdf F213b: where the one line of the carrier `carrier` is painted, when it is not on the first page of its
+/// boxes: the page that holds the baseline of the box `box_id` that sets it, and how far above the carrier's fragment on
+/// that page the line starts (the `lead` of the slice). `None` when the baseline is on `first_page` already (the line is
+/// painted where it always was: nothing changes), or when it cannot be found (the line stays on `first_page`).
+///
+/// The baseline of the line sits at `line_baseline` below the line's top, and the box's top at `box_top` below it
+/// (Parley's positions of the line and of the box, whose baseline is on the line's); the box's own baseline is
+/// `line_baseline - box_top` below its top. [`baseline_on_page`] finds the page and the y where that baseline is after
+/// the box was fragmented. The line's top is then `line_baseline` above that y, and the renderer paints the carrier's
+/// slice from the carrier's content origin on that page, so the lead is the distance between the two.
+fn baseline_line_placement(
+    geometry: &PaginationGeometryTable,
+    doc: &BaseDocument,
+    carrier: &blitz_dom::Node,
+    box_id: usize,
+    first_page: u32,
+) -> Option<(u32, crate::units::Px)> {
+    // A line that holds nothing but boxes and white space has no text to print at the baseline: its boxes are painted by
+    // their own fragments wherever the line is, and the line stays where it was (html-to-pdf F183c).
+    if !carrier_line_has_ink(doc, carrier) {
+        return None;
+    }
+    let (line_baseline, box_top) = carrier_line_box_offsets(carrier, box_id)?;
+    let (page, baseline_y) = baseline_on_page(geometry, doc, box_id, line_baseline - box_top)?;
+    if page <= first_page {
+        return None;
+    }
+    let fragment = geometry
+        .get(&carrier.id)?
+        .fragments
+        .iter()
+        .find(|f| f.page_index == page)?;
+    let inset = carrier.final_layout.border.top + carrier.final_layout.padding.top;
+    let line_top = baseline_y - line_baseline;
+    let lead = fragment.y.to_f32() + inset - line_top;
+    lead.is_finite().then(|| (page, lead.max(0.0).as_px()))
+}
+
+/// html-to-pdf F213b: whether the lines of the inline root `carrier` hold something a line prints on its own: a run of
+/// glyphs that is not all white space, or an inline box that is not an atomic inline container (an `<img>`, an inline
+/// `<svg>`; an `inline-block` is painted by its own fragments).
+fn carrier_line_has_ink(doc: &BaseDocument, carrier: &blitz_dom::Node) -> bool {
+    let Some(text_layout) = carrier
+        .element_data()
+        .and_then(|e| e.inline_layout_data.as_deref())
+    else {
+        return false;
+    };
+    text_layout
+        .layout
+        .lines()
+        .flat_map(|line| line.items().collect::<Vec<_>>())
+        .any(|item| match item {
+            parley::PositionedLayoutItem::GlyphRun(run) => text_layout
+                .text
+                .get(run.run().text_range())
+                .is_some_and(|t| !t.chars().all(char::is_whitespace)),
+            parley::PositionedLayoutItem::InlineBox(b) => doc
+                .get_node(b.id as usize)
+                .is_none_or(|n| !crate::blitz_adapter::is_atomic_inline_container_node(n)),
+        })
+}
+
+/// html-to-pdf F213b: for the single line of the inline root `carrier`, the distance in px from the top of the line to its
+/// baseline, and to the top of the atomic inline box `box_id` on it. `None` when the carrier has not exactly one line or
+/// the box is not on it.
+fn carrier_line_box_offsets(carrier: &blitz_dom::Node, box_id: usize) -> Option<(f32, f32)> {
+    let text_layout = carrier.element_data()?.inline_layout_data.as_deref()?;
+    let mut lines = text_layout.layout.lines();
+    let (line, None) = (lines.next()?, lines.next()) else {
+        return None;
+    };
+    let m = line.metrics();
+    line.items().find_map(|item| match item {
+        parley::PositionedLayoutItem::InlineBox(b) if b.id as usize == box_id => {
+            Some((m.baseline - m.min_coord, b.y - m.min_coord))
+        }
+        _ => None,
+    })
+}
+
+/// html-to-pdf F213b: the page and the page-local y (px, as [`Fragment::y`]) of the point `baseline_in_box` px below the
+/// top of the border box of `box_id`, after the box was fragmented over pages.
+///
+/// Walks down the box's `layout_children` to the deepest in-flow child whose box-local span holds the point, and places
+/// the point in that node: through its line slices when it is an inline root split between its lines, and otherwise in
+/// the fragment that holds that part of it. A point at or below the bottom of a node that no child holds is the bottom
+/// of its last fragment (the baseline of a box with no line box is its bottom margin edge, CSS 2.1 section 10.8.1). An
+/// inline root is not entered: the lines of its text are not layout children, and the boxes in its lines are placed by
+/// Parley, not by Taffy. `None` when the nodes on the way have no geometry.
+fn baseline_on_page(
+    geometry: &PaginationGeometryTable,
+    doc: &BaseDocument,
+    box_id: usize,
+    baseline_in_box: f32,
+) -> Option<(u32, f32)> {
+    let mut node_id = box_id;
+    let mut local = baseline_in_box;
+    for _ in 0..crate::MAX_DOM_DEPTH {
+        let node = doc.get_node(node_id)?;
+        if node.flags.is_inline_root() {
+            break;
+        }
+        let children = node.layout_children.borrow();
+        let next = children.as_deref().and_then(|ids| {
+            ids.iter().filter_map(|&id| doc.get_node(id)).find(|c| {
+                let l = &c.final_layout;
+                is_flow_child_with_height(c)
+                    && geometry.get(&c.id).is_some_and(|g| !g.fragments.is_empty())
+                    && l.location.y <= local
+                    && local < l.location.y + l.size.height
+            })
+        });
+        let Some(child) = next else {
+            break;
+        };
+        local -= child.final_layout.location.y;
+        node_id = child.id;
+    }
+    place_in_fragments(geometry, doc, node_id, local)
+}
+
+/// [`baseline_on_page`], the last step: where the point `local` px below the top of the border box of `node_id` is.
+fn place_in_fragments(
+    geometry: &PaginationGeometryTable,
+    doc: &BaseDocument,
+    node_id: usize,
+    local: f32,
+) -> Option<(u32, f32)> {
+    let node = doc.get_node(node_id)?;
+    let geom = geometry.get(&node_id)?;
+    let last = geom.fragments.last()?;
+    // An inline root split between its lines: the slice that holds the line the point is in. The slice puts line `first`
+    // at the fragment's content origin, as the renderer paints it (`LineSlice::offset`); the top inset is only on the
+    // first fragment of a sliced box (css-break-3 section 5.4).
+    if geom.line_slices.len() == geom.fragments.len()
+        && let Some((inset_top, _)) = geom.line_split_insets
+    {
+        let lines = collect_inline_line_metrics(node);
+        let inset_top = inset_top.to_f32();
+        let content = local - inset_top;
+        let line = lines
+            .iter()
+            .rposition(|&(top, _)| top <= content)
+            .unwrap_or(0);
+        if let Some((k, slice)) = geom
+            .line_slices
+            .iter()
+            .enumerate()
+            .find(|(_, s)| (s.first as usize..s.end as usize).contains(&line))
+            && let Some(fragment) = geom.fragments.get(k)
+        {
+            let strip_inset = if k == 0 || !geom.line_split_slice {
+                inset_top
+            } else {
+                0.0
+            };
+            let slice_top = lines.get(slice.first as usize).map_or(0.0, |l| l.0);
+            return Some((
+                fragment.page_index,
+                fragment.y.to_f32() + strip_inset + (content - slice_top),
+            ));
+        }
+    }
+    // Not split by lines: the point is in the fragment that holds that part of the box. A point at or below the bottom
+    // of the box is the bottom of the last fragment.
+    let height = node.final_layout.size.height;
+    if local >= height - 0.5 {
+        return Some((last.page_index, last.y.to_f32() + last.height.to_f32()));
+    }
+    let mut above = 0.0_f32;
+    for fragment in &geom.fragments {
+        let h = fragment.height.to_f32();
+        if local < above + h || std::ptr::eq(fragment, last) {
+            return Some((fragment.page_index, fragment.y.to_f32() + (local - above)));
+        }
+        above += h;
+    }
+    None
 }
 
 /// F12: a table's first `table-header-group`, repeated at the top of every
@@ -19648,6 +19852,194 @@ h2 { string-set: chapter-title content(text); }
         assert!(got[1..].iter().all(|s| *s == (1, 1)), "{carrier:?}");
         assert!(carrier_slices_ok(carrier));
         assert_eq!(fragments_of(&doc, &table, "a")[0].page_index, 0);
+    }
+
+    /// The page of the node `id` (the one fragment it has) and its y on that page.
+    fn the_fragment_of(
+        doc: &blitz_html::HtmlDocument,
+        table: &PaginationGeometryTable,
+        id: &str,
+    ) -> (u32, f32) {
+        let frags = fragments_of(doc, table, id);
+        assert_eq!(frags.len(), 1, "{id}: {frags:?}");
+        (frags[0].page_index, frags[0].y.to_f32())
+    }
+
+    #[test]
+    fn the_carrier_line_with_text_is_on_the_page_of_the_baseline_of_its_tall_box() {
+        // html-to-pdf F213b: `<div id=c>START box TAIL</div>`, the box a column of 30 lines of 20 px on 200 px pages
+        // (4 pages). The text of the line sits on the baseline of the box's last line box (CSS 2.1 section 10.8.1), which is
+        // on the page of the last child, so the carrier's one line is painted there, and starts above that page's fragment
+        // by the height of the box above the baseline.
+        let boxed: String = (0..30)
+            .map(|i| format!("<div id=\"l{i}\">A{i:02}</div>"))
+            .collect();
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div id=\"c\">START <div id=\"a\" style=\"display:inline-block;width:40%\">{boxed}</div> TAIL</div>"
+            ),
+            200.0,
+        );
+        let carrier = geometry_of(&doc, &table, "c").unwrap();
+        assert!(carrier_slices_ok(carrier), "{carrier:?}");
+        let last = the_fragment_of(&doc, &table, "l29");
+        assert!(last.0 >= 2, "the box spans pages: {last:?}");
+        let line = carrier
+            .line_slices
+            .iter()
+            .position(|s| (s.first, s.end) == (0, 1))
+            .unwrap();
+        assert_eq!(carrier.fragments[line].page_index, last.0, "{carrier:?}");
+        // The lead: where the line starts above the fragment, so that the text of the line is level with the last child.
+        let c = node_of(&doc, "c");
+        let (line_baseline, _) =
+            carrier_line_box_offsets(c, find_by_id(doc.deref(), "a").unwrap()).unwrap();
+        let lead = carrier.line_slices[line].lead.to_f32();
+        assert!(
+            lead > 100.0,
+            "the line starts pages above its fragment: {lead}"
+        );
+        let text_y = carrier.fragments[line].y.to_f32() - lead + line_baseline;
+        let (_, baseline_y) = baseline_on_page(
+            &table,
+            doc.deref(),
+            find_by_id(doc.deref(), "a").unwrap(),
+            line_baseline
+                - carrier_line_box_offsets(c, find_by_id(doc.deref(), "a").unwrap())
+                    .unwrap()
+                    .1,
+        )
+        .unwrap();
+        assert!(
+            (text_y - baseline_y).abs() < 0.01,
+            "{text_y} against {baseline_y}"
+        );
+        assert!(
+            (baseline_y - last.1).abs() < 20.0,
+            "the baseline is inside the last line of 20 px: {baseline_y} against {}",
+            last.1
+        );
+        for (k, s) in carrier.line_slices.iter().enumerate() {
+            if k != line {
+                assert!(
+                    s.lead == crate::units::Px::ZERO,
+                    "only the line's slice has a lead: {carrier:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_carrier_line_of_boxes_and_white_space_stays_on_the_first_page() {
+        // html-to-pdf F213b: the same box beside a second box and a space and nothing else. There is no text to print at
+        // the baseline, so the line stays on the first page of the boxes (F183c) and has no lead.
+        let boxed =
+            |p: &str| -> String { (0..30).map(|i| format!("<div>{p}{i:02}</div>")).collect() };
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div id=\"c\"><div id=\"a\" style=\"display:inline-block;width:40%\">{}</div> <div id=\"b\" style=\"display:inline-block;width:40%\">{}</div></div>",
+                boxed("A"),
+                boxed("B")
+            ),
+            200.0,
+        );
+        let carrier = geometry_of(&doc, &table, "c").unwrap();
+        assert!(carrier_slices_ok(carrier), "{carrier:?}");
+        assert_eq!(carrier.line_slices[0].end, 1, "{carrier:?}");
+        assert!(
+            carrier
+                .line_slices
+                .iter()
+                .all(|s| s.lead == crate::units::Px::ZERO)
+        );
+    }
+
+    #[test]
+    fn baseline_on_page_goes_through_a_pushed_child() {
+        // html-to-pdf F213b: a box of 470 px (200 px pages) whose last child follows a spacer of 450 px. The child is at
+        // 450 px in the box, so the baseline of the box is in it, on page 2, where the walk put it; not on page 0, where
+        // the box starts.
+        let (doc, table) = nested_geometry(
+            "<div id=\"c\">x <div id=\"a\" style=\"display:inline-block;width:40%\">\
+             <div style=\"height:450px\"></div><div id=\"k\">LOW</div></div> y</div>",
+            200.0,
+        );
+        let a = find_by_id(doc.deref(), "a").unwrap();
+        let k = fragments_of(&doc, &table, "k");
+        assert_eq!(k.len(), 1, "{k:?}");
+        // The point 10 px into the child: the child's top is at 450 px in the box.
+        let (page, y) = baseline_on_page(&table, doc.deref(), a, 460.0).unwrap();
+        assert_eq!(page, k[0].page_index);
+        assert!(
+            (y - (k[0].y.to_f32() + 10.0)).abs() < 0.01,
+            "{y} against {:?}",
+            k[0]
+        );
+        assert!(page >= 1, "the child is not on the first page");
+    }
+
+    #[test]
+    fn baseline_on_page_below_the_last_child_is_the_bottom_of_the_last_fragment() {
+        // CSS 2.1 section 10.8.1: a box with no line box has its bottom margin edge as the baseline. A point at the bottom
+        // of the box is the bottom of its last fragment, whatever its children hold.
+        let (doc, table) = nested_geometry(
+            "<div id=\"c\">x <div id=\"a\" style=\"display:inline-block;width:40%;height:500px\"><div>one</div></div> y</div>",
+            200.0,
+        );
+        let a = find_by_id(doc.deref(), "a").unwrap();
+        let geom = &table[&a];
+        let bottom = geom
+            .fragments
+            .last()
+            .map(|f| (f.page_index, f.y.to_f32() + f.height.to_f32()))
+            .unwrap();
+        let got = baseline_on_page(&table, doc.deref(), a, 500.0).unwrap();
+        assert_eq!(got.0, bottom.0);
+        assert!(
+            (got.1 - bottom.1).abs() < 0.01,
+            "{got:?} against {bottom:?}"
+        );
+    }
+
+    #[test]
+    fn a_point_in_an_inline_root_split_between_lines_is_placed_through_its_slices() {
+        // html-to-pdf F213b: a paragraph of 6 lines of 20 px recorded as three fragments of two lines (the shape
+        // `fragment_nested_inline_root` records), the first at y = 100 on page 0, the others at the top of pages 1 and 2.
+        // The point 50 px below the paragraph's top is in line 2 (40 to 60 px), the first line of the second fragment: 10 px
+        // into it.
+        let doc = laid_out("<p id=\"p\" style=\"width:1px\">a b c d e f</p>");
+        let id = find_by_id(doc.deref(), "p").unwrap();
+        let node = doc.deref().get_node(id).unwrap();
+        let lines = collect_inline_line_metrics(node);
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        let fragment = |page: u32, y: f32| Fragment {
+            page_index: page,
+            x: 0.0_f32.as_px(),
+            y: y.as_px(),
+            width: 30.0_f32.as_px(),
+            height: 40.0_f32.as_px(),
+        };
+        let slice = |first: u32, end: u32, offset: f32| LineSlice {
+            first,
+            end,
+            offset: offset.as_px(),
+            lead: crate::units::Px::ZERO,
+        };
+        let mut table = PaginationGeometryTable::new();
+        table.insert(
+            id,
+            PaginationGeometry {
+                fragments: vec![fragment(0, 100.0), fragment(1, 0.0), fragment(2, 0.0)],
+                line_slices: vec![slice(0, 2, 0.0), slice(2, 4, 40.0), slice(4, 6, 80.0)],
+                line_split_insets: Some((0.0_f32.as_px(), 0.0_f32.as_px())),
+                ..Default::default()
+            },
+        );
+        for (local, expected) in [(5.0, (0, 105.0)), (50.0, (1, 10.0)), (110.0, (2, 30.0))] {
+            let got = baseline_on_page(&table, doc.deref(), id, local).unwrap();
+            assert_eq!(got.0, expected.0, "local {local}");
+            assert!((got.1 - expected.1).abs() < 0.01, "local {local}: {got:?}");
+        }
     }
 
     #[test]

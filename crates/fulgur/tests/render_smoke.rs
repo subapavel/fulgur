@@ -10383,6 +10383,55 @@ fn render_v2_smoke_avoid_card_after_a_zero_height_box_under_an_offset_moves_whol
 }
 
 #[test]
+fn render_v2_smoke_tall_box_sharing_its_line_prints_the_text_on_the_baseline_page() {
+    // html-to-pdf F213b: `<p>START box TAIL</p>`, the box a column of 30 lines of 20 px on 300 px pages (2 pages, AFTER on a third). The
+    // text of the line sits on the baseline of the box's last line box (CSS 2.1 section 10.8.1), on the last page, so the
+    // line is painted there, `lead` above its fragment: START and TAIL used to be painted once, on the page where the box
+    // starts, below the edge of it, and printed nowhere. Every word of the box is printed once.
+    let lines: String = (1..=30)
+        .map(|i| format!("<span style=\"display:block\">L{i:02}</span>"))
+        .collect();
+    let html = format!(
+        "<!DOCTYPE html><html><head><style>@page {{ size: 400px 300px; margin: 0 }} \
+         body {{ margin: 0; line-height: 20px }} p {{ margin: 0 }}</style></head><body>\
+         <p>START <span style=\"display:inline-block;width:100px\">{lines}</span> TAIL</p>\
+         <p>AFTER</p></body></html>"
+    );
+    let pdf = noto_engine().render(&html).unwrap();
+    assert_eq!(
+        page_count(&pdf),
+        3,
+        "600 px of box on two 300 px pages, then AFTER"
+    );
+    let Some(text) = extract_pdf_text(&pdf) else {
+        eprintln!("pdftotext not installed; skipping the text check");
+        return;
+    };
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for word in ["START", "TAIL", "AFTER"] {
+        assert_eq!(
+            words.iter().filter(|w| **w == word).count(),
+            1,
+            "`{word}` is printed once: {text:?}"
+        );
+    }
+    let mut got: Vec<&str> = words
+        .iter()
+        .copied()
+        .filter(|w| w.len() == 3 && w.starts_with('L'))
+        .collect();
+    got.sort_unstable();
+    got.dedup();
+    assert_eq!(got.len(), 30, "every line of the box is printed once");
+    // START is on the box's last page (page 2: the box is 600 px, AFTER follows on page 3), with the last line of the box.
+    let last_page = text.split('\x0c').nth(1).expect("three pages of text");
+    assert!(
+        last_page.contains("START") && last_page.contains("L30"),
+        "START is on the page of the box's last line: {last_page:?}"
+    );
+}
+
+#[test]
 fn running_header_with_bundled_png_and_svg() {
     // F107: an `<img>` in a running element is painted in the margin box. The PNG has no size in its markup, the
     // SVG is sized by itself; both are in the bundle. Without the bundle in the margin-box documents neither is
