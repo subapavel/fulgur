@@ -7493,6 +7493,31 @@ fn record_carrier_slices_after(
             return;
         }
     }
+    // html-to-pdf F183c: a box that shares the carrier's one line and spans pages, because it is taller than a page (the
+    // walk enters the carrier, which is taller than a page too, and fragments the box between its lines). The line is
+    // painted once, on the page where the box starts, like the line of an alone box. Without slices the renderer measures
+    // the line from the fragment heights and paints it on no page when it is taller than the first fragment, which is
+    // what happens when a neighbour on the line hangs below the box's bottom (a `display: block; height: 9px` child ends
+    // the neighbour below its last line box, so the line is a pixel taller than the box and the box lost its first 50
+    // lines). Before the baseline walk the box and the line ended at the same pixel.
+    for &id in walk_children {
+        let Some(ib) = doc.get_node(id) else {
+            continue;
+        };
+        if !crate::blitz_adapter::is_atomic_inline_container_node(ib) {
+            continue;
+        }
+        let pages = geometry.get(&id).and_then(|g| {
+            let (first, last) = (g.fragments.first()?, g.fragments.last()?);
+            Some((first.page_index, last.page_index))
+        });
+        if let Some((first, last)) = pages
+            && last > first
+        {
+            record_carrier_slices(geometry, parent.id, first);
+            return;
+        }
+    }
 }
 
 /// F12: a table's first `table-header-group`, repeated at the top of every
@@ -19456,6 +19481,41 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(carrier.fragments.len(), 3);
         assert!(carrier_slices_ok(carrier));
         assert_eq!(fragments_of(&doc, &table, "ib")[0].page_index, 0);
+    }
+
+    #[test]
+    fn the_carrier_line_of_two_boxes_is_on_the_page_where_the_taller_one_starts() {
+        // html-to-pdf F183c: box A of 30 block lines (taller than a 200 px page) shares the carrier's one line with a box B
+        // whose last child is a block with no line in it. B hangs 9 px below its last line box, so the line is taller
+        // than A and than the carrier's first fragment, which ends at A's bottom. Without slices the renderer measured the
+        // line against the fragment, found it taller and painted none of it. The line is painted once, on the page where
+        // A starts.
+        let b = format!(
+            "<div id=\"b\" style=\"display:inline-block;width:40%\">{}<span style=\"display:block;height:9px\"></span></div>",
+            (0..3)
+                .map(|i| format!("<div>B{i:02}</div>"))
+                .collect::<String>()
+        );
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div id=\"c\"><div id=\"a\" style=\"display:inline-block;width:40%\">{}</div> {b}</div>",
+                (0..30)
+                    .map(|i| format!("<div>A{i:02}</div>"))
+                    .collect::<String>()
+            ),
+            200.0,
+        );
+        let carrier = geometry_of(&doc, &table, "c").unwrap();
+        assert!(carrier.fragments.len() >= 2, "{carrier:?}");
+        let got: Vec<(u32, u32)> = carrier
+            .line_slices
+            .iter()
+            .map(|s| (s.first, s.end))
+            .collect();
+        assert_eq!(got[0], (0, 1), "{carrier:?}");
+        assert!(got[1..].iter().all(|s| *s == (1, 1)), "{carrier:?}");
+        assert!(carrier_slices_ok(carrier));
+        assert_eq!(fragments_of(&doc, &table, "a")[0].page_index, 0);
     }
 
     #[test]
