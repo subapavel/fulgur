@@ -21379,6 +21379,163 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(fragments_of(&doc, &table, "r8")[0].page_index, 1);
     }
 
+    /// `offset_geometry` with the document's `break-*` side table, so `break-inside: avoid` is seen.
+    fn offset_geometry_with_breaks(
+        body_css: &str,
+        body: &str,
+        page_h: f32,
+    ) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        let mut doc = parse(
+            &format!(
+                "<html><head>{LINE_CSS}<style>{body_css}</style></head><body>{body}</body></html>"
+            ),
+            600.0,
+        );
+        let styles = crate::blitz_adapter::extract_column_style_table(&doc);
+        let table = run_pass_with_break_styles(doc.deref_mut(), page_h.as_px(), &styles);
+        (doc, table)
+    }
+
+    // ---- F213e-c: a zero-height sibling is a break point in front of an avoid box -----------------------------------
+
+    #[test]
+    fn page_strips_sibling_break_moves() {
+        // 1000 px pages, offset 40.5: bottom(0) = 959.5, chrome_bottom(0) = 960.
+        let strips = PageStrips::new(1000.0, 40.5);
+        // The same bounds as `first_box_overflows`, and only with a sibling on the page.
+        assert!(strips.sibling_break_moves(0, 0.0, 961.0, true));
+        assert!(!strips.sibling_break_moves(0, 0.0, 961.0, false));
+        assert!(!strips.sibling_break_moves(0, 0.0, 960.0, true));
+        assert!(strips.sibling_break_moves(0, 0.0, 1001.0, true));
+        assert!(!strips.sibling_break_moves(0, 0.0, 1001.5, true));
+        // Not past the cursor's top, not on a later page, not without an offset (no room is gained there).
+        assert!(!strips.sibling_break_moves(0, 5.0, 961.0, true));
+        assert!(!strips.sibling_break_moves(1, 0.0, 961.0, true));
+        assert!(!PageStrips::new(1000.0, 0.0).sibling_break_moves(0, 0.0, 999.0, true));
+    }
+
+    /// The `id`s of the body children that `zero_height_child_is_sibling` accepts.
+    fn siblings_among(body: &str) -> Vec<String> {
+        let doc = parse(
+            &format!("<html><head>{LINE_CSS}</head><body>{body}</body></html>"),
+            600.0,
+        );
+        let body_id = body_node(&doc);
+        let mut ids = Vec::new();
+        for &c in &doc.get_node(body_id).unwrap().children {
+            let node = doc.get_node(c).unwrap();
+            if !zero_height_child_is_sibling(node) {
+                continue;
+            }
+            let id = node
+                .element_data()
+                .and_then(|e| e.attrs().iter().find(|a| a.name.local.as_ref() == "id"))
+                .map(|a| a.value.to_string())
+                .unwrap_or_else(|| "(anonymous)".to_string());
+            ids.push(id);
+        }
+        ids
+    }
+
+    #[test]
+    fn a_zero_height_sibling_counts_unless_hidden_or_out_of_flow() {
+        // Chrome m153 (plan 7.5): an element of any display type counts, an anonymous block around an empty inline element
+        // counts; `display: none`, a comment, a float and `<script>` / `<style>` do not.
+        let body = "<div id=\"z\" style=\"height:0\"></div>\
+                    <div id=\"none\" style=\"display:none\">x</div>\
+                    <!-- comment -->\
+                    <div id=\"float\" style=\"float:left;height:0\"></div>\
+                    <script>1</script><style>p{}</style>\
+                    <div id=\"flex\" style=\"display:flex\"></div>\
+                    <div id=\"counter\" style=\"counter-reset:polozka\"></div>";
+        assert_eq!(siblings_among(body), vec!["z", "flex", "counter"]);
+        // Whitespace-only text is not a node of the walk; an empty inline element in the body gets an anonymous block.
+        assert_eq!(siblings_among("<span></span>"), vec!["(anonymous)"]);
+        assert_eq!(siblings_among("  \n  "), Vec::<String>::new());
+    }
+
+    /// 9 lines of 20 px (180 px) under a 40 px offset on 200 px pages leave 8 on page 0 and fit a fresh page.
+    fn inline_card() -> String {
+        let lines: String = (1..=9).map(|i| format!("Line{i}<br>")).collect();
+        format!(
+            "<div id=\"card\" style=\"break-inside:avoid\">{lines}</div><p id=\"after\">AFTER</p>"
+        )
+    }
+
+    fn block_card() -> String {
+        let rows: String = (0..9).map(|i| format!("<p id=\"r{i}\">row</p>")).collect();
+        format!(
+            "<div id=\"card\" style=\"break-inside:avoid\">{rows}</div><p id=\"after\">AFTER</p>"
+        )
+    }
+
+    #[test]
+    fn an_avoid_card_after_a_zero_height_box_moves_whole() {
+        // css-break-3 section 4.1 / 4.4: the zero-height `<div>` is an in-flow sibling, so the break in front of the card is a
+        // class A point, and it avoids the overflow: the card moves to the top of page 1, whole (Chrome m153: 0 / 45 for the
+        // 45-line card). The cursor stayed 0, so main read "nothing precedes" and hung the card below the content box.
+        let z = "<div style=\"height:0\"></div>";
+        for (name, card) in [("inline", inline_card()), ("blocks", block_card())] {
+            let (doc, table) =
+                offset_geometry_with_breaks("body{margin:40px 0 0}", &format!("{z}{card}"), 200.0);
+            let f = fragments_of(&doc, &table, "card");
+            assert!(
+                f.iter().all(|f| f.page_index == 1),
+                "{name}: the card is on page 1: {f:?}"
+            );
+            assert!(
+                f[0].y.to_f32().abs() < 0.5,
+                "{name}: at the top of page 1: {f:?}"
+            );
+            let after = &fragments_of(&doc, &table, "after")[0];
+            assert_eq!(after.page_index, 1, "{name}: {after:?}");
+        }
+    }
+
+    #[test]
+    fn an_avoid_card_that_fits_or_has_no_sibling_before_it_is_not_moved_by_the_zero_height_rule() {
+        let z = "<div style=\"height:0\"></div>";
+        // 5 lines (100 px) fit the 160 px left on page 0, with or without the box.
+        let small: String = (1..=5).map(|i| format!("Line{i}<br>")).collect();
+        let small = format!("<div id=\"card\" style=\"break-inside:avoid\">{small}</div>");
+        for before in ["", z] {
+            let (doc, table) = offset_geometry_with_breaks(
+                "body{margin:40px 0 0}",
+                &format!("{before}{small}"),
+                200.0,
+            );
+            assert_eq!(fragments_of(&doc, &table, "card")[0].page_index, 0);
+        }
+        // Without an offset nothing is gained by moving: the box is placed at the top of page 0 (it fits it).
+        let (doc, table) =
+            offset_geometry_with_breaks("body{margin:0}", &format!("{z}{}", inline_card()), 200.0);
+        assert_eq!(fragments_of(&doc, &table, "card")[0].page_index, 0);
+        // A hidden box before the card is no sibling: the blocks card keeps splitting in place (Chrome 40 / 5).
+        let (doc, table) = offset_geometry_with_breaks(
+            "body{margin:40px 0 0}",
+            &format!("<div style=\"display:none\">x</div>{}", block_card()),
+            200.0,
+        );
+        assert_eq!(fragments_of(&doc, &table, "r0")[0].page_index, 0);
+        assert_eq!(fragments_of(&doc, &table, "r8")[0].page_index, 1);
+    }
+
+    #[test]
+    fn a_short_paragraph_after_a_zero_height_box_moves_whole() {
+        // ADR-0010: a paragraph with no allowed break between its lines (two lines with the initial `orphans` and `widows`)
+        // that does not fit the room moves whole, and after a zero-height sibling the class A break is there as well. Room
+        // for one 20 px line on page 0 (offset 180 on 200 px pages).
+        let p = "<p id=\"p\">Line1<br>Line2</p>";
+        let (doc, table) = offset_geometry(
+            "body{margin:180px 0 0}",
+            &format!("<div style=\"height:0\"></div>{p}"),
+            200.0,
+        );
+        let f = fragments_of(&doc, &table, "p");
+        assert!(f.iter().all(|f| f.page_index == 1), "{f:?}");
+        assert!(f[0].y.to_f32().abs() < 0.5, "{f:?}");
+    }
+
     #[test]
     fn a_first_box_taller_than_a_page_stays_on_page_zero() {
         // 250 px does not fit a fresh 200 px page either (F213b, F29b): the first slice starts on page 0.

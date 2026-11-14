@@ -10351,6 +10351,38 @@ fn render_v2_smoke_multicol_card_with_offsets_that_leave_the_sheet_keeps_every_w
 }
 
 #[test]
+fn render_v2_smoke_avoid_card_after_a_zero_height_box_under_an_offset_moves_whole() {
+    // html-to-pdf F213e-c: `body { margin-top: 200px }`, a zero-height `<div>` (a `counter-reset` reset, say) and a
+    // `break-inside: avoid` card of 45 lines of 20 px. The empty box is a sibling, so the break in front of the card is a
+    // class A point (css-break-3 section 4.1) and the card moves to page 2 whole, as in Chrome. Before the fix `cursor_y`
+    // stayed 0, the card hung below the content box on page 1 and its last two lines were not printed.
+    let lines: String = (1..=45)
+        .map(|i| format!("L{i:04}<br>"))
+        .collect::<Vec<_>>()
+        .join("");
+    let html = format!(
+        "<!doctype html><html><head><style>@page{{size:A4;margin:15mm}}\
+         body{{margin:200px 0 0;font:14px/20px sans-serif}}</style></head><body>\
+         <div style=\"height:0;counter-reset:polozka\"></div>\
+         <div style=\"break-inside:avoid;border:1px solid #000\">{lines}</div><p>AFTER</p></body></html>"
+    );
+    let pdf = noto_engine().render(&html).expect("render");
+    assert_eq!(
+        page_count(&pdf),
+        2,
+        "page 1 is empty, the card is on page 2"
+    );
+    let printed = extract_pdf_text(&pdf).expect("pdftotext");
+    let mut got: Vec<&str> = printed
+        .split_whitespace()
+        .filter(|w| w.len() == 5 && w.starts_with('L'))
+        .collect();
+    got.sort_unstable();
+    got.dedup();
+    assert_eq!(got.len(), 45, "every line printed once");
+}
+
+#[test]
 fn running_header_with_bundled_png_and_svg() {
     // F107: an `<img>` in a running element is painted in the margin box. The PNG has no size in its markup, the
     // SVG is sized by itself; both are in the bundle. Without the bundle in the margin-box documents neither is
