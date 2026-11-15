@@ -327,7 +327,7 @@ pub(super) fn first_fragment_extent(
             }
             return extent;
         }
-        if let Some(split) = line_split_candidate(doc, parent, node) {
+        if let Some(split) = line_split_candidate(doc, parent, node, fresh) {
             let tall = split.inset_top + split.span() > fresh + 1.0;
             if tall || may_start_in_place(doc, parent, node, &split, avoid, fresh) {
                 return split.leading_within(fresh).min(h);
@@ -382,7 +382,7 @@ fn relaxable_first_line(
     let shape = if env.body_level {
         body_paragraph_shape(doc, node, avoid, is_float, env.body_block_flow, &lines)
     } else {
-        line_split_candidate(doc, parent, node)
+        line_split_candidate(doc, parent, node, fresh)
             .is_some_and(|s| super::may_start_in_place_shape(doc, parent, node, &s, avoid, fresh))
     };
     shape.then_some(first.1 - first.0)

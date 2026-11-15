@@ -1589,7 +1589,29 @@ fn carrier_line_page(
     drawables: &Drawables,
     ib_id: usize,
 ) -> Option<u32> {
-    let carrier = geometry.get(drawables.inline_box_carrier.get(&ib_id)?)?;
+    let carrier_id = *drawables.inline_box_carrier.get(&ib_id)?;
+    let carrier = geometry.get(&carrier_id)?;
+    // html-to-pdf F213b: a paragraph of several lines that has a line taller than a page has a slice with a lead or no
+    // line at all (the pages the tall line crosses); the box's line is the one of those slices that holds it, which is
+    // not `0..1` unless the tall line is the first.
+    if carrier.line_slices.len() == carrier.fragments.len()
+        && carrier
+            .line_slices
+            .iter()
+            .any(|s| s.first == s.end || s.lead != crate::units::Px::ZERO)
+        && let Some(para) = drawables.paragraphs.get(&carrier_id)
+        && let Some(line) = para.lines.iter().position(|line| {
+            line.items.iter().any(|item| {
+                matches!(item, crate::paragraph::LineItem::InlineBox(b) if b.node_id == Some(ib_id))
+            })
+        })
+    {
+        let pos = carrier
+            .line_slices
+            .iter()
+            .position(|s| (s.first as usize..s.end as usize).contains(&line))?;
+        return carrier.fragments.get(pos).map(|f| f.page_index);
+    }
     let pos = carrier
         .line_slices
         .iter()

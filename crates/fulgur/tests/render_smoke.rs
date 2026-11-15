@@ -10432,6 +10432,99 @@ fn render_v2_smoke_tall_box_sharing_its_line_prints_the_text_on_the_baseline_pag
 }
 
 #[test]
+fn render_v2_smoke_paragraph_with_a_tall_line_prints_every_word_once() {
+    // html-to-pdf F213b: a paragraph of two lines whose first line holds a box taller than a page (40 children of 20 px on
+    // 300 px pages: the box spans three pages). The words of the line sit on the baseline of the box's last line box, on
+    // the last page; the second line follows them there. Before the segment planner the box was one leaf on page 1 and
+    // none of the words of the paragraph was printed. A paragraph that follows with a tall line of its own starts a page.
+    let lines: String = (1..=40)
+        .map(|i| format!("<span style=\"display:block\">L{i:02}</span>"))
+        .collect();
+    let html = format!(
+        "<!DOCTYPE html><html><head><style>@page {{ size: 400px 300px; margin: 0 }} \
+         body {{ margin: 0; line-height: 20px }} p {{ margin: 0 }}</style></head><body>\
+         <div style=\"width:300px\">Lead words <span style=\"display:inline-block;width:100px\">{lines}</span> \
+         trailing words<br>second line</div><p>AFTER</p></body></html>"
+    );
+    let pdf = noto_engine().render(&html).unwrap();
+    let Some(text) = extract_pdf_text(&pdf) else {
+        eprintln!("pdftotext not installed; skipping the text check");
+        return;
+    };
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for word in ["Lead", "trailing", "second", "AFTER"] {
+        assert_eq!(
+            words.iter().filter(|w| **w == word).count(),
+            1,
+            "`{word}` is printed once: {text:?}"
+        );
+    }
+    let mut got: Vec<&str> = words
+        .iter()
+        .copied()
+        .filter(|w| {
+            w.len() == 3 && w.starts_with('L') && w[1..].chars().all(|c| c.is_ascii_digit())
+        })
+        .collect();
+    got.sort_unstable();
+    got.dedup();
+    assert_eq!(got.len(), 40, "every line of the box is printed once");
+    let pages: Vec<&str> = text.split('\x0c').collect();
+    assert!(
+        pages[2].contains("Lead") && pages[2].contains("L40") && pages[2].contains("second"),
+        "the line and the one after it are on the page of the box's last line: {:?}",
+        pages[2]
+    );
+    assert!(
+        !pages[0].contains("Lead"),
+        "not on the page where the box starts"
+    );
+}
+
+#[test]
+fn render_v2_smoke_text_lines_of_a_box_that_shares_its_line_are_split_between_lines() {
+    // html-to-pdf F213b: the box is the inline formatting context: 45 text lines of 20 px on 300 px pages, taller than a
+    // page and sharing its line with text. It is split between its lines (it was a barrier, `SharesItsLine`), every line
+    // is printed once, and START / TAIL sit with its last line.
+    let lines: String = (1..=45)
+        .map(|i| format!("L{i:02}"))
+        .collect::<Vec<_>>()
+        .join("<br>");
+    let html = format!(
+        "<!DOCTYPE html><html><head><style>@page {{ size: 400px 300px; margin: 0 }} \
+         body {{ margin: 0; line-height: 20px }} p {{ margin: 0 }}</style></head><body>\
+         <p>START <span style=\"display:inline-block;width:100px\">{lines}</span> TAIL</p>\
+         <p>AFTER</p></body></html>"
+    );
+    let pdf = noto_engine().render(&html).unwrap();
+    let Some(text) = extract_pdf_text(&pdf) else {
+        eprintln!("pdftotext not installed; skipping the text check");
+        return;
+    };
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut got: Vec<&str> = words
+        .iter()
+        .copied()
+        .filter(|w| w.len() == 3 && w.starts_with('L'))
+        .collect();
+    got.sort_unstable();
+    got.dedup();
+    assert_eq!(
+        got.len(),
+        45,
+        "every line of the box is printed once: {text:?}"
+    );
+    let last_page = text
+        .split('\x0c')
+        .rfind(|page| page.contains("L45"))
+        .expect("a page holds the last line");
+    assert!(
+        last_page.contains("START") && last_page.contains("TAIL"),
+        "START and TAIL are on the page of the last line: {last_page:?}"
+    );
+}
+
+#[test]
 fn running_header_with_bundled_png_and_svg() {
     // F107: an `<img>` in a running element is painted in the margin box. The PNG has no size in its markup, the
     // SVG is sized by itself; both are in the bundle. Without the bundle in the margin-box documents neither is

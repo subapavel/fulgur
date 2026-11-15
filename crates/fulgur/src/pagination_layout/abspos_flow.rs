@@ -919,6 +919,12 @@ fn flow_box(
         fragment_nested_inline_root(
             out,
             doc,
+            McEnv {
+                column_styles,
+                used_page_names: None,
+                facts: None,
+                multicol,
+            },
             id,
             x,
             w,
