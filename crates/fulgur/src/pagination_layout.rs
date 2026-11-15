@@ -3990,10 +3990,10 @@ impl<'a> PaginationLayoutTree<'a> {
                     // F28: when its first unit does not fit below the cursor the container starts on the
                     // next page, where it may fit whole after all.
                     let leading = mc.top_inset() + mc.first_unit();
-                    if cursor_y > 0.0
-                        && leading > strips.bottom(page_index) - cursor_y
-                        && leading <= strips.fresh()
-                    {
+                    // html-to-pdf F213b (validator round 1): also when the first unit is taller than a page: it overflows its
+                    // page wherever it starts, and starting it below other content makes it overflow by more (a line of 482 px
+                    // at the top of a page of 453 px stays inside the page box, at the middle of one it is cut and lost).
+                    if cursor_y > 0.0 && leading > strips.bottom(page_index) - cursor_y {
                         page_index += 1;
                         cursor_y = 0.0;
                     }
@@ -4112,14 +4112,15 @@ impl<'a> PaginationLayoutTree<'a> {
             // html-to-pdf F213b: a paragraph with a line that holds a box taller than a page is cut by the splitter that knows
             // such a line ([`fragment_inline_root_with_tall_lines`]); `fragment_inline_root` below plans the lines from their
             // heights and would put the whole box on one page.
-            let tall_line_here = line_metrics.len() > 1
+            let tall_line_here = (line_metrics.len() > 1
+                || one_line_with_a_tall_box_and_another(self.doc, child, self.strips.fresh()))
                 && clip_limit_here.is_none()
                 && body_block_flow
                 && !is_float
                 && !avoid_inside
                 && !crate::blitz_adapter::is_multicol_container(child)
                 && !tall_lines(self.doc, child, self.strips.fresh()).is_empty();
-            if line_metrics.len() > 1
+            if (line_metrics.len() > 1 || tall_line_here)
                 && (clip_limit_here.is_some() && !clip_whole_now
                     || inset_split_here
                     || tall_line_here)
@@ -5099,6 +5100,29 @@ fn record_descendant(
     );
 }
 
+/// html-to-pdf F213b (validator round 1): the children of a flex container whose main axis runs bottom to top
+/// (`flex-direction: column-reverse`) in the order they are laid out down the page. The fragmenter walks a box's children
+/// in document order and places each below the one before it; a reversed column has the first item at the bottom, so the walk
+/// put the items in the wrong place and lost most of them (main loses them too, in a block and in a line). Every other box
+/// keeps its order.
+fn in_visual_order(
+    doc: &BaseDocument,
+    parent: &blitz_dom::Node,
+    mut children: Vec<usize>,
+) -> Vec<usize> {
+    use ::style::properties::longhands::flex_direction::computed_value::T as FlexDirection;
+    let reversed = parent
+        .primary_styles()
+        .is_some_and(|s| s.get_position().flex_direction == FlexDirection::ColumnReverse);
+    if reversed {
+        children.sort_by(|&a, &b| {
+            let y = |id: usize| doc.get_node(id).map_or(0.0, |n| n.final_layout.location.y);
+            y(a).total_cmp(&y(b))
+        });
+    }
+    children
+}
+
 /// fulgur-7hf5 (Phase 3.1.5c): pre-flight check for the recursion
 /// gate — true if walking `parent_id`'s direct children would cross
 /// a page boundary at `available_h`.
@@ -5145,6 +5169,7 @@ fn would_split_block_subtree(
         .map(|v| v.to_vec())
         .unwrap_or_else(|| parent.children.clone());
     drop(layout_children_borrow);
+    let walk_children = in_visual_order(doc, parent, walk_children);
     for &child_id in &walk_children {
         let Some(child) = doc.get_node(child_id) else {
             continue;
@@ -6151,6 +6176,7 @@ fn fragment_block_subtree(
         .map(|v| v.to_vec())
         .unwrap_or_else(|| parent.children.clone());
     drop(layout_children_borrow);
+    let walk_children = in_visual_order(doc, parent, walk_children);
     // F83d: the rows of this table that `break-inside: avoid` keeps on one page.
     let kept_rows = if parent_is_table {
         avoid_rows(doc, parent, &walk_children, column_styles, strips.fresh())
@@ -6842,8 +6868,8 @@ fn fragment_block_subtree(
             // The container's top padding and its first line (or box) must fit; otherwise it starts on
             // the next page.
             let leading = mc.top_inset() + mc.first_unit();
-            if first_in_row && leading <= strips.fresh() {
-                leading
+            if first_in_row {
+                leading.min(strips.fresh())
             } else {
                 0.0
             }
@@ -9510,6 +9536,12 @@ fn line_split_candidate(
         {
             inline_root_lines_from(doc, child, 1)?
         }
+        // html-to-pdf F213b (validator round 1): the one line of a carrier that holds a box taller than a page and another box
+        // is cut by the segment planner, which places every box by its own extent in the line; the walk of a one-line carrier
+        // stacks the boxes one below the other (F222, B23), and the box that is not the first lost its top.
+        None if one_line_with_a_tall_box_and_another(doc, child, fresh) => {
+            inline_root_lines_from(doc, child, 1)?
+        }
         None => return None,
     };
     // F30f-b: in block flow a clip box that hides content is fragmented by its own block size, and the lines it hides
@@ -10004,6 +10036,19 @@ fn fragment_nested_inline_root(
     (page_in + ranges.len() as u32 - 1, cursor_y)
 }
 
+/// html-to-pdf F213b (validator round 1): whether `carrier` is an inline root of exactly one line that holds a box taller than a
+/// page ([`tall_lines`]) and at least one more atomic inline container.
+fn one_line_with_a_tall_box_and_another(
+    doc: &BaseDocument,
+    carrier: &blitz_dom::Node,
+    fresh: f32,
+) -> bool {
+    carrier.flags.is_inline_root()
+        && collect_inline_line_metrics(carrier).len() == 1
+        && !tall_lines(doc, carrier, fresh).is_empty()
+        && line_atomic_boxes(doc, carrier, 0).len() >= 2
+}
+
 /// html-to-pdf F213b: the lines of the inline root `carrier` that hold an atomic inline container (`inline-block`,
 /// `inline-table`, `inline-flex`, `inline-grid`) taller than a fresh page (`fresh`, with the pixel of slack of the strip
 /// slicer), as `(line index, ids of those boxes)` in line order. Empty for the paragraphs that have none, which is
@@ -10040,6 +10085,30 @@ fn tall_lines(
         }
     }
     found
+}
+
+/// html-to-pdf F213b: the atomic inline containers (`inline-block`, `inline-table`, `inline-flex`, `inline-grid`) on line `line` of
+/// the inline root `carrier`, in line order.
+fn line_atomic_boxes(doc: &BaseDocument, carrier: &blitz_dom::Node, line: usize) -> Vec<usize> {
+    let Some(text_layout) = carrier
+        .element_data()
+        .and_then(|e| e.inline_layout_data.as_deref())
+    else {
+        return Vec::new();
+    };
+    let Some(line) = text_layout.layout.lines().nth(line) else {
+        return Vec::new();
+    };
+    line.items()
+        .filter_map(|item| match item {
+            parley::PositionedLayoutItem::InlineBox(b) => Some(b.id as usize),
+            parley::PositionedLayoutItem::GlyphRun(_) => None,
+        })
+        .filter(|&id| {
+            doc.get_node(id)
+                .is_some_and(crate::blitz_adapter::is_atomic_inline_container_node)
+        })
+        .collect()
 }
 
 /// html-to-pdf F213b: fragment the box `box_id` that is taller than a page and sits on a line of the paragraph `carrier`,
@@ -10310,6 +10379,15 @@ fn fragment_inline_root_with_tall_lines(
                 let layout = node.final_layout;
                 // The box's top below the line's top, and what the line has below the box.
                 let below_line_top = layout.location.y - split.inset_top - line_top;
+                // A negative top margin puts the box above the line, and above the page when the line starts it: the part above
+                // the page cannot be printed, the box starts at its top instead (the words are all printed). A box that sits more
+                // than a page below the top of the line (a box aligned to the baseline of a tall one, a `vertical-align: top` box
+                // beside it) starts on the page that holds its top.
+                let (mut box_page, mut box_y) = (page, (line_y + below_line_top).max(top_floor));
+                while box_y >= strips.bottom(box_page) - 0.5 && box_page < page + crate::MAX_PAGES {
+                    box_y = (box_y - strips.bottom(box_page)).max(0.0) + top_floor;
+                    box_page += 1;
+                }
                 let (end_page, end_y) = fragment_tall_box(
                     geometry,
                     doc,
@@ -10317,8 +10395,8 @@ fn fragment_inline_root_with_tall_lines(
                     carrier,
                     box_id,
                     x_in_body + layout.location.x,
-                    line_y + below_line_top,
-                    page,
+                    box_y,
+                    box_page,
                     strips,
                     depth,
                 );
@@ -10342,6 +10420,64 @@ fn fragment_inline_root_with_tall_lines(
                     (p > page && p <= end.0).then_some((p, y - line_baseline))
                 })
                 .unwrap_or((page, line_y));
+            // html-to-pdf F213b (validator round 1): the other boxes on the line sit by their own extent in it (their baseline is the
+            // line's, which is on `baseline_page`), so a box that is not taller than a page may start on an earlier page than the
+            // baseline's, or reach past its bottom. Chrome slices every box on the line by the page edges; so do we, from where its
+            // top is (`fragment_tall_box`), and a box that lies wholly on an earlier page is painted there.
+            for box_id in line_atomic_boxes(doc, carrier, i) {
+                if boxes.contains(&box_id) {
+                    continue;
+                }
+                let Some(node) = doc.get_node(box_id) else {
+                    continue;
+                };
+                let layout = node.final_layout;
+                if !layout.size.height.is_finite() || layout.size.height <= 0.0 {
+                    continue;
+                }
+                let below_line_top = layout.location.y - split.inset_top - line_top;
+                let top = baseline_line_top + below_line_top;
+                let reaches_above = top < -0.5;
+                let reaches_below = top + layout.size.height > strips.bottom(baseline_page) + 0.5;
+                if !reaches_above && !reaches_below {
+                    continue;
+                }
+                let (mut p, mut y) = (baseline_page, top);
+                while y < -0.5 && p > page {
+                    p -= 1;
+                    y += strips.bottom(p);
+                }
+                let mut y = y.max(top_floor);
+                // A box whose top is a hair above the page edge does not start there: its first row would hang past it.
+                let first_row = tall_box_first_row(doc, node, strips.fresh());
+                while p < baseline_page
+                    && first_row <= strips.fresh()
+                    && y + first_row > strips.bottom(p) + 0.5
+                {
+                    p += 1;
+                    y = top_floor;
+                }
+                let (end_page, end_y) = fragment_tall_box(
+                    geometry,
+                    doc,
+                    env,
+                    carrier,
+                    box_id,
+                    x_in_body + layout.location.x,
+                    y,
+                    p,
+                    strips,
+                    depth,
+                );
+                let box_end = (
+                    end_page,
+                    end_y + (line_h - below_line_top - layout.size.height).max(0.0),
+                );
+                if box_end.0 > end.0 || (box_end.0 == end.0 && box_end.1 > end.1) {
+                    end = box_end;
+                }
+                skip.push(box_id);
+            }
             for p in page..=end.0 {
                 let (fy, inset) = if p == page {
                     (
@@ -20473,7 +20609,7 @@ h2 { string-set: chapter-title content(text); }
     }
 
     #[test]
-    fn the_carrier_line_of_two_boxes_is_on_the_page_where_the_taller_one_starts() {
+    fn the_carrier_line_of_two_boxes_is_on_the_baseline_page_of_the_taller_one() {
         // html-to-pdf F183c: box A of 30 block lines (taller than a 200 px page) shares the carrier's one line with a box B
         // whose last child is a block with no line in it. B hangs 9 px below its last line box, so the line is taller
         // than A and than the carrier's first fragment, which ends at A's bottom. Without slices the renderer measured the
@@ -20496,15 +20632,30 @@ h2 { string-set: chapter-title content(text); }
         );
         let carrier = geometry_of(&doc, &table, "c").unwrap();
         assert!(carrier.fragments.len() >= 2, "{carrier:?}");
-        let got: Vec<(u32, u32)> = carrier
+        // html-to-pdf F213b (validator round 1): a line that holds a box taller than a page and another box is cut by the
+        // segment planner: the line is painted once on the page of the baseline of A (its last line box, page 3 here), the
+        // pages before it hold an empty slice, A starts at the top of the line and B sits on its baseline (Chrome; the walk of a
+        // one-line carrier stacked B below A).
+        assert!(
+            line_slices_tile_with_gaps(&carrier.line_slices, 1),
+            "{carrier:?}"
+        );
+        let line_page = carrier
             .line_slices
             .iter()
-            .map(|s| (s.first, s.end))
-            .collect();
-        assert_eq!(got[0], (0, 1), "{carrier:?}");
-        assert!(got[1..].iter().all(|s| *s == (1, 1)), "{carrier:?}");
-        assert!(carrier_slices_ok(carrier));
+            .position(|s| (s.first, s.end) == (0, 1))
+            .expect("the line is on one fragment");
+        assert_eq!(
+            carrier.fragments[line_page].page_index,
+            fragments_of(&doc, &table, "a").last().unwrap().page_index,
+            "{carrier:?}"
+        );
         assert_eq!(fragments_of(&doc, &table, "a")[0].page_index, 0);
+        // B is not taller than a page and sits on A's baseline, at the bottom of the line: on the page where A ends.
+        assert_eq!(
+            fragments_of(&doc, &table, "b")[0].page_index,
+            fragments_of(&doc, &table, "a").last().unwrap().page_index
+        );
     }
 
     /// The page of the node `id` (the one fragment it has) and its y on that page.
@@ -20583,9 +20734,8 @@ h2 { string-set: chapter-title content(text); }
     }
 
     #[test]
-    fn a_carrier_line_of_boxes_and_white_space_stays_on_the_first_page() {
-        // html-to-pdf F213b: the same box beside a second box and a space and nothing else. There is no text to print at
-        // the baseline, so the line stays on the first page of the boxes (F183c) and has no lead.
+    fn a_carrier_line_of_boxes_and_white_space_is_cut_by_the_segment_planner() {
+        // html-to-pdf F213b: the same box beside a second box and a space and nothing else.
         let boxed =
             |p: &str| -> String { (0..30).map(|i| format!("<div>{p}{i:02}</div>")).collect() };
         let (doc, table) = nested_geometry(
@@ -20597,14 +20747,14 @@ h2 { string-set: chapter-title content(text); }
             200.0,
         );
         let carrier = geometry_of(&doc, &table, "c").unwrap();
-        assert!(carrier_slices_ok(carrier), "{carrier:?}");
-        assert_eq!(carrier.line_slices[0].end, 1, "{carrier:?}");
+        // html-to-pdf F213b (validator round 1): a line of two boxes, one taller than a page, is cut by the segment planner (the
+        // line is painted on the baseline page with a lead, and both boxes start together): the slices tile the one line.
         assert!(
-            carrier
-                .line_slices
-                .iter()
-                .all(|s| s.lead == crate::units::Px::ZERO)
+            line_slices_tile_with_gaps(&carrier.line_slices, 1),
+            "{carrier:?}"
         );
+        assert_eq!(fragments_of(&doc, &table, "a")[0].page_index, 0);
+        assert_eq!(fragments_of(&doc, &table, "b")[0].page_index, 0);
     }
 
     #[test]
@@ -20823,6 +20973,59 @@ h2 { string-set: chapter-title content(text); }
     }
 
     #[test]
+    fn a_box_beside_a_tall_box_that_sits_above_the_baseline_page_is_cut_by_the_page_edge() {
+        // html-to-pdf F213b validator round 1 (B30): A is 500 px high (pages of 200 px) and B 240 px, both on the baseline of A's
+        // last line box, which is on page 2 at about 100 px: B starts 140 px above that page, on page 1, and is cut by the edge.
+        let b: String = (0..12).map(|i| format!("<div>B{i:02}</div>")).collect();
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div id=\"c\" style=\"width:400px\">Lead {} <div id=\"b\" style=\"display:inline-block;width:40px\">{b}</div> trail<br>end</div>",
+                tall_box_html("a", 25)
+            ),
+            200.0,
+        );
+        let a_last = fragments_of(&doc, &table, "a").last().unwrap().page_index;
+        let fb = fragments_of(&doc, &table, "b");
+        assert!(fb.len() >= 2, "{fb:?}");
+        assert!(
+            fb[0].page_index < a_last,
+            "B starts before A's last page: {fb:?}"
+        );
+        assert_eq!(fb.last().unwrap().page_index, a_last, "{fb:?}");
+    }
+
+    #[test]
+    fn the_items_of_a_column_reverse_flex_box_are_fragmented_from_the_top_of_the_box() {
+        // html-to-pdf F213b validator round 1: the first item of a `column-reverse` box is at its bottom; the walk placed the
+        // items in document order, below each other, and lost most of them.
+        let items: String = (0..30)
+            .map(|i| format!("<div id=\"i{i}\">F{i:02}</div>"))
+            .collect();
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div id=\"c\" style=\"display:flex;flex-direction:column-reverse\">{items}</div>"
+            ),
+            200.0,
+        );
+        let mut seen: Vec<(u32, f32)> = (0..30)
+            .map(|i| {
+                let f = fragments_of(&doc, &table, &format!("i{i}"));
+                assert_eq!(f.len(), 1, "item {i} is placed once: {f:?}");
+                (f[0].page_index, f[0].y.to_f32())
+            })
+            .collect();
+        // Document order is bottom to top: the page and y of the items never increase from the first to the last.
+        let sorted = {
+            let mut s = seen.clone();
+            s.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)));
+            s
+        };
+        assert_eq!(seen, sorted);
+        seen.dedup();
+        assert_eq!(seen.len(), 30, "no two items share a place");
+    }
+
+    #[test]
     fn a_paragraph_without_a_tall_line_is_cut_as_before() {
         // The box fits a page: no tall line, the segment planner is not entered.
         let (doc, table) = nested_geometry(
@@ -20882,10 +21085,9 @@ h2 { string-set: chapter-title content(text); }
     }
 
     #[test]
-    fn the_carrier_line_of_two_tall_boxes_is_on_the_first_page_of_the_earlier_one() {
-        // html-to-pdf F183c (validator): both boxes are taller than a page and the walk fragments them one after the other:
-        // B starts where A ends. The line is painted on A's first page, B starts later and is painted there by its
-        // continuation (`render::box_continues_on`); the slices are recorded whichever box is first in the source.
+    fn the_two_tall_boxes_of_a_carrier_line_start_together() {
+        // html-to-pdf F183c (validator): both boxes are taller than a page; the walk fragmented them one after the other.
+        // The segment planner of F213b starts both at the top of the line; the slices tile the line whichever box is first.
         let boxes = |first: &str, second: &str| {
             let lines = |p: &str, n: usize| {
                 (0..n)
@@ -20905,17 +21107,15 @@ h2 { string-set: chapter-title content(text); }
                 fragments_of(&doc, &table, first),
                 fragments_of(&doc, &table, second),
             );
+            // html-to-pdf F213b (validator round 1): both boxes start at the top of the line, side by side (the walk of a
+            // one-line carrier stacked B below A); each is cut by the page edges.
             assert_eq!(fa[0].page_index, 0);
-            assert!(fb[0].page_index > 0, "{fb:?}");
+            assert_eq!(fb[0].page_index, 0, "{fb:?}");
             assert!(fb.last().unwrap().page_index > fb[0].page_index, "{fb:?}");
-            let got: Vec<(u32, u32)> = carrier
-                .line_slices
-                .iter()
-                .map(|s| (s.first, s.end))
-                .collect();
-            assert_eq!(got[0], (0, 1), "{carrier:?}");
-            assert!(got[1..].iter().all(|s| *s == (1, 1)), "{carrier:?}");
-            assert!(carrier_slices_ok(carrier));
+            assert!(
+                line_slices_tile_with_gaps(&carrier.line_slices, 1),
+                "{carrier:?}"
+            );
         }
     }
 

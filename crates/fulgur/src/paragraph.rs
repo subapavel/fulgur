@@ -771,6 +771,15 @@ thread_local! {
     static BODY_OFFSET_CANCELLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// html-to-pdf F213b: run `paint` as the content of a fragmented inline box that is painted under a translate that cancels the
+/// body offset (a continuation page, [`inline_box_offset`]): a fragmented box inside it must not cancel it again.
+pub(crate) fn while_body_offset_is_cancelled<R>(paint: impl FnOnce() -> R) -> R {
+    let saved = BODY_OFFSET_CANCELLED.replace(true);
+    let result = paint();
+    BODY_OFFSET_CANCELLED.set(saved);
+    result
+}
+
 /// The translate that moves the content of an inline box from the position the dispatcher paints it at,
 /// `geo = (margin + body offset + fragment)`, to where the carrier's line puts it, `inline_flow = (ox, oy)`.
 ///

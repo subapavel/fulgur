@@ -1724,20 +1724,22 @@ fn paint_inline_box_continuation(
             // F30f-b: shifted by the body offset, so not page coordinates: no block-axis clip band here.
             let saved_clip_band =
                 std::mem::replace(&mut canvas.clip_band, crate::draw_primitives::ClipBand::Off);
-            dispatch_inline_box_content(
-                canvas,
-                ib_id,
-                geom,
-                frag,
-                geo_x_pt,
-                geo_y_pt,
-                drawables,
-                geometry,
-                margin_left_pt,
-                margin_top_pt,
-                page_index,
-                &drawables.inline_box_subtree_descendants,
-            );
+            crate::paragraph::while_body_offset_is_cancelled(|| {
+                dispatch_inline_box_content(
+                    canvas,
+                    ib_id,
+                    geom,
+                    frag,
+                    geo_x_pt,
+                    geo_y_pt,
+                    drawables,
+                    geometry,
+                    margin_left_pt,
+                    margin_top_pt,
+                    page_index,
+                    &drawables.inline_box_subtree_descendants,
+                );
+            });
             canvas.clip_band = saved_clip_band;
             canvas.paint_extent.leave_local();
             canvas.surface.pop();
