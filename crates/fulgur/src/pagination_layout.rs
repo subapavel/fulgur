@@ -5125,12 +5125,30 @@ fn in_visual_order(
     doc: &BaseDocument,
     parent: &blitz_dom::Node,
     mut children: Vec<usize>,
+    fresh: f32,
 ) -> Vec<usize> {
     use ::style::properties::longhands::flex_direction::computed_value::T as FlexDirection;
-    let reversed = parent
-        .primary_styles()
-        .is_some_and(|s| s.get_position().flex_direction == FlexDirection::ColumnReverse);
-    if reversed {
+    use ::style::properties::longhands::flex_wrap::computed_value::T as FlexWrap;
+    // The block axis runs bottom to top: a `column-reverse` box, and a row box whose lines wrap in reverse (`wrap-reverse`, html-to-pdf
+    // F213b round 5: its first row is the bottom one).
+    let reversed = parent.primary_styles().is_some_and(|s| {
+        let position = s.get_position();
+        match position.flex_direction {
+            FlexDirection::ColumnReverse => true,
+            FlexDirection::Row | FlexDirection::RowReverse => {
+                position.flex_wrap == FlexWrap::WrapReverse
+            }
+            FlexDirection::Column => false,
+        }
+    });
+    // html-to-pdf F213b (round 5): not when an item is taller than a page. Such an item is one unit that overflows its page wherever it
+    // starts (a paragraph whose line holds a tall image or a clip box); the walk in document order keeps main's placement of it, which
+    // prints the words in it, where the visual order starts it on a page that its text lies below.
+    let has_tall_item = children.iter().any(|&id| {
+        doc.get_node(id)
+            .is_some_and(|n| n.final_layout.size.height > fresh + 1.0)
+    });
+    if reversed && !has_tall_item {
         children.sort_by(|&a, &b| {
             let y = |id: usize| doc.get_node(id).map_or(0.0, |n| n.final_layout.location.y);
             y(a).total_cmp(&y(b))
@@ -5185,7 +5203,7 @@ fn would_split_block_subtree(
         .map(|v| v.to_vec())
         .unwrap_or_else(|| parent.children.clone());
     drop(layout_children_borrow);
-    let walk_children = in_visual_order(doc, parent, walk_children);
+    let walk_children = in_visual_order(doc, parent, walk_children, page_h_px);
     for &child_id in &walk_children {
         let Some(child) = doc.get_node(child_id) else {
             continue;
@@ -6192,7 +6210,7 @@ fn fragment_block_subtree(
         .map(|v| v.to_vec())
         .unwrap_or_else(|| parent.children.clone());
     drop(layout_children_borrow);
-    let walk_children = in_visual_order(doc, parent, walk_children);
+    let walk_children = in_visual_order(doc, parent, walk_children, strips.fresh());
     // F83d: the rows of this table that `break-inside: avoid` keeps on one page.
     let kept_rows = if parent_is_table {
         avoid_rows(doc, parent, &walk_children, column_styles, strips.fresh())
@@ -10678,6 +10696,12 @@ fn fragment_inline_root_with_tall_lines(
                     y += strips.bottom(p);
                 }
                 let mut y = y.max(top_floor);
+                // A box that sits more than a page below the baseline page (aligned to the bottom of a line much taller than the
+                // box) starts on the page that holds its top (round 5).
+                while y >= strips.bottom(p) - 0.5 && p < baseline_page + crate::MAX_PAGES {
+                    y = (y - strips.bottom(p)).max(0.0) + top_floor;
+                    p += 1;
+                }
                 // A box whose top is a hair above the page edge does not start there: its first row would hang past it.
                 let first_row = tall_box_first_row(doc, node, strips.fresh());
                 while p < baseline_page

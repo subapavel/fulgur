@@ -865,6 +865,14 @@ pub fn draw_shaped_lines(
     {
         canvas.paint_extent.note_bottom((y + baseline).to_f32());
     }
+    if let Some(baseline) = lines
+        .iter()
+        .filter(|line| line.items.iter().any(item_is_ink))
+        .map(|line| line.baseline)
+        .min_by(|a, b| a.to_f32().total_cmp(&b.to_f32()))
+    {
+        canvas.paint_extent.note_top((y + baseline).to_f32());
+    }
     // Per-run tagging mode is active when canvas.link_run_node_id is set and
     // tagging is enabled. In this mode each glyph-run or inline-image cluster
     // bounded by `Arc<LinkSpan>` identity gets its own start_tagged/end_tagged

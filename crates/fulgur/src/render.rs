@@ -420,6 +420,15 @@ pub fn render_v2(
                 // Text below the bottom edge is not printed: every line is painted on exactly one page (F78), so a
                 // line that sits below its page's edge is on no page. The fragmenter keeps some boxes whole (an
                 // `inline-flex`, an oversized leaf); this says so where it cannot have been split.
+                // html-to-pdf F213b (round 5): text above the top edge is not on the page either; never silently.
+                if let Some(top) = canvas.paint_extent.top()
+                    && -top > PAGE_OVERFLOW_TOLERANCE_PT
+                {
+                    log::warn!(
+                        "content extends {:.1} pt above the top page edge on page {page_num} and is not printed",
+                        -top
+                    );
+                }
                 let below = canvas.paint_extent.bottom() - page_size.height;
                 if below > PAGE_OVERFLOW_TOLERANCE_PT {
                     log::warn!(

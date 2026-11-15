@@ -810,6 +810,9 @@ impl ClipBand {
 pub struct PaintExtent {
     right: f32,
     bottom: f32,
+    /// The highest text baseline painted (smallest y), when `has_top`.
+    top: f32,
+    has_top: bool,
     local: u32,
 }
 
@@ -828,6 +831,20 @@ impl PaintExtent {
         if self.local == 0 && bottom.is_finite() {
             self.bottom = self.bottom.max(bottom);
         }
+    }
+
+    /// Records that text was painted with its baseline at `top` pt from the page's top edge (html-to-pdf F213b, round 5): a baseline above
+    /// the page's top edge means the line is not on the page.
+    pub fn note_top(&mut self, top: f32) {
+        if self.local == 0 && top.is_finite() {
+            self.top = if self.has_top { self.top.min(top) } else { top };
+            self.has_top = true;
+        }
+    }
+
+    /// The highest painted text baseline in pt, `None` when nothing was recorded.
+    pub fn top(&self) -> Option<f32> {
+        self.has_top.then_some(self.top)
     }
 
     /// A clip path or a transform is pushed: x values are no longer page coordinates until the matching
@@ -4018,6 +4035,26 @@ mod paint_extent_tests {
         );
         e.note_bottom(800.0);
         assert_eq!(e.bottom(), 800.0);
+    }
+
+    /// html-to-pdf F213b (round 5): the highest text baseline, `None` until one is recorded.
+    #[test]
+    fn keeps_the_highest_text_baseline() {
+        let mut e = PaintExtent::default();
+        assert_eq!(e.top(), None);
+        e.note_top(300.0);
+        e.note_top(-40.0);
+        e.note_top(f32::NAN);
+        e.note_top(100.0);
+        assert_eq!(e.top(), Some(-40.0));
+        e.enter_local();
+        e.note_top(-900.0);
+        e.leave_local();
+        assert_eq!(
+            e.top(),
+            Some(-40.0),
+            "a clip or transform scope records nothing"
+        );
     }
 
     #[test]
