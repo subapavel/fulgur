@@ -2366,7 +2366,6 @@ fn fragment_multicol_container(
                     }
                     page.group = g as u32;
                     page.y = frag.used.as_px();
-                    pull_columns_below_the_page_top(doc, &mut page, strips.fresh());
                     let row_top = frag.cursor();
                     record_multicol_row(
                         geometry,
@@ -7361,15 +7360,6 @@ fn fragment_block_subtree(
         // in-flow child there is no valid interior split point, so
         // the leaf emits whole). Emit its fragment and recurse into
         // descendants on the same page.
-        // html-to-pdf F213b (round 4): a paragraph that starts a page and whose line holds a box that reaches above it (a negative top
-        // margin) starts that much lower: the box would be above the page and its first lines not printed.
-        if child_page_y <= top_floor + 0.5 && child.flags.is_inline_root() {
-            let pull = line_pull(doc, child_id, 0)
-                .min((strips.bottom(page_index) - child_page_y - child_h).max(0.0));
-            if pull > 0.5 {
-                child_page_y += pull;
-            }
-        }
         warn_unprinted_inline_lines(doc, parent, child, child_page_y, strips.bottom(page_index));
         geometry
             .entry(child_id)
@@ -10000,16 +9990,6 @@ fn fragment_nested_inline_root(
             .and_then(|id| doc.get_node(id))
             .is_some_and(|parent| is_cell_of_table(parent, node))
     });
-    // html-to-pdf F213b (round 4): a paragraph that starts a page and whose first line holds a box that reaches above it (a negative top
-    // margin) starts that much lower: the box would be above the page and its first lines not printed.
-    let (page_in, y_in) = if y_in <= top_floor + 0.5 && !split.lines.is_empty() {
-        let below = split.lines.last().map_or(0.0, |l| l.1) + split.inset_top + split.inset_bottom;
-        let pull =
-            line_pull(doc, child_id, 0).min((strips.bottom(page_in) - y_in - below).max(0.0));
-        (page_in, if pull > 0.5 { y_in + pull } else { y_in })
-    } else {
-        (page_in, y_in)
-    };
     let (page_in, y_in) = if is_cell && split.lines.len() == 1 {
         let (mut page, mut at) = (page_in, y_in + split.inset_top);
         let mut moved = false;
@@ -10261,63 +10241,6 @@ fn tall_lines(
         }
     }
     found
-}
-
-/// html-to-pdf F213b (round 4): how far above the top of line `line` of the inline root `carrier` an atomic inline box on that line
-/// reaches (a negative top margin puts the border box above the line box), px; 0 when none does.
-fn line_pull(doc: &BaseDocument, carrier_id: usize, line: usize) -> f32 {
-    let Some(carrier) = doc.get_node(carrier_id) else {
-        return 0.0;
-    };
-    let Some(top) = collect_inline_line_metrics(carrier).get(line).map(|l| l.0) else {
-        return 0.0;
-    };
-    let inset_top = carrier.final_layout.border.top + carrier.final_layout.padding.top;
-    line_atomic_boxes(doc, carrier, line)
-        .into_iter()
-        .filter_map(|id| doc.get_node(id))
-        .map(|n| n.final_layout.location.y - inset_top - top)
-        .filter(|v| v.is_finite())
-        .fold(0.0_f32, |pull, below| pull.max(-below))
-}
-
-/// html-to-pdf F213b (round 4): a column that starts with a line whose box reaches above the line (a negative top margin) has that
-/// box above the top of the page when the column starts the page: its first lines are not printed. The tall-line planner clamps such
-/// a box to the page top; the column is started that much lower instead (what the page cuts below is cut either way).
-fn pull_columns_below_the_page_top(doc: &BaseDocument, page: &mut McPage, room: f32) {
-    for column in &mut page.columns {
-        let pull = column
-            .iter()
-            .find_map(|piece| match piece {
-                McPiece::Lines {
-                    source, first, y, ..
-                } if y.to_f32() <= 0.5 => Some(line_pull(doc, *source, *first as usize)),
-                _ => None,
-            })
-            .unwrap_or(0.0);
-        // Lines that were on the page are not pushed off its bottom for it.
-        let bottom = column
-            .iter()
-            .map(|piece| match piece {
-                McPiece::Frame { y, height, .. } => y.to_f32() + height.to_f32(),
-                _ => 0.0,
-            })
-            .fold(page.height.to_f32(), f32::max);
-        let pull = pull.min((room - bottom).max(0.0));
-        if pull <= 0.5 {
-            continue;
-        }
-        for piece in column.iter_mut() {
-            let y = match piece {
-                McPiece::Block { y, .. }
-                | McPiece::Lines { y, .. }
-                | McPiece::Leaf { y, .. }
-                | McPiece::Frame { y, .. }
-                | McPiece::Rows { y, .. } => y,
-            };
-            *y = (y.to_f32() + pull).as_px();
-        }
-    }
 }
 
 /// html-to-pdf F213b (round 3): the bottom of what `node` holds (its last line box, or its lowest child), px from its top.
