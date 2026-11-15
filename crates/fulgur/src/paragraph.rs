@@ -1070,7 +1070,7 @@ pub fn draw_shaped_lines(
                         // it, which cancels the body offset the dispatcher adds. A split box inside a split box is painted under
                         // the translate of the outer one, which has cancelled it already: cancelling it again moved the inner box
                         // up by the body offset (`margin-top` of 300 px on the first paragraph lost the top of the box).
-                        let split = content_geom.is_split();
+                        let split = content_geom.is_split() || content_geom.line_placed;
                         let cancelled_above = BODY_OFFSET_CANCELLED.with(std::cell::Cell::get);
                         let (off_x, off_y) = if split && cancelled_above {
                             (0.0, 0.0)

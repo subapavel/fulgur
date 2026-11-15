@@ -1141,12 +1141,19 @@ fn balance_multicol_columns(
 ) -> McFill {
     let rest = &atoms[start..];
     let total: f32 = rest.iter().map(McAtom::height).sum();
-    let tallest = rest.iter().map(McAtom::height).fold(0.0f32, f32::max);
+    // html-to-pdf F213b (round 3): a unit taller than the room overflows its column whatever the budget is; the columns after it
+    // are not made taller than the page for it (css-multicol-1 section 7.1: the balanced height never exceeds the fragmentainer).
+    let tallest = rest
+        .iter()
+        .map(McAtom::height)
+        .fold(0.0f32, f32::max)
+        .min(room.max(0.0));
     let fits = |budget: f32| {
         fill_multicol_columns(atoms, frames, tables, start, n, budget, room, fresh_page).next
             >= atoms.len()
     };
-    let mut lo = tallest.max(total / n as f32);
+    // The same for the share of the total: units that overflow their columns are not a reason to make the others taller.
+    let mut lo = tallest.max(total / n as f32).min(room.max(0.0));
     let mut hi = room.max(lo);
     if fits(lo) {
         return fill_multicol_columns(atoms, frames, tables, start, n, lo, room, fresh_page);
@@ -1178,6 +1185,8 @@ struct McContainer<'a> {
     bottom_inset: f32,
     /// The block-size of the first segment's first unit (see [`McContainer::first_unit`]), px.
     first_unit: f32,
+    /// html-to-pdf F213b (round 3): the first unit is a box placed whole (a leaf), not a line of text.
+    first_unit_leaf: bool,
     /// F174: the tables of the container's flows (boxes of the groups) the fragmenter cuts between rows, by node.
     tables: BTreeMap<usize, McTable>,
     /// F198: the boxes of the flows that are taller than a page and are cut between their lines, by node ([`mc_box`]).
@@ -1200,6 +1209,11 @@ impl McContainer<'_> {
     /// Block-size of the first thing in the flow (a box, a spanner, or the first line of a paragraph), px.
     fn first_unit(&self) -> f32 {
         self.first_unit
+    }
+
+    /// Whether the first unit is a box that is placed whole, which overflows its column wherever it starts.
+    fn first_unit_is_leaf(&self) -> bool {
+        self.first_unit_leaf
     }
 }
 
@@ -1341,18 +1355,36 @@ fn multicol_container<'a>(
         }
     }
     let layout = node.final_layout;
-    let (top_inset, first_unit) = match geometry.segments.first()? {
+    let (top_inset, first_unit, first_unit_leaf) = match geometry.segments.first()? {
         // The group sits below the container's top padding and border.
         SegmentGeom::Group(g) => {
             let group = geometry.groups.get(*g)?;
+            // A box placed whole, or a first line that holds a box taller than a page: the box overflows its column wherever it
+            // starts, so moving the container to a fresh page gains nothing for it.
+            let leaf = match group.flow.first() {
+                Some(crate::multicol_layout::FlowItem::Block { node, .. }) => {
+                    !boxes.contains_key(node)
+                }
+                Some(crate::multicol_layout::FlowItem::Lines { source, .. }) => {
+                    !boxes.contains_key(source)
+                        && doc.get_node(*source).is_some_and(|n| {
+                            tall_lines(doc, n, fresh)
+                                .first()
+                                .is_some_and(|(line, _)| *line == 0)
+                        })
+                }
+                None => false,
+            };
             (
                 group.y_offset.to_f32(),
                 flow_first_unit(&group.flow, &BTreeMap::new(), &boxes),
+                leaf,
             )
         }
         SegmentGeom::SpanAll { node: span } => (
             layout.border.top + layout.padding.top,
             doc.get_node(*span)?.final_layout.size.height,
+            false,
         ),
     };
     let fill = column_styles
@@ -1366,6 +1398,7 @@ fn multicol_container<'a>(
         top_inset,
         bottom_inset: layout.border.bottom + layout.padding.bottom,
         first_unit,
+        first_unit_leaf,
         tables,
         boxes,
         baked,
@@ -2943,6 +2976,10 @@ pub struct PaginationGeometry {
     /// what a piece paints by it, so a line shifted above the piece's top (or past its side) is still the piece's. The
     /// horizontal part is less than half the column gap, so the windows of two columns stay apart. Zero for every other box.
     pub piece_slack: [crate::units::Px; 2],
+    /// html-to-pdf F213b (validator round 3): the box was placed by the segment planner of a tall line
+    /// ([`fragment_inline_root_with_tall_lines`]): its fragments are where it is painted, even with one fragment (the line's own
+    /// position of the box is above the page, where the planner cut it by the page edge).
+    pub line_placed: bool,
 }
 
 impl PaginationGeometry {
@@ -3993,7 +4030,14 @@ impl<'a> PaginationLayoutTree<'a> {
                     // html-to-pdf F213b (validator round 1): also when the first unit is taller than a page: it overflows its
                     // page wherever it starts, and starting it below other content makes it overflow by more (a line of 482 px
                     // at the top of a page of 453 px stays inside the page box, at the middle of one it is cut and lost).
-                    if cursor_y > 0.0 && leading > strips.bottom(page_index) - cursor_y {
+                    // A box placed whole that is taller than a page keeps main's rule: it overflows its column on any page, and
+                    // what follows it in the next column is placed by the plan of the page it is on (round 3: moving the
+                    // container put a following paragraph in a column beside it, past the page edge).
+                    if cursor_y > 0.0
+                        && leading > strips.bottom(page_index) - cursor_y
+                        && !(leading > strips.fresh()
+                            && (mc.first_unit_is_leaf() || leading > 2.0 * strips.fresh()))
+                    {
                         page_index += 1;
                         cursor_y = 0.0;
                     }
@@ -4553,7 +4597,12 @@ impl<'a> PaginationLayoutTree<'a> {
                 } else {
                     strips.chrome_bottom(page_index)
                 };
-                if leading <= page_height_px && cursor_y + leading > room_bottom {
+                // html-to-pdf F213b (round 3): also when the cursor is already at or below the bottom of the page (the margin
+                // under a split box ran past it) and the first row is taller than a page: nothing of it can start here, so
+                // it is entered at the top of the next page, not below the page edge where all of it is lost.
+                if (leading <= page_height_px && cursor_y + leading > room_bottom)
+                    || cursor_y >= room_bottom - 0.5
+                {
                     page_index += 1;
                     cursor_y = 0.0;
                     content_above = false;
@@ -7813,7 +7862,59 @@ fn baseline_on_page(
         local -= child.final_layout.location.y;
         node_id = child.id;
     }
+    // html-to-pdf F213b (validator round 3): an inline root whose line holds a box (a box in a box: the outer's only line is
+    // the inner one, alone on it) has the baseline of that box, which was fragmented on its own; the fragments of the
+    // outer box are page-filled frames, which do not say where its last line is.
+    if let Some(node) = doc.get_node(node_id)
+        && node.flags.is_inline_root()
+        && let Some((inner_id, inner_baseline)) = baseline_box_of_line(doc, node, local)
+        && geometry
+            .get(&inner_id)
+            .is_some_and(|g| !g.fragments.is_empty())
+        && let Some(at) = baseline_on_page(geometry, doc, inner_id, inner_baseline)
+    {
+        return Some(at);
+    }
     place_in_fragments(geometry, doc, node_id, local)
+}
+
+/// html-to-pdf F213b: of the line of the inline root `node` that holds the point `local` px below its border-box top, the atomic
+/// box that sets the line's baseline (the tallest) and the baseline's distance from its top. `None` when the line holds none.
+fn baseline_box_of_line(
+    doc: &BaseDocument,
+    node: &blitz_dom::Node,
+    local: f32,
+) -> Option<(usize, f32)> {
+    let text_layout = node.element_data()?.inline_layout_data.as_deref()?;
+    let inset = node.final_layout.border.top + node.final_layout.padding.top;
+    let content = local - inset;
+    let mut found = None;
+    for line in text_layout.layout.lines() {
+        let m = line.metrics();
+        if m.min_coord <= content || found.is_none() {
+            found = Some(line);
+        }
+        if m.min_coord > content {
+            break;
+        }
+    }
+    let line = found?;
+    let m = line.metrics();
+    line.items()
+        .filter_map(|item| match item {
+            parley::PositionedLayoutItem::InlineBox(b) => Some((b.id as usize, b.y)),
+            parley::PositionedLayoutItem::GlyphRun(_) => None,
+        })
+        .filter_map(|(id, y)| {
+            let n = doc.get_node(id)?;
+            crate::blitz_adapter::is_atomic_inline_container_node(n).then_some((
+                id,
+                m.baseline - y,
+                n.final_layout.size.height,
+            ))
+        })
+        .max_by(|a, b| a.2.total_cmp(&b.2))
+        .map(|(id, offset, _)| (id, offset))
 }
 
 /// [`baseline_on_page`], the last step: where the point `local` px below the top of the border box of `node_id` is.
@@ -7852,9 +7953,11 @@ fn place_in_fragments(
                 0.0
             };
             let slice_top = lines.get(slice.first as usize).map_or(0.0, |l| l.0);
+            // html-to-pdf F213b (validator round 3): the slice's first line starts `lead` above the fragment's line origin when it
+            // is a line taller than a page painted on the page of its baseline (a nested box of a tall line).
             return Some((
                 fragment.page_index,
-                fragment.y.to_f32() + strip_inset + (content - slice_top),
+                fragment.y.to_f32() + strip_inset + (content - slice_top) - slice.lead.to_f32(),
             ));
         }
     }
@@ -9346,7 +9449,8 @@ fn box_barrier(
         // is moved whole by F213 and stays a barrier.
         let tall = is_inline_block_or_table(node)
             && node.final_layout.size.height.is_finite()
-            && node.final_layout.size.height > fresh + 1.0;
+            && node.final_layout.size.height > fresh + 1.0
+            && !inside_multicol(doc, node);
         if !tall {
             return Some(if is_inline_block_or_table(node) {
                 LineBarrier::SharesItsLine
@@ -9893,8 +9997,16 @@ fn fragment_nested_inline_root(
     // parent starts here too (the parent's caller checked its first row), and a first line that does not fit the room below
     // would hang past the page edge and be lost. It starts the next page instead, like any box whose first row does not fit.
     let first_line_h = split.lines[0].1 - split.lines[0].0;
-    let (page_in, y_in) = if y_in > top_floor + 0.5
-        && first_line_h <= strips.fresh()
+    // Not in a flex or grid row, a table or a multi-column container: their items are placed side by side and the walk keeps the
+    // state of the row, which a move of one item to the next page would leave behind.
+    let in_block_flow = doc
+        .get_node(child_id)
+        .and_then(|n| n.layout_parent.get())
+        .and_then(|id| doc.get_node(id))
+        .is_some_and(|parent| is_block_flow_container(doc, parent));
+    let (page_in, y_in) = if in_block_flow
+        && y_in > top_floor + 0.5
+        && first_line_h <= (strips.fresh() + 1.0)
         && y_in + split.inset_top + first_line_h > strips.bottom(page_in) + 0.5
     {
         (page_in + 1, top_floor)
@@ -10046,7 +10158,38 @@ fn one_line_with_a_tall_box_and_another(
     carrier.flags.is_inline_root()
         && collect_inline_line_metrics(carrier).len() == 1
         && !tall_lines(doc, carrier, fresh).is_empty()
-        && line_atomic_boxes(doc, carrier, 0).len() >= 2
+        && line_inline_box_count(carrier, 0) >= 2
+}
+
+/// html-to-pdf F213b (round 3): the number of inline boxes of any kind (containers and replaced elements such as an image) on
+/// line `line` of the inline root `carrier`.
+fn line_inline_box_count(carrier: &blitz_dom::Node, line: usize) -> usize {
+    carrier
+        .element_data()
+        .and_then(|e| e.inline_layout_data.as_deref())
+        .and_then(|d| d.layout.lines().nth(line))
+        .map_or(0, |line| {
+            line.items()
+                .filter(|item| matches!(item, parley::PositionedLayoutItem::InlineBox(_)))
+                .count()
+        })
+}
+
+/// html-to-pdf F213b (validator round 3): whether `node` is inside a multi-column container. The columns place what they hold
+/// themselves (a box that shares its line is one unit in them, as on main): a box there keeps the barrier of
+/// [`box_barrier`].
+fn inside_multicol(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
+    let mut current = node.layout_parent.get();
+    for _ in 0..crate::MAX_DOM_DEPTH {
+        let Some(parent) = current.and_then(|id| doc.get_node(id)) else {
+            return false;
+        };
+        if crate::blitz_adapter::is_multicol_container(parent) {
+            return true;
+        }
+        current = parent.layout_parent.get();
+    }
+    false
 }
 
 /// html-to-pdf F213b: the lines of the inline root `carrier` that hold an atomic inline container (`inline-block`,
@@ -10077,14 +10220,54 @@ fn tall_lines(
                     crate::blitz_adapter::is_atomic_inline_container_node(n)
                         && n.final_layout.size.height.is_finite()
                         && n.final_layout.size.height > fresh + 1.0
+                        && !holds_tall_clip_box(doc, n, fresh)
                 })
             })
             .collect();
         if !boxes.is_empty() {
             found.push((index, boxes));
+            continue;
+        }
+        // html-to-pdf F213b (round 3): a line that is taller than a page although no box on it is: boxes of different heights
+        // aligned to one baseline (a 580px inline-flex that starts 436px below the top of the line beside a 442px one). No page
+        // holds the line, and the walk would start it where it is and lose what hangs past the page edge; it is planned as a
+        // tall line whose lead box is the tallest one on it.
+        let metrics = line.metrics();
+        if metrics.max_coord - metrics.min_coord > fresh + 1.0
+            && let Some(tallest) = line_atomic_boxes(doc, carrier, index)
+                .into_iter()
+                .filter_map(|id| doc.get_node(id).map(|n| (id, n.final_layout.size.height)))
+                .filter(|(_, h)| h.is_finite() && *h > 0.0)
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .filter(|(id, _)| {
+                    doc.get_node(*id)
+                        .is_some_and(|n| !holds_tall_clip_box(doc, n, fresh))
+                })
+        {
+            found.push((index, vec![tallest.0]));
         }
     }
     found
+}
+
+/// html-to-pdf F213b (round 3): whether a box strictly inside `node` clips its overflow and is taller than a page (`fresh`). Such a
+/// box is not cut between its lines or children (what it hides is not printed), so the box around it cannot be split into pages
+/// that hold its parts: it is left to the walk that placed it before F213b, which prints its content where it starts.
+fn holds_tall_clip_box(doc: &BaseDocument, node: &blitz_dom::Node, fresh: f32) -> bool {
+    let mut stack: Vec<(usize, usize)> = node.children.iter().map(|&c| (c, 1)).collect();
+    while let Some((id, depth)) = stack.pop() {
+        let Some(n) = doc.get_node(id) else { continue };
+        if clips_overflow(n)
+            && n.final_layout.size.height.is_finite()
+            && n.final_layout.size.height > fresh + 1.0
+        {
+            return true;
+        }
+        if depth < 8 {
+            stack.extend(n.children.iter().map(|&c| (c, depth + 1)));
+        }
+    }
+    false
 }
 
 /// html-to-pdf F213b: the atomic inline containers (`inline-block`, `inline-table`, `inline-flex`, `inline-grid`) on line `line` of
@@ -10166,9 +10349,23 @@ fn fragment_tall_box_ends(
 ) -> (u32, f32) {
     let box_id = node.id;
     let width = node.final_layout.size.width;
+    // A box that is not taller than a page keeps the barrier of a box that shares its line ([`box_barrier`]), which the walk
+    // honours; here the line is cut by the page edge, so the box that crosses it is split between its lines all the same
+    // (html-to-pdf F213b, validator round 3).
+    let crossing_split = || {
+        (node.final_layout.size.height > 0.0
+            && y + node.final_layout.size.height > strips.bottom(page) + 0.5)
+            .then(|| inline_root_lines(doc, node))
+            .flatten()
+            .map(|mut split| {
+                split.slice = slices_at_breaks(doc, carrier, node, &split);
+                split
+            })
+    };
     if node.flags.is_inline_root()
         && let Some(split) =
-            block_walk_line_split(doc, carrier, node, y, 0.0, strips, page, false, false)
+            block_walk_line_split(doc, carrier, node, y, y, strips, page, false, false)
+                .or_else(crossing_split)
     {
         return fragment_nested_inline_root(
             geometry,
@@ -10186,6 +10383,22 @@ fn fragment_tall_box_ends(
             depth + 1,
             y <= 0.0,
         );
+    }
+    // A box that is an inline root and is not split between its lines is one unit that fits where it starts (a short box of text
+    // lines on a tall line): recorded with its own height, like a box of a paragraph that is not cut. The block walk records
+    // a box with no block child as a leaf of no height, which the renderer drops (html-to-pdf F213b, validator round 3).
+    if node.flags.is_inline_root() && node.final_layout.size.height <= strips.fresh() + 1.0 {
+        let layout = node.final_layout;
+        record_descendant(
+            geometry,
+            doc,
+            box_id,
+            page,
+            y - layout.location.y,
+            x_in_body - layout.location.x,
+            depth + 1,
+        );
+        return (page, y + layout.size.height);
     }
     let (end_page, end_y, _, _) = fragment_block_subtree(
         geometry,
@@ -10331,6 +10544,8 @@ fn fragment_inline_root_with_tall_lines(
         return None;
     }
     let continuation_inset = if split.slice { 0.0 } else { split.inset_top };
+    // A paragraph never starts above its page (an item centred in a flex row that spans pages can be handed a negative y).
+    let y_in = y_in.max(top_floor);
     let mut out: Vec<TallStrip> = Vec::new();
     // The boxes whose geometry the tall lines recorded.
     let mut skip: Vec<usize> = Vec::new();
@@ -10363,7 +10578,9 @@ fn fragment_inline_root_with_tall_lines(
                         below_line_top + tall_box_first_row(doc, node, strips.fresh())
                     })
                     .fold(0.0_f32, f32::max);
-                if first_row <= strips.fresh() && line_y + first_row > strips.bottom(page) + 0.5 {
+                if first_row <= (strips.fresh() + 1.0)
+                    && line_y + first_row > strips.bottom(page) + 0.5
+                {
                     page += 1;
                     frame_y = top_floor;
                     line_y = top_floor + split.inset_top;
@@ -10411,6 +10628,7 @@ fn fragment_inline_root_with_tall_lines(
                     setting = Some((box_id, layout.size.height));
                 }
                 skip.push(box_id);
+                geometry.entry(box_id).or_default().line_placed = true;
             }
             // The page that holds the line's baseline, and the page-local y of the line's top on it.
             let (baseline_page, baseline_line_top) = setting
@@ -10451,7 +10669,7 @@ fn fragment_inline_root_with_tall_lines(
                 // A box whose top is a hair above the page edge does not start there: its first row would hang past it.
                 let first_row = tall_box_first_row(doc, node, strips.fresh());
                 while p < baseline_page
-                    && first_row <= strips.fresh()
+                    && first_row <= (strips.fresh() + 1.0)
                     && y + first_row > strips.bottom(p) + 0.5
                 {
                     p += 1;
@@ -10477,6 +10695,7 @@ fn fragment_inline_root_with_tall_lines(
                     end = box_end;
                 }
                 skip.push(box_id);
+                geometry.entry(box_id).or_default().line_placed = true;
             }
             for p in page..=end.0 {
                 let (fy, inset) = if p == page {
@@ -10533,7 +10752,7 @@ fn fragment_inline_root_with_tall_lines(
         if i == 0
             && out.is_empty()
             && line_y > top_floor + 0.5
-            && run[0].1 - run[0].0 <= strips.fresh()
+            && run[0].1 - run[0].0 <= (strips.fresh() + 1.0)
             && line_y + (run[0].1 - run[0].0) > strips.bottom(page) + 0.5
         {
             page += 1;
@@ -23301,6 +23520,28 @@ h2 { string-set: chapter-title content(text); }
         let pages = plan_no_tables(&[lines(1, 4, 20.0)], 2, 5.0, 5.0, ColumnFill::Balance, 0.0);
         assert_lines_tile(&pages, 1, 4);
         assert_eq!(pages.len(), 2);
+    }
+
+    #[test]
+    fn plan_balance_does_not_make_columns_taller_than_the_room_for_a_unit_that_overflows() {
+        // html-to-pdf F213b (round 3): a block of 1200 overflows its column on a page of 500; the 300 and the 400 after it are
+        // not packed into one column of 700 (taller than the page: the 400 hung past the bottom and was lost), they take the
+        // columns the page has.
+        let flow = [block(1, 1200.0), block(2, 300.0), block(3, 400.0)];
+        let pages = plan_no_tables(&flow, 3, 500.0, 500.0, ColumnFill::Balance, 0.0);
+        assert_eq!(pages.len(), 1);
+        let nodes = |col: usize| -> Vec<usize> {
+            pages[0].columns[col]
+                .iter()
+                .filter_map(|piece| match piece {
+                    McPiece::Block { node, .. } => Some(*node),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(nodes(0), vec![1]);
+        assert_eq!(nodes(1), vec![2]);
+        assert_eq!(nodes(2), vec![3]);
     }
 
     #[test]

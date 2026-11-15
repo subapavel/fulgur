@@ -1190,6 +1190,20 @@ pub(crate) fn dispatch_inline_box_content(
     page_index: u32,
     inline_box_subtree_descendants: &std::collections::BTreeMap<usize, Vec<usize>>,
 ) {
+    // html-to-pdf F213b (validator round 3): the wrappers below position what they hold from `margin + fragment` (the main loop
+    // hands them a margin that already holds the body offset of page 0), while this caller works in body-relative coordinates:
+    // `x_pt` and `y_pt` hold the offset and the descendants of a clip box did not, so they were painted `body offset` too high.
+    // Only for a box that was fragmented or placed by the segment planner: a clip box that is one unit keeps the positions it had
+    // (inside a multi-column container, where the columns place their content, the box sat `body offset` higher than its
+    // frame and the words it holds were printed; moving them down lost the last of them below the page).
+    let (wrap_left_pt, wrap_top_pt) = if content_geom.is_split() || content_geom.line_placed {
+        (
+            margin_left_pt + drawables.body_offset_pt.0.to_f32(),
+            margin_top_pt + drawables.body_offset_pt.1.to_f32(),
+        )
+    } else {
+        (margin_left_pt, margin_top_pt)
+    };
     if let Some(tx) = drawables.transforms.get(&content_id) {
         draw_under_transform(
             canvas,
@@ -1201,8 +1215,8 @@ pub(crate) fn dispatch_inline_box_content(
             y_pt,
             geometry,
             drawables,
-            margin_left_pt,
-            margin_top_pt,
+            wrap_left_pt,
+            wrap_top_pt,
             page_index,
         );
         return;
@@ -1220,8 +1234,8 @@ pub(crate) fn dispatch_inline_box_content(
             y_pt,
             geometry,
             drawables,
-            margin_left_pt,
-            margin_top_pt,
+            wrap_left_pt,
+            wrap_top_pt,
             page_index,
         );
         return;
@@ -1239,8 +1253,8 @@ pub(crate) fn dispatch_inline_box_content(
             y_pt,
             geometry,
             drawables,
-            margin_left_pt,
-            margin_top_pt,
+            wrap_left_pt,
+            wrap_top_pt,
             page_index,
         );
         return;
