@@ -8321,7 +8321,8 @@ impl LineSplit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LineBarrier {
     /// An `inline-block` or `inline-table` that is not alone on its line: the carrier's line holds more than the box,
-    /// and one fragment of it would have to hold the rest (F30f-b).
+    /// and one fragment of it would have to hold the rest (F30f-b). Only for a box that fits a fresh page, which F213 moves
+    /// whole; a box taller than a page is fragmented with its line (html-to-pdf F213b, [`box_barrier`]).
     SharesItsLine,
     /// An `inline-flex` or `inline-grid` box, or an `inline-block` or `inline-table` with no carrier line to find.
     AtomicNotFlowRoot,
@@ -10072,6 +10073,52 @@ fn fragment_tall_box(
     (end_page, end_y)
 }
 
+/// html-to-pdf F213b: the boxes on a tall line that are not tall themselves are placed relative to the line, on the page that
+/// holds its baseline (the part of a box that reaches above that page is not printed; Chrome fragments it over the page
+/// before). Say so, as for every other place the fragmenter knows content is lost.
+fn warn_boxes_above_their_page(
+    doc: &BaseDocument,
+    carrier: &blitz_dom::Node,
+    split: &LineSplit,
+    tall: &[(usize, Vec<usize>)],
+    skip: &[usize],
+    strips: &[TallStrip],
+) {
+    let Some(text_layout) = carrier
+        .element_data()
+        .and_then(|e| e.inline_layout_data.as_deref())
+    else {
+        return;
+    };
+    for &(line, _) in tall {
+        let Some(strip) = strips.iter().find(|s| (s.first..s.end).contains(&line)) else {
+            continue;
+        };
+        let Some(parley_line) = text_layout.layout.lines().nth(line) else {
+            continue;
+        };
+        for item in parley_line.items() {
+            let parley::PositionedLayoutItem::InlineBox(b) = item else {
+                continue;
+            };
+            let id = b.id as usize;
+            let Some(node) = doc.get_node(id).filter(|_| !skip.contains(&id)) else {
+                continue;
+            };
+            let layout = node.final_layout;
+            let top = strip.line_top + (layout.location.y - split.inset_top - split.lines[line].0);
+            if top < -0.5 && layout.size.height > 0.0 {
+                log::warn!(
+                    "pagination: a box of {:.0}px on a line taller than a page starts {:.0}px above the page that holds the \
+                     line's baseline; the part above it is not printed",
+                    layout.size.height,
+                    -top,
+                );
+            }
+        }
+    }
+}
+
 /// html-to-pdf F213b: what one page holds of a paragraph that has a line taller than a page
 /// ([`fragment_inline_root_with_tall_lines`]).
 struct TallStrip {
@@ -10362,6 +10409,7 @@ fn fragment_inline_root_with_tall_lines(
         depth,
         &skip,
     );
+    warn_boxes_above_their_page(doc, carrier, split, &tall, &skip, &out);
     Some((cursor.0, cursor.1 + split.inset_bottom))
 }
 
@@ -20746,7 +20794,21 @@ h2 { string-set: chapter-title content(text); }
 
     #[test]
     fn an_inline_block_sharing_its_line_keeps_its_paragraph_whole() {
-        // Text on the line: the box is one unit (Chrome slices it, F30f-b).
+        // Text on the line: a box that fits a page is one unit (F213 moves it whole; Chrome slices it, F30f-b).
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div>Hi <span id=\"x\" style=\"display:inline-block\">{}</span> end</div>",
+                br_lines(8)
+            ),
+            200.0,
+        );
+        let n = geometry_of(&doc, &table, "x").map_or(0, |g| g.fragments.len());
+        assert!(n <= 1, "{n} fragments");
+    }
+
+    #[test]
+    fn an_inline_block_taller_than_a_page_that_shares_its_line_is_split_between_its_lines() {
+        // html-to-pdf F213b: 30 lines of 20 px on 200 px pages: the box is fragmented with its line (it was one leaf).
         let (doc, table) = nested_geometry(
             &format!(
                 "<div>Hi <span id=\"x\" style=\"display:inline-block\">{}</span> end</div>",
@@ -20754,8 +20816,9 @@ h2 { string-set: chapter-title content(text); }
             ),
             200.0,
         );
-        let n = geometry_of(&doc, &table, "x").map_or(0, |g| g.fragments.len());
-        assert!(n <= 1, "{n} fragments");
+        let g = geometry_of(&doc, &table, "x").expect("geometry");
+        assert_eq!(g.fragments.len(), 3, "{:?}", g.fragments);
+        assert!(line_slices_tile(&g.line_slices, 30), "{:?}", g.line_slices);
     }
 
     #[test]
@@ -21659,14 +21722,16 @@ h2 { string-set: chapter-title content(text); }
         assert!((below - 100.0).abs() < 0.5, "{below}");
         assert_eq!(barrier, Some(LineBarrier::ClipsItsContent));
         // A paragraph kept whole by an inline-block that shares its line says so.
+        // (A box that fits a page: one taller than a page is split with its line, html-to-pdf F213b.)
+        let short = br_lines(8);
         let doc = laid_out(&format!(
-            "<div>Hi <span id=\"p\" style=\"display:inline-block\"><p id=\"c\">{lines}</p></span></div>"
+            "<div>Hi <span id=\"p\" style=\"display:inline-block\"><p id=\"c\">{short}</p></span></div>"
         ));
         let (_, _, barrier) = unprinted_inline_lines(
             doc.deref(),
             node_of(&doc, "p"),
             node_of(&doc, "c"),
-            0.0,
+            100.0,
             200.0,
         )
         .expect("lines below the page");
@@ -21811,10 +21876,11 @@ h2 { string-set: chapter-title content(text); }
 
     #[test]
     fn an_inline_table_sharing_its_line_keeps_its_paragraph_whole() {
+        // A table that fits a page (html-to-pdf F213b: one taller than a page is split with its line).
         let (doc, table) = nested_geometry(
             &format!(
                 "<div>Hi <span id=\"it\" style=\"display:inline-table\">{}</span> end</div>",
-                br_lines(30)
+                br_lines(8)
             ),
             200.0,
         );
