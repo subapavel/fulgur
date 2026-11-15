@@ -1594,12 +1594,15 @@ fn carrier_line_page(
     // html-to-pdf F213b: a paragraph of several lines that has a line taller than a page has a slice with a lead or no
     // line at all (the pages the tall line crosses); the box's line is the one of those slices that holds it, which is
     // not `0..1` unless the tall line is the first.
+    // A carrier of several lines is always read this way: `0..1` is the slice of its first line, not of the box's (a tall line
+    // that starts on the page of its baseline has no empty slice and no lead, and the box was painted a second time).
     if carrier.line_slices.len() == carrier.fragments.len()
-        && carrier
-            .line_slices
-            .iter()
-            .any(|s| s.first == s.end || s.lead != crate::units::Px::ZERO)
         && let Some(para) = drawables.paragraphs.get(&carrier_id)
+        && (para.lines.len() > 1
+            || carrier
+                .line_slices
+                .iter()
+                .any(|s| s.first == s.end || s.lead != crate::units::Px::ZERO))
         && let Some(line) = para.lines.iter().position(|line| {
             line.items.iter().any(|item| {
                 matches!(item, crate::paragraph::LineItem::InlineBox(b) if b.node_id == Some(ib_id))

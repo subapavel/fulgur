@@ -9499,8 +9499,19 @@ fn line_split_candidate(
     child: &blitz_dom::Node,
     fresh: f32,
 ) -> Option<LineSplit> {
-    // Cheap exit first: a paragraph of one line has nothing to split.
-    let split = inline_root_lines(doc, child)?;
+    // Cheap exit first: a paragraph of one line has nothing to split, except the line of a table cell that is taller than a
+    // page: Blitz moves it down in a cell that centres or bottom-aligns its content (the offset is the cell's top padding),
+    // the row spans pages, and the line may land on a later page than the cell's first fragment (html-to-pdf F213b validator round 1).
+    let split = match inline_root_lines(doc, child) {
+        Some(split) => split,
+        None if is_cell_of_table(parent, child)
+            && child.final_layout.size.height > fresh + 1.0
+            && child.final_layout.padding.top > fresh * 0.25 =>
+        {
+            inline_root_lines_from(doc, child, 1)?
+        }
+        None => return None,
+    };
     // F30f-b: in block flow a clip box that hides content is fragmented by its own block size, and the lines it hides
     // get no place on any page: the barrier of the clip boxes is lifted and the lines are cut at the tightest clip.
     let through_clips = is_block_flow_container(doc, parent);
@@ -9538,8 +9549,17 @@ fn abspos_line_split(doc: &BaseDocument, child: &blitz_dom::Node) -> Option<Line
 /// F30f: `child` as an inline root of at least two lines that is not multicol, floating or transformed, with its
 /// lines. What [`abspos_line_split`] and [`line_split_candidate`] share; the atomic and clipping checks differ.
 fn inline_root_lines(doc: &BaseDocument, child: &blitz_dom::Node) -> Option<LineSplit> {
+    inline_root_lines_from(doc, child, 2)
+}
+
+/// [`inline_root_lines`] for an inline root of at least `min_lines` lines.
+fn inline_root_lines_from(
+    doc: &BaseDocument,
+    child: &blitz_dom::Node,
+    min_lines: usize,
+) -> Option<LineSplit> {
     let lines = collect_inline_line_metrics(child);
-    if lines.len() < 2
+    if lines.len() < min_lines
         || crate::blitz_adapter::is_multicol_container(child)
         || crate::blitz_adapter::node_is_floating(child)
         || child
@@ -9837,6 +9857,18 @@ fn fragment_nested_inline_root(
     ) {
         return end;
     }
+    // html-to-pdf F213b (validator round 1): the walk cannot move a paragraph that is flush with the top of its parent when the
+    // parent starts here too (the parent's caller checked its first row), and a first line that does not fit the room below
+    // would hang past the page edge and be lost. It starts the next page instead, like any box whose first row does not fit.
+    let first_line_h = split.lines[0].1 - split.lines[0].0;
+    let (page_in, y_in) = if y_in > top_floor + 0.5
+        && first_line_h <= strips.fresh()
+        && y_in + split.inset_top + first_line_h > strips.bottom(page_in) + 0.5
+    {
+        (page_in + 1, top_floor)
+    } else {
+        (page_in, y_in)
+    };
     let max_strips = crate::MAX_PAGES.saturating_sub(page_in).max(1) as usize;
     // Room for what follows the last line is only kept when it fits a page next
     // to a line; a bottom padding taller than that overflows, as in browsers,
@@ -10030,6 +10062,40 @@ fn fragment_tall_box(
     let Some(node) = doc.get_node(box_id) else {
         return (page, y);
     };
+    let ends = fragment_tall_box_ends(
+        geometry, doc, env, carrier, node, x_in_body, y, page, strips, depth,
+    );
+    // html-to-pdf F213b (validator round 1): a box with a fixed height and little content (one short child) is not entered by the
+    // walk, so its fragments are as tall as its content and the rest of its frame is not drawn (stress backlog B29). Say so.
+    let drawn: f32 = geometry
+        .get(&box_id)
+        .map_or(0.0, |g| g.fragments.iter().map(|f| f.height.to_f32()).sum());
+    let missing = node.final_layout.size.height - drawn;
+    if missing > strips.fresh() * 0.25 {
+        log::warn!(
+            "pagination: the frame of a box of {:.0}px that is taller than a page is drawn {drawn:.0}px high, {missing:.0}px of it are \
+             not drawn (a box with a fixed height and short content is not fragmented)",
+            node.final_layout.size.height,
+        );
+    }
+    ends
+}
+
+/// [`fragment_tall_box`] without the check of the drawn frame.
+#[allow(clippy::too_many_arguments)]
+fn fragment_tall_box_ends(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    env: McEnv<'_>,
+    carrier: &blitz_dom::Node,
+    node: &blitz_dom::Node,
+    x_in_body: f32,
+    y: f32,
+    page: u32,
+    strips: PageStrips,
+    depth: usize,
+) -> (u32, f32) {
+    let box_id = node.id;
     let width = node.final_layout.size.width;
     if node.flags.is_inline_root()
         && let Some(split) =
@@ -10119,6 +10185,26 @@ fn warn_boxes_above_their_page(
     }
 }
 
+/// html-to-pdf F213b: how much of the box `node` (taller than a page) has to fit below the place it starts at for starting it
+/// there to make progress: its first row, as [`leading_block_size_with`] counts it for a box of block children, and its border,
+/// padding and first `orphans` lines for a box that is an inline root.
+fn tall_box_first_row(doc: &BaseDocument, node: &blitz_dom::Node, fresh: f32) -> f32 {
+    if node.flags.is_inline_root() {
+        let lines = collect_inline_line_metrics(node);
+        let keep = line_rules(doc, node).orphans.max(1).min(lines.len());
+        let inset = node.final_layout.border.top + node.final_layout.padding.top;
+        // A box whose first lines are taller than a page (they hold a taller box of their own) is counted by its first row.
+        if let (Some(first), Some(last)) = (
+            lines.first(),
+            keep.checked_sub(1).and_then(|k| lines.get(k)),
+        ) && last.1 - first.0 <= fresh
+        {
+            return inset + last.1 - first.0;
+        }
+    }
+    leading_block_size_with(doc, node.id, None, 0.0, 0, fresh, true, None)
+}
+
 /// html-to-pdf F213b: what one page holds of a paragraph that has a line taller than a page
 /// ([`fragment_inline_root_with_tall_lines`]).
 struct TallStrip {
@@ -10188,12 +10274,32 @@ fn fragment_inline_root_with_tall_lines(
     let mut i = 0usize;
     while i < n {
         if let Some((_, boxes)) = tall.iter().find(|(line, _)| *line == i) {
+            let (line_top, line_bottom) = split.lines[i];
             if i > 0 {
                 page += 1;
                 frame_y = top_floor;
                 line_y = top_floor + continuation_inset;
+            } else if line_y > top_floor + 0.5 {
+                // The first line of the paragraph starts where the paragraph does, but a box whose first row does not fit the
+                // room below that place moves to the next page first, as the walk moves any box in front of its first row (F28):
+                // entering it there hangs the first row past the page edge (a paragraph that follows an oversized leaf, or a
+                // top margin that is the body offset of page 0, starts below the page bottom), and the line's text and the
+                // box's top are lost.
+                let first_row = boxes
+                    .iter()
+                    .filter_map(|&id| doc.get_node(id))
+                    .map(|node| {
+                        let below_line_top =
+                            node.final_layout.location.y - split.inset_top - line_top;
+                        below_line_top + tall_box_first_row(doc, node, strips.fresh())
+                    })
+                    .fold(0.0_f32, f32::max);
+                if first_row <= strips.fresh() && line_y + first_row > strips.bottom(page) + 0.5 {
+                    page += 1;
+                    frame_y = top_floor;
+                    line_y = top_floor + split.inset_top;
+                }
             }
-            let (line_top, line_bottom) = split.lines[i];
             let line_h = line_bottom - line_top;
             let mut end = (page, line_y + line_h);
             let mut setting: Option<(usize, f32)> = None;
@@ -10285,6 +10391,19 @@ fn fragment_inline_root_with_tall_lines(
             .find(|&line| line > i)
             .unwrap_or(n);
         let run = &split.lines[i..j];
+        // The paragraph starts below the bottom of its page when something that is not cut precedes it (an oversized leaf
+        // leaves the cursor past the edge): its first line does not fit there and moves to the next page, as the plain splitter
+        // does (html-to-pdf F213b validator round 1).
+        if i == 0
+            && out.is_empty()
+            && line_y > top_floor + 0.5
+            && run[0].1 - run[0].0 <= strips.fresh()
+            && line_y + (run[0].1 - run[0].0) > strips.bottom(page) + 0.5
+        {
+            page += 1;
+            frame_y = top_floor;
+            line_y = top_floor + split.inset_top;
+        }
         if open.is_some() && run[0].1 - run[0].0 > strips.bottom(page) - line_y + 0.01 {
             // Not even the first line fits below the tall line: it starts the next page.
             page += 1;
@@ -20668,6 +20787,39 @@ h2 { string-set: chapter-title content(text); }
                 (3, 2, 4, true)
             ]
         );
+    }
+
+    #[test]
+    fn a_tall_line_whose_box_has_no_room_for_its_first_row_starts_the_next_page() {
+        // html-to-pdf F213b validator round 1: 190 px of 200 are taken, the box's first row is 20 px: the first line of the
+        // paragraph, which holds the box, starts the next page instead of hanging past the edge of the first.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:190px\"></div><div id=\"c\" style=\"width:300px\">Lead {} trail<br>end</div>",
+                tall_box_html("a", 25)
+            ),
+            200.0,
+        );
+        assert_eq!(fragments_of(&doc, &table, "a")[0].page_index, 1);
+        assert_eq!(fragments_of(&doc, &table, "c")[0].page_index, 1);
+        assert!(
+            carrier_slices_of(&doc, &table, "c")
+                .iter()
+                .all(|s| s.0 >= 1)
+        );
+    }
+
+    #[test]
+    fn the_lines_before_a_tall_line_start_the_next_page_when_the_first_does_not_fit() {
+        // The first line of the paragraph is not the tall one and has no room (10 px of 200): the paragraph moves.
+        let (doc, table) = nested_geometry(
+            &format!(
+                "<div style=\"height:190px\"></div><div id=\"c\" style=\"width:300px\">X<br>Lead {} trail</div>",
+                tall_box_html("a", 25)
+            ),
+            200.0,
+        );
+        assert_eq!(fragments_of(&doc, &table, "c")[0].page_index, 1);
     }
 
     #[test]

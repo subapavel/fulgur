@@ -765,6 +765,12 @@ fn lines_right_edge(lines: &[ShapedLine], x: crate::units::Pt) -> crate::units::
     right
 }
 
+thread_local! {
+    /// html-to-pdf F213b: whether the box being painted is inside the content of a fragmented inline box whose translate has
+    /// already cancelled the body offset ([`inline_box_offset`]).
+    static BODY_OFFSET_CANCELLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The translate that moves the content of an inline box from the position the dispatcher paints it at,
 /// `geo = (margin + body offset + fragment)`, to where the carrier's line puts it, `inline_flow = (ox, oy)`.
 ///
@@ -1051,15 +1057,27 @@ pub fn draw_shaped_lines(
                         let geo_y_pt = ctx.margin_top_pt
                             + ctx.drawables.body_offset_pt.1.to_f32()
                             + content_frag.y.in_pt().to_f32();
-                        let (off_x, off_y) = inline_box_offset(
-                            content_geom.is_split(),
-                            (
-                                ctx.drawables.body_offset_pt.0.to_f32(),
-                                ctx.drawables.body_offset_pt.1.to_f32(),
-                            ),
-                            (ox.to_f32(), oy.to_f32()),
-                            (geo_x_pt, geo_y_pt),
-                        );
+                        // html-to-pdf F213b (validator round 1): a box fragmented over pages is painted where the fragmenter put
+                        // it, which cancels the body offset the dispatcher adds. A split box inside a split box is painted under
+                        // the translate of the outer one, which has cancelled it already: cancelling it again moved the inner box
+                        // up by the body offset (`margin-top` of 300 px on the first paragraph lost the top of the box).
+                        let split = content_geom.is_split();
+                        let cancelled_above = BODY_OFFSET_CANCELLED.with(std::cell::Cell::get);
+                        let (off_x, off_y) = if split && cancelled_above {
+                            (0.0, 0.0)
+                        } else {
+                            inline_box_offset(
+                                split,
+                                (
+                                    ctx.drawables.body_offset_pt.0.to_f32(),
+                                    ctx.drawables.body_offset_pt.1.to_f32(),
+                                ),
+                                (ox.to_f32(), oy.to_f32()),
+                                (geo_x_pt, geo_y_pt),
+                            )
+                        };
+                        let saved_cancelled =
+                            BODY_OFFSET_CANCELLED.replace(cancelled_above || split);
                         let transform = krilla::geom::Transform::from_translate(off_x, off_y);
                         let link_affine = crate::draw_primitives::Affine2D::translation(
                             off_x.as_pt(),
@@ -1104,6 +1122,7 @@ pub fn draw_shaped_lines(
                                 lc.pop_transform();
                             }
                         });
+                        BODY_OFFSET_CANCELLED.set(saved_cancelled);
                     }
 
                     // Link rect built after the opacity block ends, so link
