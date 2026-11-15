@@ -1185,8 +1185,6 @@ struct McContainer<'a> {
     bottom_inset: f32,
     /// The block-size of the first segment's first unit (see [`McContainer::first_unit`]), px.
     first_unit: f32,
-    /// html-to-pdf F213b (round 3): the first unit is a box placed whole (a leaf), not a line of text.
-    first_unit_leaf: bool,
     /// F174: the tables of the container's flows (boxes of the groups) the fragmenter cuts between rows, by node.
     tables: BTreeMap<usize, McTable>,
     /// F198: the boxes of the flows that are taller than a page and are cut between their lines, by node ([`mc_box`]).
@@ -1209,11 +1207,6 @@ impl McContainer<'_> {
     /// Block-size of the first thing in the flow (a box, a spanner, or the first line of a paragraph), px.
     fn first_unit(&self) -> f32 {
         self.first_unit
-    }
-
-    /// Whether the first unit is a box that is placed whole, which overflows its column wherever it starts.
-    fn first_unit_is_leaf(&self) -> bool {
-        self.first_unit_leaf
     }
 }
 
@@ -1355,36 +1348,18 @@ fn multicol_container<'a>(
         }
     }
     let layout = node.final_layout;
-    let (top_inset, first_unit, first_unit_leaf) = match geometry.segments.first()? {
+    let (top_inset, first_unit) = match geometry.segments.first()? {
         // The group sits below the container's top padding and border.
         SegmentGeom::Group(g) => {
             let group = geometry.groups.get(*g)?;
-            // A box placed whole, or a first line that holds a box taller than a page: the box overflows its column wherever it
-            // starts, so moving the container to a fresh page gains nothing for it.
-            let leaf = match group.flow.first() {
-                Some(crate::multicol_layout::FlowItem::Block { node, .. }) => {
-                    !boxes.contains_key(node)
-                }
-                Some(crate::multicol_layout::FlowItem::Lines { source, .. }) => {
-                    !boxes.contains_key(source)
-                        && doc.get_node(*source).is_some_and(|n| {
-                            tall_lines(doc, n, fresh)
-                                .first()
-                                .is_some_and(|(line, _)| *line == 0)
-                        })
-                }
-                None => false,
-            };
             (
                 group.y_offset.to_f32(),
                 flow_first_unit(&group.flow, &BTreeMap::new(), &boxes),
-                leaf,
             )
         }
         SegmentGeom::SpanAll { node: span } => (
             layout.border.top + layout.padding.top,
             doc.get_node(*span)?.final_layout.size.height,
-            false,
         ),
     };
     let fill = column_styles
@@ -1398,7 +1373,6 @@ fn multicol_container<'a>(
         top_inset,
         bottom_inset: layout.border.bottom + layout.padding.bottom,
         first_unit,
-        first_unit_leaf,
         tables,
         boxes,
         baked,
@@ -4030,14 +4004,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     // html-to-pdf F213b (validator round 1): also when the first unit is taller than a page: it overflows its
                     // page wherever it starts, and starting it below other content makes it overflow by more (a line of 482 px
                     // at the top of a page of 453 px stays inside the page box, at the middle of one it is cut and lost).
-                    // A box placed whole that is taller than a page keeps main's rule: it overflows its column on any page, and
-                    // what follows it in the next column is placed by the plan of the page it is on (round 3: moving the
-                    // container put a following paragraph in a column beside it, past the page edge).
-                    if cursor_y > 0.0
-                        && leading > strips.bottom(page_index) - cursor_y
-                        && !(leading > strips.fresh()
-                            && (mc.first_unit_is_leaf() || leading > 2.0 * strips.fresh()))
-                    {
+                    if cursor_y > 0.0 && leading > strips.bottom(page_index) - cursor_y {
                         page_index += 1;
                         cursor_y = 0.0;
                     }
@@ -9450,7 +9417,8 @@ fn box_barrier(
         let tall = is_inline_block_or_table(node)
             && node.final_layout.size.height.is_finite()
             && node.final_layout.size.height > fresh + 1.0
-            && !inside_multicol(doc, node);
+            && !inside_multicol(doc, node)
+            && !holds_tall_clip_box(doc, node, fresh);
         if !tall {
             return Some(if is_inline_block_or_table(node) {
                 LineBarrier::SharesItsLine
@@ -10013,6 +9981,31 @@ fn fragment_nested_inline_root(
     } else {
         (page_in, y_in)
     };
+    // html-to-pdf F213b (round 3): a table cell that centres or bottom-aligns its text in a row that spans pages has the text below
+    // the page the cell starts on (the offset is the cell's top padding): the row goes on at the top of the next page, so the line
+    // is on that page, as far below its top as the padding reaches past the page bottom.
+    let is_cell = doc.get_node(child_id).is_some_and(|node| {
+        node.layout_parent
+            .get()
+            .and_then(|id| doc.get_node(id))
+            .is_some_and(|parent| is_cell_of_table(parent, node))
+    });
+    let (page_in, y_in) = if is_cell && split.lines.len() == 1 {
+        let (mut page, mut at) = (page_in, y_in + split.inset_top);
+        let mut moved = false;
+        while at >= strips.bottom(page) - 0.5 && page < page_in + crate::MAX_PAGES {
+            at = at - strips.bottom(page) + top_floor;
+            page += 1;
+            moved = true;
+        }
+        if moved {
+            (page, at - split.inset_top)
+        } else {
+            (page_in, y_in)
+        }
+    } else {
+        (page_in, y_in)
+    };
     let max_strips = crate::MAX_PAGES.saturating_sub(page_in).max(1) as usize;
     // Room for what follows the last line is only kept when it fits a page next
     // to a line; a bottom padding taller than that overflows, as in browsers,
@@ -10250,6 +10243,24 @@ fn tall_lines(
     found
 }
 
+/// html-to-pdf F213b (round 3): the bottom of what `node` holds (its last line box, or its lowest child), px from its top.
+fn content_extent(doc: &BaseDocument, node: &blitz_dom::Node) -> f32 {
+    if node.flags.is_inline_root() {
+        return collect_inline_line_metrics(node)
+            .last()
+            .map_or(0.0, |line| line.1);
+    }
+    let children = node.layout_children.borrow();
+    children
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|&id| doc.get_node(id))
+        .map(|c| c.final_layout.location.y + c.final_layout.size.height)
+        .filter(|v| v.is_finite())
+        .fold(0.0_f32, f32::max)
+}
+
 /// html-to-pdf F213b (round 3): whether a box strictly inside `node` clips its overflow and is taller than a page (`fresh`). Such a
 /// box is not cut between its lines or children (what it hides is not printed), so the box around it cannot be split into pages
 /// that hold its parts: it is left to the walk that placed it before F213b, which prints its content where it starts.
@@ -10260,6 +10271,7 @@ fn holds_tall_clip_box(doc: &BaseDocument, node: &blitz_dom::Node, fresh: f32) -
         if clips_overflow(n)
             && n.final_layout.size.height.is_finite()
             && n.final_layout.size.height > fresh + 1.0
+            && content_extent(doc, n) <= fresh + 1.0
         {
             return true;
         }
@@ -22889,7 +22901,7 @@ h2 { string-set: chapter-title content(text); }
     }
 
     #[test]
-    fn table_cells_after_a_split_cell_start_at_the_row_top() {
+    fn short_table_cells_after_a_split_cell_are_on_the_page_of_their_centred_text() {
         let (doc, table) = nested_geometry(
             &format!(
                 "<table style=\"width:100%\"><tr><td id=\"a\"><p>{}</p></td><td id=\"b\">x</td><td id=\"c\">y</td></tr></table><p id=\"after\">after</p>",
@@ -22899,14 +22911,14 @@ h2 { string-set: chapter-title content(text); }
         );
         let a = fragments_of(&doc, &table, "a");
         assert!(a.len() >= 3, "{a:?}");
+        // The short cells centre their word in the 600 px row: 290 px down, which is on the second page of 200 px. The cell is
+        // placed there, above the page top by the padding that centres the word (html-to-pdf F213b, round 3: it used to be placed
+        // at the row top of the first page, where the word hung below the page edge and was not printed).
         for id in ["b", "c"] {
             let f = fragments_of(&doc, &table, id);
             assert_eq!(f.len(), 1, "{id}: {f:?}");
-            assert_eq!(f[0].page_index, 0, "{id}");
-            assert!(
-                (f[0].y.to_f32() - a[0].y.to_f32()).abs() < 0.5,
-                "{id}: {f:?} vs {a:?}"
-            );
+            assert_eq!(f[0].page_index, 1, "{id}: {f:?}");
+            assert!(f[0].y.to_f32() < 0.5, "{id}: {f:?}");
         }
         // What follows the table continues below the split cell.
         let after = &fragments_of(&doc, &table, "after")[0];

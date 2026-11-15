@@ -10482,6 +10482,48 @@ fn render_v2_smoke_paragraph_with_a_tall_line_prints_every_word_once() {
 }
 
 #[test]
+fn render_v2_smoke_table_cell_text_below_the_page_the_row_starts_on_is_printed() {
+    // html-to-pdf F213b (round 3): a row of 500 px starts 40 px above the bottom of a 300 px page; its first cell centres the word
+    // 240 px down, which is on the second page. The cell was placed whole where the row starts, below the page edge, and the
+    // word was printed nowhere.
+    let html = "<!DOCTYPE html><html><head><style>@page { size: 400px 300px; margin: 0 } \
+         body { margin: 0; line-height: 20px } td { padding: 0 }</style></head><body>\
+         <div style=\"height:260px\"></div>\
+         <table><tr><td>CELLWORD</td><td><div style=\"height:500px;width:100px\"></div></td></tr></table></body></html>";
+    let pdf = noto_engine().render(html).unwrap();
+    let Some(text) = extract_pdf_text(&pdf) else {
+        eprintln!("pdftotext not installed; skipping the text check");
+        return;
+    };
+    assert_eq!(
+        text.split_whitespace().filter(|w| *w == "CELLWORD").count(),
+        1,
+        "the cell's word is printed once: {text:?}"
+    );
+}
+
+#[test]
+fn render_v2_smoke_tall_box_that_holds_a_tall_clip_box_prints_its_word() {
+    // html-to-pdf F213b (round 3): a box around a clip box with a fixed height taller than a page and one short line is not split
+    // into pages (the clip box is one piece); the word in the clip box was painted on no page.
+    let html = "<!DOCTYPE html><html><head><style>@page { size: 400px 300px; margin: 0 } \
+         body { margin: 0; line-height: 20px }</style></head><body>\
+         <div style=\"width:400px\"><span style=\"display:inline-block;width:300px\">\
+         <span style=\"display:inline-block;overflow:hidden;height:700px\">CLIPWORD</span></span>\
+         <span style=\"display:inline-block;width:300px\"></span></div></body></html>";
+    let pdf = noto_engine().render(html).unwrap();
+    let Some(text) = extract_pdf_text(&pdf) else {
+        eprintln!("pdftotext not installed; skipping the text check");
+        return;
+    };
+    assert_eq!(
+        text.split_whitespace().filter(|w| *w == "CLIPWORD").count(),
+        1,
+        "the word in the clip box is printed once: {text:?}"
+    );
+}
+
+#[test]
 fn render_v2_smoke_text_lines_of_a_box_that_shares_its_line_are_split_between_lines() {
     // html-to-pdf F213b: the box is the inline formatting context: 45 text lines of 20 px on 300 px pages, taller than a
     // page and sharing its line with text. It is split between its lines (it was a barrier, `SharesItsLine`), every line
