@@ -5145,8 +5145,9 @@ fn in_visual_order(
     // starts (a paragraph whose line holds a tall image or a clip box); the walk in document order keeps main's placement of it, which
     // prints the words in it, where the visual order starts it on a page that its text lies below.
     let has_tall_item = children.iter().any(|&id| {
-        doc.get_node(id)
-            .is_some_and(|n| n.final_layout.size.height > fresh + 1.0)
+        doc.get_node(id).is_some_and(|n| {
+            n.final_layout.size.height > fresh + 1.0 || content_overflows_box(doc, n)
+        })
     });
     if reversed && !has_tall_item {
         children.sort_by(|&a, &b| {
@@ -10259,6 +10260,27 @@ fn tall_lines(
         }
     }
     found
+}
+
+/// html-to-pdf F213b (round 5): whether something inside `node` reaches below its bottom edge (a fixed height and more content, or a
+/// box taller than its parent): its page is not decided by the box's own height.
+fn content_overflows_box(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
+    let height = node.final_layout.size.height;
+    let mut stack: Vec<(usize, f32, usize)> = node.children.iter().map(|&c| (c, 0.0, 1)).collect();
+    let mut seen = 0usize;
+    while let Some((id, top, depth)) = stack.pop() {
+        let Some(n) = doc.get_node(id) else { continue };
+        seen += 1;
+        let at = top + n.final_layout.location.y;
+        if n.final_layout.size.height.is_finite() && at + n.final_layout.size.height > height + 0.5
+        {
+            return true;
+        }
+        if depth < 6 && seen < 2_000 {
+            stack.extend(n.children.iter().map(|&c| (c, at, depth + 1)));
+        }
+    }
+    false
 }
 
 /// html-to-pdf F213b (round 3): the bottom of what `node` holds (its last line box, or its lowest child), px from its top.
